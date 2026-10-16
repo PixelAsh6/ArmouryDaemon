@@ -1,0 +1,15 @@
+[package]
+name = "armoury-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+armoury-core.workspace = true
+log.workspace = true
+crossbeam-channel.workspace = true
+interprocess.workspace = true
+tray-icon.workspace = true
+global-hotkey.workspace = true
+windows.workspace = true
+windows-sys.workspace = true
