@@ -7,6 +7,8 @@ use interprocess::local_socket::{prelude::*, Listener, Stream};
 use log::{info, warn};
 use std::io::BufReader;
 use std::thread;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::SetEvent;
 
 pub enum PipeEvent {
     Connected { id: u64, push: Sender<Response> },
@@ -14,8 +16,9 @@ pub enum PipeEvent {
     Disconnected { id: u64 },
 }
 
-/// Spawn the accept loop on a dedicated thread.
-pub fn start(listener: Listener, tx: Sender<PipeEvent>) {
+/// Spawn the accept loop on a dedicated thread. `wake` is the daemon's wake event
+/// (raw handle as usize) so pipe traffic is handled without waiting for the 1 s tick.
+pub fn start(listener: Listener, tx: Sender<PipeEvent>, wake: usize) {
     thread::spawn(move || {
         let mut next_id: u64 = 1;
         for conn in listener.incoming() {
@@ -24,7 +27,7 @@ pub fn start(listener: Listener, tx: Sender<PipeEvent>) {
                     let id = next_id;
                     next_id += 1;
                     let tx = tx.clone();
-                    thread::spawn(move || handle_conn(stream, id, tx));
+                    thread::spawn(move || handle_conn(stream, id, tx, wake));
                 }
                 Err(e) => warn!("pipe accept error: {e}"),
             }
@@ -32,7 +35,13 @@ pub fn start(listener: Listener, tx: Sender<PipeEvent>) {
     });
 }
 
-fn handle_conn(stream: Stream, id: u64, tx: Sender<PipeEvent>) {
+fn signal(wake: usize) {
+    if wake != 0 {
+        unsafe { SetEvent(wake as HANDLE) };
+    }
+}
+
+fn handle_conn(stream: Stream, id: u64, tx: Sender<PipeEvent>, wake: usize) {
     let (recv_half, send_half) = stream.split();
 
     // Writer thread: daemon -> client.
@@ -51,6 +60,7 @@ fn handle_conn(stream: Stream, id: u64, tx: Sender<PipeEvent>) {
         id,
         push: push_tx.clone(),
     });
+    signal(wake);
 
     // Reader loop (this thread): client -> daemon.
     let mut reader = BufReader::new(recv_half);
@@ -61,6 +71,7 @@ fn handle_conn(stream: Stream, id: u64, tx: Sender<PipeEvent>) {
                 if tx.send(PipeEvent::Request { id, req }).is_err() {
                     break;
                 }
+                signal(wake);
             }
             Ok(None) => break, // clean EOF: client closed the pipe
             Err(e) => {
@@ -71,6 +82,7 @@ fn handle_conn(stream: Stream, id: u64, tx: Sender<PipeEvent>) {
     }
 
     let _ = tx.send(PipeEvent::Disconnected { id });
+    signal(wake);
     drop(push_tx);
     let _ = writer.join();
     info!("pipe client {id} handler finished");

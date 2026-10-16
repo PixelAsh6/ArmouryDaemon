@@ -10,6 +10,8 @@ pub enum Request {
     UiHello { pid: u32 },
     GetStatus,
     ShowUi,
+    AddTrackedApp { name: String, exe: String },
+    RemoveTrackedApp { exe: String },
 }
 
 /// Messages sent from the daemon to a client.
@@ -80,6 +82,7 @@ mod tests {
                 cooldown_seconds: 60,
                 paused: false,
                 killswitch_active: false,
+                tracked_apps: vec![],
                 tracked_apps_running: vec![],
             },
         };

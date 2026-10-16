@@ -1,3 +1,4 @@
+use crate::config::TrackedApp;
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon state machine (Phase 1: always Idle).
@@ -20,5 +21,8 @@ pub struct StatusSnapshot {
     pub cooldown_seconds: u64,
     pub paused: bool,
     pub killswitch_active: bool,
+    /// The user's configured tracked-app list.
+    pub tracked_apps: Vec<TrackedApp>,
+    /// Display names of tracked apps that are currently running.
     pub tracked_apps_running: Vec<String>,
 }

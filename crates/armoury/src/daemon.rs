@@ -2,30 +2,24 @@
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
 use crate::ipc;
-use armoury_core::config::AppConfig;
+use crate::watch;
+use armoury_core::config::{AppConfig, TrackedApp};
+use armoury_core::engine::{Engine, EngineState, Transition};
 use armoury_core::protocol::{Request, Response};
 use armoury_core::status::{RunState, StatusSnapshot};
-use crossbeam_channel::select;
 use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-
-const TICK: Duration = Duration::from_millis(20);
-
-enum AppEvent {
-    Tray(TrayIconEvent),
-    Menu(MenuEvent),
-    Hotkey(GlobalHotKeyEvent),
-    Pipe(ipc::PipeEvent),
-    Tick,
-}
+use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, QS_ALLINPUT};
 
 pub fn run() {
     if let Err(e) = armoury_core::logging::init("daemon") {
@@ -71,8 +65,28 @@ pub fn run() {
         }
     };
     let (pipe_tx, pipe_rx) = crossbeam_channel::unbounded::<ipc::PipeEvent>();
-    ipc::start(listener, pipe_tx);
+
+    // ---- wake event: every producer signals it so the main loop reacts immediately ----
+    let wake = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if wake.is_null() {
+        error!("failed to create the wake event");
+        return;
+    }
+    let wake_handle = wake as usize;
+
+    ipc::start(listener, pipe_tx, wake_handle);
     info!("pipe server ready ({})", armoury_core::PIPE_NAME);
+
+    // ---- tracked-app watcher + trigger engine ----
+    let tracked = Arc::new(Mutex::new(cfg.tracked_apps.clone()));
+    let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<watch::WatchEvent>();
+    watch::start(tracked.clone(), watch_tx, wake_handle);
+    let engine = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
+    info!(
+        "watching {} tracked app(s); cooldown {}s",
+        cfg.tracked_apps.len(),
+        cfg.cooldown_seconds
+    );
 
     // ---- tray icon + menu (created on this thread: it owns the message pump) ----
     let menu = Menu::new();
@@ -121,12 +135,16 @@ pub fn run() {
     }
 
     // ---- main loop ----
+    // A single waitable event lets every producer (watcher, pipe threads) wake the loop
+    // immediately; Win32 messages (tray, hotkey) wake it through the message queue.
     let tray_rx = TrayIconEvent::receiver();
     let menu_rx = MenuEvent::receiver();
     let hotkey_rx = GlobalHotKeyEvent::receiver();
 
     let mut app = App {
         cfg,
+        tracked,
+        engine,
         started: Instant::now(),
         clients: HashMap::new(),
         ui_conn: None,
@@ -134,42 +152,63 @@ pub fn run() {
         spawning_ui: false,
         last_broadcast: Instant::now(),
     };
+    let mut last_housekeeping = Instant::now();
     info!("daemon ready");
 
-    loop {
+    let quit = loop {
         pump_win32_messages();
-        let ev = select! {
-            recv(tray_rx) -> r => r.ok().map(AppEvent::Tray),
-            recv(menu_rx) -> r => r.ok().map(AppEvent::Menu),
-            recv(hotkey_rx) -> r => r.ok().map(AppEvent::Hotkey),
-            recv(pipe_rx) -> r => r.ok().map(AppEvent::Pipe),
-            default(TICK) => Some(AppEvent::Tick),
-        };
-        let Some(ev) = ev else { continue };
-        match ev {
-            AppEvent::Tray(TrayIconEvent::Click {
+
+        // drain every source without blocking
+        let mut quit = false;
+        while let Ok(e) = tray_rx.try_recv() {
+            if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
                 ..
-            }) => app.on_open(),
-            AppEvent::Tray(_) => {}
-            AppEvent::Menu(e) => match e.id.0.as_str() {
+            } = e
+            {
+                app.on_open();
+            }
+        }
+        while let Ok(e) = menu_rx.try_recv() {
+            match e.id.0.as_str() {
                 "open" => app.on_open(),
                 "quit" => {
                     info!("quit requested from tray menu");
-                    break;
+                    quit = true;
                 }
                 other => info!("tray menu '{other}' — not implemented yet"),
-            },
-            AppEvent::Hotkey(e) => {
-                if e.state == HotKeyState::Pressed {
-                    // Phase 4 turns this into the killswitch; for now, prove the wiring.
-                    info!("Scroll Lock pressed (killswitch wiring check — Phase 4)");
-                }
             }
-            AppEvent::Pipe(p) => app.on_pipe(p),
-            AppEvent::Tick => app.on_tick(),
         }
+        while let Ok(e) = hotkey_rx.try_recv() {
+            if e.state == HotKeyState::Pressed {
+                app.on_hotkey();
+            }
+        }
+        while let Ok(p) = pipe_rx.try_recv() {
+            app.on_pipe(p);
+        }
+        while let Ok(w) = watch_rx.try_recv() {
+            app.on_watch(w);
+        }
+        if quit {
+            break true;
+        }
+
+        if last_housekeeping.elapsed() >= Duration::from_secs(1) {
+            last_housekeeping = Instant::now();
+            app.on_tick();
+        }
+
+        // Block until a message arrives, a producer signals the event, or 1 s passes.
+        // Idle cost is therefore ~zero (no polling tick).
+        unsafe {
+            MsgWaitForMultipleObjectsEx(1, &wake, 1000, QS_ALLINPUT, 0);
+        }
+    };
+
+    if !quit {
+        info!("main loop ended unexpectedly");
     }
 
     // ---- shutdown ----
@@ -196,6 +235,9 @@ fn make_tray_icon() -> tray_icon::Icon {
 
 struct App {
     cfg: AppConfig,
+    /// Shared with the watcher thread (single source of truth for what to watch).
+    tracked: Arc<Mutex<Vec<TrackedApp>>>,
+    engine: Engine,
     started: Instant,
     clients: HashMap<u64, crossbeam_channel::Sender<Response>>,
     ui_conn: Option<u64>,
@@ -206,20 +248,105 @@ struct App {
 
 impl App {
     fn status(&self) -> StatusSnapshot {
+        let now = Instant::now();
+        let (state, trigger_source) = match self.engine.state() {
+            EngineState::Idle => (RunState::Idle, None),
+            EngineState::Triggered => (RunState::Triggered, self.engine.source()),
+            EngineState::Cooldown => (RunState::Cooldown, self.engine.source()),
+        };
         StatusSnapshot {
             daemon_version: armoury_core::VERSION.to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
-            state: RunState::Idle,
-            trigger_source: None,
-            cooldown_remaining_ms: None,
+            state,
+            trigger_source,
+            cooldown_remaining_ms: self
+                .engine
+                .cooldown_remaining(now)
+                .map(|d| d.as_millis() as u64),
             cooldown_seconds: self.cfg.cooldown_seconds,
             paused: false,
             killswitch_active: false,
-            tracked_apps_running: Vec::new(),
+            tracked_apps: self.cfg.tracked_apps.clone(),
+            tracked_apps_running: self.engine.running_names(),
         }
     }
 
+    fn on_watch(&mut self, ev: watch::WatchEvent) {
+        let now = Instant::now();
+        let transition = match ev {
+            watch::WatchEvent::Started { exe, name, pid } => {
+                self.engine.on_started(&exe, &name, pid, now)
+            }
+            watch::WatchEvent::Stopped { exe, pid } => self.engine.on_stopped(&exe, pid, now),
+        };
+        if let Some(t) = transition {
+            self.on_transition(t);
+        }
+    }
+
+    fn on_transition(&mut self, t: Transition) {
+        match &t {
+            Transition::Triggered => info!(
+                "state -> Triggered ({}) [packs will apply in Phase 3]",
+                self.engine.source().unwrap_or_default()
+            ),
+            Transition::Cooldown => info!(
+                "state -> Cooldown ({}s until revert)",
+                self.cfg.cooldown_seconds
+            ),
+            Transition::Reverted => info!("state -> Idle (cooldown expired; packs revert in Phase 3)"),
+        }
+        self.broadcast_status();
+    }
+
+    fn add_tracked_app(&mut self, name: String, exe: String) {
+        if self
+            .cfg
+            .tracked_apps
+            .iter()
+            .any(|a| a.exe.eq_ignore_ascii_case(&exe))
+        {
+            info!("tracked app already in the list: {exe}");
+            return;
+        }
+        self.cfg.tracked_apps.push(TrackedApp {
+            name,
+            exe: exe.clone(),
+        });
+        info!("tracked app added: {exe}");
+        self.save_and_share_tracked();
+    }
+
+    fn remove_tracked_app(&mut self, exe: &str) {
+        let before = self.cfg.tracked_apps.len();
+        self.cfg
+            .tracked_apps
+            .retain(|a| !a.exe.eq_ignore_ascii_case(exe));
+        if self.cfg.tracked_apps.len() != before {
+            info!("tracked app removed: {exe}");
+            self.save_and_share_tracked();
+        }
+    }
+
+    fn save_and_share_tracked(&mut self) {
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        if let Ok(mut list) = self.tracked.lock() {
+            *list = self.cfg.tracked_apps.clone();
+        }
+        self.broadcast_status();
+    }
+
+    fn on_hotkey(&mut self) {
+        // Phase 4 turns this into the killswitch; for now, prove the wiring.
+        info!("Scroll Lock pressed (killswitch wiring check — Phase 4)");
+    }
+
     fn on_tick(&mut self) {
+        if let Some(t) = self.engine.tick(Instant::now()) {
+            self.on_transition(t);
+        }
         if self.last_broadcast.elapsed() >= Duration::from_secs(1) {
             self.last_broadcast = Instant::now();
             self.broadcast_status();
@@ -325,6 +452,8 @@ impl App {
                     }
                 }
                 Request::ShowUi => self.on_open(),
+                Request::AddTrackedApp { name, exe } => self.add_tracked_app(name, exe),
+                Request::RemoveTrackedApp { exe } => self.remove_tracked_app(&exe),
             },
         }
     }

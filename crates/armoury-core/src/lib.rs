@@ -1,4 +1,5 @@
 pub mod config;
+pub mod engine;
 pub mod icon;
 pub mod logging;
 pub mod protocol;

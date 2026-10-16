@@ -7,6 +7,7 @@
 mod daemon;
 mod ipc;
 mod ui;
+mod watch;
 
 fn main() {
     let is_ui = std::env::args().skip(1).any(|a| a == "--ui");

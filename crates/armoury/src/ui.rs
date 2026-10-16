@@ -3,12 +3,13 @@
 //! placed at the bottom exterior corner of the primary monitor, above the taskbar.
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
+use armoury_core::config::TrackedApp;
 use armoury_core::protocol::{read_msg, write_msg, Request, Response};
 use armoury_core::status::{RunState, StatusSnapshot};
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, FontFamily, FontId, Rect, RichText, Stroke, TextStyle};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -83,6 +84,8 @@ pub fn run() {
     }
     log::info!("connected to daemon");
 
+    let (pick_tx, pick_rx) = crossbeam_channel::unbounded::<PathBuf>();
+
     let (tx, rx) = crossbeam_channel::unbounded::<UiEvent>();
     thread::spawn(move || {
         let mut reader = BufReader::new(recv_half);
@@ -137,7 +140,13 @@ pub fn run() {
         "ArmouryDaemon",
         options,
         Box::new(move |_cc| {
-            let app: Box<dyn eframe::App> = Box::new(App::new(rx, shared));
+            let app: Box<dyn eframe::App> = Box::new(App::new(
+                rx,
+                shared,
+                Box::new(send_half) as Box<dyn Write>,
+                pick_tx,
+                pick_rx,
+            ));
             Ok(app)
         }),
     );
@@ -146,18 +155,53 @@ pub fn run() {
 struct App {
     rx: Receiver<UiEvent>,
     shared: Arc<Mutex<Shared>>,
+    /// Pipe writer — used to ask the daemon to change the tracked list.
+    send: Box<dyn Write>,
+    /// Paths coming back from the native "browse for exe" dialog.
+    pick_rx: Receiver<PathBuf>,
+    /// Running apps offered in the picker (title, exe path).
+    apps: Vec<(String, String)>,
+    apps_refreshed: Instant,
+    pick_tx: crossbeam_channel::Sender<PathBuf>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
 }
 
 impl App {
-    fn new(rx: Receiver<UiEvent>, shared: Arc<Mutex<Shared>>) -> Self {
+    fn new(
+        rx: Receiver<UiEvent>,
+        shared: Arc<Mutex<Shared>>,
+        send: Box<dyn Write>,
+        pick_tx: crossbeam_channel::Sender<PathBuf>,
+        pick_rx: Receiver<PathBuf>,
+    ) -> Self {
         Self {
             rx,
             shared,
+            send,
+            pick_tx,
+            pick_rx,
+            apps: Vec::new(),
+            apps_refreshed: Instant::now() - Duration::from_secs(60),
             styled: false,
             last_desired: None,
         }
+    }
+
+    fn request(&mut self, req: &Request) {
+        if let Err(e) = write_msg(&mut self.send, req) {
+            log::warn!("failed to send request: {e}");
+        }
+    }
+
+    fn add_tracked(&mut self, name: String, exe: String) {
+        self.request(&Request::AddTrackedApp { name, exe });
+    }
+
+    fn remove_tracked(&mut self, exe: &str) {
+        self.request(&Request::RemoveTrackedApp {
+            exe: exe.to_string(),
+        });
     }
 }
 
@@ -209,6 +253,23 @@ impl eframe::App for App {
             }
         }
 
+        // Native "browse for exe" results.
+        while let Ok(path) = self.pick_rx.try_recv() {
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            let exe = path.display().to_string();
+            log::info!("picked {exe}");
+            self.add_tracked(name, exe);
+        }
+
+        // Keep the running-app list fresh for the picker (~2 s is plenty).
+        if self.apps_refreshed.elapsed() >= Duration::from_secs(2) {
+            self.apps_refreshed = Instant::now();
+            self.apps = list_window_apps();
+        }
+
         // Keep the window live: pipe updates arrive at ~1 Hz.
         ctx.request_repaint_after(Duration::from_secs(1));
     }
@@ -227,7 +288,7 @@ impl eframe::App for App {
         }
 
         // ---- snapshot of shared state for this frame ----
-        let (status_text, status_color, rows, settings_open) = {
+        let (status_text, status_color, rows, settings_open, tracked, running) = {
             let s = self.shared.lock().unwrap();
             let (text, color) = match &s.status {
                 Some(st) => match st.state {
@@ -277,7 +338,17 @@ impl eframe::App for App {
                 ),
                 ("packs".to_string(), "none installed".to_string()),
             ];
-            (text, color, rows, s.settings_open)
+            let tracked: Vec<TrackedApp> = s
+                .status
+                .as_ref()
+                .map(|st| st.tracked_apps.clone())
+                .unwrap_or_default();
+            let running: Vec<String> = s
+                .status
+                .as_ref()
+                .map(|st| st.tracked_apps_running.clone())
+                .unwrap_or_default();
+            (text, color, rows, s.settings_open, tracked, running)
         };
 
         // ---- window body (padded so text never hugs the border) ----
@@ -318,6 +389,71 @@ impl eframe::App for App {
             ui.add_space(8.0);
             for (key, value) in &rows {
                 row(ui, key, value);
+            }
+
+            // ---- tracked apps ----
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new("Tracked apps").strong());
+            ui.add_space(4.0);
+
+            let mut pick: Option<(String, String)> = None;
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("pick-app")
+                    .selected_text("Pick a running app…")
+                    .width(215.0)
+                    .show_ui(ui, |ui| {
+                        let mut any = false;
+                        for (title, exe) in &self.apps {
+                            if tracked.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)) {
+                                continue;
+                            }
+                            any = true;
+                            let label = format!("{title}  ({})", file_name(exe));
+                            if ui.selectable_label(false, label).clicked() {
+                                pick = Some((title.clone(), exe.clone()));
+                            }
+                        }
+                        if !any {
+                            ui.label("(nothing new running)");
+                        }
+                    });
+                if ui.button("Browse…").clicked() {
+                    spawn_picker(self.pick_tx.clone());
+                }
+            });
+            if let Some((name, exe)) = pick {
+                self.add_tracked(name, exe);
+            }
+
+            if tracked.is_empty() {
+                ui.add_space(4.0);
+                ui.small("No tracked apps yet — pick one above or browse for an .exe.");
+            }
+
+            let mut remove: Option<String> = None;
+            for app in &tracked {
+                ui.horizontal(|ui| {
+                    let is_running = running.iter().any(|n| n.eq_ignore_ascii_case(&app.name));
+                    status_dot(
+                        ui,
+                        if is_running {
+                            Color32::from_rgb(52, 211, 153)
+                        } else {
+                            Color32::from_gray(110)
+                        },
+                    );
+                    ui.label(&app.name);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if icon_button(ui, 18.0, draw_close).clicked() {
+                            remove = Some(app.exe.clone());
+                        }
+                    });
+                });
+            }
+            if let Some(exe) = remove {
+                self.remove_tracked(&exe);
             }
         });
 
@@ -694,6 +830,140 @@ fn initial_geometry() -> (egui::Vec2, egui::Pos2) {
     };
     let y = (b - size.y - margin_y).max(t + margin_y);
     (size, egui::pos2(x, y))
+}
+
+fn file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Run the native picker on a worker thread: the dialog runs its own modal loop, and
+/// keeping it off the egui event thread avoids re-entrancy surprises.
+fn spawn_picker(tx: crossbeam_channel::Sender<PathBuf>) {
+    thread::spawn(move || match pick_exe_dialog() {
+        Some(path) => {
+            let _ = tx.send(path);
+        }
+        None => log::info!("file picker cancelled"),
+    });
+}
+
+/// Modern common item dialog (`IFileDialog`) — no extra dependencies.
+fn pick_exe_dialog() -> Option<PathBuf> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+        CoInitializeEx, CoTaskMemFree, CoUninitialize,
+    };
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{
+        FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FileOpenDialog, IFileOpenDialog,
+        SIGDN_FILESYSPATH,
+    };
+    use windows::core::w;
+
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let result = (|| -> Option<PathBuf> {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+            if let Ok(opts) = dialog.GetOptions() {
+                let _ = dialog.SetOptions(
+                    opts | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM,
+                );
+            }
+            let _ = dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("Applications"),
+                pszSpec: w!("*.exe"),
+            }]);
+            let _ = dialog.SetTitle(w!("Pick an application to track"));
+            if dialog.Show(None).is_err() {
+                return None; // cancelled
+            }
+            let item = dialog.GetResult().ok()?;
+            let display = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+            let path = display.to_string().ok().map(PathBuf::from);
+            CoTaskMemFree(Some(display.0 as *const core::ffi::c_void));
+            path
+        })();
+        if hr.is_ok() {
+            CoUninitialize();
+        }
+        result
+    }
+}
+
+/// Visible top-level windows: (title, exe path), deduplicated by exe.
+fn list_window_apps() -> Vec<(String, String)> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GWL_EXSTYLE, GW_OWNER, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
+        GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TOOLWINDOW,
+    };
+
+    static APPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    static OWN_EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let own_exe = OWN_EXE.get_or_init(|| {
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default()
+    });
+
+    let own_exe_ptr: *const String = own_exe;
+
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> windows_sys::core::BOOL {
+        unsafe {
+            let own_exe: &String = &*(lparam as *const String);
+            if IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            if !GetWindow(hwnd, GW_OWNER).is_null() {
+                return 1; // owned windows are usually dialogs/popups
+            }
+            if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW as isize) != 0 {
+                return 1; // tool windows: tray/overlays, not apps
+            }
+            let len = GetWindowTextLengthW(hwnd);
+            if len <= 0 {
+                return 1;
+            }
+            let mut buf = vec![0u16; (len + 1) as usize];
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            if n <= 0 {
+                return 1;
+            }
+            buf.truncate(n as usize);
+            let title = String::from_utf16_lossy(&buf);
+
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == 0 {
+                return 1;
+            }
+            if let Some(exe) = crate::watch::process_path(pid) {
+                if !own_exe.is_empty() && exe.eq_ignore_ascii_case(own_exe) {
+                    return 1; // never offer our own GUI as a tracked app
+                }
+                if let Ok(mut apps) = APPS.lock() {
+                    if !apps.iter().any(|(_, e)| e.eq_ignore_ascii_case(&exe)) {
+                        apps.push((title, exe));
+                    }
+                }
+            }
+        }
+        1
+    }
+
+    if let Ok(mut apps) = APPS.lock() {
+        apps.clear();
+    }
+    unsafe {
+        EnumWindows(Some(collect), own_exe_ptr as LPARAM);
+    }
+    let mut out = APPS.lock().map(|g| g.clone()).unwrap_or_default();
+    out.sort_by_key(|(title, _)| title.to_lowercase());
+    out
 }
 
 fn monitor_count() -> usize {    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CMONITORS};
