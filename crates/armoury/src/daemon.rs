@@ -1,12 +1,8 @@
-//! ArmouryDaemon — resident core.
-//! Phase 1: single instance, tray icon + menu, Scroll Lock global hotkey (placeholder),
-//! named-pipe server, spawn/focus/kill of the UI process, status broadcasting.
+//! Daemon mode: single instance, tray icon + menu, Scroll Lock global hotkey,
+//! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-mod icon;
-mod ipc;
-
+use crate::ipc;
+use armoury_core::config::AppConfig;
 use armoury_core::protocol::{Request, Response};
 use armoury_core::status::{RunState, StatusSnapshot};
 use crossbeam_channel::select;
@@ -31,7 +27,7 @@ enum AppEvent {
     Tick,
 }
 
-fn main() {
+pub fn run() {
     if let Err(e) = armoury_core::logging::init("daemon") {
         eprintln!("logging init failed: {e}");
     }
@@ -50,7 +46,7 @@ fn main() {
     // ---- config ----
     let cfg = armoury_core::config::load_or_create().unwrap_or_else(|e| {
         error!("config load failed ({e}); using in-memory defaults");
-        armoury_core::config::AppConfig::default()
+        AppConfig::default()
     });
     info!(
         "config: cooldown {}s, {} tracked app(s), voice {}",
@@ -78,7 +74,7 @@ fn main() {
     ipc::start(listener, pipe_tx);
     info!("pipe server ready ({})", armoury_core::PIPE_NAME);
 
-    // ---- tray icon + menu (must be created on this thread: it hosts the message pump) ----
+    // ---- tray icon + menu (created on this thread: it owns the message pump) ----
     let menu = Menu::new();
     let open_item = MenuItem::with_id("open", "Open dashboard", true, None);
     let pause_item = MenuItem::with_id("pause_all", "Pause all packs (coming soon)", false, None);
@@ -90,7 +86,7 @@ fn main() {
     let tray: Option<TrayIcon> = match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("ArmouryDaemon")
-        .with_icon(icon::make_icon())
+        .with_icon(make_tray_icon())
         .with_menu_on_left_click(false)
         .build()
     {
@@ -130,6 +126,7 @@ fn main() {
     let hotkey_rx = GlobalHotKeyEvent::receiver();
 
     let mut app = App {
+        cfg,
         started: Instant::now(),
         clients: HashMap::new(),
         ui_conn: None,
@@ -189,9 +186,16 @@ fn main() {
     log::logger().flush();
 }
 
+/// Tray icon built from the shared procedural icon generator.
+fn make_tray_icon() -> tray_icon::Icon {
+    let (rgba, w, h) = armoury_core::icon::rgba_icon(32);
+    tray_icon::Icon::from_rgba(rgba, w, h).expect("tray icon rgba is 32x32")
+}
+
 // ---------------------------------------------------------------------------
 
 struct App {
+    cfg: AppConfig,
     started: Instant,
     clients: HashMap<u64, crossbeam_channel::Sender<Response>>,
     ui_conn: Option<u64>,
@@ -208,6 +212,7 @@ impl App {
             state: RunState::Idle,
             trigger_source: None,
             cooldown_remaining_ms: None,
+            cooldown_seconds: self.cfg.cooldown_seconds,
             paused: false,
             killswitch_active: false,
             tracked_apps_running: Vec::new(),
@@ -264,20 +269,22 @@ impl App {
             return;
         }
 
-        let ui_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.join("armoury-ui.exe")));
-        let Some(ui_exe) = ui_exe else {
-            warn!("cannot resolve daemon executable directory");
+        // The UI is this same executable, started with `--ui`.
+        // CREATE_NO_WINDOW: never flash a console, even in debug builds.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+
+        let exe = std::env::current_exe();
+        let Some(exe) = exe.ok() else {
+            warn!("cannot resolve own executable path");
             return;
         };
-        if !ui_exe.exists() {
-            warn!("UI executable not found: {}", ui_exe.display());
-            return;
-        }
-        match Command::new(&ui_exe).spawn() {
+        match Command::new(&exe)
+            .arg("--ui")
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn() {
             Ok(child) => {
-                info!("spawned UI (pid {})", child.id());
+                info!("spawned UI (pid {}) from {}", child.id(), exe.display());
                 self.ui_child = Some(child);
                 self.spawning_ui = true;
             }

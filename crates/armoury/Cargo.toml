@@ -1,8 +1,12 @@
 [package]
-name = "armoury-daemon"
+name = "armoury"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[[bin]]
+name = "ArmouryDaemon"
+path = "src/main.rs"
 
 [dependencies]
 armoury-core.workspace = true
@@ -13,3 +17,4 @@ tray-icon.workspace = true
 global-hotkey.workspace = true
 windows.workspace = true
 windows-sys.workspace = true
+eframe.workspace = true

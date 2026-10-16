@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/armoury-core", "crates/armoury-daemon", "crates/armoury-ui"]
+members = ["crates/armoury-core", "crates/armoury"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,8 +16,8 @@ crossbeam-channel = "0.5.17"
 interprocess = "2.4.5"
 tray-icon = "0.26.1"
 global-hotkey = "0.9.0"
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation", "Win32_UI_HiDpi"] }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
 
 [profile.release]

@@ -17,6 +17,7 @@ pub struct StatusSnapshot {
     pub state: RunState,
     pub trigger_source: Option<String>,
     pub cooldown_remaining_ms: Option<u64>,
+    pub cooldown_seconds: u64,
     pub paused: bool,
     pub killswitch_active: bool,
     pub tracked_apps_running: Vec<String>,
