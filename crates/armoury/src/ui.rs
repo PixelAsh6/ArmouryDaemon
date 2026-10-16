@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 const SETTINGS_VIEWPORT: &str = "armoury-settings";
 const MIN_WINDOW_WIDTH: f32 = 380.0;
 const MIN_SETTINGS_WIDTH: f32 = 300.0;
+/// Inner padding of every window (text must never hug the border).
+const PAD: i8 = 10;
+const PAD_F: f32 = PAD as f32;
 
 enum UiEvent {
     Response(Response),
@@ -37,6 +40,9 @@ struct Shared {
     /// Safety valve: reveal anyway if placement cannot be confirmed in time.
     settings_deadline: Option<Instant>,
     settings_target: Option<egui::Pos2>,
+    /// (dashboard rect, own size) the current position was computed for —
+    /// lets the settings window follow the dashboard when it grows or moves.
+    settings_anchor: Option<(Rect, egui::Vec2)>,
 }
 
 pub fn run() {
@@ -142,7 +148,6 @@ struct App {
     shared: Arc<Mutex<Shared>>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
-    anchors_left: u8,
 }
 
 impl App {
@@ -152,7 +157,6 @@ impl App {
             shared,
             styled: false,
             last_desired: None,
-            anchors_left: 8,
         }
     }
 }
@@ -276,40 +280,46 @@ impl eframe::App for App {
             (text, color, rows, s.settings_open)
         };
 
-        // ---- custom title bar ----
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("ArmouryDaemon").strong().size(17.0));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, 22.0, draw_close).clicked() {
-                    // Core X: close every window and unload the GUI.
-                    self.shared.lock().unwrap().settings_open = false;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                ui.add_space(6.0);
-                if icon_button(ui, 22.0, draw_gear).clicked() {
-                    let mut s = self.shared.lock().unwrap();
-                    s.settings_open = !settings_open;
-                    if s.settings_open {
-                        s.settings_stage = 0;
-                        s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
-                    }
-                }
-            });
-        });
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(8.0);
+        // ---- window body (padded so text never hugs the border) ----
+        let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
+        frame.show(ui, |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
-        // ---- content ----
-        ui.horizontal(|ui| {
-            status_dot(ui, status_color);
-            ui.label(RichText::new(&status_text).strong().size(17.0));
+            // custom title bar
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("ArmouryDaemon").strong().size(17.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if icon_button(ui, 22.0, draw_close).clicked() {
+                        // Core X: close every window and unload the GUI.
+                        self.shared.lock().unwrap().settings_open = false;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    ui.add_space(6.0);
+                    if icon_button(ui, 22.0, draw_gear).clicked() {
+                        let mut s = self.shared.lock().unwrap();
+                        s.settings_open = !settings_open;
+                        if s.settings_open {
+                            s.settings_stage = 0;
+                            s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
+                            s.settings_anchor = None;
+                        }
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // content
+            ui.horizontal(|ui| {
+                status_dot(ui, status_color);
+                ui.label(RichText::new(&status_text).strong().size(17.0));
+            });
+            ui.add_space(8.0);
+            for (key, value) in &rows {
+                row(ui, key, value);
+            }
         });
-        ui.add_space(8.0);
-        for (key, value) in &rows {
-            row(ui, key, value);
-        }
 
         // ---- auto-fit + placement ----
         // eframe reveals the window right after its first frame, so the size AND the
@@ -326,23 +336,21 @@ impl eframe::App for App {
                 w = w.max(tw(&body_font, k) + 32.0 + tw(&body_font, v));
             }
             egui::vec2(
-                (w + 32.0).max(MIN_WINDOW_WIDTH),
-                (ui.min_rect().height() + 26.0).max(150.0),
+                (w + 2.0 * PAD_F + 8.0).max(MIN_WINDOW_WIDTH),
+                (ui.min_rect().height() + 4.0).max(150.0),
             )
         };
 
         let ctx = ui.ctx();
         let changed = self.last_desired != Some(desired);
         if changed {
+            // Self-resizing: whenever the content changes size, resize and stay pinned
+            // to the bottom-right corner. The settings window follows automatically,
+            // because it is positioned from this window's rect (see `settings_ui`).
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-            if self.anchors_left > 0 {
-                // The window is born in the corner (see `initial_geometry`), so resize
-                // corrections only need to keep the bottom-right corner pinned.
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(bottom_corner(
-                    ctx, desired,
-                )));
-                self.anchors_left -= 1;
-            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(bottom_corner(
+                ctx, desired,
+            )));
             self.last_desired = Some(desired);
         }
 
@@ -404,24 +412,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         )
     };
 
-    // ---- custom title bar ----
-    ui.add_space(2.0);
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("Settings").strong().size(16.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if icon_button(ui, 20.0, draw_close).clicked() {
-                shared.lock().unwrap().settings_open = false;
-                // The root viewport owns the decision to keep this window alive.
-                ui.ctx()
-                    .request_repaint_of(egui::ViewportId::ROOT);
-            }
-        });
-    });
-    ui.add_space(4.0);
-    ui.separator();
-    ui.add_space(8.0);
-
-    // ---- rows ----
+    // ---- rows data ----
     let mut rows: Vec<(String, String)> = Vec::new();
     rows.push((
         "state".to_string(),
@@ -440,19 +431,41 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         cooldown.map(|c| format!("{c}s")).unwrap_or_else(|| "—".to_string()),
     ));
     rows.push(("monitors".to_string(), monitors.to_string()));
-    for (key, value) in &rows {
-        row(ui, key, value);
-    }
-
-    ui.add_space(8.0);
-    ui.separator();
-    ui.add_space(8.0);
     let config_dir = armoury_core::config::config_dir();
-    if ui.button("Open config folder").clicked() {
-        open_folder(&config_dir);
-    }
-    ui.add_space(4.0);
-    ui.small("Full settings UI arrives in Phase 6.");
+
+    // ---- window body (padded so text never hugs the border) ----
+    let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
+    frame.show(ui, |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+
+        // custom title bar
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Settings").strong().size(16.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, 20.0, draw_close).clicked() {
+                    shared.lock().unwrap().settings_open = false;
+                    // The root viewport owns the decision to keep this window alive.
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        for (key, value) in &rows {
+            row(ui, key, value);
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(8.0);
+        if ui.button("Open config folder").clicked() {
+            open_folder(&config_dir);
+        }
+        ui.add_space(4.0);
+        ui.small("Full settings UI arrives in Phase 6.");
+    });
 
     // ---- shrink-wrap, position above the core window, then show ----
     let title_font = FontId::new(16.0, FontFamily::Proportional);
@@ -466,8 +479,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             w = w.max(tw(&body_font, k) + 32.0 + tw(&body_font, v));
         }
         egui::vec2(
-            (w + 32.0).max(MIN_SETTINGS_WIDTH),
-            (ui.min_rect().height() + 26.0).max(170.0),
+            (w + 2.0 * PAD_F + 8.0).max(MIN_SETTINGS_WIDTH),
+            (ui.min_rect().height() + 4.0).max(170.0),
         )
     };
 
@@ -488,6 +501,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 let pos = above_core(ctx, core, desired);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 s.settings_target = Some(pos);
+                s.settings_anchor = Some((core, desired));
                 s.settings_stage = 2;
             }
         }
@@ -509,7 +523,19 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(t));
             }
         }
-        _ => {}
+        _ => {
+            // Follow the dashboard: whenever its rect (or our own size) changes, re-stack
+            // above it so the gap stays constant. A plain drag of this window changes
+            // neither, so the user can still move it freely.
+            if let Some(core) = s.core_rect {
+                if s.settings_anchor != Some((core, desired)) {
+                    let pos = above_core(ctx, core, desired);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    s.settings_target = Some(pos);
+                    s.settings_anchor = Some((core, desired));
+                }
+            }
+        }
     }
     drop(s);
 
@@ -637,7 +663,7 @@ fn initial_geometry() -> (egui::Vec2, egui::Pos2) {
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     };
 
-    const EST_HEIGHT: f32 = 220.0; // measured height with the four status rows
+    const EST_HEIGHT: f32 = 218.0; // measured height with padding and the four status rows
     let size = egui::vec2(MIN_WINDOW_WIDTH, EST_HEIGHT);
 
     let scale = system_scale().max(0.5);
