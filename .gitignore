@@ -1,0 +1,9 @@
+# Rust build output
+/target
+**/target
+
+# Local VibeWise learning notes (not versioned)
+.vibe-wise/
+
+# Logs
+*.log
