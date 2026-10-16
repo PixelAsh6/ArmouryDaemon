@@ -164,6 +164,8 @@ struct App {
     apps_refreshed: Instant,
     /// Search text for the running-app picker.
     pick_query: String,
+    /// Focus the picker search box once per opening.
+    pick_focus_done: bool,
     pick_tx: crossbeam_channel::Sender<PathBuf>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
@@ -186,6 +188,7 @@ impl App {
             apps: Vec::new(),
             apps_refreshed: Instant::now() - Duration::from_secs(60),
             pick_query: String::new(),
+            pick_focus_done: false,
             styled: false,
             last_desired: None,
         }
@@ -424,11 +427,16 @@ impl eframe::App for App {
                     .selected_text("Pick a running app…")
                     .width(215.0)
                     .show_ui(ui, |ui| {
-                        ui.add(
+                        let search = ui.add(
                             egui::TextEdit::singleline(&mut self.pick_query)
                                 .hint_text("type to search…")
                                 .desired_width(200.0),
                         );
+                        // Typing should work the moment the dropdown opens.
+                        if !search.has_focus() && !self.pick_focus_done {
+                            search.request_focus();
+                            self.pick_focus_done = true;
+                        }
                         let query = self.pick_query.trim().to_ascii_lowercase();
                         let mut matches: Vec<(String, String, String)> = Vec::new();
                         for (title, exe) in &self.apps {
@@ -459,6 +467,7 @@ impl eframe::App for App {
                     });
                 if pick.is_some() {
                     self.pick_query.clear();
+                    self.pick_focus_done = false;
                 }
                 if ui.button("Browse…").clicked() {
                     spawn_picker(self.pick_tx.clone());
