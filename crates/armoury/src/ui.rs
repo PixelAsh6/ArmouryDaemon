@@ -162,6 +162,8 @@ struct App {
     /// Running apps offered in the picker (title, exe path).
     apps: Vec<(String, String)>,
     apps_refreshed: Instant,
+    /// Search text for the running-app picker.
+    pick_query: String,
     pick_tx: crossbeam_channel::Sender<PathBuf>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
@@ -183,6 +185,7 @@ impl App {
             pick_rx,
             apps: Vec::new(),
             apps_refreshed: Instant::now() - Duration::from_secs(60),
+            pick_query: String::new(),
             styled: false,
             last_desired: None,
         }
@@ -262,6 +265,7 @@ impl eframe::App for App {
                 .unwrap_or_else(|| path.display().to_string());
             let exe = path.display().to_string();
             log::info!("picked {exe}");
+            // track by exe name (the user's rule), not the window title
             self.add_tracked(name, exe);
         }
 
@@ -289,7 +293,7 @@ impl eframe::App for App {
         }
 
         // ---- snapshot of shared state for this frame ----
-        let (status_text, status_color, rows, settings_open, tracked, running) = {
+        let (status_text, status_color, rows, settings_open, tracked, running, paused) = {
             let s = self.shared.lock().unwrap();
             let (text, color) = match &s.status {
                 Some(st) => match st.state {
@@ -349,7 +353,8 @@ impl eframe::App for App {
                 .as_ref()
                 .map(|st| st.tracked_apps_running.clone())
                 .unwrap_or_default();
-            (text, color, rows, s.settings_open, tracked, running)
+            let paused = s.status.as_ref().map(|st| st.paused).unwrap_or(false);
+            (text, color, rows, s.settings_open, tracked, running, paused)
         };
 
         // ---- window body (padded so text never hugs the border) ----
@@ -365,6 +370,15 @@ impl eframe::App for App {
                         // Core X: close every window and unload the GUI.
                         self.shared.lock().unwrap().settings_open = false;
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    ui.add_space(6.0);
+                    let label = if paused { "Start" } else { "Pause" };
+                    if ui
+                        .button(label)
+                        .on_hover_text("Pause / resume all pack switching")
+                        .clicked()
+                    {
+                        self.request(&Request::SetPaused { paused: !paused });
                     }
                     ui.add_space(6.0);
                     if icon_button(ui, 22.0, draw_gear).clicked() {
@@ -384,8 +398,13 @@ impl eframe::App for App {
 
             // content
             ui.horizontal(|ui| {
-                status_dot(ui, status_color);
-                ui.label(RichText::new(&status_text).strong().size(17.0));
+                if paused {
+                    status_dot(ui, Color32::from_gray(150));
+                    ui.label(RichText::new(format!("Paused — {status_text}")).strong().size(17.0));
+                } else {
+                    status_dot(ui, status_color);
+                    ui.label(RichText::new(&status_text).strong().size(17.0));
+                }
             });
             ui.add_space(8.0);
             for (key, value) in &rows {
@@ -405,21 +424,42 @@ impl eframe::App for App {
                     .selected_text("Pick a running app…")
                     .width(215.0)
                     .show_ui(ui, |ui| {
-                        let mut any = false;
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.pick_query)
+                                .hint_text("type to search…")
+                                .desired_width(200.0),
+                        );
+                        let query = self.pick_query.trim().to_ascii_lowercase();
+                        let mut matches: Vec<(String, String, String)> = Vec::new();
                         for (title, exe) in &self.apps {
                             if tracked.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)) {
                                 continue;
                             }
-                            any = true;
-                            let label = format!("{title}  ({})", file_name(exe));
-                            if ui.selectable_label(false, label).clicked() {
-                                pick = Some((title.clone(), exe.clone()));
+                            let name = file_name(exe);
+                            if query.is_empty()
+                                || name.to_ascii_lowercase().contains(&query)
+                                || title.to_ascii_lowercase().contains(&query)
+                            {
+                                matches.push((name, exe.clone(), title.clone()));
                             }
                         }
-                        if !any {
-                            ui.label("(nothing new running)");
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        for (name, exe, title) in &matches {
+                            let label = format!("{name}  —  {title}");
+                            if ui.selectable_label(false, label).clicked() {
+                                pick = Some((name.clone(), exe.clone()));
+                            }
+                        }
+                        if matches.is_empty() {
+                            ui.label("(no match)");
+                        } else if matches.len() == 1 && enter {
+                            // half-typed name + a single candidate → Enter selects it
+                            pick = Some((matches[0].0.clone(), matches[0].1.clone()));
                         }
                     });
+                if pick.is_some() {
+                    self.pick_query.clear();
+                }
                 if ui.button("Browse…").clicked() {
                     spawn_picker(self.pick_tx.clone());
                 }

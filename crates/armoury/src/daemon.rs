@@ -91,7 +91,7 @@ pub fn run() {
     // ---- tray icon + menu (created on this thread: it owns the message pump) ----
     let menu = Menu::new();
     let open_item = MenuItem::with_id("open", "Open dashboard", true, None);
-    let pause_item = MenuItem::with_id("pause_all", "Pause all packs (coming soon)", false, None);
+    let pause_item = MenuItem::with_id("pause_all", "Pause all packs", true, None);
     let kill_item = MenuItem::with_id("killswitch", "Killswitch (coming soon)", false, None);
     let quit_item = MenuItem::with_id("quit", "Quit", true, None);
     if let Err(e) = menu.append_items(&[&open_item, &pause_item, &kill_item, &quit_item]) {
@@ -143,6 +143,7 @@ pub fn run() {
 
     let mut app = App {
         cfg,
+        pause_item: pause_item.clone(),
         tracked,
         running_paths: HashMap::new(),
         engine,
@@ -154,6 +155,10 @@ pub fn run() {
         last_broadcast: Instant::now(),
     };
     let mut last_housekeeping = Instant::now();
+    if app.cfg.paused {
+        app.pause_item.set_text("Resume all packs");
+        info!("starting paused (packs will not switch until resumed)");
+    }
     info!("daemon ready");
 
     let quit = loop {
@@ -174,6 +179,10 @@ pub fn run() {
         while let Ok(e) = menu_rx.try_recv() {
             match e.id.0.as_str() {
                 "open" => app.on_open(),
+                "pause_all" => {
+                    let paused = app.cfg.paused;
+                    app.set_paused(!paused);
+                }
                 "quit" => {
                     info!("quit requested from tray menu");
                     quit = true;
@@ -242,6 +251,8 @@ fn make_tray_icon() -> tray_icon::Icon {    let (rgba, w, h) = armoury_core::ico
 
 struct App {
     cfg: AppConfig,
+    /// Tray menu item whose label flips between Pause/Resume.
+    pause_item: tray_icon::menu::MenuItem,
     /// Shared with the watcher thread (single source of truth for what to watch).
     tracked: Arc<Mutex<Vec<TrackedApp>>>,
     /// Tracked key (exe file name, lowercase) -> last resolved image path, for pack templates.
@@ -273,7 +284,7 @@ impl App {
                 .cooldown_remaining(now)
                 .map(|d| d.as_millis() as u64),
             cooldown_seconds: self.cfg.cooldown_seconds,
-            paused: false,
+            paused: self.cfg.paused,
             killswitch_active: false,
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
@@ -306,6 +317,11 @@ impl App {
     }
 
     fn on_transition(&mut self, t: Transition) {
+        if self.cfg.paused {
+            info!("paused — skipping the {:?} transition", t);
+            self.broadcast_status();
+            return;
+        }
         match t {
             Transition::Applied => info!(
                 "packs APPLIED (triggered by {}) [pack execution lands in Phase 3]",
@@ -315,6 +331,24 @@ impl App {
                 info!("packs REVERTED (cooldown expired with nothing running)")
             }
         }
+        self.broadcast_status();
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        if self.cfg.paused == paused {
+            return;
+        }
+        self.cfg.paused = paused;
+        self.pause_item
+            .set_text(if paused { "Resume all packs" } else { "Pause all packs" });
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        info!(
+            "packs {} (all switching {})",
+            if paused { "paused" } else { "resumed" },
+            if paused { "suppressed" } else { "active" }
+        );
         self.broadcast_status();
     }
 
@@ -475,6 +509,7 @@ impl App {
                 Request::ShowUi => self.on_open(),
                 Request::AddTrackedApp { name, exe } => self.add_tracked_app(name, exe),
                 Request::RemoveTrackedApp { exe } => self.remove_tracked_app(&exe),
+                Request::SetPaused { paused } => self.set_paused(paused),
             },
         }
     }

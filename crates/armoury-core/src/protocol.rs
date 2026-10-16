@@ -12,6 +12,8 @@ pub enum Request {
     ShowUi,
     AddTrackedApp { name: String, exe: String },
     RemoveTrackedApp { exe: String },
+    /// Pause / resume all pack switching.
+    SetPaused { paused: bool },
 }
 
 /// Messages sent from the daemon to a client.

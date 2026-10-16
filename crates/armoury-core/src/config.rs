@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub tracked_apps: Vec<TrackedApp>,
     /// Per-pack user settings (one dropdown per pack); opaque to the core for now.
     pub packs: HashMap<String, serde_json::Value>,
+    /// Pause all pack switching (tray menu / dashboard button).
+    pub paused: bool,
     pub voice_enabled: bool,
 }
 
@@ -22,6 +24,7 @@ impl Default for AppConfig {
             cooldown_seconds: 60,
             tracked_apps: Vec::new(),
             packs: HashMap::new(),
+            paused: false,
             voice_enabled: false,
         }
     }
