@@ -144,6 +144,7 @@ pub fn run() {
     let mut app = App {
         cfg,
         tracked,
+        running_paths: HashMap::new(),
         engine,
         started: Instant::now(),
         clients: HashMap::new(),
@@ -225,9 +226,15 @@ pub fn run() {
     log::logger().flush();
 }
 
+fn basename_lower(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_else(|| path.to_ascii_lowercase())
+}
+
 /// Tray icon built from the shared procedural icon generator.
-fn make_tray_icon() -> tray_icon::Icon {
-    let (rgba, w, h) = armoury_core::icon::rgba_icon(32);
+fn make_tray_icon() -> tray_icon::Icon {    let (rgba, w, h) = armoury_core::icon::rgba_icon(32);
     tray_icon::Icon::from_rgba(rgba, w, h).expect("tray icon rgba is 32x32")
 }
 
@@ -237,6 +244,8 @@ struct App {
     cfg: AppConfig,
     /// Shared with the watcher thread (single source of truth for what to watch).
     tracked: Arc<Mutex<Vec<TrackedApp>>>,
+    /// Tracked key (exe file name, lowercase) -> last resolved image path, for pack templates.
+    running_paths: HashMap<String, String>,
     engine: Engine,
     started: Instant,
     clients: HashMap<u64, crossbeam_channel::Sender<Response>>,
@@ -274,10 +283,22 @@ impl App {
     fn on_watch(&mut self, ev: watch::WatchEvent) {
         let now = Instant::now();
         let transition = match ev {
-            watch::WatchEvent::Started { exe, name, pid } => {
-                self.engine.on_started(&exe, &name, pid, now)
+            watch::WatchEvent::Started {
+                key,
+                display,
+                path,
+                pid,
+            } => {
+                self.running_paths.insert(key.clone(), path);
+                self.engine.on_started(&key, &display, pid, now)
             }
-            watch::WatchEvent::Stopped { exe, pid } => self.engine.on_stopped(&exe, pid, now),
+            watch::WatchEvent::Stopped { key, pid } => {
+                let t = self.engine.on_stopped(&key, pid, now);
+                if !self.engine.is_running(&key) {
+                    self.running_paths.remove(&key);
+                }
+                t
+            }
         };
         if let Some(t) = transition {
             self.on_transition(t);
@@ -285,28 +306,28 @@ impl App {
     }
 
     fn on_transition(&mut self, t: Transition) {
-        match &t {
-            Transition::Triggered => info!(
-                "state -> Triggered ({}) [packs will apply in Phase 3]",
+        match t {
+            Transition::Applied => info!(
+                "packs APPLIED (triggered by {}) [pack execution lands in Phase 3]",
                 self.engine.source().unwrap_or_default()
             ),
-            Transition::Cooldown => info!(
-                "state -> Cooldown ({}s until revert)",
-                self.cfg.cooldown_seconds
-            ),
-            Transition::Reverted => info!("state -> Idle (cooldown expired; packs revert in Phase 3)"),
+            Transition::Reverted => {
+                info!("packs REVERTED (cooldown expired with nothing running)")
+            }
         }
         self.broadcast_status();
     }
 
     fn add_tracked_app(&mut self, name: String, exe: String) {
+        // Matching is by file name (the user's choice), so dedupe on that too.
+        let base = basename_lower(&exe);
         if self
             .cfg
             .tracked_apps
             .iter()
-            .any(|a| a.exe.eq_ignore_ascii_case(&exe))
+            .any(|a| basename_lower(&a.exe) == base)
         {
-            info!("tracked app already in the list: {exe}");
+            info!("tracked app already in the list (by name): {base}");
             return;
         }
         self.cfg.tracked_apps.push(TrackedApp {

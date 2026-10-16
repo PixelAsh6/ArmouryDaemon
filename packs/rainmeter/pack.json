@@ -1,0 +1,28 @@
+{
+  "spec": 1,
+  "id": "rainmeter",
+  "name": "Rainmeter",
+  "version": "1.0.0",
+  "order": 30,
+  "targets": { "process": ["Rainmeter.exe"] },
+  "settings": [
+    {
+      "key": "layout",
+      "label": "Layout while a tracked app runs",
+      "type": "enum",
+      "values": ["Empty", "Default", "illustro default"],
+      "default": "Empty"
+    }
+  ],
+  "capture": [{ "key": "was_running", "mechanism": "process_running" }],
+  "apply": {
+    "guard": { "targetRunning": true },
+    "steps": [
+      { "mechanism": "rainmeter_bang", "bang": "!LoadLayout \"{{settings.layout}}\"" }
+    ]
+  },
+  "revert": {
+    "guard": { "targetRunning": true },
+    "steps": [{ "mechanism": "rainmeter_bang", "bang": "!LoadLayout \"@Backup\"" }]
+  }
+}

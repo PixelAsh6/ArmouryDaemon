@@ -28,8 +28,18 @@ use windows_sys::Win32::System::Threading::{
 };
 
 pub enum WatchEvent {
-    Started { exe: String, name: String, pid: u32 },
-    Stopped { exe: String, pid: u32 },
+    /// `key` is the lowercased file name (the tracked identity), `path` the resolved
+    /// image path (used for pack templates), `display` what the user sees.
+    Started {
+        key: String,
+        display: String,
+        path: String,
+        pid: u32,
+    },
+    Stopped {
+        key: String,
+        pid: u32,
+    },
 }
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
@@ -74,13 +84,13 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
                 }
                 let stale: Vec<u32> = running
                     .iter()
-                    .filter(|(_, r)| !wanted.iter().any(|w| w.exe == r.exe))
+                    .filter(|(_, r)| !wanted.iter().any(|w| w.base == r.exe))
                     .map(|(pid, _)| *pid)
                     .collect();
                 for pid in stale {
                     if let Some(r) = running.remove(&pid) {
                         let _ = tx.send(WatchEvent::Stopped {
-                            exe: r.exe.clone(),
+                            key: r.exe.clone(),
                             pid,
                         });
                         signal(wake);
@@ -105,7 +115,7 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
                 for pid in gone {
                     if let Some(r) = running.remove(&pid) {
                         let _ = tx.send(WatchEvent::Stopped {
-                            exe: r.exe.clone(),
+                            key: r.exe.clone(),
                             pid,
                         });
                         signal(wake);
@@ -144,7 +154,7 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
                 if let Some(run) = running.remove(&pid) {
                     info!("tracked app stopped: {} (pid {pid})", run.name);
                     let _ = tx.send(WatchEvent::Stopped {
-                        exe: run.exe.clone(),
+                        key: run.exe.clone(),
                         pid,
                     });
                     signal(wake);
@@ -168,6 +178,8 @@ fn signal(wake: usize) {
 }
 
 /// Is this PID one of the tracked apps we are not watching yet?
+/// Matching is by **file name** (the user's choice): any process whose exe name is in
+/// the tracked list counts, regardless of where it runs from.
 fn consider(
     pid: u32,
     wanted: &[Wanted],
@@ -181,8 +193,8 @@ fn consider(
     let Some(path) = process_path(pid) else {
         return; // protected/exiting process
     };
-    let lower = path.to_ascii_lowercase();
-    let Some(w) = wanted.iter().find(|w| w.exe == lower) else {
+    let base = base_name(&path);
+    let Some(w) = wanted.iter().find(|w| w.base == base) else {
         return; // not one of ours
     };
     match open_for_wait(pid) {
@@ -192,13 +204,14 @@ fn consider(
                 pid,
                 Running {
                     handle,
-                    exe: w.exe.clone(),
+                    exe: w.base.clone(),
                     name: w.display.clone(),
                 },
             );
             let _ = tx.send(WatchEvent::Started {
-                exe: w.exe.clone(),
-                name: w.display.clone(),
+                key: w.base.clone(),
+                display: w.display.clone(),
+                path,
                 pid,
             });
             signal(wake);

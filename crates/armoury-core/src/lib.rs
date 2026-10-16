@@ -2,6 +2,7 @@ pub mod config;
 pub mod engine;
 pub mod icon;
 pub mod logging;
+pub mod pack;
 pub mod protocol;
 pub mod status;
 

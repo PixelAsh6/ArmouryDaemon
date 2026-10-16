@@ -209,6 +209,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.styled {
             self.styled = true;
+            install_fonts(ctx);
             ctx.all_styles_mut(|style| {
                 style
                     .text_styles
@@ -830,6 +831,44 @@ fn initial_geometry() -> (egui::Vec2, egui::Pos2) {
     };
     let y = (b - size.y - margin_y).max(t + margin_y);
     (size, egui::pos2(x, y))
+}
+
+/// Use the machine's own fonts instead of egui's embedded ones: Segoe UI Variable Text
+/// (Windows 11) → Segoe UI → Arial. Exactly one file is loaded (the first that exists) and
+/// it also backs the monospace family, so nothing extra is kept in memory.
+fn install_fonts(ctx: &egui::Context) {
+    const CANDIDATES: [(&str, &str); 3] = [
+        ("C:\\Windows\\Fonts\\SegUIVar.ttf", "Segoe UI Variable Text"),
+        ("C:\\Windows\\Fonts\\segoeui.ttf", "Segoe UI"),
+        ("C:\\Windows\\Fonts\\arial.ttf", "Arial"),
+    ];
+
+    let mut fonts = egui::FontDefinitions::default();
+    let mut chosen = None;
+    for (path, label) in CANDIDATES {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "ui".to_owned(),
+                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            chosen = Some(label);
+            break;
+        }
+    }
+
+    match chosen {
+        Some(label) => {
+            let family = vec!["ui".to_owned()];
+            fonts
+                .families
+                .insert(egui::FontFamily::Proportional, family.clone());
+            fonts.families.insert(egui::FontFamily::Monospace, family);
+            log::info!("using the system font: {label}");
+        }
+        None => log::warn!("no system UI font found; text may not render"),
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 fn file_name(path: &str) -> String {

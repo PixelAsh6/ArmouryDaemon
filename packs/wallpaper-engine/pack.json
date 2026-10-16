@@ -1,0 +1,34 @@
+{
+  "spec": 1,
+  "id": "wallpaper-engine",
+  "name": "Wallpaper Engine",
+  "version": "1.0.0",
+  "order": 10,
+  "targets": { "process": ["wallpaper64.exe", "wallpaper32.exe"] },
+  "settings": [
+    {
+      "key": "action",
+      "label": "While a tracked app runs",
+      "type": "enum",
+      "values": ["stop", "pause"],
+      "default": "stop"
+    }
+  ],
+  "capture": [{ "key": "was_running", "mechanism": "process_running" }],
+  "apply": {
+    "guard": { "targetRunning": true },
+    "steps": [
+      {
+        "mechanism": "cli",
+        "exe": "{{target.exe}}",
+        "args": ["-control", "{{settings.action}}"]
+      }
+    ]
+  },
+  "revert": {
+    "guard": { "targetRunning": true },
+    "steps": [
+      { "mechanism": "cli", "exe": "{{target.exe}}", "args": ["-control", "play"] }
+    ]
+  }
+}
