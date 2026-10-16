@@ -476,7 +476,8 @@ impl eframe::App for App {
             let mut remove: Option<String> = None;
             for app in &tracked {
                 ui.horizontal(|ui| {
-                    let is_running = running.iter().any(|n| n.eq_ignore_ascii_case(&app.name));
+                    let shown = file_name(&app.exe);
+                    let is_running = running.iter().any(|n| n.eq_ignore_ascii_case(&shown));
                     status_dot(
                         ui,
                         if is_running {
@@ -485,7 +486,7 @@ impl eframe::App for App {
                             Color32::from_gray(110)
                         },
                     );
-                    ui.label(&app.name);
+                    ui.label(&shown);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if icon_button(ui, 18.0, draw_close).clicked() {
                             remove = Some(app.exe.clone());

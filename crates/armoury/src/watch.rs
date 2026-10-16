@@ -256,14 +256,12 @@ fn base_name(exe: &str) -> String {
 }
 
 fn display_name(app: &TrackedApp) -> String {
-    if app.name.trim().is_empty() {
-        std::path::Path::new(&app.exe)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| app.exe.clone())
-    } else {
-        app.name.clone()
-    }
+    // The user's rule: tracked apps are shown by exe file name, not window title,
+    // so this stays right even for entries added before the rule existed.
+    std::path::Path::new(&app.exe)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| app.exe.clone())
 }
 
 /// All PIDs, growing the buffer once if the system has more processes than expected.
