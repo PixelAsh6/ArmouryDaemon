@@ -122,6 +122,7 @@ mod tests {
                 state: RunState::Idle,
                 trigger_source: None,
                 cooldown_remaining_ms: None,
+                cooldown_action: None,
                 cooldown_seconds: 60,
                 paused: false,
                 killswitch_active: false,

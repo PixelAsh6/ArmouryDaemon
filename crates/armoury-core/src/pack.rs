@@ -105,6 +105,13 @@ pub struct Step {
     pub mechanism: String,
     #[serde(default)]
     pub exe: Option<String>,
+    /// Pick the exe from a dropdown instead of `exe` (e.g. which binary of an app to drive).
+    /// The chosen value is looked up in `exe_map` and then template-substituted.
+    #[serde(default)]
+    pub exe_from_setting: Option<String>,
+    /// Dropdown value -> exe template, used with `exe_from_setting`.
+    #[serde(default)]
+    pub exe_map: HashMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -195,6 +202,9 @@ pub struct TemplateCtx {
     pub target_exe: String,
     /// The running target: exe file name.
     pub target_name: String,
+    /// The running target's folder (so a pack can call a sibling binary, e.g. the 32-bit
+    /// variant of an app that has both).
+    pub target_dir: String,
 }
 
 /// Replace `{{settings.x}}`, `{{captured.x}}`, `{{target.exe}}`, `{{target.name}}`.
@@ -215,6 +225,7 @@ pub fn substitute(template: &str, ctx: &TemplateCtx) -> (String, Vec<String>) {
         let value = match expr {
             "target.exe" => Some(ctx.target_exe.clone()),
             "target.name" => Some(ctx.target_name.clone()),
+            "target.dir" => Some(ctx.target_dir.clone()),
             _ => {
                 let (scope, key) = expr.split_once('.').unwrap_or(("", expr));
                 match scope {
@@ -265,10 +276,13 @@ impl Pack {
         if self.targets.process.is_empty() {
             errs.push("targets.process must list at least one exe file name".into());
         }
-        if self.settings.len() > 1 {
-            errs.push("v1 packs expose exactly one setting (the dropdown)".into());
+        if self.settings.len() > 4 {
+            errs.push("a pack may expose at most 4 dropdowns".into());
         }
-        for s in &self.settings {
+        for (i, s) in self.settings.iter().enumerate() {
+            if self.settings[..i].iter().any(|other| other.key == s.key) {
+                errs.push(format!("setting '{}': duplicate key", s.key));
+            }
             if s.kind != "enum" {
                 errs.push(format!("setting '{}': unsupported type '{}'", s.key, s.kind));
             }
@@ -306,10 +320,16 @@ impl Pack {
                         step.mechanism
                     ));
                 }
-                if step.mechanism == "cli" && step.exe.is_none() {
+                if step.mechanism == "cli"
+                    && step.exe.is_none()
+                    && step.exe_from_setting.is_none()
+                {
                     errs.push(format!("{block} step {i}: cli needs an exe"));
                 }
-                if step.mechanism == "process_start" && step.exe.is_none() {
+                if step.mechanism == "process_start"
+                    && step.exe.is_none()
+                    && step.exe_from_setting.is_none()
+                {
                     errs.push(format!("{block} step {i}: process_start needs an exe"));
                 }
                 if step.mechanism == "registry_set" && step.registry.is_none() {
@@ -328,6 +348,18 @@ impl Pack {
                     errs.push(format!(
                         "{block} step {i}: hotkey needs keys_from_mode or keys_from_captured"
                     ));
+                }
+                if step.exe_from_setting.is_some() && step.exe_map.is_empty() {
+                    errs.push(format!(
+                        "{block} step {i}: exe_from_setting needs an exe_map"
+                    ));
+                }
+                if let Some(key) = &step.exe_from_setting {
+                    if !self.settings.iter().any(|s| &s.key == key) {
+                        errs.push(format!(
+                            "{block} step {i}: exe_from_setting '{key}' is not one of the pack's settings"
+                        ));
+                    }
                 }
             }
         }
@@ -376,20 +408,28 @@ mod tests {
             let pack = Pack::parse(text).unwrap_or_else(|e| panic!("{label}: {e}"));
             assert_eq!(pack.spec, 1);
             assert!(!pack.targets.process.is_empty());
-            assert!(pack.settings.len() <= 1);
+            assert!(!pack.settings.is_empty());
             assert!(!pack.apply.steps.is_empty());
             assert!(!pack.revert.steps.is_empty());
         }
     }
 
     #[test]
-    fn shipped_packs_have_one_dropdown_with_a_default() {
+    fn shipped_packs_have_dropdowns_with_defaults() {
         for text in [WE, GH, RM] {
             let pack = Pack::parse(text).unwrap();
-            let setting = &pack.settings[0];
-            assert_eq!(setting.kind, "enum");
-            assert!(setting.default.is_some(), "{} needs a default", pack.id);
-            assert!(setting.values.contains(setting.default.as_ref().unwrap()));
+            for setting in &pack.settings {
+                assert_eq!(setting.kind, "enum");
+                assert!(
+                    setting.default.is_some(),
+                    "{}: setting '{}' needs a default",
+                    pack.id,
+                    setting.key
+                );
+                assert!(setting
+                    .values
+                    .contains(setting.default.as_ref().unwrap()));
+            }
         }
     }
 
@@ -421,16 +461,25 @@ mod tests {
 
     #[test]
     fn validation_rejects_the_usual_mistakes() {
+        // more than four dropdowns is a mistake
         let mut pack = Pack::parse(WE).unwrap();
-        pack.settings.push(Setting {
-            key: "extra".into(),
-            label: "Extra".into(),
-            kind: "enum".into(),
-            values: vec!["a".into()],
-            default: None,
-        });
+        for key in ["extra1", "extra2", "extra3", "extra4"] {
+            pack.settings.push(Setting {
+                key: key.into(),
+                label: key.into(),
+                kind: "enum".into(),
+                values: vec!["a".into()],
+                default: None,
+            });
+        }
         let errs = pack.validate();
-        assert!(errs.iter().any(|e| e.contains("exactly one setting")));
+        assert!(errs.iter().any(|e| e.contains("at most 4 dropdowns")));
+
+        // a duplicate setting key is refused
+        let mut pack = Pack::parse(WE).unwrap();
+        let first = pack.settings[0].clone();
+        pack.settings.push(first);
+        assert!(pack.validate().iter().any(|e| e.contains("duplicate key")));
 
         let mut pack = Pack::parse(GH).unwrap();
         pack.apply.steps[0].mechanism = "exec_shell".into();
@@ -445,6 +494,20 @@ mod tests {
             .validate()
             .iter()
             .any(|e| e.contains("is not one of the values")));
+
+        // exe_from_setting must name a real setting and have a map
+        let mut pack = Pack::parse(WE).unwrap();
+        pack.apply.steps[0].exe_from_setting = Some("nope".into());
+        assert!(pack
+            .validate()
+            .iter()
+            .any(|e| e.contains("is not one of the pack's settings")));
+        let mut pack = Pack::parse(WE).unwrap();
+        pack.apply.steps[0].exe_map.clear();
+        assert!(pack
+            .validate()
+            .iter()
+            .any(|e| e.contains("needs an exe_map")));
     }
 
     #[test]

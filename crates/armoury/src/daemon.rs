@@ -9,7 +9,7 @@ use crate::watch;
 use armoury_core::config::{AppConfig, TrackedApp};
 use armoury_core::engine::{Engine, EngineState, Transition};
 use armoury_core::protocol::{Request, Response};
-use armoury_core::status::{PackStatus, RunState, StatusSnapshot};
+use armoury_core::status::{PackSettingStatus, PackStatus, RunState, StatusSnapshot};
 use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
@@ -253,6 +253,10 @@ pub fn run(show_ui_when_running: bool) {
                 "killswitch" => app.toggle_killswitch(),
                 "quit" => {
                     info!("quit requested from tray menu");
+                    // "Quit means close everything" (user decision 2026-10-18): put the apps back
+                    // before the daemon goes away, instead of leaving them in game mode until the
+                    // next start reverts them.
+                    app.revert_before_quit();
                     quit = true;
                 }
                 other => info!("tray menu '{other}' — not implemented yet"),
@@ -406,7 +410,7 @@ pub struct PackMeta {
     pub id: String,
     pub name: String,
     pub version: String,
-    pub setting: Option<armoury_core::pack::Setting>,
+    pub settings: Vec<armoury_core::pack::Setting>,
 }
 
 fn build_catalog(installed: &[packs::Installed]) -> Vec<PackMeta> {
@@ -416,7 +420,7 @@ fn build_catalog(installed: &[packs::Installed]) -> Vec<PackMeta> {
             id: p.pack.id.clone(),
             name: p.pack.name.clone(),
             version: p.pack.version.clone(),
-            setting: p.pack.settings.first().cloned(),
+            settings: p.pack.settings.clone(),
         })
         .collect()
 }
@@ -490,6 +494,9 @@ impl App {
                 .engine
                 .cooldown_remaining(now)
                 .map(|d| d.as_millis() as u64),
+            cooldown_action: self.engine.pending_action().map(|apply| {
+                if apply { "apply" } else { "revert" }.to_string()
+            }),
             cooldown_seconds: self.cfg.cooldown_seconds,
             paused: self.cfg.paused,
             killswitch_active: self.killswitch.is_active(),
@@ -507,28 +514,26 @@ impl App {
                 .map(|m| {
                     let user = self.cfg.packs.get(&m.id);
                     let enabled = user.map(|u| u.enabled).unwrap_or(false);
-                    let (key, label, values, value) = match &m.setting {
-                        Some(s) => (
-                            Some(s.key.clone()),
-                            Some(s.label.clone()),
-                            s.values.clone(),
-                            Some(
+                    let settings = m
+                        .settings
+                        .iter()
+                        .map(|s| PackSettingStatus {
+                            key: s.key.clone(),
+                            label: s.label.clone(),
+                            values: s.values.clone(),
+                            value: Some(
                                 user.and_then(|u| u.values.get(&s.key).cloned())
                                     .or_else(|| s.default.clone())
                                     .unwrap_or_default(),
                             ),
-                        ),
-                        None => (None, None, Vec::new(), None),
-                    };
+                        })
+                        .collect();
                     PackStatus {
                         id: m.id.clone(),
                         name: m.name.clone(),
                         version: m.version.clone(),
                         enabled,
-                        setting_key: key,
-                        setting_label: label,
-                        values,
-                        value,
+                        settings,
                         applied: self.applied_packs.contains(&m.id),
                     }
                 })
@@ -601,9 +606,7 @@ impl App {
                 "packs applied (triggered by {})",
                 self.engine.source().unwrap_or_default()
             ),
-            Transition::Reverted => {
-                info!("packs REVERTED (cooldown expired with nothing running)")
-            }
+            Transition::Reverted => info!("packs reverted"),
         }
         self.broadcast_status();
     }
@@ -995,6 +998,56 @@ impl App {
             };
             if let Err(e) = tray.set_icon(Some(icon)) {
                 warn!("tray icon swap failed: {e}");
+            }
+        }
+    }
+
+    /// Called once when the user quits: run the revert and wait (bounded) for it, so the apps are
+    /// really back before the daemon exits. Without this the packs stayed applied until the next
+    /// start noticed the journal ("Quit means close everything", 2026-10-18).
+    fn revert_before_quit(&mut self) {
+        if !self.engine.is_applied() {
+            return;
+        }
+        let job = packs::PackJob {
+            apply: false,
+            tag: None,
+            enabled: self
+                .cfg
+                .packs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.enabled))
+                .collect(),
+            values: self
+                .cfg
+                .packs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.values.clone()))
+                .collect(),
+            captured: self.captured_by_pack.clone(),
+        };
+        info!("quit: reverting the packs before exiting");
+        let _ = self.pack_tx.send(job);
+
+        // Shutdown is not time-critical; the kill/relaunch paths can take a few seconds.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            match self.pack_out_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(outcome) => {
+                    let reverted = !outcome.applied;
+                    self.on_pack_outcome(outcome);
+                    if reverted {
+                        info!("quit: packs reverted, exiting");
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if Instant::now() >= deadline {
+                        warn!("quit: the revert did not finish within 15 s — exiting anyway");
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
             }
         }
     }

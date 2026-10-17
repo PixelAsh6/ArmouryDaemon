@@ -18,6 +18,9 @@ pub struct StatusSnapshot {
     pub state: RunState,
     pub trigger_source: Option<String>,
     pub cooldown_remaining_ms: Option<u64>,
+    /// While in Cooldown: what the pending switch will do — `"apply"` or `"revert"`.
+    #[serde(default)]
+    pub cooldown_action: Option<String>,
     pub cooldown_seconds: u64,
     pub paused: bool,
     pub killswitch_active: bool,
@@ -53,11 +56,18 @@ pub struct PackStatus {
     #[serde(default)]
     pub version: String,
     pub enabled: bool,
-    /// The pack's single dropdown (v1).
-    pub setting_key: Option<String>,
-    pub setting_label: Option<String>,
-    pub values: Vec<String>,
-    pub value: Option<String>,
+    /// Every dropdown the pack exposes. The dashboard shows the first one; the pack window all.
+    #[serde(default)]
+    pub settings: Vec<PackSettingStatus>,
     /// Currently applied (game mode on) per the journal.
     pub applied: bool,
+}
+
+/// One dropdown of a pack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackSettingStatus {
+    pub key: String,
+    pub label: String,
+    pub values: Vec<String>,
+    pub value: Option<String>,
 }

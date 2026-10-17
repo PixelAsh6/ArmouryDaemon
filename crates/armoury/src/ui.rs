@@ -201,8 +201,6 @@ struct App {
     apps_refreshed: Instant,
     /// Search text for the running-app picker.
     pick_query: String,
-    /// Focus the picker search box once per opening.
-    pick_focus_done: bool,
     pick_tx: crossbeam_channel::Sender<Picked>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
@@ -227,7 +225,6 @@ impl App {
             apps: Vec::new(),
             apps_refreshed: Instant::now() - Duration::from_secs(60),
             pick_query: String::new(),
-            pick_focus_done: false,
             styled: false,
             last_desired: None,
         }
@@ -333,7 +330,7 @@ impl eframe::App for App {
         // Keep the running-app list fresh for the picker (~2 s is plenty).
         if self.apps_refreshed.elapsed() >= Duration::from_secs(2) {
             self.apps_refreshed = Instant::now();
-            self.apps = list_window_apps();
+            self.apps = list_running_apps();
         }
 
         // Keep the window live: pipe updates arrive at ~1 Hz. While a child window is open the
@@ -377,9 +374,15 @@ impl eframe::App for App {
                         Color32::from_rgb(251, 191, 36),
                     ),
                     RunState::Cooldown => (
-                        match st.cooldown_remaining_ms {
-                            Some(ms) => format!("Cooldown — {}s left", ms / 1000),
-                            None => "Cooldown".to_string(),
+                        match (st.cooldown_action.as_deref(), st.cooldown_remaining_ms) {
+                            (Some("apply"), Some(ms)) => {
+                                format!("Cooldown — applying in {}s", ms / 1000)
+                            }
+                            (Some("revert"), Some(ms)) => {
+                                format!("Cooldown — reverting in {}s", ms / 1000)
+                            }
+                            (_, Some(ms)) => format!("Cooldown — {}s left", ms / 1000),
+                            _ => "Cooldown".to_string(),
                         },
                         Color32::from_rgb(96, 165, 250),
                     ),
@@ -491,10 +494,15 @@ impl eframe::App for App {
                             // a fresh window: forget the previous install/remove message and
                             // seed the number boxes from what the daemon reports right now
                             s.last_pack_op = None;
-                            if let Some(st) = &s.status {
-                                s.cooldown_text = st.cooldown_seconds.to_string();
-                                s.failsafe_text = st.idle_failsafe_minutes.to_string();
-                            }
+                            let (cooldown_text, failsafe_text) = match &s.status {
+                                Some(st) => (
+                                    st.cooldown_seconds.to_string(),
+                                    st.idle_failsafe_minutes.to_string(),
+                                ),
+                                None => (s.cooldown_text.clone(), s.failsafe_text.clone()),
+                            };
+                            s.cooldown_text = cooldown_text;
+                            s.failsafe_text = failsafe_text;
                             s.settings_stage = 0;
                             s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
                             s.settings_anchor = None;
@@ -570,20 +578,18 @@ impl eframe::App for App {
 
             let mut pick: Option<(String, String)> = None;
             ui.horizontal(|ui| {
+                // The search box sits in the dashboard body, NOT inside the popup: a text field
+                // inside a ComboBox popup loses focus when clicked (reported 2026-10-18), which
+                // made the picker unusable.
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pick_query)
+                        .hint_text("search…")
+                        .desired_width(110.0),
+                );
                 egui::ComboBox::from_id_salt("pick-app")
-                    .selected_text("Pick a running app…")
-                    .width(215.0)
+                    .selected_text("Pick an app…")
+                    .width(140.0)
                     .show_ui(ui, |ui| {
-                        let search = ui.add(
-                            egui::TextEdit::singleline(&mut self.pick_query)
-                                .hint_text("type to search…")
-                                .desired_width(200.0),
-                        );
-                        // Typing should work the moment the dropdown opens.
-                        if !search.has_focus() && !self.pick_focus_done {
-                            search.request_focus();
-                            self.pick_focus_done = true;
-                        }
                         let query = self.pick_query.trim().to_ascii_lowercase();
                         let mut matches: Vec<(String, String, String)> = Vec::new();
                         for (title, exe) in &self.apps {
@@ -612,14 +618,13 @@ impl eframe::App for App {
                             pick = Some((matches[0].0.clone(), matches[0].1.clone()));
                         }
                     });
-                if pick.is_some() {
-                    self.pick_query.clear();
-                    self.pick_focus_done = false;
-                }
                 if ui.button("Browse…").clicked() {
                     spawn_picker(self.pick_tx.clone(), Picker::TrackedApp);
                 }
             });
+            if pick.is_some() {
+                self.pick_query.clear();
+            }
             if let Some((name, exe)) = pick {
                 self.add_tracked(name, exe);
             }
@@ -693,16 +698,19 @@ impl eframe::App for App {
                         ui.small("· applied");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(key) = &pack.setting_key {
-                            let current = pack.value.clone().unwrap_or_default();
-                            egui::ComboBox::from_id_salt(format!("pack-{}", pack.id))
+                        if let Some(setting) = pack.settings.first() {
+                            let current = setting.value.clone().unwrap_or_default();
+                            egui::ComboBox::from_id_salt(format!("pack-{}", setting.key))
                                 .selected_text(current.clone())
                                 .width(130.0)
                                 .show_ui(ui, |ui| {
-                                    for value in &pack.values {
+                                    for value in &setting.values {
                                         if ui.selectable_label(value == &current, value).clicked() {
-                                            set_value =
-                                                Some((pack.id.clone(), key.clone(), value.clone()));
+                                            set_value = Some((
+                                                pack.id.clone(),
+                                                setting.key.clone(),
+                                                value.clone(),
+                                            ));
                                         }
                                     }
                                 });
@@ -911,28 +919,29 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         });
 
         ui.add_space(6.0);
-        if let Some(key) = &pack.setting_key {
-            if let Some(label) = &pack.setting_label {
-                ui.small(label);
+        for setting in &pack.settings {
+            if !setting.label.is_empty() {
+                ui.small(&setting.label);
             }
-            let current = pack.value.clone().unwrap_or_default();
-            egui::ComboBox::from_id_salt(format!("pack-win-{}", pack.id))
+            let current = setting.value.clone().unwrap_or_default();
+            egui::ComboBox::from_id_salt(format!("pack-win-{}-{}", pack.id, setting.key))
                 .selected_text(current.clone())
                 .width(190.0)
                 .show_ui(ui, |ui| {
-                    for value in &pack.values {
+                    for value in &setting.values {
                         if ui.selectable_label(value == &current, value).clicked() {
                             send_request(
                                 shared,
                                 &Request::SetPackValue {
                                     id: pack.id.clone(),
-                                    key: key.clone(),
+                                    key: setting.key.clone(),
                                     value: value.clone(),
                                 },
                             );
                         }
                     }
                 });
+            ui.add_space(4.0);
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -966,13 +975,13 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
         let mut w = tw(&title_font, &pack.name) + 60.0; // title + close button
         w = w.max(tw(&body_font, "Applies when a tracked app starts.") + 24.0);
-        if let Some(label) = &pack.setting_label {
-            w = w.max(tw(&body_font, label) + 24.0);
+        for setting in &pack.settings {
+            w = w.max(tw(&body_font, &setting.label) + 24.0);
+            // the dropdown is 190 wide, plus its current text and the row padding
+            w = w.max(
+                tw(&body_font, setting.value.as_deref().unwrap_or("")) + 190.0 + 60.0,
+            );
         }
-        // the dropdown is 190 wide, plus its current text and the row padding
-        w = w.max(
-            tw(&body_font, pack.value.as_deref().unwrap_or("")) + 190.0 + 60.0,
-        );
         egui::vec2(
             (w + 2.0 * PAD_F + 8.0).max(MIN_SETTINGS_WIDTH),
             (ui.min_rect().height() + 4.0).max(160.0),
@@ -1080,8 +1089,13 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     st.trigger_source.as_deref().unwrap_or("?")
                 ),
                 RunState::Cooldown => format!(
-                    "Cooldown ({}s left)",
-                    st.cooldown_remaining_ms.unwrap_or(0) / 1000
+                    "Cooldown ({})",
+                    match (st.cooldown_action.as_deref(), st.cooldown_remaining_ms) {
+                        (Some("apply"), Some(ms)) => format!("applying in {}s", ms / 1000),
+                        (Some("revert"), Some(ms)) => format!("reverting in {}s", ms / 1000),
+                        (_, Some(ms)) => format!("{}s left", ms / 1000),
+                        _ => "pending".to_string(),
+                    }
                 ),
             }
         });
@@ -1715,35 +1729,32 @@ fn pick_dialog(kind: Picker) -> Option<PathBuf> {
     }
 }
 
-/// Visible top-level windows: (title, exe path), deduplicated by exe.
-fn list_window_apps() -> Vec<(String, String)> {
+/// Every running process: (window title or empty, exe path), deduplicated by path.
+/// The picker lists all of them (user decision 2026-10-18) — background apps like G-Helper have no
+/// window at all, and they are exactly the kind of thing people want to track.
+fn list_running_apps() -> Vec<(String, String)> {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GWL_EXSTYLE, GW_OWNER, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW,
         GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TOOLWINDOW,
     };
 
-    static APPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
-    static OWN_EXE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    let own_exe = OWN_EXE.get_or_init(|| {
-        std::env::current_exe()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default()
-    });
-
-    let own_exe_ptr: *const String = own_exe;
-
-    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> windows_sys::core::BOOL {
+    // pid -> a visible top-level window title, used as a friendly label when there is one
+    static TITLES: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+    unsafe extern "system" fn collect_titles(hwnd: HWND, _lparam: LPARAM) -> windows_sys::core::BOOL {
         unsafe {
-            let own_exe: &String = &*(lparam as *const String);
             if IsWindowVisible(hwnd) == 0 {
                 return 1;
             }
             if !GetWindow(hwnd, GW_OWNER).is_null() {
-                return 1; // owned windows are usually dialogs/popups
+                return 1;
             }
             if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW as isize) != 0 {
-                return 1; // tool windows: tray/overlays, not apps
+                return 1;
             }
             let len = GetWindowTextLengthW(hwnd);
             if len <= 0 {
@@ -1755,20 +1766,12 @@ fn list_window_apps() -> Vec<(String, String)> {
                 return 1;
             }
             buf.truncate(n as usize);
-            let title = String::from_utf16_lossy(&buf);
-
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid == 0 {
-                return 1;
-            }
-            if let Some(exe) = crate::watch::process_path(pid) {
-                if !own_exe.is_empty() && exe.eq_ignore_ascii_case(own_exe) {
-                    return 1; // never offer our own GUI as a tracked app
-                }
-                if let Ok(mut apps) = APPS.lock() {
-                    if !apps.iter().any(|(_, e)| e.eq_ignore_ascii_case(&exe)) {
-                        apps.push((title, exe));
+            if pid != 0 {
+                if let Ok(mut titles) = TITLES.lock() {
+                    if !titles.iter().any(|(p, _)| *p == pid) {
+                        titles.push((pid, String::from_utf16_lossy(&buf)));
                     }
                 }
             }
@@ -1776,14 +1779,53 @@ fn list_window_apps() -> Vec<(String, String)> {
         1
     }
 
-    if let Ok(mut apps) = APPS.lock() {
-        apps.clear();
+    if let Ok(mut titles) = TITLES.lock() {
+        titles.clear();
     }
     unsafe {
-        EnumWindows(Some(collect), own_exe_ptr as LPARAM);
+        EnumWindows(Some(collect_titles), 0);
     }
-    let mut out = APPS.lock().map(|g| g.clone()).unwrap_or_default();
-    out.sort_by_key(|(title, _)| title.to_lowercase());
+    let titles = TITLES.lock().map(|t| t.clone()).unwrap_or_default();
+
+    let own = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let mut out: Vec<(String, String)> = Vec::new();
+
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap.is_null() || snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return out;
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut ok = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+    while ok {
+        let pid = entry.th32ProcessID;
+        if pid != 0 && pid != 4 {
+            if let Some(path) = crate::watch::process_path(pid) {
+                if !own.is_empty() && path.eq_ignore_ascii_case(&own) {
+                    ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
+                    continue;
+                }
+                if !out.iter().any(|(_, p)| p.eq_ignore_ascii_case(&path)) {
+                    let title = titles
+                        .iter()
+                        .find(|(p, _)| *p == pid)
+                        .map(|(_, t)| t.clone())
+                        .unwrap_or_default();
+                    out.push((title, path));
+                }
+            }
+        }
+        ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
+    }
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(snap) };
+    out.sort_by_key(|(_, path)| {
+        path.rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(path)
+            .to_ascii_lowercase()
+    });
     out
 }
 

@@ -1,16 +1,13 @@
 //! Trigger engine: pure state machine driven by tracked-app start/stop events.
 //!
-//! Semantics (user-specified, 2026-10-16):
-//! - A tracked app starting **applies** the packs immediately.
-//! - When every tracked app has closed, a cooldown **starts and keeps counting**, no
-//!   matter how often the app reopens (reopening never resets it).
-//! - The packs only **revert** when the cooldown has expired.
-//! - If the cooldown expires while a tracked app is running, nothing happens: we "stay
-//!   ready". The switch happens on the *next* close, and that switch starts a new cooldown.
-//! - After the new cooldown passes with nothing running we go idle (no further switching).
-//! - **Idle mode cancels all switching** (user decision B8): entering idle reverts whatever is
-//!   applied, and tracked apps are treated as ordinary apps while idle. Leaving idle re-applies
-//!   if a tracked app is running at that moment.
+//! Semantics (user-specified, revised 2026-10-18):
+//! - The packs only switch **after the tracked state has been stable for the cooldown**, in both
+//!   directions: a tracked app must be running for `cooldown` before the packs apply, and nothing
+//!   may have been running for `cooldown` before they revert. Every state change starts (or
+//!   cancels) that countdown, so a launcher that opens and closes quickly never causes a switch.
+//! - Reopening during a pending revert cancels it; closing during a pending apply cancels that.
+//! - Idle mode cancels switching entirely (entering reverts, leaving re-applies when one runs).
+//! - Removing the last tracked app is not an app event: it reverts immediately.
 //!
 //! Deliberately free of Windows/clock dependencies so it can be unit-tested.
 
@@ -29,7 +26,7 @@ pub enum EngineState {
 pub enum Transition {
     /// Tracked app(s) is/are running: apply the packs.
     Applied,
-    /// The cooldown expired with nothing running: revert the packs.
+    /// Nothing has been running for a cooldown: revert the packs.
     Reverted,
 }
 
@@ -39,9 +36,8 @@ pub struct Engine {
     applied: bool,
     /// Idle mode is up: packs are reverted and stay that way until idle ends.
     idle: bool,
-    /// When the pending revert becomes due (kept even after it has passed, so an
-    /// overdue switch happens on the next close).
-    deadline: Option<Instant>,
+    /// A switch waiting for the cooldown: (deadline, target applied state).
+    pending: Option<(Instant, bool)>,
     /// exe file name (lowercase, the tracked identity) -> (display name, live pids)
     running: BTreeMap<String, (String, Vec<u32>)>,
     last_source: Option<String>,
@@ -53,7 +49,7 @@ impl Engine {
             cooldown,
             applied: false,
             idle: false,
-            deadline: None,
+            pending: None,
             running: BTreeMap::new(),
             last_source: None,
         }
@@ -63,12 +59,12 @@ impl Engine {
         self.cooldown = cooldown;
     }
 
-    /// Display state: what the user should see.
+    /// What the user should see. `Cooldown` covers both directions (see `pending_action`).
     pub fn state(&self) -> EngineState {
-        if !self.running.is_empty() {
-            EngineState::Triggered
-        } else if self.deadline.is_some() {
+        if self.pending.is_some() {
             EngineState::Cooldown
+        } else if self.applied {
+            EngineState::Triggered
         } else {
             EngineState::Idle
         }
@@ -78,9 +74,15 @@ impl Engine {
         self.last_source.clone()
     }
 
+    /// How long until the pending switch, if one is scheduled.
     pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
-        self.deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
+        self.pending
+            .map(|(deadline, _)| deadline.saturating_duration_since(now))
+    }
+
+    /// `true` when the pending switch is an apply, `false` for a revert.
+    pub fn pending_action(&self) -> Option<bool> {
+        self.pending.map(|(_, apply)| apply)
     }
 
     /// Display names of the tracked apps that are currently running.
@@ -106,16 +108,16 @@ impl Engine {
     }
 
     /// Enter or leave idle mode (black screens + muted audio). Entering reverts whatever is
-    /// applied and forgets any pending cooldown; leaving re-applies when a tracked app is
-    /// running right now. Returns the transition the daemon must run, if any.
+    /// applied; leaving re-applies when a tracked app is running right now. Returns the transition
+    /// the daemon must run, if any.
     pub fn set_idle(&mut self, idle: bool) -> Option<Transition> {
         if self.idle == idle {
             return None;
         }
         self.idle = idle;
+        // Idle cancels any pending switch: nothing may move while it is up.
+        self.pending = None;
         if idle {
-            // Idle cancels switching: drop the pending switch and revert what is on.
-            self.deadline = None;
             if self.applied {
                 self.applied = false;
                 self.last_source = None;
@@ -123,7 +125,8 @@ impl Engine {
             }
             None
         } else if !self.running.is_empty() && !self.applied {
-            // Back to normal with a tracked app still running: apply again.
+            // Back to normal with a tracked app still running: apply again (no cooldown: this is
+            // a mode change, not an app start).
             self.applied = true;
             self.last_source = Some(self.source_label());
             Some(Transition::Applied)
@@ -134,7 +137,7 @@ impl Engine {
 
     /// A tracked app was removed from the user's list: forget it entirely. If nothing tracked is
     /// running any more, the packs revert **now** instead of waiting out the cooldown — the user
-    /// just told us the app no longer matters (2026-10-17 feedback).
+    /// just said the app no longer matters (2026-10-17 feedback).
     pub fn on_untracked(&mut self, key: &str) -> Option<Transition> {
         self.running.remove(&key.to_ascii_lowercase());
         self.last_source = if self.running.is_empty() {
@@ -142,10 +145,16 @@ impl Engine {
         } else {
             Some(self.source_label())
         };
-        if self.running.is_empty() && self.applied {
-            self.applied = false;
-            self.deadline = None;
-            return Some(Transition::Reverted);
+        if self.running.is_empty() {
+            // No apply can be pending for an app we just stopped tracking.
+            if self.pending.map(|(_, apply)| apply) == Some(true) {
+                self.pending = None;
+            }
+            if self.applied {
+                self.applied = false;
+                self.pending = None;
+                return Some(Transition::Reverted);
+            }
         }
         None
     }
@@ -155,7 +164,7 @@ impl Engine {
         key: &str,
         name: &str,
         pid: u32,
-        _now: Instant,
+        now: Instant,
     ) -> Option<Transition> {
         let entry = self
             .running
@@ -170,12 +179,16 @@ impl Engine {
         if self.idle {
             return None;
         }
-        // Reopening during a cooldown leaves the countdown alone ("stay ready").
-        if self.applied {
+        // Already on, or an apply is already counting down: nothing to schedule.
+        if self.applied || self.pending.map(|(_, apply)| apply) == Some(true) {
+            // A pending revert is cancelled: the app is back before the cooldown elapsed.
+            if self.pending.map(|(_, apply)| apply) == Some(false) {
+                self.pending = None;
+            }
             return None;
         }
-        self.applied = true;
-        Some(Transition::Applied)
+        self.pending = Some((now + self.cooldown, true));
+        None
     }
 
     pub fn on_stopped(&mut self, key: &str, pid: u32, now: Instant) -> Option<Transition> {
@@ -186,47 +199,56 @@ impl Engine {
                 self.running.remove(&lookup);
             }
         }
-        if self.applied {
+        if self.running.is_empty() {
+            self.last_source = None;
+        } else {
             self.last_source = Some(self.source_label());
         }
 
-        // While idle nothing is applied, so no cooldown is ever started.
         if self.idle {
             return None;
         }
 
-        // Every tracked app closed → the countdown starts (once).
-        if self.running.is_empty() && self.applied && self.deadline.is_none() {
-            self.deadline = Some(now + self.cooldown);
+        if self.running.is_empty() {
+            if self.applied {
+                // Start the revert countdown (keep an existing one: no reset on reopen/close churn).
+                if self.pending.is_none() {
+                    self.pending = Some((now + self.cooldown, false));
+                }
+            } else if self.pending.map(|(_, apply)| apply) == Some(true) {
+                // Closed before the apply deadline: nothing to switch.
+                self.pending = None;
+            }
         }
         None
     }
 
-    /// Advance time (called ~1/s). Returns `Reverted` exactly when the packs must revert.
+    /// Advance time (called ~1/s). Returns the transition exactly when the pending switch is due.
     pub fn tick(&mut self, now: Instant) -> Option<Transition> {
-        let Some(deadline) = self.deadline else {
+        let Some((deadline, apply)) = self.pending else {
             return None;
         };
         if now < deadline {
             return None;
         }
-
-        // Expired while a tracked app is running: stay ready, switch on the next close.
-        if !self.running.is_empty() {
+        // The tracked state must still match the target; app events cancel pending switches.
+        if self.running.is_empty() == apply {
+            self.pending = None;
             return None;
         }
-
-        if self.applied {
-            self.applied = false;
-            self.last_source = None;
-            // The switch starts a new cooldown (per the user's model).
-            self.deadline = Some(now + self.cooldown);
-            return Some(Transition::Reverted);
+        self.pending = None;
+        if apply == self.applied {
+            return None;
         }
-
-        // Nothing applied any more and the extra cooldown has passed → idle.
-        self.deadline = None;
-        None
+        self.applied = apply;
+        if !apply {
+            self.last_source = None;
+        }
+        Some(if apply {
+            Transition::Applied
+        } else {
+            Transition::Reverted
+        })
     }
 
     fn source_label(&self) -> String {
@@ -249,118 +271,99 @@ mod tests {
         Instant::now()
     }
 
+    /// Drive the engine from idle to "packs applied" and return the engine.
+    fn applied_engine(now: Instant) -> Engine {
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Applied));
+        e
+    }
+
     #[test]
-    fn start_applies_and_close_starts_the_cooldown() {
+    fn applying_waits_for_the_cooldown() {
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
 
-        assert_eq!(
-            e.on_started("game.exe", "game.exe", 10, now),
-            Some(Transition::Applied)
-        );
-        assert_eq!(e.state(), EngineState::Triggered);
-        assert!(e.is_applied());
-
-        assert_eq!(e.on_stopped("game.exe", 10, now), None);
+        assert_eq!(e.on_started("game.exe", "game.exe", 10, now), None);
         assert_eq!(e.state(), EngineState::Cooldown);
+        assert_eq!(e.pending_action(), Some(true));
         assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
-    }
-
-    #[test]
-    fn reopening_never_resets_the_countdown() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        e.on_stopped("game.exe", 1, now);
-
-        // three quick reopens, as in the user's example
-        for i in 0..3 {
-            let t = now + Duration::from_secs(10 * (i + 1));
-            assert_eq!(e.on_started("game.exe", "game.exe", 100 + i as u32, t), None);
-            assert_eq!(e.state(), EngineState::Triggered);
-            assert!(e.is_applied());
-            assert_eq!(e.on_stopped("game.exe", 100 + i as u32, t), None);
-            // the original deadline is untouched
-            assert_eq!(
-                e.cooldown_remaining(t),
-                Some(Duration::from_secs(C) - Duration::from_secs(10 * (i + 1)))
-            );
-        }
-    }
-
-    #[test]
-    fn expired_while_running_stays_ready_and_switches_on_the_next_close() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        e.on_stopped("game.exe", 1, now);
-
-        // comes back and stays past the deadline
-        let back = now + Duration::from_secs(30);
-        e.on_started("game.exe", "game.exe", 2, back);
-        assert_eq!(e.tick(now + Duration::from_secs(C + 5)), None); // stay ready
-        assert_eq!(e.state(), EngineState::Triggered);
-        assert!(e.is_applied());
-
-        // next close: the switch happens (now overdue) and a new cooldown starts
-        let close = now + Duration::from_secs(120);
-        e.on_stopped("game.exe", 2, close);
-        assert_eq!(e.tick(close), Some(Transition::Reverted));
         assert!(!e.is_applied());
-        assert_eq!(e.state(), EngineState::Cooldown);
-        assert_eq!(e.cooldown_remaining(close), Some(Duration::from_secs(C)));
 
-        // and once that new cooldown passes quietly we are idle
-        assert_eq!(e.tick(close + Duration::from_secs(C)), None);
-        assert_eq!(e.state(), EngineState::Idle);
-        assert_eq!(e.cooldown_remaining(close + Duration::from_secs(C)), None);
-    }
-
-    #[test]
-    fn quiet_cooldown_reverts_then_goes_idle() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        e.on_stopped("game.exe", 1, now);
-
+        // just before the deadline: still nothing
         assert_eq!(e.tick(now + Duration::from_secs(C - 1)), None);
-        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Reverted));
-        assert_eq!(e.state(), EngineState::Cooldown); // the post-switch cooldown
-        assert_eq!(e.tick(now + Duration::from_secs(2 * C)), None);
-        assert_eq!(e.state(), EngineState::Idle);
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Applied));
+        assert!(e.is_applied());
+        assert_eq!(e.state(), EngineState::Triggered);
+        assert_eq!(e.pending_action(), None);
     }
 
     #[test]
-    fn start_after_a_revert_applies_again() {
+    fn a_quick_open_and_close_never_switches() {
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        e.on_stopped("game.exe", 1, now);
-        e.tick(now + Duration::from_secs(C));
 
-        let later = now + Duration::from_secs(C + 30);
-        assert_eq!(
-            e.on_started("game.exe", "game.exe", 9, later),
-            Some(Transition::Applied)
-        );
+        // a launcher that opens and closes inside the cooldown: no switch at all
+        e.on_started("setup.exe", "setup.exe", 5, now);
+        e.on_stopped("setup.exe", 5, now + Duration::from_secs(5));
+        assert_eq!(e.pending_action(), None);
+        assert_eq!(e.state(), EngineState::Idle);
+        assert!(!e.is_applied());
+        assert_eq!(e.tick(now + Duration::from_secs(10 * C)), None);
+        assert!(!e.is_applied());
+    }
+
+    #[test]
+    fn reopening_during_the_pending_revert_cancels_it() {
+        let now = t0();
+        let mut e = applied_engine(now);
+
+        e.on_stopped("game.exe", 1, now + Duration::from_secs(C + 1));
+        assert_eq!(e.pending_action(), Some(false));
+        assert_eq!(e.state(), EngineState::Cooldown);
+
+        // back before the countdown ends: the packs stay applied
+        e.on_started("game.exe", "game.exe", 2, now + Duration::from_secs(C + 10));
+        assert_eq!(e.pending_action(), None);
+        assert!(e.is_applied());
+        assert_eq!(e.tick(now + Duration::from_secs(5 * C)), None);
         assert!(e.is_applied());
     }
 
     #[test]
-    fn second_instance_and_second_app_keep_it_applied() {
+    fn reverting_waits_for_the_cooldown_and_then_goes_idle() {
+        let now = t0();
+        let mut e = applied_engine(now);
+        let closed = now + Duration::from_secs(C + 1);
+
+        e.on_stopped("game.exe", 1, closed);
+        assert_eq!(e.state(), EngineState::Cooldown);
+        assert_eq!(
+            e.cooldown_remaining(closed),
+            Some(Duration::from_secs(C))
+        );
+        assert_eq!(e.tick(closed + Duration::from_secs(C - 1)), None);
+        assert_eq!(e.tick(closed + Duration::from_secs(C)), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.state(), EngineState::Idle);
+    }
+
+    #[test]
+    fn a_second_instance_and_a_second_app_keep_the_state_stable() {
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("a.exe", "a.exe", 1, now);
-        assert_eq!(e.on_started("a.exe", "a.exe", 2, now), None);
-        assert_eq!(e.on_started("b.exe", "b.exe", 3, now), None);
+        e.on_started("a.exe", "a.exe", 2, now);
+        e.on_started("b.exe", "b.exe", 3, now);
         assert_eq!(e.source().as_deref(), Some("a.exe +1"));
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Applied));
 
-        assert_eq!(e.on_stopped("a.exe", 1, now), None);
-        assert_eq!(e.on_stopped("a.exe", 2, now), None);
+        e.on_stopped("a.exe", 1, now + Duration::from_secs(C + 1));
+        e.on_stopped("a.exe", 2, now + Duration::from_secs(C + 1));
         assert_eq!(e.state(), EngineState::Triggered); // b.exe still running
-        assert_eq!(e.on_stopped("b.exe", 3, now), None);
+        e.on_stopped("b.exe", 3, now + Duration::from_secs(C + 1));
         assert_eq!(e.state(), EngineState::Cooldown);
-        assert_eq!(e.source().as_deref(), Some("—"));
+        assert_eq!(e.pending_action(), Some(false));
     }
 
     #[test]
@@ -379,32 +382,30 @@ mod tests {
         e.on_started("App.EXE", "App.EXE", 3, now);
         assert!(e.is_running("app.exe"));
         e.on_stopped("app.exe", 3, now);
-        assert_eq!(e.state(), EngineState::Cooldown);
+        assert_eq!(e.state(), EngineState::Idle);
     }
 
     #[test]
     fn entering_idle_reverts_the_applied_packs() {
         let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
+        let mut e = applied_engine(now);
+        assert!(e.is_applied());
+
         assert_eq!(e.set_idle(true), Some(Transition::Reverted));
         assert!(!e.is_applied());
         assert!(e.is_idle_mode());
-        // a second press changes nothing
-        assert_eq!(e.set_idle(true), None);
+        assert_eq!(e.set_idle(true), None); // a second press changes nothing
     }
 
     #[test]
-    fn idle_cancels_a_pending_cooldown() {
+    fn idle_cancels_a_pending_switch() {
         let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        e.on_stopped("game.exe", 1, now);
-        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+        let mut e = applied_engine(now);
+        e.on_stopped("game.exe", 1, now + Duration::from_secs(C + 1));
+        assert_eq!(e.pending_action(), Some(false));
 
         e.set_idle(true);
-        assert_eq!(e.cooldown_remaining(now), None);
-        // the old deadline must not fire while idle
+        assert_eq!(e.pending_action(), None);
         assert_eq!(e.tick(now + Duration::from_secs(5 * C)), None);
         assert_eq!(e.state(), EngineState::Idle);
     }
@@ -415,26 +416,24 @@ mod tests {
         let mut e = Engine::new(Duration::from_secs(C));
         e.set_idle(true);
         assert_eq!(e.on_started("game.exe", "game.exe", 1, now), None);
+        assert_eq!(e.pending_action(), None);
+        assert_eq!(e.tick(now + Duration::from_secs(5 * C)), None);
         assert!(!e.is_applied());
         e.on_stopped("game.exe", 1, now);
-        assert_eq!(e.cooldown_remaining(now), None);
-        assert_eq!(e.state(), EngineState::Idle);
+        assert_eq!(e.pending_action(), None);
     }
 
     #[test]
     fn last_tracked_app_removed_reverts_immediately() {
         let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
+        let mut e = applied_engine(now);
         assert!(e.is_applied());
 
-        // untracking the app that is running must not wait out a cooldown
         assert_eq!(e.on_untracked("game.exe"), Some(Transition::Reverted));
         assert!(!e.is_applied());
         assert_eq!(e.state(), EngineState::Idle);
         assert_eq!(e.cooldown_remaining(now), None);
 
-        // untracking an app that is not running changes nothing
         assert_eq!(e.on_untracked("ghost.exe"), None);
         assert!(!e.is_applied());
     }
@@ -445,6 +444,8 @@ mod tests {
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("a.exe", "a.exe", 1, now);
         e.on_started("b.exe", "b.exe", 2, now);
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Applied));
+
         assert_eq!(e.on_untracked("a.exe"), None);
         assert!(e.is_applied());
         assert_eq!(e.state(), EngineState::Triggered);
@@ -454,19 +455,16 @@ mod tests {
     #[test]
     fn leaving_idle_reapplies_when_a_tracked_app_is_running() {
         let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
+        let mut e = applied_engine(now);
         e.set_idle(true);
         assert!(!e.is_applied());
 
-        // still running when idle ends → applied again
         assert_eq!(e.set_idle(false), Some(Transition::Applied));
         assert!(e.is_applied());
         assert_eq!(e.state(), EngineState::Triggered);
 
-        // leaving again with nothing running does nothing
         e.set_idle(true);
-        e.on_stopped("game.exe", 1, now);
+        e.on_stopped("game.exe", 1, now + Duration::from_secs(C + 2));
         assert_eq!(e.set_idle(false), None);
         assert!(!e.is_applied());
         assert_eq!(e.state(), EngineState::Idle);

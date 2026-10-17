@@ -149,6 +149,10 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
         let mut ctx = TemplateCtx {
             target_exe: target_exe.clone(),
             target_name: target_name.clone(),
+            target_dir: std::path::Path::new(&target_exe)
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             ..Default::default()
         };
         if let Some(values) = job.values.get(&pack.id) {
@@ -262,7 +266,7 @@ fn run_block(block: &StepBlock, ctx: &TemplateCtx, setting_key: Option<&str>) ->
 fn describe_step(step: &Step, ctx: &TemplateCtx) -> String {
     match step.mechanism.as_str() {
         "cli" => {
-            let exe = substitute(step.exe.as_deref().unwrap_or(""), ctx).0;
+            let exe = resolve_exe(step, ctx).unwrap_or_default();
             let args: Vec<String> = step.args.iter().map(|a| substitute(a, ctx).0).collect();
             format!("cli {exe} {}", args.join(" "))
         }
@@ -278,6 +282,20 @@ fn describe_step(step: &Step, ctx: &TemplateCtx) -> String {
     }
 }
 
+/// The exe a step runs: either its own `exe` template, or one picked from a dropdown via
+/// `exe_from_setting` + `exe_map` (e.g. "auto / 64-bit / 32-bit" of a multi-binary app).
+fn resolve_exe(step: &Step, ctx: &TemplateCtx) -> Result<String, String> {
+    if let Some(key) = &step.exe_from_setting {
+        let value = ctx.settings.get(key).cloned().unwrap_or_default();
+        let template = step
+            .exe_map
+            .get(&value)
+            .ok_or_else(|| format!("no exe mapped for {key} = '{value}'"))?;
+        return Ok(substitute(template, ctx).0);
+    }
+    Ok(substitute(step.exe.as_deref().unwrap_or(""), ctx).0)
+}
+
 fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result<bool, String> {
     if let Some(cond) = &step.when {
         if !cond.matches(ctx, setting_key) {
@@ -291,12 +309,12 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
     }
     match step.mechanism.as_str() {
         "cli" => {
-            let exe = substitute(step.exe.as_deref().unwrap_or(""), ctx).0;
+            let exe = resolve_exe(step, ctx)?;
             let args: Vec<String> = step.args.iter().map(|a| substitute(a, ctx).0).collect();
             run_cli(&exe, &args, step.expect_exit)
         }
         "process_start" => {
-            let exe = substitute(step.exe.as_deref().unwrap_or(""), ctx).0;
+            let exe = resolve_exe(step, ctx)?;
             if exe.is_empty() {
                 return Err("process_start: no exe".into());
             }
@@ -313,7 +331,7 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
             start_process(&exe)
         }
         "process_kill" => {
-            let exe = substitute(step.exe.as_deref().unwrap_or(""), ctx).0;
+            let exe = resolve_exe(step, ctx)?;
             let name = exe
                 .rsplit(['\\', '/'])
                 .next()
