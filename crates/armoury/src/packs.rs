@@ -26,6 +26,9 @@ pub struct Installed {
 pub struct PackJob {
     /// true = trigger (game mode on), false = revert.
     pub apply: bool,
+    /// Set for a single-pack operation (removing an applied pack): the outcome is then
+    /// merged for that pack only instead of replacing the whole applied state.
+    pub tag: Option<String>,
     /// Per-pack enabled flags and dropdown values (from config).
     pub enabled: HashMap<String, bool>,
     pub values: HashMap<String, HashMap<String, String>>,
@@ -36,7 +39,10 @@ pub struct PackJob {
 /// What happened, for logging and the dashboard's "applied" flag.
 pub struct PackOutcome {
     pub applied: bool,
-    /// Pack ids that are now in the applied state.
+    /// Echo of `PackJob::tag`.
+    pub tag: Option<String>,
+    /// Packs this job acted on. A pack whose block *started* is in here even if a step
+    /// failed halfway: the machine was changed, so it must be journalled and reverted.
     pub applied_ids: Vec<String>,
     /// The dropdown values this job ran with (echoed so the journal can record them).
     pub values: HashMap<String, HashMap<String, String>>,
@@ -193,14 +199,22 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
             continue;
         }
 
+        // Past the guards: this pack's captures belong in the journal.
+        if job.apply {
+            captured_out.insert(pack.id.clone(), ctx.captured.clone());
+        }
+
         let setting_key = pack.settings.first().map(|s| s.key.as_str());
-        match run_block(block, &ctx, setting_key) {
+        let result = run_block(block, &ctx, setting_key);
+        if job.apply {
+            // "applied" means the block was started. A pack that failed on its second step has
+            // already changed the machine, so it must be journalled (and reverted) like any other.
+            applied_ids.push(pack.id.clone());
+        }
+        match result {
             Ok(lines) => {
                 for l in lines {
                     strings.push(format!("{}: {l}", pack.id));
-                }
-                if job.apply {
-                    applied_ids.push(pack.id.clone());
                 }
                 info!(
                     "{}: {} (target: {})",
@@ -218,6 +232,7 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
 
     PackOutcome {
         applied: job.apply,
+        tag: job.tag.clone(),
         applied_ids,
         values: job.values.clone(),
         captured: captured_out,
@@ -722,7 +737,15 @@ pub fn remove_id(search_dirs: &[PathBuf], id: &str) -> Result<String, String> {
 }
 
 fn is_safe_id(id: &str) -> bool {
-    !id.trim().is_empty() && !id.contains(['/', '\\']) && !id.contains("..")
+    // A Windows folder name only: no separators, no drive prefix (`C:evil` escapes the root when
+    // joined), no traversal, no leading/trailing dot (Windows strips those, so they would not round
+    // trip through the file system).
+    let id = id.trim();
+    if id.is_empty() || id.len() > 64 || id.starts_with('.') || id.ends_with(['.', ' ']) {
+        return false;
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
 }
 
 /// The revert a fresh daemon start must run: a restart counts as "revert everything"
@@ -774,6 +797,7 @@ pub fn journal_pending_revert_in(config_dir: &Path) -> Option<PackJob> {
 
     Some(PackJob {
         apply: false,
+        tag: None,
         enabled: ids.iter().map(|id| (id.clone(), true)).collect(),
         values: nested("values"),
         captured: nested("captured"),
@@ -1023,6 +1047,16 @@ mod tests {
     }"#;
 
     #[test]
+    fn pack_ids_must_be_plain_folder_names() {
+        assert!(is_safe_id("wallpaper-engine"));
+        assert!(is_safe_id("my pack.1"));
+        for bad in ["", " ", "..", ".", "../..", "a/b", "a\\b", "C:evil", "evil.", ".hidden", "."] {
+            assert!(!is_safe_id(bad), "'{bad}' must be refused");
+        }
+        assert!(!is_safe_id(&"x".repeat(65)));
+    }
+
+    #[test]
     fn install_then_remove_a_pack() {
         let install = scratch_install("install");
         let source = install.join("incoming");
@@ -1048,6 +1082,7 @@ mod tests {
         // nothing left to remove, and traversal is refused
         assert!(remove_id(&[install.clone()], "sample").is_err());
         assert!(remove_id(&[install.clone()], "../..").is_err());
+        assert!(remove_id(&[install.clone()], "C:evil").is_err());
         let _ = std::fs::remove_dir_all(&install);
     }
 

@@ -468,6 +468,8 @@ impl eframe::App for App {
                         let mut s = self.shared.lock().unwrap();
                         s.settings_open = !settings_open;
                         if s.settings_open {
+                            // a fresh window: forget the previous install/remove message
+                            s.last_pack_op = None;
                             s.settings_stage = 0;
                             s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
                             s.settings_anchor = None;
@@ -932,16 +934,23 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 
     let (status, connected, version, monitors, cooldown) = {
         let s = shared.lock().unwrap();
-        let st = s.status.as_ref().map(|st| match st.state {
-            RunState::Idle => "Idle".to_string(),
-            RunState::Triggered => format!(
-                "Triggered ({})",
-                st.trigger_source.as_deref().unwrap_or("?")
-            ),
-            RunState::Cooldown => format!(
-                "Cooldown ({}s left)",
-                st.cooldown_remaining_ms.unwrap_or(0) / 1000
-            ),
+        let st = s.status.as_ref().map(|st| {
+            if st.idle_active {
+                // idle cancels switching: the engine state would still say "Triggered" for a
+                // running tracked app, which is misleading while the packs are deliberately off.
+                return "Idle mode (packs cancelled)".to_string();
+            }
+            match st.state {
+                RunState::Idle => "Idle".to_string(),
+                RunState::Triggered => format!(
+                    "Triggered ({})",
+                    st.trigger_source.as_deref().unwrap_or("?")
+                ),
+                RunState::Cooldown => format!(
+                    "Cooldown ({}s left)",
+                    st.cooldown_remaining_ms.unwrap_or(0) / 1000
+                ),
+            }
         });
         (
             st,

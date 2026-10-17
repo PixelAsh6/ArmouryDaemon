@@ -29,10 +29,10 @@ pub fn run(show_ui_when_running: bool) {
         eprintln!("logging init failed: {e}");
     }
     info!("daemon starting (v{})", armoury_core::VERSION);
-    killswitch::init_com();
-    overlay::recover_if_needed();
 
     // ---- single instance ----
+    // Before anything with a side effect: overlay::recover_if_needed() unmutes every output
+    // device, and a scheduler start (logon + resume) must never do that to a running daemon.
     let _mutex_guard = match acquire_singleton() {
         Singleton::AlreadyRunning => {
             if show_ui_when_running {
@@ -47,6 +47,11 @@ pub fn run(show_ui_when_running: bool) {
         }
         Singleton::Acquired(h) => h,
     };
+
+    // Now that we know we are the only instance: COM for the audio interfaces, and recover
+    // from a previous run that died while idle.
+    killswitch::init_com();
+    overlay::recover_if_needed();
 
     // ---- config ----
     let cfg = armoury_core::config::load_or_create().unwrap_or_else(|e| {
@@ -194,6 +199,7 @@ pub fn run(show_ui_when_running: bool) {
         pack_catalog,
         applied_packs: Vec::new(),
         captured_by_pack: HashMap::new(),
+        pending_removal: None,
         started: Instant::now(),
         clients: HashMap::new(),
         ui_conn: None,
@@ -428,6 +434,8 @@ struct App {
     applied_packs: Vec<String>,
     /// Journal: per-pack values captured at apply time, replayed on revert.
     captured_by_pack: HashMap<String, HashMap<String, String>>,
+    /// A pack removal that is waiting for its revert to finish: (pack id, requesting client).
+    pending_removal: Option<(String, u64)>,
     /// Shared with the watcher thread (single source of truth for what to watch).
     tracked: Arc<Mutex<Vec<TrackedApp>>>,
     /// Tracked key (exe file name, lowercase) -> last resolved image path, for pack templates.
@@ -550,6 +558,7 @@ impl App {
         // Hand the transition to the pack worker (it owns the mechanisms).
         let job = packs::PackJob {
             apply: t == Transition::Applied,
+            tag: None,
             enabled: self
                 .cfg
                 .packs
@@ -596,6 +605,27 @@ impl App {
     }
 
     fn on_pack_outcome(&mut self, o: packs::PackOutcome) {
+        if let Some(tag) = o.tag.clone() {
+            // A single-pack operation (removing an applied pack): merge instead of replacing.
+            self.applied_packs.retain(|p| p != &tag);
+            self.captured_by_pack.remove(&tag);
+            for line in &o.succeeded {
+                info!("pack {line}");
+            }
+            let failed = o.failed.first().map(|(_, e)| e.clone());
+            for (id, err) in &o.failed {
+                warn!("pack {id} failed: {err}");
+            }
+            if self.pending_removal.as_ref().map(|(id, _)| id == &tag) == Some(true) {
+                let (_, client) = self.pending_removal.take().unwrap();
+                self.finish_removal(&tag, client, failed);
+            } else {
+                self.write_journal(&o, false);
+                self.broadcast_status();
+            }
+            return;
+        }
+
         if o.applied {
             self.applied_packs = o.applied_ids.clone();
             // keep the journal so the matching revert restores the right state
@@ -610,13 +640,19 @@ impl App {
         for (id, err) in &o.failed {
             warn!("pack {id} failed: {err}");
         }
-        self.write_journal(&o);
+        self.write_journal(&o, true);
         self.broadcast_status();
     }
 
     /// The journal is also the restart record: it must carry everything a revert needs
     /// (which packs, their dropdown values and the values captured at apply time).
-    fn write_journal(&self, o: &packs::PackOutcome) {
+    /// `whole_state` = this outcome describes the full applied set (a transition or a global
+    /// revert); a single-pack outcome only updates that pack's row.
+    fn write_journal(&self, o: &packs::PackOutcome, whole_state: bool) {
+        if !whole_state {
+            // a single-pack operation is not the whole applied state — leave the journal alone
+            return;
+        }
         let path = armoury_core::config::config_dir().join("journal.json");
         let entry = serde_json::json!({
             "at": std::time::SystemTime::now()
@@ -644,7 +680,31 @@ impl App {
             log.drain(0..drop);
         }
         if let Ok(text) = serde_json::to_string_pretty(&log) {
-            let _ = std::fs::write(&path, text);
+            // atomic-ish write: a truncated journal would silently skip the restart revert
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Remove a pack folder now that its (optional) revert has finished.
+    fn finish_removal(&mut self, pack_id: &str, client: u64, revert_error: Option<String>) {
+        match packs::remove_id(&self.search, pack_id) {
+            Ok(removed) => {
+                self.reload_packs();
+                let ok = revert_error.is_none();
+                let message = match &revert_error {
+                    Some(e) => format!("{removed} removed, but reverting it failed: {e}"),
+                    None => format!("{removed} removed"),
+                };
+                info!("pack op: {message}");
+                self.reply_pack_op(client, ok, message);
+            }
+            Err(e) => {
+                warn!("pack remove failed: {e}");
+                self.reply_pack_op(client, false, e);
+            }
         }
     }
 
@@ -782,6 +842,13 @@ impl App {
         // marker first: if we crash while idle, the next start can restore the audio
         let _ = std::fs::write(overlay::marker_path(), b"idle");
         overlay::show(&mut self.overlay);
+        if !self.overlay.is_active() {
+            // The black windows could not be created. Do not cancel pack switching in that case:
+            // the user would have no way out of a mode that is not actually up.
+            warn!("idle overlay could not be shown — leaving pack switching alone");
+            let _ = std::fs::remove_file(overlay::marker_path());
+            return;
+        }
         self.idle_engage_tick = tick_count();
         self.idle_deadline = if self.cfg.idle_failsafe_enabled {
             Some(Instant::now() + Duration::from_secs(self.cfg.idle_failsafe_minutes.max(1) * 60))
@@ -1028,13 +1095,23 @@ impl App {
                     }
                 }
                 Request::RemovePack { id: pack_id } => {
-                    // If the pack is applied right now, put the app back before its folder goes:
-                    // the worker still has the pack, so queue the revert first (exact captures).
-                    if self.applied_packs.iter().any(|p| p == &pack_id) {
-                        let captured = self.captured_by_pack.get(&pack_id).cloned();
-                        if let Some(captured) = captured {
-                            let job = packs::PackJob {
+                    if let Some((pending, _)) = &self.pending_removal {
+                        let message = format!(
+                            "a removal of {pending} is still running — try again in a moment"
+                        );
+                        warn!("pack remove refused: {message}");
+                        self.reply_pack_op(id, false, message);
+                        return;
+                    }
+                    // If the pack is applied right now, put the app back *first*: the worker still
+                    // has the pack, so queue the revert with its exact captures and remove the
+                    // folder when that outcome comes back (`pending_removal`).
+                    let applied = self.applied_packs.iter().any(|p| p == &pack_id);
+                    let job = if applied {
+                        self.captured_by_pack.get(&pack_id).cloned().map(|captured| {
+                            packs::PackJob {
                                 apply: false,
+                                tag: Some(pack_id.clone()),
                                 enabled: HashMap::from([(pack_id.clone(), true)]),
                                 values: self
                                     .cfg
@@ -1043,24 +1120,24 @@ impl App {
                                     .map(|v| HashMap::from([(pack_id.clone(), v.values.clone())]))
                                     .unwrap_or_default(),
                                 captured: HashMap::from([(pack_id.clone(), captured)]),
-                            };
+                            }
+                        })
+                    } else {
+                        None
+                    };
+
+                    match job {
+                        Some(job) => {
                             info!("pack {pack_id} is applied — reverting it before removal");
+                            self.pending_removal = Some((pack_id.clone(), id));
                             let _ = self.pack_tx.send(job);
                         }
-                        self.applied_packs.retain(|p| p != &pack_id);
-                        self.captured_by_pack.remove(&pack_id);
-                    }
-                    let result = packs::remove_id(&self.search, &pack_id);
-                    match result {
-                        Ok(removed) => {
-                            self.reload_packs();
-                            let message = format!("{removed} removed");
-                            info!("pack op: {message}");
-                            self.reply_pack_op(id, true, message);
-                        }
-                        Err(e) => {
-                            warn!("pack remove failed: {e}");
-                            self.reply_pack_op(id, false, e);
+                        None => {
+                            if applied {
+                                warn!("pack {pack_id} is applied but has no captures — removing anyway");
+                                self.applied_packs.retain(|p| p != &pack_id);
+                            }
+                            self.finish_removal(&pack_id, id, None);
                         }
                     }
                 }
