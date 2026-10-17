@@ -1,6 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/armoury-core", "crates/armoury"]
+# The voice helper is its own workspace: sherpa-onnx statically links a large prebuilt onnxruntime
+# and must not slow down (or require network for) a normal daemon build.
+#   cargo build --release --manifest-path voice/Cargo.toml
+exclude = ["voice"]
 
 [workspace.package]
 version = "0.1.0"

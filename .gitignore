@@ -7,3 +7,8 @@
 
 # Logs
 *.log
+
+# Voice: models are downloaded, never committed (voice/fetch-models.ps1)
+voice/models/
+# Voice: dev-time python venv for keyword generation (sentencepiece)
+voice/.venv/
