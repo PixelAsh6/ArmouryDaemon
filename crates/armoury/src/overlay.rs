@@ -96,13 +96,13 @@ unsafe fn draw_hint(hwnd: HWND, hdc: HDC) {
     }
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
-    let band = |dy: i32| -> RECT {
-        let top = (height / 2 + dy).clamp(0, height.saturating_sub(1));
+    // "IDLE" sits a little above the middle, the hint just under it — both centred horizontally.
+    let band = |centre_y: i32, half: i32| -> RECT {
         RECT {
             left: 0,
             right: width,
-            top,
-            bottom: (top + height / 4).min(height),
+            top: centre_y - half,
+            bottom: centre_y + half,
         }
     };
 
@@ -111,7 +111,7 @@ unsafe fn draw_hint(hwnd: HWND, hdc: HDC) {
         let old = SelectObject(hdc, HGDIOBJ(big.0));
 
         let mut title: Vec<u16> = "IDLE".encode_utf16().collect();
-        let mut r = band(-90);
+        let mut r = band(height / 2 - 70, 80);
         let _ = SetTextColor(hdc, COLORREF(0x00969696)); // RGB(150,150,150)
         let _ = DrawTextW(
             hdc,
@@ -124,7 +124,7 @@ unsafe fn draw_hint(hwnd: HWND, hdc: HDC) {
         let mut line: Vec<u16> = "press any key to wake up"
             .encode_utf16()
             .collect();
-        let mut r2 = band(10);
+        let mut r2 = band(height / 2 + 40, 45);
         let _ = SetTextColor(hdc, COLORREF(0x00787878)); // RGB(120,120,120)
         let _ = DrawTextW(
             hdc,

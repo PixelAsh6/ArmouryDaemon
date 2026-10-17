@@ -2,7 +2,7 @@
   "spec": 1,
   "id": "wallpaper-engine",
   "name": "Wallpaper Engine",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "order": 10,
   "targets": { "process": ["wallpaper64.exe", "wallpaper32.exe"] },
   "settings": [
@@ -44,7 +44,6 @@
       { "mechanism": "process_start", "exe": "{{captured.target_path}}",
         "when": { "source": "setting", "equals": "kill" } },
       { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "play"],
-        "sleep_ms": 2500,
         "when": { "source": "setting", "not_equals": "kill" } },
       { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "play"],
         "sleep_ms": 2500,

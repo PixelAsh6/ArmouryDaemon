@@ -765,6 +765,29 @@ impl App {
             warn!("failed to save config: {e}");
         }
         info!("pack {id} {}", if enabled { "enabled" } else { "disabled" });
+
+        if enabled {
+            // Flipping a switch mid-session should act now, not at some future trigger.
+            self.apply_now_if_triggered(&format!("pack {id} enabled"));
+        } else if self.applied_packs.iter().any(|p| p == &id) {
+            // Disabling something that is currently applied puts that app back straight away.
+            if let Some(captured) = self.captured_by_pack.get(&id).cloned() {
+                let job = packs::PackJob {
+                    apply: false,
+                    tag: Some(id.clone()),
+                    enabled: HashMap::from([(id.clone(), true)]),
+                    values: self
+                        .cfg
+                        .packs
+                        .get(&id)
+                        .map(|v| HashMap::from([(id.clone(), v.values.clone())]))
+                        .unwrap_or_default(),
+                    captured: HashMap::from([(id.clone(), captured)]),
+                };
+                info!("pack {id} is applied — reverting it now that it is disabled");
+                let _ = self.pack_tx.send(job);
+            }
+        }
         self.broadcast_status();
     }
 
@@ -778,8 +801,38 @@ impl App {
         if let Err(e) = armoury_core::config::save(&self.cfg) {
             warn!("failed to save config: {e}");
         }
-        info!("pack {id}: {key} = {value} (applies on the next trigger)");
+        info!("pack {id}: {key} = {value}");
+        self.apply_now_if_triggered(&format!("pack {id} changed to {value}"));
         self.broadcast_status();
+    }
+
+    /// A pack was enabled or re-configured while a tracked app is already running: apply it now
+    /// instead of waiting for some future trigger (what a user expects when flipping a switch
+    /// mid-session — the 2026-10-17 test round). The captures from the original trigger are kept,
+    /// so a later revert still restores the true pre-trigger state.
+    fn apply_now_if_triggered(&mut self, why: &str) {
+        if self.cfg.paused || self.overlay.is_active() || !self.engine.is_applied() {
+            return; // paused / idle / nothing running: the next trigger picks the change up
+        }
+        let job = packs::PackJob {
+            apply: true,
+            tag: None,
+            enabled: self
+                .cfg
+                .packs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.enabled))
+                .collect(),
+            values: self
+                .cfg
+                .packs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.values.clone()))
+                .collect(),
+            captured: self.captured_by_pack.clone(),
+        };
+        let _ = self.pack_tx.send(job);
+        info!("packs applied now ({why}, a tracked app is already running)");
     }
 
     fn add_tracked_app(&mut self, name: String, exe: String) {
@@ -810,6 +863,14 @@ impl App {
         if self.cfg.tracked_apps.len() != before {
             info!("tracked app removed: {exe}");
             self.save_and_share_tracked();
+            // If that was the only tracked app holding the packs applied, revert now instead of
+            // waiting out the cooldown — the user just said this app no longer matters
+            // (feedback 2026-10-17: "it only made the changes after it entered another cooldown").
+            let key = basename_lower(exe);
+            if let Some(t) = self.engine.on_untracked(&key) {
+                info!("nothing tracked is running any more — reverting the packs immediately");
+                self.on_transition(t);
+            }
         }
     }
 

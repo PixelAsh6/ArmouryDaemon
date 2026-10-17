@@ -61,6 +61,9 @@ struct Shared {
     /// When each pack window was asked for, so a viewport that never reports its size
     /// still gets placed and shown instead of hanging invisibly.
     pack_first_seen: HashMap<String, Instant>,
+    /// The settings window's number boxes, kept as text so they can be emptied while typing.
+    cooldown_text: String,
+    failsafe_text: String,
     /// Requests raised from child viewports, drained by the root App.
     outbox: Option<crossbeam_channel::Sender<Request>>,
     /// File dialogs started from a child viewport report back through this.
@@ -333,8 +336,18 @@ impl eframe::App for App {
             self.apps = list_window_apps();
         }
 
-        // Keep the window live: pipe updates arrive at ~1 Hz.
-        ctx.request_repaint_after(Duration::from_secs(1));
+        // Keep the window live: pipe updates arrive at ~1 Hz. While a child window is open the
+        // cadence is faster so typing in the settings boxes never feels laggy (feedback
+        // 2026-10-17: a digit took ~2 s to vanish because the child only repainted on the 1 s tick).
+        let child_open = {
+            let s = self.shared.lock().unwrap();
+            s.settings_open || !s.open_packs.is_empty()
+        };
+        ctx.request_repaint_after(if child_open {
+            Duration::from_millis(150)
+        } else {
+            Duration::from_secs(1)
+        });
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -475,8 +488,13 @@ impl eframe::App for App {
                         let mut s = self.shared.lock().unwrap();
                         s.settings_open = !settings_open;
                         if s.settings_open {
-                            // a fresh window: forget the previous install/remove message
+                            // a fresh window: forget the previous install/remove message and
+                            // seed the number boxes from what the daemon reports right now
                             s.last_pack_op = None;
+                            if let Some(st) = &s.status {
+                                s.cooldown_text = st.cooldown_seconds.to_string();
+                                s.failsafe_text = st.idle_failsafe_minutes.to_string();
+                            }
                             s.settings_stage = 0;
                             s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
                             s.settings_anchor = None;
@@ -779,10 +797,11 @@ fn send_request(shared: &Arc<Mutex<Shared>>, req: &Request) {
     }
 }
 
-/// Bottom-aligned to the left of the core window; `index` = opening order.
-fn place_left(ctx: &egui::Context, core: Rect, size: egui::Vec2, index: usize) -> egui::Pos2 {
+/// Bottom-aligned to the left of an anchor edge; `anchor_left` is the left edge of the leftmost
+/// window we already have on screen (the dashboard when nothing else is open).
+fn place_left(ctx: &egui::Context, anchor_left: f32, core: Rect, size: egui::Vec2) -> egui::Pos2 {
     let gap = 8.0;
-    let x = core.left() - gap - size.x - index as f32 * (size.x + gap);
+    let x = anchor_left - gap - size.x;
     let mut y = core.bottom() - size.y;
     if let Some((left, top, _right, bottom)) = work_area_pts(ctx) {
         let margin = 6.0;
@@ -793,8 +812,47 @@ fn place_left(ctx: &egui::Context, core: Rect, size: egui::Vec2, index: usize) -
     egui::pos2(x, y)
 }
 
+/// Actual rect (logical points) of one of our own child windows, straight from the OS.
+fn window_rect_pts(ctx: &egui::Context, title: &str) -> Option<Rect> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect};
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+    let hwnd = unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) }.ok()?;
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
+    let ppp = ctx.pixels_per_point().max(0.5);
+    Some(Rect::from_min_max(
+        egui::pos2(rect.left as f32 / ppp, rect.top as f32 / ppp),
+        egui::pos2(rect.right as f32 / ppp, rect.bottom as f32 / ppp),
+    ))
+}
+
+/// Left edge of the leftmost window already on screen among the settings window and the pack
+/// windows that have been placed (stage >= 2). A new pack window is placed against this edge, so
+/// it always lands next to its neighbour — even when the user has dragged one somewhere else.
+/// Called with the `Shared` lock already held by the caller.
+fn leftmost_edge(ctx: &egui::Context, s: &Shared, skip: &str, core: Rect) -> f32 {
+    let mut anchor = core.left();
+    if s.settings_open && s.settings_stage >= 2 {
+        if let Some(rect) = window_rect_pts(ctx, "Settings") {
+            anchor = anchor.min(rect.left());
+        }
+    }
+    for (other, (stage, _)) in s.pack_windows.iter() {
+        if other == skip || *stage < 2 {
+            continue;
+        }
+        if let Some(rect) = window_rect_pts(ctx, &format!("Pack: {other}")) {
+            anchor = anchor.min(rect.left());
+        }
+    }
+    anchor
+}
+
 /// One pack's own window: enable toggle + its single dropdown.
-fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: usize) {
+fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index: usize) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
     let bg = ui.interact(
         ui.max_rect(),
@@ -950,7 +1008,11 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: 
         }
         1 => {
             if let Some(core) = s.core_rect {
-                let pos = place_left(ctx, core, desired, index);
+                // Anchor on the leftmost window already on screen (Settings included), so a new
+                // pack window always lands next to its neighbour, never over it and never with a
+                // gap where a dragged window used to be.
+                let anchor = leftmost_edge(ctx, &s, id, core);
+                let pos = place_left(ctx, anchor, core, desired);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 s.pack_windows.insert(id.to_string(), (2, Some(pos)));
                 log::info!("pack window {id}: placed at {:.0},{:.0}", pos.x, pos.y);
@@ -980,7 +1042,8 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: 
                 };
                 if off_screen {
                     if let Some(core) = s.core_rect {
-                        let pos = place_left(ctx, core, desired, index);
+                        let anchor = leftmost_edge(ctx, &s, id, core);
+                        let pos = place_left(ctx, anchor, core, desired);
                         ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                         s.pack_windows.insert(id.to_string(), (3, Some(pos)));
                     }
@@ -1077,29 +1140,53 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
 
         // ---- timing: revert cooldown + idle failsafe ----
-        let (cooldown, fs_enabled, fs_minutes) = {
+        let (cooldown, fs_enabled, fs_minutes, mut cd_text, mut fs_text) = {
             let s = shared.lock().unwrap();
             let st = s.status.as_ref();
             (
                 st.map(|x| x.cooldown_seconds).unwrap_or(60),
                 st.map(|x| x.idle_failsafe_enabled).unwrap_or(true),
                 st.map(|x| x.idle_failsafe_minutes).unwrap_or(180),
+                s.cooldown_text.clone(),
+                s.failsafe_text.clone(),
             )
+        };
+        let (packs, last_op) = {
+            let s = shared.lock().unwrap();
+            let packs = s
+                .status
+                .as_ref()
+                .map(|st| st.packs.clone())
+                .unwrap_or_default();
+            (packs, s.last_pack_op.clone())
         };
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(6.0);
-        let mut new_cooldown = cooldown;
+
+        // Plain typable boxes (a DragValue refuses to be emptied, which made editing them
+        // painful — 2026-10-17 feedback). They commit on Enter or when focus moves away.
+        let mut cd_commit: Option<u64> = None;
+        let mut fs_commit: Option<u64> = None;
         ui.horizontal(|ui| {
             ui.label("Revert after");
-            if ui
-                .add(egui::DragValue::new(&mut new_cooldown).range(5..=3600).suffix(" s"))
-                .changed()
-            {
-                send_request(shared, &Request::SetCooldown { seconds: new_cooldown });
+            let resp = ui.add_sized(
+                [46.0, 20.0],
+                egui::TextEdit::singleline(&mut cd_text).char_limit(5),
+            );
+            ui.label("s");
+            if resp.lost_focus() {
+                match cd_text.trim().parse::<u64>() {
+                    Ok(v) => {
+                        let v = v.clamp(5, 3600);
+                        cd_text = v.to_string();
+                        cd_commit = Some(v);
+                    }
+                    Err(_) => cd_text = cooldown.to_string(), // put the old value back
+                }
             }
         });
-        let (mut fs_on, mut fs_min) = (fs_enabled, fs_minutes);
+        let (mut fs_on, fs_min) = (fs_enabled, fs_minutes);
         let mut fs_changed = false;
         if ui
             .checkbox(&mut fs_on, "Idle failsafe")
@@ -1110,56 +1197,67 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
         ui.horizontal(|ui| {
             ui.label("Leave idle after");
-            if ui
-                .add(
-                    egui::DragValue::new(&mut fs_min)
-                        .range(1..=1440)
-                        .speed(1.0)
-                        .suffix(" min"),
-                )
-                .on_hover_text("Type any value from 1 to 1440 minutes")
-                .changed()
-            {
-                fs_changed = true;
+            let resp = ui.add_sized(
+                [46.0, 20.0],
+                egui::TextEdit::singleline(&mut fs_text).char_limit(4),
+            );
+            ui.label("min");
+            if resp.lost_focus() {
+                match fs_text.trim().parse::<u64>() {
+                    Ok(v) => {
+                        let v = v.clamp(1, 1440);
+                        fs_text = v.to_string();
+                        fs_commit = Some(v);
+                    }
+                    Err(_) => fs_text = fs_minutes.to_string(),
+                }
             }
         });
-        if fs_changed {
+        {
+            // keep the in-progress text so a repaint (or another window taking focus) keeps it
+            let mut s = shared.lock().unwrap();
+            s.cooldown_text = cd_text.clone();
+            s.failsafe_text = fs_text.clone();
+        }
+        if let Some(seconds) = cd_commit {
+            send_request(shared, &Request::SetCooldown { seconds });
+            ui.ctx().request_repaint();
+        }
+        let minutes_now = fs_commit
+            .or_else(|| fs_text.trim().parse::<u64>().ok())
+            .unwrap_or(fs_min);
+        if fs_changed || fs_commit.is_some() {
             send_request(
                 shared,
                 &Request::SetIdleFailsafe {
                     enabled: fs_on,
-                    minutes: fs_min,
+                    minutes: minutes_now,
                 },
             );
+            ui.ctx().request_repaint();
         }
 
         // ---- packs: what is installed, install more, remove ----
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(6.0);
-        ui.label(RichText::new("Packs").strong());
+        // The count is deliberate: if a row ever goes missing, this says whether the daemon or
+        // the window is at fault.
+        ui.label(RichText::new(format!("Packs ({})", packs.len())).strong());
         ui.add_space(4.0);
 
-        let (packs, last_op) = {
-            let s = shared.lock().unwrap();
-            let packs = s
-                .status
-                .as_ref()
-                .map(|st| st.packs.clone())
-                .unwrap_or_default();
-            (packs, s.last_pack_op.clone())
-        };
-        if packs.is_empty() {
-            ui.small("No packs installed.");
-        }
         let mut remove_pack: Option<String> = None;
-        for pack in &packs {
-            ui.horizontal(|ui| {
-                ui.label(&pack.name);
-                if !pack.version.is_empty() {
-                    ui.small(RichText::new(format!("v{}", pack.version)).weak());
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        egui::Grid::new("settings-packs")
+            .num_columns(2)
+            .spacing(egui::vec2(10.0, 4.0))
+            .show(ui, |ui| {
+                for pack in &packs {
+                    ui.horizontal(|ui| {
+                        ui.label(&pack.name);
+                        if !pack.version.is_empty() {
+                            ui.small(RichText::new(format!("v{}", pack.version)).weak());
+                        }
+                    });
                     if ui
                         .small_button("Remove")
                         .on_hover_text("Delete this pack's folder and reload")
@@ -1167,9 +1265,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     {
                         remove_pack = Some(pack.id.clone());
                     }
-                });
+                    ui.end_row();
+                }
             });
-        }
         if let Some(id) = remove_pack {
             send_request(shared, &Request::RemovePack { id });
         }

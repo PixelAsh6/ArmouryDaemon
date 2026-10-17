@@ -132,6 +132,24 @@ impl Engine {
         }
     }
 
+    /// A tracked app was removed from the user's list: forget it entirely. If nothing tracked is
+    /// running any more, the packs revert **now** instead of waiting out the cooldown — the user
+    /// just told us the app no longer matters (2026-10-17 feedback).
+    pub fn on_untracked(&mut self, key: &str) -> Option<Transition> {
+        self.running.remove(&key.to_ascii_lowercase());
+        self.last_source = if self.running.is_empty() {
+            None
+        } else {
+            Some(self.source_label())
+        };
+        if self.running.is_empty() && self.applied {
+            self.applied = false;
+            self.deadline = None;
+            return Some(Transition::Reverted);
+        }
+        None
+    }
+
     pub fn on_started(
         &mut self,
         key: &str,
@@ -401,6 +419,36 @@ mod tests {
         e.on_stopped("game.exe", 1, now);
         assert_eq!(e.cooldown_remaining(now), None);
         assert_eq!(e.state(), EngineState::Idle);
+    }
+
+    #[test]
+    fn last_tracked_app_removed_reverts_immediately() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert!(e.is_applied());
+
+        // untracking the app that is running must not wait out a cooldown
+        assert_eq!(e.on_untracked("game.exe"), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.state(), EngineState::Idle);
+        assert_eq!(e.cooldown_remaining(now), None);
+
+        // untracking an app that is not running changes nothing
+        assert_eq!(e.on_untracked("ghost.exe"), None);
+        assert!(!e.is_applied());
+    }
+
+    #[test]
+    fn untracking_one_of_two_apps_keeps_the_packs_applied() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("a.exe", "a.exe", 1, now);
+        e.on_started("b.exe", "b.exe", 2, now);
+        assert_eq!(e.on_untracked("a.exe"), None);
+        assert!(e.is_applied());
+        assert_eq!(e.state(), EngineState::Triggered);
+        assert_eq!(e.source().as_deref(), Some("b.exe"));
     }
 
     #[test]
