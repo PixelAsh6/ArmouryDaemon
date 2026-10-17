@@ -24,7 +24,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 use windows_sys::Win32::System::Threading::CreateEventW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, QS_ALLINPUT};
 
-pub fn run() {
+pub fn run(show_ui_when_running: bool) {
     if let Err(e) = armoury_core::logging::init("daemon") {
         eprintln!("logging init failed: {e}");
     }
@@ -35,8 +35,14 @@ pub fn run() {
     // ---- single instance ----
     let _mutex_guard = match acquire_singleton() {
         Singleton::AlreadyRunning => {
-            info!("another instance is already running — asking it to show the UI");
-            nudge_existing_instance();
+            if show_ui_when_running {
+                // a user launch (tray / second Start-Process): surface the dashboard
+                info!("another instance is already running — asking it to show the UI");
+                nudge_existing_instance();
+            } else {
+                // the scheduler fired again (logon + resume): do nothing visible
+                info!("another instance is already running — autostart ignored, no UI");
+            }
             return;
         }
         Singleton::Acquired(h) => h,
@@ -89,52 +95,11 @@ pub fn run() {
     let engine = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
 
     // ---- packs ----
-    let mut search: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            search.push(dir.to_path_buf());
-            // dev layout: <repo>/target/release/ArmouryDaemon.exe -> <repo>
-            if let Some(up2) = dir.parent().and_then(|d| d.parent()) {
-                search.push(up2.to_path_buf());
-            }
-        }
-    }
+    let search = pack_search_dirs();
     let mut installed = packs::load(&search);
+    enrich_rainmeter(&mut installed);
 
-    // Rainmeter: guarantee a truly empty layout exists and offer the machine's real layouts.
-    if let Some(empty) = packs::ensure_empty_layout() {
-        let mut values: Vec<String> = packs::rainmeter_layouts()
-            .into_iter()
-            .filter(|l| !l.eq_ignore_ascii_case("@Backup"))
-            .collect();
-        if !values.iter().any(|v| v.eq_ignore_ascii_case(&empty)) {
-            values.push(empty.clone());
-        }
-        values.push("kill".to_string());
-        for p in installed.iter_mut() {
-            if p.pack.id == "rainmeter" {
-                if let Some(setting) = p.pack.settings.first_mut() {
-                    setting.values = values.clone();
-                    if setting.default.is_none() {
-                        setting.default = Some(empty.clone());
-                    }
-                }
-            }
-        }
-        info!(
-            "Rainmeter: empty layout '{empty}' ready; dropdown offers {}",
-            values.join(", ")
-        );
-    }
-
-    let pack_catalog: Vec<PackMeta> = installed
-        .iter()
-        .map(|p| PackMeta {
-            id: p.pack.id.clone(),
-            name: p.pack.name.clone(),
-            setting: p.pack.settings.first().cloned(),
-        })
-        .collect();
+    let pack_catalog: Vec<PackMeta> = build_catalog(&installed);
     let (pack_tx, pack_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
     let (pack_out_tx, pack_out_rx) = crossbeam_channel::unbounded::<packs::PackOutcome>();
     packs::start(installed, pack_rx, pack_out_tx, wake_handle);
@@ -143,6 +108,16 @@ pub fn run() {
         cfg.tracked_apps.len(),
         cfg.cooldown_seconds
     );
+
+    // A restart counts as "revert everything" (decision A3). The journal's last entry holds
+    // the applied ids plus the values captured at apply time, so the revert is exact.
+    if let Some(job) = packs::journal_pending_revert() {
+        info!(
+            "journal: {} pack(s) were applied when the daemon last stopped — reverting now",
+            job.enabled.len()
+        );
+        let _ = pack_tx.send(job);
+    }
 
     // ---- tray icon + menu (created on this thread: it owns the message pump) ----
     let menu = Menu::new();
@@ -209,9 +184,11 @@ pub fn run() {
         echo_until: None,
         overlay: overlay::Overlay::default(),
         idle_engage_tick: 0,
-        idle_deadline: None,        tracked,
+        idle_deadline: None,
+        tracked,
         running_paths: HashMap::new(),
         engine,
+        search,
         pack_tx,
         pack_out_rx,
         pack_catalog,
@@ -223,6 +200,7 @@ pub fn run() {
         ui_child: None,
         spawning_ui: false,
         last_broadcast: Instant::now(),
+        wake: wake_handle,
     };
     let mut last_housekeeping = Instant::now();
     if app.cfg.paused {
@@ -355,11 +333,68 @@ fn make_tray_icon_active() -> tray_icon::Icon {
 
 // ---------------------------------------------------------------------------
 
+/// Where packs are looked for: beside the executable first (the install folder), then the
+/// repository root for a dev build (`<repo>/target/release/ArmouryDaemon.exe`).
+fn pack_search_dirs() -> Vec<std::path::PathBuf> {
+    let mut search: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search.push(dir.to_path_buf());
+            if let Some(up2) = dir.parent().and_then(|d| d.parent()) {
+                search.push(up2.to_path_buf());
+            }
+        }
+    }
+    search
+}
+
+/// Rainmeter: guarantee a truly empty layout exists and offer the machine's real layouts.
+fn enrich_rainmeter(installed: &mut [packs::Installed]) {
+    let Some(empty) = packs::ensure_empty_layout() else {
+        return;
+    };
+    let mut values: Vec<String> = packs::rainmeter_layouts()
+        .into_iter()
+        .filter(|l| !l.eq_ignore_ascii_case("@Backup"))
+        .collect();
+    if !values.iter().any(|v| v.eq_ignore_ascii_case(&empty)) {
+        values.push(empty.clone());
+    }
+    values.push("kill".to_string());
+    for p in installed.iter_mut() {
+        if p.pack.id == "rainmeter" {
+            if let Some(setting) = p.pack.settings.first_mut() {
+                setting.values = values.clone();
+                if setting.default.is_none() {
+                    setting.default = Some(empty.clone());
+                }
+            }
+        }
+    }
+    info!(
+        "Rainmeter: empty layout '{empty}' ready; dropdown offers {}",
+        values.join(", ")
+    );
+}
+
 /// What the dashboard needs to know about one installed pack.
 pub struct PackMeta {
     pub id: String,
     pub name: String,
+    pub version: String,
     pub setting: Option<armoury_core::pack::Setting>,
+}
+
+fn build_catalog(installed: &[packs::Installed]) -> Vec<PackMeta> {
+    installed
+        .iter()
+        .map(|p| PackMeta {
+            id: p.pack.id.clone(),
+            name: p.pack.name.clone(),
+            version: p.pack.version.clone(),
+            setting: p.pack.settings.first().cloned(),
+        })
+        .collect()
 }
 
 struct App {
@@ -383,6 +418,8 @@ struct App {
     /// Tick count when idle mode started, so any later input dismisses it.
     idle_engage_tick: u32,
     idle_deadline: Option<Instant>,
+    /// Pack search order (install folder first) — reused when packs are installed/removed.
+    search: Vec<std::path::PathBuf>,
     /// Jobs to the pack worker (apply/revert).
     pack_tx: crossbeam_channel::Sender<packs::PackJob>,
     pack_out_rx: crossbeam_channel::Receiver<packs::PackOutcome>,
@@ -402,6 +439,8 @@ struct App {
     ui_child: Option<Child>,
     spawning_ui: bool,
     last_broadcast: Instant,
+    /// The wake event every producer signals (handed to each pack worker).
+    wake: usize,
 }
 
 impl App {
@@ -454,6 +493,7 @@ impl App {
                     PackStatus {
                         id: m.id.clone(),
                         name: m.name.clone(),
+                        version: m.version.clone(),
                         enabled,
                         setting_key: key,
                         setting_label: label,
@@ -570,21 +610,26 @@ impl App {
         for (id, err) in &o.failed {
             warn!("pack {id} failed: {err}");
         }
-        self.write_journal(o.applied, &o.failed);
+        self.write_journal(&o);
         self.broadcast_status();
     }
 
-    fn write_journal(&self, applied: bool, failed: &[(String, String)]) {
+    /// The journal is also the restart record: it must carry everything a revert needs
+    /// (which packs, their dropdown values and the values captured at apply time).
+    fn write_journal(&self, o: &packs::PackOutcome) {
         let path = armoury_core::config::config_dir().join("journal.json");
         let entry = serde_json::json!({
             "at": std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
-            "applied": applied,
+            "applied": o.applied,
             "trigger": self.engine.source(),
             "packs": self.applied_packs,
-            "failed": failed
+            "values": o.values,
+            "captured": self.captured_by_pack,
+            "failed": o
+                .failed
                 .iter()
                 .map(|(id, e)| serde_json::json!({ "id": id, "error": e }))
                 .collect::<Vec<_>>(),
@@ -600,6 +645,27 @@ impl App {
         }
         if let Ok(text) = serde_json::to_string_pretty(&log) {
             let _ = std::fs::write(&path, text);
+        }
+    }
+
+    /// Re-read the packs folders (after an install/remove) and give the worker the new list.
+    /// Dropping the old sender makes the old worker thread exit on its own.
+    fn reload_packs(&mut self) {
+        let mut installed = packs::load(&self.search);
+        enrich_rainmeter(&mut installed);
+        self.pack_catalog = build_catalog(&installed);
+        let (tx, rx) = crossbeam_channel::unbounded::<packs::PackJob>();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded::<packs::PackOutcome>();
+        packs::start(installed, rx, out_tx, self.wake);
+        self.pack_tx = tx;
+        self.pack_out_rx = out_rx;
+        info!("pack list reloaded: {} installed", self.pack_catalog.len());
+        self.broadcast_status();
+    }
+
+    fn reply_pack_op(&self, client: u64, ok: bool, message: String) {
+        if let Some(push) = self.clients.get(&client) {
+            let _ = push.send(Response::PackOp { ok, message });
         }
     }
 
@@ -632,10 +698,6 @@ impl App {
         }
         info!("pack {id}: {key} = {value} (applies on the next trigger)");
         self.broadcast_status();
-    }
-
-    fn on_pack(&mut self, o: packs::PackOutcome) {
-        self.on_pack_outcome(o);
     }
 
     fn add_tracked_app(&mut self, name: String, exe: String) {
@@ -726,6 +788,11 @@ impl App {
         } else {
             None
         };
+        // Idle cancels switching: whatever is applied reverts now (decision B8).
+        if let Some(t) = self.engine.set_idle(true) {
+            info!("idle mode: tracked apps are normal apps again");
+            self.on_transition(t);
+        }
         self.broadcast_status();
     }
 
@@ -736,6 +803,11 @@ impl App {
         overlay::hide(&mut self.overlay);
         let _ = std::fs::remove_file(overlay::marker_path());
         self.idle_deadline = None;
+        // Idle over: re-apply if a tracked app is running at this moment (decision B8).
+        if let Some(t) = self.engine.set_idle(false) {
+            info!("idle mode over: a tracked app is running, applying the packs again");
+            self.on_transition(t);
+        }
         self.broadcast_status();
     }
 
@@ -743,6 +815,7 @@ impl App {
         if self.killswitch.is_active() {
             killswitch::disengage(&mut self.killswitch);
             self.set_tray_icon(false);
+            self.kill_item.set_text("Toggle killswitch");
         } else {
             let pids: Vec<u32> = self.running_pids.values().flatten().copied().collect();
             if pids.is_empty() {
@@ -751,6 +824,7 @@ impl App {
             }
             killswitch::engage(&pids, &mut self.killswitch);
             self.set_tray_icon(true);
+            self.kill_item.set_text("Release killswitch");
         }
         self.broadcast_status();
     }
@@ -927,6 +1001,46 @@ impl App {
                         self.cfg.idle_failsafe_minutes
                     );
                     self.broadcast_status();
+                }
+                Request::InstallPack { source } => {
+                    let result =
+                        packs::install_from_path(&self.search, std::path::Path::new(&source));
+                    match result {
+                        Ok((pack_id, updated)) => {
+                            self.reload_packs();
+                            let name = self
+                                .pack_catalog
+                                .iter()
+                                .find(|m| m.id == pack_id)
+                                .map(|m| m.name.clone())
+                                .unwrap_or_else(|| pack_id.clone());
+                            let message = format!(
+                                "{name} {}",
+                                if updated { "updated" } else { "installed" }
+                            );
+                            info!("pack op: {message}");
+                            self.reply_pack_op(id, true, message);
+                        }
+                        Err(e) => {
+                            warn!("pack install failed: {e}");
+                            self.reply_pack_op(id, false, e);
+                        }
+                    }
+                }
+                Request::RemovePack { id: pack_id } => {
+                    let result = packs::remove_id(&self.search, &pack_id);
+                    match result {
+                        Ok(removed) => {
+                            self.reload_packs();
+                            let message = format!("{removed} removed");
+                            info!("pack op: {message}");
+                            self.reply_pack_op(id, true, message);
+                        }
+                        Err(e) => {
+                            warn!("pack remove failed: {e}");
+                            self.reply_pack_op(id, false, e);
+                        }
+                    }
                 }
             },
         }

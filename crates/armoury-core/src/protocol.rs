@@ -24,6 +24,10 @@ pub enum Request {
     SetIdleFailsafe { enabled: bool, minutes: u64 },
     /// Change the revert cooldown.
     SetCooldown { seconds: u64 },
+    /// Install a pack from a local `pack.json` (or a folder holding one).
+    InstallPack { source: String },
+    /// Remove an installed pack (its folder under `<install>\packs`).
+    RemovePack { id: String },
 }
 
 /// Messages sent from the daemon to a client.
@@ -38,6 +42,8 @@ pub enum Response {
         status: StatusSnapshot,
     },
     Focus,
+    /// Result of an install/remove request, for the settings window.
+    PackOp { ok: bool, message: String },
 }
 
 /// Serialize `msg` as one JSON line and write it (flushing immediately).
@@ -80,6 +86,31 @@ mod tests {
         write_msg(&mut out, &req).unwrap();
         let back: Request = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
         assert!(matches!(back, Request::UiHello { pid: 42 }));
+    }
+
+    #[test]
+    fn roundtrip_pack_ops() {
+        let mut out = Vec::new();
+        write_msg(
+            &mut out,
+            &Request::InstallPack {
+                source: "C:\\x\\pack.json".into(),
+            },
+        )
+        .unwrap();
+        write_msg(
+            &mut out,
+            &Response::PackOp {
+                ok: false,
+                message: "nope".into(),
+            },
+        )
+        .unwrap();
+        let mut reader = &out[..];
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(req, Request::InstallPack { .. }));
+        let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(resp, Response::PackOp { ok: false, .. }));
     }
 
     #[test]

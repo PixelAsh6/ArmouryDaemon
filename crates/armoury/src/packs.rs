@@ -8,7 +8,7 @@ use armoury_core::pack::{Pack, Step, StepBlock, TemplateCtx, substitute};
 use crossbeam_channel::Receiver;
 use log::{info, warn};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -38,6 +38,8 @@ pub struct PackOutcome {
     pub applied: bool,
     /// Pack ids that are now in the applied state.
     pub applied_ids: Vec<String>,
+    /// The dropdown values this job ran with (echoed so the journal can record them).
+    pub values: HashMap<String, HashMap<String, String>>,
     /// Per-pack captured values (journal for the matching revert).
     pub captured: HashMap<String, HashMap<String, String>>,
     pub succeeded: Vec<String>,
@@ -217,6 +219,7 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
     PackOutcome {
         applied: job.apply,
         applied_ids,
+        values: job.values.clone(),
         captured: captured_out,
         succeeded: strings,
         failed,
@@ -281,6 +284,16 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
             let exe = substitute(step.exe.as_deref().unwrap_or(""), ctx).0;
             if exe.is_empty() {
                 return Err("process_start: no exe".into());
+            }
+            // Never start a second copy: after a restart-revert the app may already be back.
+            let base = exe
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(&exe)
+                .to_ascii_lowercase();
+            if snapshot_targets().contains_key(&base) {
+                info!("process_start: {base} is already running — nothing to start");
+                return Ok(false);
             }
             start_process(&exe)
         }
@@ -637,6 +650,136 @@ pub fn ensure_empty_layout() -> Option<String> {
     Some(name)
 }
 
+// ---------------------------------------------------------------------------
+// Install / remove / restart reconciliation
+
+/// The `packs` folder the daemon reads and writes: the first search dir that already has
+/// one, otherwise `packs` beside the executable (the install folder).
+pub fn packs_root(search_dirs: &[PathBuf]) -> PathBuf {
+    for dir in search_dirs {
+        let root = dir.join("packs");
+        if root.is_dir() {
+            return root;
+        }
+    }
+    search_dirs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("packs")
+}
+
+/// Install (or update) a pack from a local `pack.json`, or from a folder holding one.
+/// Returns `(id, updated?)`. Only `pack.json` is copied — packs carry no code.
+pub fn install_from_path(search_dirs: &[PathBuf], source: &Path) -> Result<(String, bool), String> {
+    let manifest = if source.is_dir() {
+        source.join("pack.json")
+    } else {
+        source.to_path_buf()
+    };
+    if !manifest.is_file() {
+        return Err(format!(
+            "{} is not a pack.json or a folder containing one",
+            source.display()
+        ));
+    }
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let pack = Pack::parse(&text)?; // validates spec/settings/steps
+
+    let root = packs_root(search_dirs);
+    let target = root.join(&pack.id);
+    if !is_safe_id(&pack.id) {
+        return Err(format!("pack id '{}' is not a safe folder name", pack.id));
+    }
+    let existed = target.is_dir();
+    std::fs::create_dir_all(&target)
+        .map_err(|e| format!("cannot create {}: {e}", target.display()))?;
+    std::fs::write(target.join("pack.json"), &text)
+        .map_err(|e| format!("cannot write {}: {e}", target.display()))?;
+    info!(
+        "pack {} {} into {}",
+        pack.id,
+        if existed { "updated" } else { "installed" },
+        target.display()
+    );
+    Ok((pack.id, existed))
+}
+
+/// Remove an installed pack folder (only when it really holds that pack).
+pub fn remove_id(search_dirs: &[PathBuf], id: &str) -> Result<String, String> {
+    if !is_safe_id(id) {
+        return Err(format!("invalid pack id '{id}'"));
+    }
+    let root = packs_root(search_dirs);
+    let dir = root.join(id);
+    if !dir.join("pack.json").is_file() {
+        return Err(format!("pack '{id}' is not installed in {}", root.display()));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+    info!("pack {id} removed ({})", dir.display());
+    Ok(id.to_string())
+}
+
+fn is_safe_id(id: &str) -> bool {
+    !id.trim().is_empty() && !id.contains(['/', '\\']) && !id.contains("..")
+}
+
+/// The revert a fresh daemon start must run: a restart counts as "revert everything"
+/// (decision A3). The journal's last entry carries the applied ids, the dropdown values and
+/// the captured values from that apply, so the revert can be replayed exactly. `None` when
+/// nothing is pending.
+pub fn journal_pending_revert() -> Option<PackJob> {
+    journal_pending_revert_in(&armoury_core::config::config_dir())
+}
+
+/// Same, against an explicit folder (so it can be tested without touching the live config).
+pub fn journal_pending_revert_in(config_dir: &Path) -> Option<PackJob> {
+    let path = config_dir.join("journal.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let log: Vec<serde_json::Value> = serde_json::from_str(&text).ok()?;
+    let last = log.last()?;
+    if last.get("applied").and_then(|v| v.as_bool()) != Some(true) {
+        return None;
+    }
+    let ids: Vec<String> = last
+        .get("packs")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect();
+    if ids.is_empty() {
+        return None;
+    }
+
+    // { pack: { key: value } } out of the journal entry
+    let nested = |key: &str| -> HashMap<String, HashMap<String, String>> {
+        last.get(key)
+            .and_then(|v| v.as_object())
+            .map(|outer| {
+                outer
+                    .iter()
+                    .filter_map(|(pack, inner)| {
+                        let inner = inner.as_object()?;
+                        let map: HashMap<String, String> = inner
+                            .iter()
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                            .collect();
+                        Some((pack.clone(), map))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    Some(PackJob {
+        apply: false,
+        enabled: ids.iter().map(|id| (id.clone(), true)).collect(),
+        values: nested("values"),
+        captured: nested("captured"),
+    })
+}
+
 /// Expand %VARS% in a pack path.
 fn expand_env(path: &str) -> String {
     let mut out = String::with_capacity(path.len());
@@ -853,5 +996,114 @@ mod tests {
         // sorted by order: WE (10) before GH (20) before RM (30)
         assert_eq!(packs[0].pack.id, "wallpaper-engine");
         assert_eq!(packs.last().unwrap().pack.id, "rainmeter");
+    }
+
+    /// A scratch install layout: <tmp>/install/packs
+    fn scratch_install(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("armoury-packs-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("packs")).unwrap();
+        dir
+    }
+
+    /// A minimal valid pack, used by the install/remove tests.
+    const SAMPLE: &str = r#"{
+        "spec": 1,
+        "id": "sample",
+        "name": "Sample",
+        "version": "1.0.0",
+        "targets": { "process": ["sample.exe"] },
+        "settings": [
+            { "key": "action", "label": "Action", "type": "enum",
+              "values": ["stop", "pause"], "default": "stop" }
+        ],
+        "capture": [ { "key": "was_running", "mechanism": "process_running" } ],
+        "apply": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-stop"] } ] },
+        "revert": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-play"] } ] }
+    }"#;
+
+    #[test]
+    fn install_then_remove_a_pack() {
+        let install = scratch_install("install");
+        let source = install.join("incoming");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("pack.json"), SAMPLE).unwrap();
+
+        let (id, updated) = install_from_path(&[install.clone()], &source).unwrap();
+        assert_eq!(id, "sample");
+        assert!(!updated);
+        assert!(install.join("packs").join("sample").join("pack.json").is_file());
+
+        // installing again is an update, not a second copy
+        let (id, updated) = install_from_path(&[install.clone()], &source).unwrap();
+        assert_eq!(id, "sample");
+        assert!(updated);
+        assert_eq!(load(&[install.clone()]).len(), 1);
+
+        let removed = remove_id(&[install.clone()], "sample").unwrap();
+        assert_eq!(removed, "sample");
+        assert!(!install.join("packs").join("sample").exists());
+        assert!(load(&[install.clone()]).is_empty());
+
+        // nothing left to remove, and traversal is refused
+        assert!(remove_id(&[install.clone()], "sample").is_err());
+        assert!(remove_id(&[install.clone()], "../..").is_err());
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    #[test]
+    fn install_rejects_an_invalid_pack() {
+        let install = scratch_install("invalid");
+        let bad = install.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("pack.json"), r#"{"spec":1}"#).unwrap();
+        assert!(install_from_path(&[install.clone()], &bad).is_err());
+        assert!(!install.join("packs").join("x").exists());
+        assert!(load(&[install.clone()]).is_empty());
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    #[test]
+    fn journal_pending_revert_reads_the_last_applied_entry() {
+        let dir = scratch_install("journal").join("cfg");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // nothing journalled yet
+        assert!(journal_pending_revert_in(&dir).is_none());
+
+        let entry = |applied: bool, ids: Vec<&str>| {
+            serde_json::json!({
+                "at": 1,
+                "applied": applied,
+                "trigger": "game.exe",
+                "packs": ids,
+                "values": { "g-helper": { "mode": "Turbo" } },
+                "captured": { "rainmeter": { "was_running": "1" } },
+                "failed": [],
+            })
+        };
+        std::fs::write(
+            dir.join("journal.json"),
+            serde_json::to_string(&vec![entry(true, vec!["rainmeter"])]).unwrap(),
+        )
+        .unwrap();
+
+        let job = journal_pending_revert_in(&dir).unwrap();
+        assert!(!job.apply);
+        assert_eq!(job.enabled.get("rainmeter"), Some(&true));
+        assert_eq!(job.values.get("g-helper").unwrap().get("mode").unwrap(), "Turbo");
+        assert_eq!(
+            job.captured.get("rainmeter").unwrap().get("was_running").unwrap(),
+            "1"
+        );
+
+        // a reverted last entry means nothing is pending
+        std::fs::write(
+            dir.join("journal.json"),
+            serde_json::to_string(&vec![entry(true, vec!["rainmeter"]), entry(false, vec![])]).unwrap(),
+        )
+        .unwrap();
+        assert!(journal_pending_revert_in(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

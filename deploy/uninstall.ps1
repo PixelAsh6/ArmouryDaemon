@@ -1,6 +1,6 @@
 #requires -RunAsAdministrator
 <#
-    ArmouryDaemon uninstall — removes the logon task and stops the daemon.
+    ArmouryDaemon uninstall — removes the autostart task and stops the daemon.
     Leaves your config (%APPDATA%\ArmouryDaemon) alone unless you pass -PurgeConfig.
 #>
 param([switch]$PurgeConfig)
@@ -13,6 +13,12 @@ if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
     Write-Host "Removed scheduled task '$taskName'."
 } else {
     Write-Host "No scheduled task named '$taskName'."
+}
+
+# the old project's task from an earlier install, if it is still registered
+if (Get-ScheduledTask -TaskName 'Armoury Daemon' -ErrorAction SilentlyContinue) {
+    Unregister-ScheduledTask -TaskName 'Armoury Daemon' -Confirm:$false
+    Write-Host "Removed the leftover legacy task '\Armoury Daemon'."
 }
 
 Get-Process ArmouryDaemon -ErrorAction SilentlyContinue | Stop-Process -Force

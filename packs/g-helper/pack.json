@@ -2,7 +2,7 @@
   "spec": 1,
   "id": "g-helper",
   "name": "G-Helper",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "order": 20,
   "targets": { "process": ["GHelper.exe"] },
   "settings": [
@@ -10,7 +10,7 @@
       "key": "mode",
       "label": "Mode while a tracked app runs",
       "type": "enum",
-      "values": ["Turbo", "Balanced", "Silent", "kill"],
+      "values": ["Turbo", "Balanced", "Silent"],
       "default": "Turbo"
     }
   ],
@@ -21,8 +21,7 @@
       "path": "%APPDATA%\\GHelper\\config.json",
       "pointer": "/performance_mode"
     },
-    { "key": "was_running", "mechanism": "process_running" },
-    { "key": "target_path", "mechanism": "target_path" }
+    { "key": "was_running", "mechanism": "process_running" }
   ],
   "apply": {
     "guard": { "targetRunning": true },
@@ -35,16 +34,12 @@
           "Balanced": "ctrl+shift+alt+f17",
           "Silent": "ctrl+shift+alt+f16"
         }
-      },
-      { "mechanism": "process_kill", "exe": "{{captured.target_path}}",
-        "when": { "source": "setting", "equals": "kill" } }
+      }
     ]
   },
   "revert": {
     "guard": { "targetRunning": false, "capturedRunning": true },
     "steps": [
-      { "mechanism": "process_start", "exe": "{{captured.target_path}}",
-        "when": { "source": "setting", "equals": "kill" } },
       {
         "mechanism": "hotkey",
         "keys_from_captured": "prev_mode",

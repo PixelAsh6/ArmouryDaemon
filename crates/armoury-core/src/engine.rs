@@ -8,6 +8,9 @@
 //! - If the cooldown expires while a tracked app is running, nothing happens: we "stay
 //!   ready". The switch happens on the *next* close, and that switch starts a new cooldown.
 //! - After the new cooldown passes with nothing running we go idle (no further switching).
+//! - **Idle mode cancels all switching** (user decision B8): entering idle reverts whatever is
+//!   applied, and tracked apps are treated as ordinary apps while idle. Leaving idle re-applies
+//!   if a tracked app is running at that moment.
 //!
 //! Deliberately free of Windows/clock dependencies so it can be unit-tested.
 
@@ -34,6 +37,8 @@ pub struct Engine {
     cooldown: Duration,
     /// Are the packs currently in the "triggered" state?
     applied: bool,
+    /// Idle mode is up: packs are reverted and stay that way until idle ends.
+    idle: bool,
     /// When the pending revert becomes due (kept even after it has passed, so an
     /// overdue switch happens on the next close).
     deadline: Option<Instant>,
@@ -47,6 +52,7 @@ impl Engine {
         Self {
             cooldown,
             applied: false,
+            idle: false,
             deadline: None,
             running: BTreeMap::new(),
             last_source: None,
@@ -95,6 +101,37 @@ impl Engine {
         self.applied
     }
 
+    pub fn is_idle_mode(&self) -> bool {
+        self.idle
+    }
+
+    /// Enter or leave idle mode (black screens + muted audio). Entering reverts whatever is
+    /// applied and forgets any pending cooldown; leaving re-applies when a tracked app is
+    /// running right now. Returns the transition the daemon must run, if any.
+    pub fn set_idle(&mut self, idle: bool) -> Option<Transition> {
+        if self.idle == idle {
+            return None;
+        }
+        self.idle = idle;
+        if idle {
+            // Idle cancels switching: drop the pending switch and revert what is on.
+            self.deadline = None;
+            if self.applied {
+                self.applied = false;
+                self.last_source = None;
+                return Some(Transition::Reverted);
+            }
+            None
+        } else if !self.running.is_empty() && !self.applied {
+            // Back to normal with a tracked app still running: apply again.
+            self.applied = true;
+            self.last_source = Some(self.source_label());
+            Some(Transition::Applied)
+        } else {
+            None
+        }
+    }
+
     pub fn on_started(
         &mut self,
         key: &str,
@@ -111,6 +148,10 @@ impl Engine {
         }
         self.last_source = Some(self.source_label());
 
+        // While idle, a tracked app is just another app (idle cancels switching).
+        if self.idle {
+            return None;
+        }
         // Reopening during a cooldown leaves the countdown alone ("stay ready").
         if self.applied {
             return None;
@@ -129,6 +170,11 @@ impl Engine {
         }
         if self.applied {
             self.last_source = Some(self.source_label());
+        }
+
+        // While idle nothing is applied, so no cooldown is ever started.
+        if self.idle {
+            return None;
         }
 
         // Every tracked app closed → the countdown starts (once).
@@ -316,5 +362,65 @@ mod tests {
         assert!(e.is_running("app.exe"));
         e.on_stopped("app.exe", 3, now);
         assert_eq!(e.state(), EngineState::Cooldown);
+    }
+
+    #[test]
+    fn entering_idle_reverts_the_applied_packs() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert_eq!(e.set_idle(true), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert!(e.is_idle_mode());
+        // a second press changes nothing
+        assert_eq!(e.set_idle(true), None);
+    }
+
+    #[test]
+    fn idle_cancels_a_pending_cooldown() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        e.on_stopped("game.exe", 1, now);
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+
+        e.set_idle(true);
+        assert_eq!(e.cooldown_remaining(now), None);
+        // the old deadline must not fire while idle
+        assert_eq!(e.tick(now + Duration::from_secs(5 * C)), None);
+        assert_eq!(e.state(), EngineState::Idle);
+    }
+
+    #[test]
+    fn while_idle_a_tracked_app_does_not_apply() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.set_idle(true);
+        assert_eq!(e.on_started("game.exe", "game.exe", 1, now), None);
+        assert!(!e.is_applied());
+        e.on_stopped("game.exe", 1, now);
+        assert_eq!(e.cooldown_remaining(now), None);
+        assert_eq!(e.state(), EngineState::Idle);
+    }
+
+    #[test]
+    fn leaving_idle_reapplies_when_a_tracked_app_is_running() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        e.set_idle(true);
+        assert!(!e.is_applied());
+
+        // still running when idle ends → applied again
+        assert_eq!(e.set_idle(false), Some(Transition::Applied));
+        assert!(e.is_applied());
+        assert_eq!(e.state(), EngineState::Triggered);
+
+        // leaving again with nothing running does nothing
+        e.set_idle(true);
+        e.on_stopped("game.exe", 1, now);
+        assert_eq!(e.set_idle(false), None);
+        assert!(!e.is_applied());
+        assert_eq!(e.state(), EngineState::Idle);
     }
 }

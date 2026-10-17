@@ -30,12 +30,6 @@ impl Ledger {
     pub fn is_active(&self) -> bool {
         self.active
     }
-    pub fn hidden_count(&self) -> usize {
-        self.hidden.len()
-    }
-    pub fn muted_count(&self) -> usize {
-        self.muted.len()
-    }
 }
 
 /// COM for the audio interfaces, once per thread.
@@ -199,7 +193,8 @@ fn set_mute(pid: u32, mute: bool) -> Option<bool> {
     previous
 }
 
-/// Mute state of a process's sessions (for tests / diagnostics).
+/// Mute state of a process's sessions (diagnostics: used by the drill scripts).
+#[allow(dead_code)]
 pub fn current_mute(pid: u32) -> Option<bool> {
     for control in sessions() {
         unsafe {

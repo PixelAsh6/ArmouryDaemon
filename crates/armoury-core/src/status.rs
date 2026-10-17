@@ -49,6 +49,9 @@ pub struct StatusSnapshot {
 pub struct PackStatus {
     pub id: String,
     pub name: String,
+    /// Pack version, shown small in the pack window.
+    #[serde(default)]
+    pub version: String,
     pub enabled: bool,
     /// The pack's single dropdown (v1).
     pub setting_key: Option<String>,

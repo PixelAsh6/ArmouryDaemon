@@ -4,7 +4,7 @@
 use log::{info, warn};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, EnumDisplayMonitors, GetMonitorInfoW, HBRUSH, HDC, HMONITOR, MONITORINFO,
+    CreateSolidBrush, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
 };
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
@@ -17,7 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SetWindowPos, ShowWindow, TranslateMessage, WM_DESTROY, WM_PAINT, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
-use windows::core::{BOOL, PCWSTR, w};
+use windows::core::{BOOL, w};
 
 #[derive(Default)]
 pub struct Overlay {
@@ -59,7 +59,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_PAINT => LRESULT(0), // the class brush paints it black
         WM_DESTROY => {
             let _ = hwnd;
-            PostQuitMessage(0);
+            unsafe { PostQuitMessage(0) };
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
@@ -241,6 +241,7 @@ pub fn recover_if_needed() {
 }
 
 /// Mute state of the default output device (used by the drill).
+#[allow(dead_code)]
 pub fn default_device_muted() -> Option<bool> {    unsafe {
         let enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;

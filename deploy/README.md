@@ -8,7 +8,9 @@ A small always-on Windows daemon that reacts to the apps you care about.
   in before (after a cooldown you choose; reopening cancels the revert).
 - **Killswitch** — Scroll Lock hides + mutes the running tracked apps; press again to restore.
 - **Idle mode** — one click blacks out every screen and mutes all audio; any input brings it back
-  (with an optional 3 h failsafe).
+  (with an optional 3 h failsafe). While idle is up, pack switching is cancelled: tracked apps are
+  treated as ordinary apps, and the packs are applied again when you wake it with a tracked app
+  still running.
 - **Pause** — stop all pack switching without uninstalling anything.
 
 Everything is local. No telemetry, no network calls except the optional pack catalog.
@@ -22,8 +24,10 @@ Everything is local. No telemetry, no network calls except the optional pack cat
    powershell -ExecutionPolicy Bypass -File .\setup.ps1
    ```
 
-   This registers a Scheduled Task that starts the daemon at logon **with highest privileges**, so
-   there is no UAC prompt afterwards, and starts it immediately.
+   This registers a Scheduled Task that starts the daemon at logon and when Windows resumes from
+   sleep **with highest privileges**, so there is no UAC prompt afterwards, and starts it
+   immediately. It also removes the leftover disabled `\Armoury Daemon` task from an older install
+   if one is still registered.
 
 3. The tray icon is the amber **A**. Left-click it for the dashboard; right-click for the menu
    (Open dashboard / Pause / Toggle killswitch / Quit).
@@ -53,5 +57,8 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -PurgeConfig
 
 Packs are data-only JSON (see `packs/*/pack.json`): a target process, exactly one dropdown, what
 to capture before acting, and ordered steps to apply and to revert. Available mechanisms: `cli`,
-`hotkey`, `rainmeter_bang`, `process_kill`, `process_start`; captures: `process_running`,
-`target_path`, `json_file`. No pack can execute arbitrary code.
+`hotkey`, `rainmeter_bang`, `process_kill`, `process_start`, `registry_set`; captures:
+`process_running`, `target_path`, `json_file`. No pack can execute arbitrary code.
+
+Settings → **Install pack…** copies a `pack.json` into this folder's `packs\<id>\` (the daemon
+validates it first and reloads), **Remove** deletes a pack again.

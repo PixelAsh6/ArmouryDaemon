@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 const SETTINGS_VIEWPORT: &str = "armoury-settings";
 const MIN_WINDOW_WIDTH: f32 = 380.0;
-const MIN_SETTINGS_WIDTH: f32 = 300.0;
+const MIN_SETTINGS_WIDTH: f32 = 330.0;
 /// Inner padding of every window (text must never hug the border).
 const PAD: i8 = 10;
 const PAD_F: f32 = PAD as f32;
@@ -26,6 +26,15 @@ const PAD_F: f32 = PAD as f32;
 enum UiEvent {
     Response(Response),
     Eof,
+}
+
+/// What a native file dialog came back with.
+#[derive(Debug, Clone)]
+enum Picked {
+    /// An executable chosen to be a tracked app.
+    TrackedApp(PathBuf),
+    /// A `pack.json` chosen for installation.
+    PackJson(PathBuf),
 }
 
 #[derive(Default)]
@@ -47,6 +56,10 @@ struct Shared {
     settings_anchor: Option<(Rect, egui::Vec2)>,
     /// Requests raised from child viewports, drained by the root App.
     outbox: Option<crossbeam_channel::Sender<Request>>,
+    /// File dialogs started from a child viewport report back through this.
+    pick_tx: Option<crossbeam_channel::Sender<Picked>>,
+    /// Result of the last pack install/remove, shown in the settings window.
+    last_pack_op: Option<(bool, String)>,
     /// Per-pack windows: ids in open order.
     open_packs: Vec<String>,
     /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
@@ -91,7 +104,7 @@ pub fn run() {
     }
     log::info!("connected to daemon");
 
-    let (pick_tx, pick_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    let (pick_tx, pick_rx) = crossbeam_channel::unbounded::<Picked>();
     // requests raised from child viewports (settings, pack windows) come back through here
     let (req_tx, req_rx) = crossbeam_channel::unbounded::<Request>();
 
@@ -122,6 +135,7 @@ pub fn run() {
     let shared = Arc::new(Mutex::new(Shared {
         monitors: monitor_count(),
         outbox: Some(req_tx),
+        pick_tx: Some(pick_tx.clone()),
         ..Default::default()
     }));
 
@@ -168,8 +182,8 @@ struct App {
     shared: Arc<Mutex<Shared>>,
     /// Pipe writer — used to ask the daemon to change the tracked list.
     send: Box<dyn Write>,
-    /// Paths coming back from the native "browse for exe" dialog.
-    pick_rx: Receiver<PathBuf>,
+    /// Paths coming back from the native file dialogs.
+    pick_rx: Receiver<Picked>,
     /// Requests raised by child viewports (settings / pack windows).
     req_rx: Receiver<Request>,
     /// Running apps offered in the picker (title, exe path).
@@ -179,7 +193,7 @@ struct App {
     pick_query: String,
     /// Focus the picker search box once per opening.
     pick_focus_done: bool,
-    pick_tx: crossbeam_channel::Sender<PathBuf>,
+    pick_tx: crossbeam_channel::Sender<Picked>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
 }
@@ -189,8 +203,8 @@ impl App {
         rx: Receiver<UiEvent>,
         shared: Arc<Mutex<Shared>>,
         send: Box<dyn Write>,
-        pick_tx: crossbeam_channel::Sender<PathBuf>,
-        pick_rx: Receiver<PathBuf>,
+        pick_tx: crossbeam_channel::Sender<Picked>,
+        pick_rx: Receiver<Picked>,
         req_rx: Receiver<Request>,
     ) -> Self {
         Self {
@@ -268,6 +282,10 @@ impl eframe::App for App {
                     log::info!("focus requested by daemon");
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
+                UiEvent::Response(Response::PackOp { ok, message }) => {
+                    log::info!("pack op result: {message}");
+                    self.shared.lock().unwrap().last_pack_op = Some((ok, message));
+                }
                 UiEvent::Eof => {
                     log::info!("daemon went away — exiting");
                     std::process::exit(0);
@@ -280,16 +298,26 @@ impl eframe::App for App {
             self.request(&req);
         }
 
-        // Native "browse for exe" results.
+        // Native file dialog results: a tracked app to add, or a pack to install.
         while let Ok(path) = self.pick_rx.try_recv() {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| path.display().to_string());
-            let exe = path.display().to_string();
-            log::info!("picked {exe}");
-            // track by exe name (the user's rule), not the window title
-            self.add_tracked(name, exe);
+            match path {
+                Picked::TrackedApp(path) => {
+                    let name = path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    let exe = path.display().to_string();
+                    log::info!("picked {exe}");
+                    // track by exe name (the user's rule), not the window title
+                    self.add_tracked(name, exe);
+                }
+                Picked::PackJson(path) => {
+                    log::info!("installing pack from {}", path.display());
+                    self.request(&Request::InstallPack {
+                        source: path.display().to_string(),
+                    });
+                }
+            }
         }
 
         // Keep the running-app list fresh for the picker (~2 s is plenty).
@@ -316,7 +344,7 @@ impl eframe::App for App {
         }
 
         // ---- snapshot of shared state for this frame ----
-        let (status_text, status_color, rows, settings_open, tracked, running, paused, packs) = {
+        let (status_text, status_color, rows, settings_open, tracked, running, paused, packs, idle) = {
             let s = self.shared.lock().unwrap();
             let (text, color) = match &s.status {
                 Some(st) => match st.state {
@@ -393,7 +421,23 @@ impl eframe::App for App {
                 .as_ref()
                 .map(|st| st.packs.clone())
                 .unwrap_or_default();
-            (text, color, rows, s.settings_open, tracked, running, paused, packs)
+            // idle: (active, monitors covered, output devices muted)
+            let idle = s
+                .status
+                .as_ref()
+                .map(|st| (st.idle_active, st.idle_monitors, st.idle_devices))
+                .unwrap_or((false, 0, 0));
+            (
+                text,
+                color,
+                rows,
+                s.settings_open,
+                tracked,
+                running,
+                paused,
+                packs,
+                idle,
+            )
         };
 
         // ---- window body (padded so text never hugs the border) ----
@@ -418,21 +462,6 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.request(&Request::SetPaused { paused: !paused });
-                    }
-                    ui.add_space(6.0);
-                    let idle_active = {
-                        let s = self.shared.lock().unwrap();
-                        s.status.as_ref().map(|st| st.idle_active).unwrap_or(false)
-                    };
-                    let idle_label = if idle_active { "Wake" } else { "Idle" };
-                    if ui
-                        .button(idle_label)
-                        .on_hover_text("Idle mode: black out every screen and mute all audio (any input brings it back)")
-                        .clicked()
-                    {
-                        self.request(&Request::SetIdle {
-                            active: !idle_active,
-                        });
                     }
                     ui.add_space(6.0);
                     if icon_button(ui, 22.0, draw_gear).clicked() {
@@ -469,6 +498,9 @@ impl eframe::App for App {
                             .strong()
                             .size(17.0),
                     );
+                } else if idle.0 {
+                    status_dot(ui, Color32::from_rgb(147, 197, 253));
+                    ui.label(RichText::new("Idle mode").strong().size(17.0));
                 } else {
                     status_dot(ui, status_color);
                     ui.label(RichText::new(&status_text).strong().size(17.0));
@@ -477,6 +509,29 @@ impl eframe::App for App {
             ui.add_space(8.0);
             for (key, value) in &rows {
                 row(ui, key, value);
+            }
+
+            // ---- idle (in the body, per the user's choice) ----
+            ui.add_space(8.0);
+            let mut idle_clicked = false;
+            ui.horizontal(|ui| {
+                let label = if idle.0 { "Wake up" } else { "Idle mode" };
+                idle_clicked = ui
+                    .button(label)
+                    .on_hover_text(
+                        "Black out every screen and mute all audio. Any input brings it back.\n\
+                         While idle, pack switching is cancelled (tracked apps are normal apps).",
+                    )
+                    .clicked();
+                if idle.0 {
+                    ui.small(format!(
+                        "{} screen(s) black · {} device(s) muted",
+                        idle.1, idle.2
+                    ));
+                }
+            });
+            if idle_clicked {
+                self.request(&Request::SetIdle { active: !idle.0 });
             }
 
             // ---- tracked apps ----
@@ -535,7 +590,7 @@ impl eframe::App for App {
                     self.pick_focus_done = false;
                 }
                 if ui.button("Browse…").clicked() {
-                    spawn_picker(self.pick_tx.clone());
+                    spawn_picker(self.pick_tx.clone(), Picker::TrackedApp);
                 }
             });
             if let Some((name, exe)) = pick {
@@ -593,8 +648,9 @@ impl eframe::App for App {
                     {
                         set_enabled = Some((pack.id.clone(), enabled));
                     }
+                    ui.label(&pack.name);
                     if ui
-                        .small_button(&pack.name)
+                        .small_button("›")
                         .on_hover_text("Open this pack's own window")
                         .clicked()
                     {
@@ -680,7 +736,7 @@ impl eframe::App for App {
                     .with_decorations(false)
                     .with_resizable(false)
                     .with_visible(false)
-                    .with_inner_size([MIN_SETTINGS_WIDTH, 250.0]),
+                    .with_inner_size([MIN_SETTINGS_WIDTH, 300.0]),
                 move |ui, _class| settings_ui(ui, &shared),
             );
         }
@@ -810,10 +866,17 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: 
                 });
         }
         ui.add_space(6.0);
-        ui.small(if pack.applied {
-            "Applied right now."
-        } else {
-            "Applies when a tracked app starts."
+        ui.horizontal(|ui| {
+            ui.small(if pack.applied {
+                "Applied right now."
+            } else {
+                "Applies when a tracked app starts."
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !pack.version.is_empty() {
+                    ui.small(RichText::new(format!("v{}", pack.version)).weak());
+                }
+            });
         });
     });
 
@@ -934,64 +997,151 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             row(ui, key, value);
         }
 
+        // ---- timing: revert cooldown + idle failsafe ----
+        let (cooldown, fs_enabled, fs_minutes) = {
+            let s = shared.lock().unwrap();
+            let st = s.status.as_ref();
+            (
+                st.map(|x| x.cooldown_seconds).unwrap_or(60),
+                st.map(|x| x.idle_failsafe_enabled).unwrap_or(true),
+                st.map(|x| x.idle_failsafe_minutes).unwrap_or(180),
+            )
+        };
         ui.add_space(8.0);
         ui.separator();
-        ui.add_space(8.0);
-        if ui.button("Open config folder").clicked() {
-            open_folder(&config_dir);
-        }
-        ui.add_space(4.0);
-        ui.small("Full settings UI arrives in Phase 6.");
-    // ---- cooldown + idle failsafe ----
-    let (cooldown, fs_enabled, fs_minutes) = {
-        let s = shared.lock().unwrap();
-        let st = s.status.as_ref();
-        (
-            st.map(|x| x.cooldown_seconds).unwrap_or(60),
-            st.map(|x| x.idle_failsafe_enabled).unwrap_or(true),
-            st.map(|x| x.idle_failsafe_minutes).unwrap_or(180),
-        )
-    };
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(6.0);
-    let mut new_cooldown = cooldown;
-    ui.horizontal(|ui| {
-        ui.label("Revert after");
+        ui.add_space(6.0);
+        let mut new_cooldown = cooldown;
+        ui.horizontal(|ui| {
+            ui.label("Revert after");
+            if ui
+                .add(egui::DragValue::new(&mut new_cooldown).range(5..=3600).suffix(" s"))
+                .changed()
+            {
+                send_request(shared, &Request::SetCooldown { seconds: new_cooldown });
+            }
+        });
+        let (mut fs_on, mut fs_min) = (fs_enabled, fs_minutes);
+        let mut fs_changed = false;
         if ui
-            .add(egui::DragValue::new(&mut new_cooldown).range(5..=3600).suffix(" s"))
-            .changed()
-        {
-            send_request(shared, &Request::SetCooldown { seconds: new_cooldown });
-        }
-    });
-    let (mut fs_on, mut fs_min) = (fs_enabled, fs_minutes);
-    let mut fs_changed = false;
-    if ui
-        .checkbox(&mut fs_on, "Idle failsafe")
-        .on_hover_text("Leave idle mode automatically after the time below")
-        .changed()
-    {
-        fs_changed = true;
-    }
-    ui.horizontal(|ui| {
-        ui.label("Force-quit idle after");
-        if ui
-            .add(egui::DragValue::new(&mut fs_min).range(1..=1440).suffix(" min"))
+            .checkbox(&mut fs_on, "Idle failsafe")
+            .on_hover_text("Leave idle mode automatically after the time below")
             .changed()
         {
             fs_changed = true;
         }
-    });
-    if fs_changed {
-        send_request(
-            shared,
-            &Request::SetIdleFailsafe {
-                enabled: fs_on,
-                minutes: fs_min,
-            },
-        );
-    }
+        ui.horizontal(|ui| {
+            ui.label("Leave idle after");
+            for preset in [30u64, 60, 180, 360] {
+                if ui
+                    .selectable_label(fs_min == preset, format!("{preset}m"))
+                    .clicked()
+                {
+                    fs_min = preset;
+                    fs_changed = true;
+                }
+            }
+            if ui
+                .add(egui::DragValue::new(&mut fs_min).range(1..=1440).suffix(" min"))
+                .on_hover_text("Or type any value from 1 to 1440 minutes")
+                .changed()
+            {
+                fs_changed = true;
+            }
+        });
+        if fs_changed {
+            send_request(
+                shared,
+                &Request::SetIdleFailsafe {
+                    enabled: fs_on,
+                    minutes: fs_min,
+                },
+            );
+        }
+
+        // ---- packs: what is installed, install more, remove ----
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("Packs").strong());
+        ui.add_space(4.0);
+
+        let (packs, last_op) = {
+            let s = shared.lock().unwrap();
+            let packs = s
+                .status
+                .as_ref()
+                .map(|st| st.packs.clone())
+                .unwrap_or_default();
+            (packs, s.last_pack_op.clone())
+        };
+        if packs.is_empty() {
+            ui.small("No packs installed.");
+        }
+        let mut remove_pack: Option<String> = None;
+        for pack in &packs {
+            ui.horizontal(|ui| {
+                ui.label(&pack.name);
+                if !pack.version.is_empty() {
+                    ui.small(RichText::new(format!("v{}", pack.version)).weak());
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .small_button("Remove")
+                        .on_hover_text("Delete this pack's folder and reload")
+                        .clicked()
+                    {
+                        remove_pack = Some(pack.id.clone());
+                    }
+                });
+            });
+        }
+        if let Some(id) = remove_pack {
+            send_request(shared, &Request::RemovePack { id });
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Install pack…")
+                .on_hover_text("Pick a pack.json from disk; it is validated before it is installed")
+                .clicked()
+            {
+                let tx = shared.lock().unwrap().pick_tx.clone();
+                if let Some(tx) = tx {
+                    spawn_picker(tx, Picker::PackJson);
+                }
+            }
+            if ui.button("Open packs folder").clicked() {
+                open_folder(&packs_dir());
+            }
+        });
+        if let Some((ok, message)) = last_op {
+            ui.add_space(2.0);
+            ui.small(
+                RichText::new(message).color(if ok {
+                    Color32::from_rgb(52, 211, 153)
+                } else {
+                    Color32::from_rgb(248, 113, 113)
+                }),
+            );
+        }
+
+        // ---- logs + config ----
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Reveal logs")
+                .on_hover_text("Open the folder holding daemon.log and ui.log")
+                .clicked()
+            {
+                open_folder(&config_dir.join("logs"));
+            }
+            if ui.button("Open config folder").clicked() {
+                open_folder(&config_dir);
+            }
+        });
+        ui.add_space(4.0);
     });
 
     // ---- shrink-wrap, position above the core window, then show ----
@@ -1001,7 +1151,19 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let p = ui.painter();
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
         let mut w = tw(&title_font, "Settings") + 60.0;
-        w = w.max(tw(&body_font, "Open config folder") + 24.0);
+        // the widest fixed strings in the body decide the width
+        for text in [
+            "Open packs folder",
+            "Reveal logs",
+            "Open config folder",
+            "Leave idle after",
+            "Install pack…",
+            "Applies when a tracked app starts.",
+        ] {
+            w = w.max(tw(&body_font, text) + 24.0);
+        }
+        // one pack row: name + version bubble + the Remove button
+        w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&body_font, "Remove") + 24.0);
         for (k, v) in &rows {
             w = w.max(tw(&body_font, k) + 32.0 + tw(&body_font, v));
         }
@@ -1132,6 +1294,24 @@ fn open_folder(path: &PathBuf) {
     }
 }
 
+/// The packs folder the daemon reads and writes: beside the executable (the install
+/// folder), otherwise the repository root of a dev build. Mirrors the daemon's search order.
+fn packs_dir() -> PathBuf {
+    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        let beside = dir.join("packs");
+        if beside.is_dir() {
+            return beside;
+        }
+        if let Some(repo) = dir.parent().and_then(|d| d.parent()).map(|d| d.join("packs")) {
+            if repo.is_dir() {
+                return repo;
+            }
+        }
+        return beside;
+    }
+    PathBuf::from("packs")
+}
+
 /// Actual top-left of one of our own windows, straight from the OS (physical pixels).
 /// egui's cached `outer_rect` is optimistic right after a move, so placement is
 /// confirmed against the OS before a window is revealed.
@@ -1259,19 +1439,31 @@ fn file_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// Which native dialog to open.
+#[derive(Debug, Clone, Copy)]
+enum Picker {
+    /// An .exe to track.
+    TrackedApp,
+    /// A `pack.json` to install.
+    PackJson,
+}
+
 /// Run the native picker on a worker thread: the dialog runs its own modal loop, and
 /// keeping it off the egui event thread avoids re-entrancy surprises.
-fn spawn_picker(tx: crossbeam_channel::Sender<PathBuf>) {
-    thread::spawn(move || match pick_exe_dialog() {
+fn spawn_picker(tx: crossbeam_channel::Sender<Picked>, kind: Picker) {
+    thread::spawn(move || match pick_dialog(kind) {
         Some(path) => {
-            let _ = tx.send(path);
+            let _ = tx.send(match kind {
+                Picker::TrackedApp => Picked::TrackedApp(path),
+                Picker::PackJson => Picked::PackJson(path),
+            });
         }
         None => log::info!("file picker cancelled"),
     });
 }
 
 /// Modern common item dialog (`IFileDialog`) — no extra dependencies.
-fn pick_exe_dialog() -> Option<PathBuf> {
+fn pick_dialog(kind: Picker) -> Option<PathBuf> {
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
         CoInitializeEx, CoTaskMemFree, CoUninitialize,
@@ -1282,6 +1474,15 @@ fn pick_exe_dialog() -> Option<PathBuf> {
         SIGDN_FILESYSPATH,
     };
     use windows::core::w;
+
+    let (name, spec, title) = match kind {
+        Picker::TrackedApp => (w!("Applications"), w!("*.exe"), w!("Pick an application to track")),
+        Picker::PackJson => (
+            w!("ArmouryDaemon packs"),
+            w!("pack.json"),
+            w!("Pick a pack.json to install"),
+        ),
+    };
 
     unsafe {
         let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -1294,10 +1495,10 @@ fn pick_exe_dialog() -> Option<PathBuf> {
                 );
             }
             let _ = dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
-                pszName: w!("Applications"),
-                pszSpec: w!("*.exe"),
+                pszName: name,
+                pszSpec: spec,
             }]);
-            let _ = dialog.SetTitle(w!("Pick an application to track"));
+            let _ = dialog.SetTitle(title);
             if dialog.Show(None).is_err() {
                 return None; // cancelled
             }
@@ -1453,15 +1654,20 @@ fn bottom_corner(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 {
     egui::pos2(x, y)
 }
 
-/// Position a window above the core window, right edges aligned.
+/// Position a window above the core window, right edges aligned. If there is no room above,
+/// or the window is taller than the space left, it is pushed back into the work area.
 fn above_core(ctx: &egui::Context, core: Rect, size: egui::Vec2) -> egui::Pos2 {
     let gap = 8.0;
     let x = core.right() - size.x;
     let mut y = core.top() - gap - size.y;
-    if let Some((left, top, right, _bottom)) = work_area_pts(ctx) {
+    if let Some((left, top, right, bottom)) = work_area_pts(ctx) {
         let margin = 6.0;
         if y < top + margin {
             y = core.bottom() + gap; // fall back to below the core
+        }
+        if y + size.y > bottom - margin {
+            // still off-screen (e.g. a tall settings window at the bottom of the desktop)
+            y = (bottom - size.y - margin).max(top + margin);
         }
         let x = x.max(left + margin).min(right - size.x - margin);
         return egui::pos2(x, y);
