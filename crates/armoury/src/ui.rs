@@ -5,7 +5,7 @@
 
 use armoury_core::config::TrackedApp;
 use armoury_core::protocol::{read_msg, write_msg, Request, Response};
-use armoury_core::status::{RunState, StatusSnapshot};
+use armoury_core::status::{PackStatus, RunState, StatusSnapshot};
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, FontFamily, FontId, Rect, RichText, Stroke, TextStyle};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
@@ -296,7 +296,7 @@ impl eframe::App for App {
         }
 
         // ---- snapshot of shared state for this frame ----
-        let (status_text, status_color, rows, settings_open, tracked, running, paused) = {
+        let (status_text, status_color, rows, settings_open, tracked, running, paused, packs) = {
             let s = self.shared.lock().unwrap();
             let (text, color) = match &s.status {
                 Some(st) => match st.state {
@@ -344,7 +344,18 @@ impl eframe::App for App {
                         None => "—".to_string(),
                     },
                 ),
-                ("packs".to_string(), "none installed".to_string()),
+                ("packs".to_string(), {
+                    let list: Vec<PackStatus> = s
+                        .status
+                        .as_ref()
+                        .map(|st| st.packs.clone())
+                        .unwrap_or_default();
+                    format!(
+                        "{} installed · {} enabled",
+                        list.len(),
+                        list.iter().filter(|p| p.enabled).count()
+                    )
+                }),
             ];
             let tracked: Vec<TrackedApp> = s
                 .status
@@ -357,7 +368,12 @@ impl eframe::App for App {
                 .map(|st| st.tracked_apps_running.clone())
                 .unwrap_or_default();
             let paused = s.status.as_ref().map(|st| st.paused).unwrap_or(false);
-            (text, color, rows, s.settings_open, tracked, running, paused)
+            let packs: Vec<PackStatus> = s
+                .status
+                .as_ref()
+                .map(|st| st.packs.clone())
+                .unwrap_or_default();
+            (text, color, rows, s.settings_open, tracked, running, paused, packs)
         };
 
         // ---- window body (padded so text never hugs the border) ----
@@ -505,6 +521,56 @@ impl eframe::App for App {
             }
             if let Some(exe) = remove {
                 self.remove_tracked(&exe);
+            }
+
+            // ---- packs ----
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+            ui.label(RichText::new("Packs").strong());
+            ui.add_space(4.0);
+            if packs.is_empty() {
+                ui.small("No packs found (looked in <app>/packs).");
+            }
+            let mut set_enabled: Option<(String, bool)> = None;
+            let mut set_value: Option<(String, String, String)> = None;
+            for pack in &packs {
+                ui.horizontal(|ui| {
+                    let mut enabled = pack.enabled;
+                    if ui
+                        .checkbox(&mut enabled, "")
+                        .on_hover_text("Enable this pack")
+                        .changed()
+                    {
+                        set_enabled = Some((pack.id.clone(), enabled));
+                    }
+                    ui.label(&pack.name);
+                    if pack.applied {
+                        ui.small("· applied");
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some(key) = &pack.setting_key {
+                            let current = pack.value.clone().unwrap_or_default();
+                            egui::ComboBox::from_id_salt(format!("pack-{}", pack.id))
+                                .selected_text(current.clone())
+                                .width(130.0)
+                                .show_ui(ui, |ui| {
+                                    for value in &pack.values {
+                                        if ui.selectable_label(value == &current, value).clicked() {
+                                            set_value =
+                                                Some((pack.id.clone(), key.clone(), value.clone()));
+                                        }
+                                    }
+                                });
+                        }
+                    });
+                });
+            }
+            if let Some((id, enabled)) = set_enabled {
+                self.request(&Request::SetPackEnabled { id, enabled });
+            }
+            if let Some((id, key, value)) = set_value {
+                self.request(&Request::SetPackValue { id, key, value });
             }
         });
 

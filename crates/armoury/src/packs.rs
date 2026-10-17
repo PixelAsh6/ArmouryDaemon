@@ -234,8 +234,9 @@ fn target_name_or(pack: &Pack) -> String {
 fn run_block(block: &StepBlock, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
     for step in &block.steps {
-        run_step(step, ctx, setting_key)?;
-        done.push(describe_step(step, ctx));
+        if run_step(step, ctx, setting_key)? {
+            done.push(describe_step(step, ctx));
+        }
     }
     Ok(done)
 }
@@ -255,10 +256,10 @@ fn describe_step(step: &Step, ctx: &TemplateCtx) -> String {
     }
 }
 
-fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result<(), String> {
+fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result<bool, String> {
     if let Some(cond) = &step.when {
         if !cond.matches(ctx, setting_key) {
-            return Ok(()); // step does not apply to this configuration
+            return Ok(false); // step does not apply to this configuration
         }
     }
     if let Some(ms) = step.sleep_ms {
@@ -304,6 +305,7 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
         }
         other => Err(format!("unsupported mechanism '{other}'")),
     }
+    .map(|_| true)
 }
 
 /// Terminate every process with this exe file name (lowercase).
@@ -727,7 +729,10 @@ mod tests {
 
     #[test]
     fn chord_parsing() {
-        assert_eq!(parse_chord("ctrl+shift+alt+f18").unwrap(), vec![0x11, 0x10, 0x12, 0x81]);
+        assert_eq!(
+            parse_chord("ctrl+shift+alt+f18").unwrap(),
+            vec![0xA2, 0xA0, 0xA4, 0x81]
+        );
         assert_eq!(parse_chord("f16").unwrap(), vec![0x7F]);
         assert_eq!(parse_chord("a").unwrap(), vec![0x41]);
         assert!(parse_chord("ctrl+nope").is_err());
