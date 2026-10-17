@@ -416,10 +416,24 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // content
+            let (ks_active, ks_count) = {
+                let s = self.shared.lock().unwrap();
+                s.status
+                    .as_ref()
+                    .map(|st| (st.killswitch_active, st.killswitch_count))
+                    .unwrap_or((false, 0))
+            };
             ui.horizontal(|ui| {
                 if paused {
                     status_dot(ui, Color32::from_gray(150));
                     ui.label(RichText::new(format!("Paused — {status_text}")).strong().size(17.0));
+                } else if ks_active {
+                    status_dot(ui, Color32::from_rgb(239, 68, 68));
+                    ui.label(
+                        RichText::new(format!("Killswitch — {ks_count} app(s) hidden + muted"))
+                            .strong()
+                            .size(17.0),
+                    );
                 } else {
                     status_dot(ui, status_color);
                     ui.label(RichText::new(&status_text).strong().size(17.0));

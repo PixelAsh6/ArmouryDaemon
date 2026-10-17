@@ -88,6 +88,7 @@ mod tests {
                 cooldown_seconds: 60,
                 paused: false,
                 killswitch_active: false,
+                killswitch_count: 0,
                 tracked_apps: vec![],
                 tracked_apps_running: vec![],
                 packs: vec![],

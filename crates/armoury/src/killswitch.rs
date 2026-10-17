@@ -1,0 +1,205 @@
+//! Killswitch: hide + mute the running tracked apps, then put back exactly what changed.
+//!
+//! Everything is recorded in a ledger so the restore is exact and only touches what we
+//! altered (windows we hid, audio sessions we muted and their previous mute state).
+
+use log::{info, warn};
+use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::core::{BOOL, Interface};
+use windows::Win32::Media::Audio::{
+    IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eMultimedia, eRender,
+};
+use windows::Win32::System::Com::{
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GWL_EXSTYLE, GW_OWNER, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+    IsWindowVisible, SW_HIDE, SW_SHOW, ShowWindow, WS_EX_TOOLWINDOW,
+};
+
+#[derive(Default)]
+pub struct Ledger {
+    hidden: Vec<isize>,
+    /// (pid, was muted before us) for every session we muted
+    muted: Vec<(u32, bool)>,
+    active: bool,
+}
+
+impl Ledger {
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+    pub fn hidden_count(&self) -> usize {
+        self.hidden.len()
+    }
+    pub fn muted_count(&self) -> usize {
+        self.muted.len()
+    }
+}
+
+/// COM for the audio interfaces, once per thread.
+pub fn init_com() {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+}
+
+/// Hide every visible top-level window of these processes and mute their audio sessions.
+pub fn engage(pids: &[u32], ledger: &mut Ledger) -> (usize, usize) {
+    let mut hidden_now = 0;
+    let mut muted_now = 0;
+
+    for pid in pids {
+        for hwnd in windows_of(*pid) {
+            if !ledger.hidden.contains(&hwnd) {
+                unsafe {
+                    let _ = ShowWindow(HWND(hwnd as *mut _), SW_HIDE);
+                }
+                ledger.hidden.push(hwnd);
+                hidden_now += 1;
+            }
+        }
+        if let Some(previous) = set_mute(*pid, true) {
+            if !previous {
+                // only remember sessions we actually changed from unmuted
+                ledger.muted.push((*pid, previous));
+                muted_now += 1;
+            } else {
+                ledger.muted.push((*pid, true));
+            }
+        }
+    }
+
+    ledger.active = true;
+    info!(
+        "killswitch engaged: {hidden_now} window(s) hidden, {muted_now} session(s) muted (ledger: {} windows, {} sessions)",
+        ledger.hidden.len(),
+        ledger.muted.len()
+    );
+    (ledger.hidden.len(), ledger.muted.len())
+}
+
+/// Put back exactly what we changed.
+pub fn disengage(ledger: &mut Ledger) {
+    for hwnd in ledger.hidden.drain(..) {
+        unsafe {
+            let _ = ShowWindow(HWND(hwnd as *mut _), SW_SHOW);
+        }
+    }
+    for (pid, was_muted) in ledger.muted.drain(..) {
+        // only unmute what we muted (leave sessions that were already muted alone)
+        if !was_muted {
+            set_mute(pid, false);
+        }
+    }
+    ledger.active = false;
+    info!("killswitch released: windows shown, audio restored");
+}
+
+/// Visible, unowned, non-tool top-level windows belonging to a process.
+fn windows_of(pid: u32) -> Vec<isize> {
+    struct Ctx {
+        pid: u32,
+        out: Vec<isize>,
+    }
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        unsafe {
+            let ctx = &mut *(lparam.0 as *mut Ctx);
+            if IsWindowVisible(hwnd).as_bool() {
+                let mut owner_pid = 0u32;
+                GetWindowThreadProcessId(hwnd, Some(&mut owner_pid));
+                if owner_pid == ctx.pid
+                    && GetWindow(hwnd, GW_OWNER).is_err()
+                    && (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW.0 as isize)) == 0
+                {
+                    ctx.out.push(hwnd.0 as isize);
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = Ctx {
+        pid,
+        out: Vec::new(),
+    };
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut ctx as *mut Ctx as isize));
+    }
+    ctx.out
+}
+
+fn sessions() -> Option<IAudioSessionEnumerator> {
+    unsafe {
+        let enumerator: IMMDeviceEnumerator =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+        let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
+        let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None).ok()?;
+        manager.GetSessionEnumerator().ok()
+    }
+}
+
+/// Mute/unmute every audio session of a process. Returns the previous mute state.
+fn set_mute(pid: u32, mute: bool) -> Option<bool> {
+    unsafe {
+        let list = sessions()?;
+        let count = list.GetCount().ok()?;
+        let mut previous = None;
+        for index in 0..count {
+            let Ok(control) = list.GetSession(index) else {
+                continue;
+            };
+            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            if control2.GetProcessId().unwrap_or(0) != pid {
+                continue;
+            }
+            let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {
+                continue;
+            };
+            if let Ok(was) = volume.GetMute() {
+                let was = was.as_bool();
+                if was != mute {
+                    if let Err(e) = volume.SetMute(mute, std::ptr::null()) {
+                        warn!("SetMute failed for pid {pid}: {e}");
+                    }
+                }
+                previous = Some(previous.unwrap_or(was));
+            }
+        }
+        if previous.is_none() {
+            info!("killswitch: no audio session for pid {pid} (nothing to mute)");
+        }
+        previous
+    }
+}
+
+/// Mute state of a process's sessions (for tests / diagnostics).
+pub fn current_mute(pid: u32) -> Option<bool> {
+    unsafe {
+        let list = sessions()?;
+        let count = list.GetCount().ok()?;
+        for index in 0..count {
+            let Ok(control) = list.GetSession(index) else {
+                continue;
+            };
+            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            if control2.GetProcessId().unwrap_or(0) != pid {
+                continue;
+            }
+            let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {
+                continue;
+            };
+            return volume.GetMute().ok().map(|b| b.as_bool());
+        }
+        None
+    }
+}
+
+/// Keep the compiler honest about the interface imports we rely on.
+#[allow(dead_code)]
+fn _assert_types(_: Option<IAudioSessionControl>) {}

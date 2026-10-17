@@ -2,6 +2,7 @@
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
 use crate::ipc;
+use crate::killswitch;
 use crate::packs;
 use crate::watch;
 use armoury_core::config::{AppConfig, TrackedApp};
@@ -27,6 +28,7 @@ pub fn run() {
         eprintln!("logging init failed: {e}");
     }
     info!("daemon starting (v{})", armoury_core::VERSION);
+    killswitch::init_com();
 
     // ---- single instance ----
     let _mutex_guard = match acquire_singleton() {
@@ -144,7 +146,7 @@ pub fn run() {
     let menu = Menu::new();
     let open_item = MenuItem::with_id("open", "Open dashboard", true, None);
     let pause_item = MenuItem::with_id("pause_all", "Pause all packs", true, None);
-    let kill_item = MenuItem::with_id("killswitch", "Killswitch (coming soon)", false, None);
+    let kill_item = MenuItem::with_id("killswitch", "Toggle killswitch", true, None);
     let quit_item = MenuItem::with_id("quit", "Quit", true, None);
     if let Err(e) = menu.append_items(&[&open_item, &pause_item, &kill_item, &quit_item]) {
         warn!("failed to build tray menu: {e}");
@@ -196,7 +198,13 @@ pub fn run() {
     let mut app = App {
         cfg,
         pause_item: pause_item.clone(),
-        tracked,
+        kill_item: kill_item.clone(),
+        tray,
+        icon_normal: make_tray_icon(),
+        icon_active: make_tray_icon_active(),
+        killswitch: killswitch::Ledger::default(),
+        running_pids: HashMap::new(),
+        echo_until: None,        tracked,
         running_paths: HashMap::new(),
         engine,
         pack_tx,
@@ -240,6 +248,7 @@ pub fn run() {
                     let paused = app.cfg.paused;
                     app.set_paused(!paused);
                 }
+                "killswitch" => app.toggle_killswitch(),
                 "quit" => {
                     info!("quit requested from tray menu");
                     quit = true;
@@ -294,7 +303,6 @@ pub fn run() {
     if let Some(mut child) = app.ui_child.take() {
         let _ = child.kill();
     }
-    drop(tray);
     log::logger().flush();
 }
 
@@ -305,8 +313,20 @@ fn basename_lower(path: &str) -> String {
         .unwrap_or_else(|| path.to_ascii_lowercase())
 }
 
+/// The current Scroll Lock toggle state (GetAsyncKeyState reads the global toggle).
+fn scroll_lock_state() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    unsafe { GetAsyncKeyState(0x91) & 1 != 0 }
+}
+
 /// Tray icon built from the shared procedural icon generator.
 fn make_tray_icon() -> tray_icon::Icon {    let (rgba, w, h) = armoury_core::icon::rgba_icon(32);
+    tray_icon::Icon::from_rgba(rgba, w, h).expect("tray icon rgba is 32x32")
+}
+
+/// The killswitch variant (red slash) so the state is visible without a Scroll Lock LED.
+fn make_tray_icon_active() -> tray_icon::Icon {
+    let (rgba, w, h) = armoury_core::icon::rgba_icon_active(32);
     tray_icon::Icon::from_rgba(rgba, w, h).expect("tray icon rgba is 32x32")
 }
 
@@ -323,6 +343,18 @@ struct App {
     cfg: AppConfig,
     /// Tray menu item whose label flips between Pause/Resume.
     pause_item: tray_icon::menu::MenuItem,
+    /// Tray menu item that toggles the killswitch.
+    kill_item: tray_icon::menu::MenuItem,
+    /// Owned here so the icon can be swapped while the killswitch is active.
+    tray: Option<TrayIcon>,
+    icon_normal: tray_icon::Icon,
+    icon_active: tray_icon::Icon,
+    /// What the killswitch hid/muted.
+    killswitch: killswitch::Ledger,
+    /// Tracked key -> live pids (needed to hide/mute mid-killswitch starts).
+    running_pids: HashMap<String, Vec<u32>>,
+    /// Ignore our own Scroll Lock correction presses until this instant.
+    echo_until: Option<Instant>,
     /// Jobs to the pack worker (apply/revert).
     pack_tx: crossbeam_channel::Sender<packs::PackJob>,
     pack_out_rx: crossbeam_channel::Receiver<packs::PackOutcome>,
@@ -363,7 +395,8 @@ impl App {
                 .map(|d| d.as_millis() as u64),
             cooldown_seconds: self.cfg.cooldown_seconds,
             paused: self.cfg.paused,
-            killswitch_active: false,
+            killswitch_active: self.killswitch.is_active(),
+            killswitch_count: (self.running_pids.values().flatten().count()) as u32,
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
             packs: self
@@ -410,14 +443,24 @@ impl App {
                 pid,
             } => {
                 self.running_paths.insert(key.clone(), path);
+                self.running_pids.entry(key.clone()).or_default().push(pid);
+                if self.killswitch.is_active() {
+                    // a tracked app started while the killswitch is on: hide + mute it too
+                    info!("killswitch: {display} started while active — hiding it");
+                    killswitch::engage(&[pid], &mut self.killswitch);
+                    self.broadcast_status();
+                }
                 self.engine.on_started(&key, &display, pid, now)
             }
             watch::WatchEvent::Stopped { key, pid } => {
-                let t = self.engine.on_stopped(&key, pid, now);
+                if let Some(list) = self.running_pids.get_mut(&key) {
+                    list.retain(|p| *p != pid);
+                }
                 if !self.engine.is_running(&key) {
                     self.running_paths.remove(&key);
+                    self.running_pids.remove(&key);
                 }
-                t
+                self.engine.on_stopped(&key, pid, now)
             }
         };
         if let Some(t) = transition {
@@ -604,8 +647,66 @@ impl App {
     }
 
     fn on_hotkey(&mut self) {
-        // Phase 4 turns this into the killswitch; for now, prove the wiring.
-        info!("Scroll Lock pressed (killswitch wiring check — Phase 4)");
+        // Ignore the correction presses we send ourselves.
+        if self
+            .echo_until
+            .map_or(false, |t| Instant::now() < t)
+        {
+            info!("Scroll Lock echo ignored");
+            return;
+        }
+
+        // Windows toggles the Scroll Lock state at driver level; the press that just
+        // arrived has already flipped it. Whatever it was before, we want it back.
+        let want = !scroll_lock_state();
+        self.toggle_killswitch();
+
+        for _ in 0..3 {
+            if scroll_lock_state() == want {
+                break;
+            }
+            self.echo_until = Some(Instant::now() + Duration::from_millis(500));
+            if let Err(e) = packs::send_chord("scrolllock") {
+                warn!("could not send the Scroll Lock correction: {e}");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(80));
+        }
+
+        if scroll_lock_state() == want {
+            info!("Scroll Lock state kept (was {}, still {})", !want as u8, want as u8);
+        } else {
+            warn!("Scroll Lock state could not be corrected (left toggled)");
+        }
+    }
+
+    fn toggle_killswitch(&mut self) {
+        if self.killswitch.is_active() {
+            killswitch::disengage(&mut self.killswitch);
+            self.set_tray_icon(false);
+        } else {
+            let pids: Vec<u32> = self.running_pids.values().flatten().copied().collect();
+            if pids.is_empty() {
+                info!("killswitch: no tracked app is running — nothing to hide or mute");
+                return;
+            }
+            killswitch::engage(&pids, &mut self.killswitch);
+            self.set_tray_icon(true);
+        }
+        self.broadcast_status();
+    }
+
+    fn set_tray_icon(&self, active: bool) {
+        if let Some(tray) = &self.tray {
+            let icon = if active {
+                self.icon_active.clone()
+            } else {
+                self.icon_normal.clone()
+            };
+            if let Err(e) = tray.set_icon(Some(icon)) {
+                warn!("tray icon swap failed: {e}");
+            }
+        }
     }
 
     fn on_tick(&mut self) {

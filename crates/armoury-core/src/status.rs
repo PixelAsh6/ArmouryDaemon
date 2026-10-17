@@ -21,6 +21,9 @@ pub struct StatusSnapshot {
     pub cooldown_seconds: u64,
     pub paused: bool,
     pub killswitch_active: bool,
+    /// How many tracked apps the killswitch is currently hiding/muting.
+    #[serde(default)]
+    pub killswitch_count: u32,
     /// The user's configured tracked-app list.
     pub tracked_apps: Vec<TrackedApp>,
     /// Display names of tracked apps that are currently running.

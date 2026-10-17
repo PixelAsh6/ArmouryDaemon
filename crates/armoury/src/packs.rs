@@ -646,8 +646,7 @@ fn snapshot_targets() -> HashMap<String, (String, u32)> {
 // ---------------------------------------------------------------------------
 // Input synthesis
 
-fn send_chord(chord: &str) -> Result<(), String> {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+pub fn send_chord(chord: &str) -> Result<(), String> {    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     };
 
@@ -696,6 +695,7 @@ fn parse_chord(chord: &str) -> Result<Vec<u16>, String> {
             "shift" => 0xA0,            // VK_LSHIFT
             "alt" | "menu" => 0xA4,     // VK_LMENU
             "win" | "lwin" => 0x5B,
+            "scrolllock" | "scroll" => 0x91,
             _ if p.len() >= 2 && p.starts_with('f') => {
                 let n: u16 = p[1..].parse().map_err(|_| format!("bad key '{p}'"))?;
                 if !(1..=24).contains(&n) {
