@@ -7,6 +7,7 @@
 mod daemon;
 mod ipc;
 mod killswitch;
+mod overlay;
 mod packs;
 mod ui;
 mod watch;

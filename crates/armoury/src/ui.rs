@@ -400,6 +400,21 @@ impl eframe::App for App {
                         self.request(&Request::SetPaused { paused: !paused });
                     }
                     ui.add_space(6.0);
+                    let idle_active = {
+                        let s = self.shared.lock().unwrap();
+                        s.status.as_ref().map(|st| st.idle_active).unwrap_or(false)
+                    };
+                    let idle_label = if idle_active { "Wake" } else { "Idle" };
+                    if ui
+                        .button(idle_label)
+                        .on_hover_text("Idle mode: black out every screen and mute all audio (any input brings it back)")
+                        .clicked()
+                    {
+                        self.request(&Request::SetIdle {
+                            active: !idle_active,
+                        });
+                    }
+                    ui.add_space(6.0);
                     if icon_button(ui, 22.0, draw_gear).clicked() {
                         let mut s = self.shared.lock().unwrap();
                         s.settings_open = !settings_open;

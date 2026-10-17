@@ -3,6 +3,7 @@
 
 use crate::ipc;
 use crate::killswitch;
+use crate::overlay;
 use crate::packs;
 use crate::watch;
 use armoury_core::config::{AppConfig, TrackedApp};
@@ -29,6 +30,7 @@ pub fn run() {
     }
     info!("daemon starting (v{})", armoury_core::VERSION);
     killswitch::init_com();
+    overlay::recover_if_needed();
 
     // ---- single instance ----
     let _mutex_guard = match acquire_singleton() {
@@ -204,7 +206,10 @@ pub fn run() {
         icon_active: make_tray_icon_active(),
         killswitch: killswitch::Ledger::default(),
         running_pids: HashMap::new(),
-        echo_until: None,        tracked,
+        echo_until: None,
+        overlay: overlay::Overlay::default(),
+        idle_engage_tick: 0,
+        idle_deadline: None,        tracked,
         running_paths: HashMap::new(),
         engine,
         pack_tx,
@@ -282,10 +287,12 @@ pub fn run() {
             app.on_tick();
         }
 
-        // Block until a message arrives, a producer signals the event, or 1 s passes.
-        // Idle cost is therefore ~zero (no polling tick).
+        // Block until a message arrives, a producer signals the event, or the wait expires.
+        // Idle cost is therefore ~zero (no polling tick); while the overlay is up we wake
+        // more often so input dismisses it promptly.
+        let wait_ms = if app.overlay.is_active() { 250 } else { 1000 };
         unsafe {
-            MsgWaitForMultipleObjectsEx(1, &wake, 1000, QS_ALLINPUT, 0);
+            MsgWaitForMultipleObjectsEx(1, &wake, wait_ms, QS_ALLINPUT, 0);
         }
     };
 
@@ -313,9 +320,25 @@ fn basename_lower(path: &str) -> String {
         .unwrap_or_else(|| path.to_ascii_lowercase())
 }
 
+/// Tick of the last keyboard/mouse input in this session.
+fn last_input_tick() -> u32 {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    unsafe {
+        GetLastInputInfo(&mut info);
+    }
+    info.dwTime
+}
+
+fn tick_count() -> u32 {
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() }
+}
+
 /// The current Scroll Lock toggle state (GetAsyncKeyState reads the global toggle).
-fn scroll_lock_state() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+fn scroll_lock_state() -> bool {    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     unsafe { GetAsyncKeyState(0x91) & 1 != 0 }
 }
 
@@ -355,6 +378,11 @@ struct App {
     running_pids: HashMap<String, Vec<u32>>,
     /// Ignore our own Scroll Lock correction presses until this instant.
     echo_until: Option<Instant>,
+    /// Idle overlay (black screens + muted output devices).
+    overlay: overlay::Overlay,
+    /// Tick count when idle mode started, so any later input dismisses it.
+    idle_engage_tick: u32,
+    idle_deadline: Option<Instant>,
     /// Jobs to the pack worker (apply/revert).
     pack_tx: crossbeam_channel::Sender<packs::PackJob>,
     pack_out_rx: crossbeam_channel::Receiver<packs::PackOutcome>,
@@ -397,6 +425,11 @@ impl App {
             paused: self.cfg.paused,
             killswitch_active: self.killswitch.is_active(),
             killswitch_count: (self.running_pids.values().flatten().count()) as u32,
+            idle_active: self.overlay.is_active(),
+            idle_monitors: self.overlay.monitor_count() as u32,
+            idle_devices: self.overlay.muted_devices() as u32,
+            idle_failsafe_enabled: self.cfg.idle_failsafe_enabled,
+            idle_failsafe_minutes: self.cfg.idle_failsafe_minutes,
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
             packs: self
@@ -680,6 +713,32 @@ impl App {
         }
     }
 
+    fn enter_idle(&mut self) {
+        if self.overlay.is_active() {
+            return;
+        }
+        // marker first: if we crash while idle, the next start can restore the audio
+        let _ = std::fs::write(overlay::marker_path(), b"idle");
+        overlay::show(&mut self.overlay);
+        self.idle_engage_tick = tick_count();
+        self.idle_deadline = if self.cfg.idle_failsafe_enabled {
+            Some(Instant::now() + Duration::from_secs(self.cfg.idle_failsafe_minutes.max(1) * 60))
+        } else {
+            None
+        };
+        self.broadcast_status();
+    }
+
+    fn exit_idle(&mut self) {
+        if !self.overlay.is_active() {
+            return;
+        }
+        overlay::hide(&mut self.overlay);
+        let _ = std::fs::remove_file(overlay::marker_path());
+        self.idle_deadline = None;
+        self.broadcast_status();
+    }
+
     fn toggle_killswitch(&mut self) {
         if self.killswitch.is_active() {
             killswitch::disengage(&mut self.killswitch);
@@ -710,6 +769,22 @@ impl App {
     }
 
     fn on_tick(&mut self) {
+        if self.overlay.is_active() {
+            overlay::pump();
+            // any input after we went idle dismisses the overlay
+            if last_input_tick().wrapping_sub(self.idle_engage_tick) > 0 {
+                info!("idle overlay dismissed by user input");
+                self.exit_idle();
+            } else if let Some(deadline) = self.idle_deadline {
+                if Instant::now() >= deadline {
+                    warn!(
+                        "idle failsafe fired after {} min — leaving idle mode",
+                        self.cfg.idle_failsafe_minutes
+                    );
+                    self.exit_idle();
+                }
+            }
+        }
         if let Some(t) = self.engine.tick(Instant::now()) {
             self.on_transition(t);
         }
@@ -823,6 +898,26 @@ impl App {
                 Request::SetPaused { paused } => self.set_paused(paused),
                 Request::SetPackEnabled { id, enabled } => self.set_pack_enabled(id, enabled),
                 Request::SetPackValue { id, key, value } => self.set_pack_value(id, key, value),
+                Request::SetIdle { active } => {
+                    if active {
+                        self.enter_idle();
+                    } else {
+                        self.exit_idle();
+                    }
+                }
+                Request::SetIdleFailsafe { enabled, minutes } => {
+                    self.cfg.idle_failsafe_enabled = enabled;
+                    self.cfg.idle_failsafe_minutes = minutes.max(1);
+                    if let Err(e) = armoury_core::config::save(&self.cfg) {
+                        warn!("failed to save config: {e}");
+                    }
+                    info!(
+                        "idle failsafe {} ({} min)",
+                        if enabled { "on" } else { "off" },
+                        self.cfg.idle_failsafe_minutes
+                    );
+                    self.broadcast_status();
+                }
             },
         }
     }

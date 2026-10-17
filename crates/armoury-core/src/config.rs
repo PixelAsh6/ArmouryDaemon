@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub packs: HashMap<String, PackUserConfig>,
     /// Pause all pack switching (tray menu / dashboard button).
     pub paused: bool,
+    /// Idle overlay safety cap: force-quit after `idle_failsafe_minutes`.
+    pub idle_failsafe_enabled: bool,
+    pub idle_failsafe_minutes: u64,
     pub voice_enabled: bool,
 }
 
@@ -34,6 +37,8 @@ impl Default for AppConfig {
             tracked_apps: Vec::new(),
             packs: HashMap::new(),
             paused: false,
+            idle_failsafe_enabled: true,
+            idle_failsafe_minutes: 180,
             voice_enabled: false,
         }
     }

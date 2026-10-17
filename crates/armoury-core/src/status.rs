@@ -24,6 +24,17 @@ pub struct StatusSnapshot {
     /// How many tracked apps the killswitch is currently hiding/muting.
     #[serde(default)]
     pub killswitch_count: u32,
+    /// Idle overlay state.
+    #[serde(default)]
+    pub idle_active: bool,
+    #[serde(default)]
+    pub idle_monitors: u32,
+    #[serde(default)]
+    pub idle_devices: u32,
+    #[serde(default)]
+    pub idle_failsafe_enabled: bool,
+    #[serde(default)]
+    pub idle_failsafe_minutes: u64,
     /// The user's configured tracked-app list.
     pub tracked_apps: Vec<TrackedApp>,
     /// Display names of tracked apps that are currently running.

@@ -18,6 +18,10 @@ pub enum Request {
     SetPackEnabled { id: String, enabled: bool },
     /// Set a pack's dropdown value.
     SetPackValue { id: String, key: String, value: String },
+    /// Enter / leave idle mode (black overlay + mute every output device).
+    SetIdle { active: bool },
+    /// Configure the idle failsafe.
+    SetIdleFailsafe { enabled: bool, minutes: u64 },
 }
 
 /// Messages sent from the daemon to a client.
@@ -89,6 +93,11 @@ mod tests {
                 paused: false,
                 killswitch_active: false,
                 killswitch_count: 0,
+                idle_active: false,
+                idle_monitors: 0,
+                idle_devices: 0,
+                idle_failsafe_enabled: true,
+                idle_failsafe_minutes: 180,
                 tracked_apps: vec![],
                 tracked_apps_running: vec![],
                 packs: vec![],
