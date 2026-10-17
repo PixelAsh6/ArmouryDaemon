@@ -158,6 +158,16 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
         if let Some(values) = job.values.get(&pack.id) {
             ctx.settings = values.clone();
         }
+        // A pack can gain a dropdown after the user's config was written (Wallpaper Engine got the
+        // "binary" choice that way): fill anything the config does not know yet with its default,
+        // or steps using it would see an empty value and refuse to run.
+        for setting in &pack.settings {
+            if !ctx.settings.contains_key(&setting.key) {
+                if let Some(default) = &setting.default {
+                    ctx.settings.insert(setting.key.clone(), default.clone());
+                }
+            }
+        }
 
         // Apply captures live; a revert replays what the matching apply captured.
         if job.apply {
