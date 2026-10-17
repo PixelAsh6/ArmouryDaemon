@@ -1028,6 +1028,28 @@ impl App {
                     }
                 }
                 Request::RemovePack { id: pack_id } => {
+                    // If the pack is applied right now, put the app back before its folder goes:
+                    // the worker still has the pack, so queue the revert first (exact captures).
+                    if self.applied_packs.iter().any(|p| p == &pack_id) {
+                        let captured = self.captured_by_pack.get(&pack_id).cloned();
+                        if let Some(captured) = captured {
+                            let job = packs::PackJob {
+                                apply: false,
+                                enabled: HashMap::from([(pack_id.clone(), true)]),
+                                values: self
+                                    .cfg
+                                    .packs
+                                    .get(&pack_id)
+                                    .map(|v| HashMap::from([(pack_id.clone(), v.values.clone())]))
+                                    .unwrap_or_default(),
+                                captured: HashMap::from([(pack_id.clone(), captured)]),
+                            };
+                            info!("pack {pack_id} is applied — reverting it before removal");
+                            let _ = self.pack_tx.send(job);
+                        }
+                        self.applied_packs.retain(|p| p != &pack_id);
+                        self.captured_by_pack.remove(&pack_id);
+                    }
                     let result = packs::remove_id(&self.search, &pack_id);
                     match result {
                         Ok(removed) => {

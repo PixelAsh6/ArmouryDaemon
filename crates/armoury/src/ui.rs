@@ -1289,6 +1289,8 @@ fn fmt_uptime(secs: u64) -> String {
 }
 
 fn open_folder(path: &PathBuf) {
+    // "Reveal logs" may be the first thing a user clicks: make sure the folder exists.
+    let _ = std::fs::create_dir_all(path);
     if let Err(e) = std::process::Command::new("explorer").arg(path).spawn() {
         log::warn!("failed to open {}: {e}", path.display());
     }
