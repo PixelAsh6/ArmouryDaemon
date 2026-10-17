@@ -127,6 +127,18 @@ pub struct Step {
     /// Wait this long before running the step (lets a relaunched app come up).
     #[serde(default)]
     pub sleep_ms: Option<u64>,
+    /// For registry steps: what to write.
+    #[serde(default)]
+    pub registry: Option<RegistrySet>,
+}
+
+/// A REG_DWORD write, e.g. clearing Wallpaper Engine's `faultyShutdown` flag.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrySet {
+    /// Full key path, e.g. `HKEY_CURRENT_USER\Software\WallpaperEngine`.
+    pub path: String,
+    pub name: String,
+    pub dword: u32,
 }
 
 /// A simple equality condition used to branch on the pack's dropdown or a captured value.
@@ -227,7 +239,14 @@ pub fn substitute(template: &str, ctx: &TemplateCtx) -> (String, Vec<String>) {
     (out, unknown)
 }
 
-const ALLOWED_MECHANISMS: [&str; 5] = ["cli", "hotkey", "rainmeter_bang", "process_kill", "process_start"];
+const ALLOWED_MECHANISMS: [&str; 6] = [
+    "cli",
+    "hotkey",
+    "rainmeter_bang",
+    "process_kill",
+    "process_start",
+    "registry_set",
+];
 const ALLOWED_CAPTURES: [&str; 3] = ["process_running", "json_file", "target_path"];
 
 impl Pack {
@@ -292,6 +311,9 @@ impl Pack {
                 }
                 if step.mechanism == "process_start" && step.exe.is_none() {
                     errs.push(format!("{block} step {i}: process_start needs an exe"));
+                }
+                if step.mechanism == "registry_set" && step.registry.is_none() {
+                    errs.push(format!("{block} step {i}: registry_set needs a registry block"));
                 }
                 if step.mechanism == "rainmeter_bang" && step.bang.is_none() {
                     errs.push(format!("{block} step {i}: rainmeter_bang needs a bang"));

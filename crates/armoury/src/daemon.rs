@@ -527,7 +527,7 @@ impl App {
         let _ = self.pack_tx.send(job);
         match t {
             Transition::Applied => info!(
-                "packs APPLIED (triggered by {}) [pack execution lands in Phase 3]",
+                "packs applied (triggered by {})",
                 self.engine.source().unwrap_or_default()
             ),
             Transition::Reverted => {

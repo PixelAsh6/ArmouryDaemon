@@ -252,6 +252,10 @@ fn describe_step(step: &Step, ctx: &TemplateCtx) -> String {
         "rainmeter_bang" => {
             format!("bang {}", substitute(step.bang.as_deref().unwrap_or(""), ctx).0)
         }
+        "registry_set" => match &step.registry {
+            Some(r) => format!("registry {}\\{} = {}", r.path, r.name, r.dword),
+            None => "registry_set".to_string(),
+        },
         other => other.to_string(),
     }
 }
@@ -292,6 +296,10 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
             }
             kill_by_name(&name)
         }
+        "registry_set" => {
+            let reg = step.registry.as_ref().ok_or("registry_set: no registry block")?;
+            set_registry_dword(&reg.path, &reg.name, reg.dword)
+        }
         "hotkey" => {
             match resolve_chord(step, ctx) {
                 Some(chord) => send_chord(&chord),
@@ -328,6 +336,68 @@ fn kill_by_name(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("TerminateProcess failed for {name} (pid {pid})"))
+    }
+}
+
+/// Write a REG_DWORD (used to clear a crash flag before relaunching an app).
+fn set_registry_dword(path: &str, name: &str, value: u32) -> Result<(), String> {
+    use windows::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE,
+        RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+    };
+    use windows::core::PCWSTR;
+
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+
+    let (root, sub) = if let Some(rest) = path
+        .strip_prefix("HKEY_CURRENT_USER\\")
+        .or_else(|| path.strip_prefix("HKCU\\"))
+    {
+        (HKEY_CURRENT_USER, rest)
+    } else if let Some(rest) = path
+        .strip_prefix("HKEY_LOCAL_MACHINE\\")
+        .or_else(|| path.strip_prefix("HKLM\\"))
+    {
+        (HKEY_LOCAL_MACHINE, rest)
+    } else {
+        return Err(format!(
+            "registry_set: only HKCU/HKLM paths are allowed, got '{path}'"
+        ));
+    };
+
+    unsafe {
+        let sub_w = wide(sub);
+        let name_w = wide(name);
+        let mut key = HKEY::default();
+        let rc = RegCreateKeyExW(
+            root,
+            PCWSTR(sub_w.as_ptr()),
+            None,
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        );
+        if rc.0 != 0 {
+            return Err(format!("RegCreateKeyExW {path}: error {}", rc.0));
+        }
+
+        let bytes = value.to_le_bytes();
+        let rc = RegSetValueExW(
+            key,
+            PCWSTR(name_w.as_ptr()),
+            None,
+            REG_DWORD,
+            Some(&bytes),
+        );
+        let _ = RegCloseKey(key);
+        if rc.0 != 0 {
+            return Err(format!("RegSetValueExW {path}\\{name}: error {}", rc.0));
+        }
+        info!("registry_set: {path}\\{name} = {value}");
+        Ok(())
     }
 }
 

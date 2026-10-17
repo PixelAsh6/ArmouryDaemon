@@ -32,6 +32,15 @@
   "revert": {
     "guard": { "targetRunning": false, "capturedRunning": true },
     "steps": [
+      {
+        "mechanism": "registry_set",
+        "registry": {
+          "path": "HKEY_CURRENT_USER\\Software\\WallpaperEngine",
+          "name": "faultyShutdown",
+          "dword": 0
+        },
+        "when": { "source": "setting", "equals": "kill" }
+      },
       { "mechanism": "process_start", "exe": "{{captured.target_path}}",
         "when": { "source": "setting", "equals": "kill" } },
       { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "play"],
