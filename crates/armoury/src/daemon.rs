@@ -905,6 +905,16 @@ impl App {
                         self.exit_idle();
                     }
                 }
+                Request::SetCooldown { seconds } => {
+                    self.cfg.cooldown_seconds = seconds.clamp(5, 3600);
+                    self.engine
+                        .set_cooldown(Duration::from_secs(self.cfg.cooldown_seconds));
+                    if let Err(e) = armoury_core::config::save(&self.cfg) {
+                        warn!("failed to save config: {e}");
+                    }
+                    info!("cooldown set to {}s", self.cfg.cooldown_seconds);
+                    self.broadcast_status();
+                }
                 Request::SetIdleFailsafe { enabled, minutes } => {
                     self.cfg.idle_failsafe_enabled = enabled;
                     self.cfg.idle_failsafe_minutes = minutes.max(1);

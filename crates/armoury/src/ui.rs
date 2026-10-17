@@ -9,6 +9,7 @@ use armoury_core::status::{PackStatus, RunState, StatusSnapshot};
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, FontFamily, FontId, Rect, RichText, Stroke, TextStyle};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
+use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -33,7 +34,7 @@ struct Shared {
     connected: bool,
     daemon_version: String,
     monitors: usize,
-    /// Outer rect (logical points) of the core window, for stacking the settings above it.
+    /// Outer rect (logical points) of the core window, for stacking the child windows.
     core_rect: Option<Rect>,
     settings_open: bool,
     /// 0 = settling, 1 = positioned (waiting for confirmation), 2 = shown
@@ -44,6 +45,12 @@ struct Shared {
     /// (dashboard rect, own size) the current position was computed for —
     /// lets the settings window follow the dashboard when it grows or moves.
     settings_anchor: Option<(Rect, egui::Vec2)>,
+    /// Requests raised from child viewports, drained by the root App.
+    outbox: Option<crossbeam_channel::Sender<Request>>,
+    /// Per-pack windows: ids in open order.
+    open_packs: Vec<String>,
+    /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
+    pack_windows: HashMap<String, (u8, Option<egui::Pos2>)>,
 }
 
 pub fn run() {
@@ -85,6 +92,8 @@ pub fn run() {
     log::info!("connected to daemon");
 
     let (pick_tx, pick_rx) = crossbeam_channel::unbounded::<PathBuf>();
+    // requests raised from child viewports (settings, pack windows) come back through here
+    let (req_tx, req_rx) = crossbeam_channel::unbounded::<Request>();
 
     let (tx, rx) = crossbeam_channel::unbounded::<UiEvent>();
     thread::spawn(move || {
@@ -112,6 +121,7 @@ pub fn run() {
 
     let shared = Arc::new(Mutex::new(Shared {
         monitors: monitor_count(),
+        outbox: Some(req_tx),
         ..Default::default()
     }));
 
@@ -146,6 +156,7 @@ pub fn run() {
                 Box::new(send_half) as Box<dyn Write>,
                 pick_tx,
                 pick_rx,
+                req_rx,
             ));
             Ok(app)
         }),
@@ -159,6 +170,8 @@ struct App {
     send: Box<dyn Write>,
     /// Paths coming back from the native "browse for exe" dialog.
     pick_rx: Receiver<PathBuf>,
+    /// Requests raised by child viewports (settings / pack windows).
+    req_rx: Receiver<Request>,
     /// Running apps offered in the picker (title, exe path).
     apps: Vec<(String, String)>,
     apps_refreshed: Instant,
@@ -178,6 +191,7 @@ impl App {
         send: Box<dyn Write>,
         pick_tx: crossbeam_channel::Sender<PathBuf>,
         pick_rx: Receiver<PathBuf>,
+        req_rx: Receiver<Request>,
     ) -> Self {
         Self {
             rx,
@@ -185,6 +199,7 @@ impl App {
             send,
             pick_tx,
             pick_rx,
+            req_rx,
             apps: Vec::new(),
             apps_refreshed: Instant::now() - Duration::from_secs(60),
             pick_query: String::new(),
@@ -258,6 +273,11 @@ impl eframe::App for App {
                     std::process::exit(0);
                 }
             }
+        }
+
+        // Requests raised by child viewports.
+        while let Ok(req) = self.req_rx.try_recv() {
+            self.request(&req);
         }
 
         // Native "browse for exe" results.
@@ -573,7 +593,17 @@ impl eframe::App for App {
                     {
                         set_enabled = Some((pack.id.clone(), enabled));
                     }
-                    ui.label(&pack.name);
+                    if ui
+                        .small_button(&pack.name)
+                        .on_hover_text("Open this pack's own window")
+                        .clicked()
+                    {
+                        let mut s = self.shared.lock().unwrap();
+                        if !s.open_packs.contains(&pack.id) {
+                            s.open_packs.push(pack.id.clone());
+                            s.pack_windows.remove(&pack.id);
+                        }
+                    }
                     if pack.applied {
                         ui.small("· applied");
                     }
@@ -654,11 +684,176 @@ impl eframe::App for App {
                 move |ui, _class| settings_ui(ui, &shared),
             );
         }
+        // ---- per-pack windows (opened from the dashboard, stacked to the left) ----
+        let open_packs: Vec<String> = { self.shared.lock().unwrap().open_packs.clone() };
+        for (index, pack_id) in open_packs.iter().enumerate() {
+            let shared = self.shared.clone();
+            let id = pack_id.clone();
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of(format!("armoury-pack-{pack_id}")),
+                egui::ViewportBuilder::default()
+                    .with_title(format!("Pack: {pack_id}"))
+                    .with_decorations(false)
+                    .with_resizable(false)
+                    .with_visible(false)
+                    .with_inner_size([MIN_SETTINGS_WIDTH, 200.0]),
+                move |ui, _class| pack_window(ui, &shared, &id, index),
+            );
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Settings window
+/// Raise a request from a child viewport (drained by the root App's logic()).
+fn send_request(shared: &Arc<Mutex<Shared>>, req: &Request) {
+    if let Ok(s) = shared.lock() {
+        if let Some(tx) = &s.outbox {
+            let _ = tx.send(req.clone());
+        }
+    }
+}
+
+/// Bottom-aligned to the left of the core window; `index` = opening order.
+fn place_left(ctx: &egui::Context, core: Rect, size: egui::Vec2, index: usize) -> egui::Pos2 {
+    let gap = 8.0;
+    let x = core.left() - gap - size.x - index as f32 * (size.x + gap);
+    let mut y = core.bottom() - size.y;
+    if let Some((left, top, _right, bottom)) = work_area_pts(ctx) {
+        let margin = 6.0;
+        let x = x.max(left + margin);
+        y = y.max(top + margin).min(bottom - size.y - margin);
+        return egui::pos2(x, y);
+    }
+    egui::pos2(x, y)
+}
+
+/// One pack's own window: enable toggle + its single dropdown.
+fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: usize) {
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    let bg = ui.interact(
+        ui.max_rect(),
+        ui.scope_id().with(("pack-drag", id)),
+        egui::Sense::click_and_drag(),
+    );
+    if bg.drag_started() {
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+    }
+
+    let pack = {
+        let s = shared.lock().unwrap();
+        s.status
+            .as_ref()
+            .and_then(|st| st.packs.iter().find(|p| p.id == id))
+            .cloned()
+    };
+    let Some(pack) = pack else {
+        // the pack disappeared (uninstalled): close the window
+        let mut s = shared.lock().unwrap();
+        s.open_packs.retain(|p| p != id);
+        s.pack_windows.remove(id);
+        return;
+    };
+
+    let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
+    let mut close = false;
+    frame.show(ui, |ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&pack.name).strong().size(16.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icon_button(ui, 20.0, draw_close).clicked() {
+                    close = true;
+                }
+            });
+        });
+        ui.add_space(4.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            let mut enabled = pack.enabled;
+            if ui.checkbox(&mut enabled, "Enabled").changed() {
+                send_request(
+                    shared,
+                    &Request::SetPackEnabled {
+                        id: pack.id.clone(),
+                        enabled,
+                    },
+                );
+            }
+            if pack.applied {
+                ui.small("· applied");
+            }
+        });
+
+        ui.add_space(6.0);
+        if let Some(key) = &pack.setting_key {
+            if let Some(label) = &pack.setting_label {
+                ui.small(label);
+            }
+            let current = pack.value.clone().unwrap_or_default();
+            egui::ComboBox::from_id_salt(format!("pack-win-{}", pack.id))
+                .selected_text(current.clone())
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for value in &pack.values {
+                        if ui.selectable_label(value == &current, value).clicked() {
+                            send_request(
+                                shared,
+                                &Request::SetPackValue {
+                                    id: pack.id.clone(),
+                                    key: key.clone(),
+                                    value: value.clone(),
+                                },
+                            );
+                        }
+                    }
+                });
+        }
+        ui.add_space(6.0);
+        ui.small(if pack.applied {
+            "Applied right now."
+        } else {
+            "Applies when a tracked app starts."
+        });
+    });
+
+    if close {
+        let mut s = shared.lock().unwrap();
+        s.open_packs.retain(|p| p != id);
+        s.pack_windows.remove(id);
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+        return;
+    }
+
+    // auto-fit, then place once to the left of the core (never follows it afterwards)
+    let desired = (ui.min_rect().size() + egui::vec2(4.0, 4.0))
+        .max(egui::vec2(MIN_SETTINGS_WIDTH, 160.0));
+    let ctx = ui.ctx();
+    let mut s = shared.lock().unwrap();
+    let stage = s.pack_windows.get(id).map(|(st, _)| *st).unwrap_or(0);
+    match stage {
+        0 => {
+            let current = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
+            let settled = current.map_or(false, |c| (c - desired).length() <= 0.5);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            if settled {
+                s.pack_windows.insert(id.to_string(), (1, None));
+            }
+        }
+        1 => {
+            if let Some(core) = s.core_rect {
+                let pos = place_left(ctx, core, desired, index);
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                s.pack_windows.insert(id.to_string(), (2, Some(pos)));
+            }
+        }
+        2 => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            s.pack_windows.insert(id.to_string(), (3, None));
+        }
+        _ => {}
+    }
+}
 
 fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -747,6 +942,56 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
         ui.add_space(4.0);
         ui.small("Full settings UI arrives in Phase 6.");
+    // ---- cooldown + idle failsafe ----
+    let (cooldown, fs_enabled, fs_minutes) = {
+        let s = shared.lock().unwrap();
+        let st = s.status.as_ref();
+        (
+            st.map(|x| x.cooldown_seconds).unwrap_or(60),
+            st.map(|x| x.idle_failsafe_enabled).unwrap_or(true),
+            st.map(|x| x.idle_failsafe_minutes).unwrap_or(180),
+        )
+    };
+    ui.add_space(6.0);
+    ui.separator();
+    ui.add_space(6.0);
+    let mut new_cooldown = cooldown;
+    ui.horizontal(|ui| {
+        ui.label("Revert after");
+        if ui
+            .add(egui::DragValue::new(&mut new_cooldown).range(5..=3600).suffix(" s"))
+            .changed()
+        {
+            send_request(shared, &Request::SetCooldown { seconds: new_cooldown });
+        }
+    });
+    let (mut fs_on, mut fs_min) = (fs_enabled, fs_minutes);
+    let mut fs_changed = false;
+    if ui
+        .checkbox(&mut fs_on, "Idle failsafe")
+        .on_hover_text("Leave idle mode automatically after the time below")
+        .changed()
+    {
+        fs_changed = true;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Force-quit idle after");
+        if ui
+            .add(egui::DragValue::new(&mut fs_min).range(1..=1440).suffix(" min"))
+            .changed()
+        {
+            fs_changed = true;
+        }
+    });
+    if fs_changed {
+        send_request(
+            shared,
+            &Request::SetIdleFailsafe {
+                enabled: fs_on,
+                minutes: fs_min,
+            },
+        );
+    }
     });
 
     // ---- shrink-wrap, position above the core window, then show ----
@@ -806,17 +1051,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             }
         }
         _ => {
-            // Follow the dashboard: whenever its rect (or our own size) changes, re-stack
-            // above it so the gap stays constant. A plain drag of this window changes
-            // neither, so the user can still move it freely.
-            if let Some(core) = s.core_rect {
-                if s.settings_anchor != Some((core, desired)) {
-                    let pos = above_core(ctx, core, desired);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                    s.settings_target = Some(pos);
-                    s.settings_anchor = Some((core, desired));
-                }
-            }
+            // Deliberately no tracking: a child window is positioned once when it opens
+            // and then stays where the user put it.
         }
     }
     drop(s);

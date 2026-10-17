@@ -22,6 +22,8 @@ pub enum Request {
     SetIdle { active: bool },
     /// Configure the idle failsafe.
     SetIdleFailsafe { enabled: bool, minutes: u64 },
+    /// Change the revert cooldown.
+    SetCooldown { seconds: u64 },
 }
 
 /// Messages sent from the daemon to a client.
