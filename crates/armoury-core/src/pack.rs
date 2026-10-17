@@ -83,12 +83,18 @@ pub struct Guard {
     /// Skip the whole block when the target process is not running.
     #[serde(rename = "targetRunning", default = "default_true")]
     pub target_running: bool,
+    /// Skip the whole block unless the target was running when we applied
+    /// (captured `was_running == "1"`). Keeps revert from starting apps that were off,
+    /// while still restoring an app we deliberately killed.
+    #[serde(rename = "capturedRunning", default)]
+    pub captured_running: bool,
 }
 
 impl Default for Guard {
     fn default() -> Self {
         Self {
             target_running: true,
+            captured_running: false,
         }
     }
 }
@@ -115,6 +121,55 @@ pub struct Step {
     /// For cli steps: expected exit code (otherwise any success is fine).
     #[serde(default)]
     pub expect_exit: Option<i32>,
+    /// Only run this step when a condition matches (data-only branching).
+    #[serde(default)]
+    pub when: Option<When>,
+    /// Wait this long before running the step (lets a relaunched app come up).
+    #[serde(default)]
+    pub sleep_ms: Option<u64>,
+}
+
+/// A simple equality condition used to branch on the pack's dropdown or a captured value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct When {
+    /// "setting" (the pack's dropdown) or "captured".
+    pub source: String,
+    /// For `setting`: the setting key (defaults to the pack's only setting).
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub equals: Option<String>,
+    #[serde(default)]
+    pub not_equals: Option<String>,
+}
+
+impl When {
+    /// Does this step apply, given the current template context?
+    pub fn matches(&self, ctx: &TemplateCtx, setting_key: Option<&str>) -> bool {
+        let value = match self.source.as_str() {
+            "setting" => {
+                let key = self.key.as_deref().or(setting_key).unwrap_or_default();
+                ctx.settings.get(key).cloned().unwrap_or_default()
+            }
+            "captured" => ctx
+                .captured
+                .get(self.key.as_deref().unwrap_or_default())
+                .cloned()
+                .unwrap_or_default(),
+            _ => return false,
+        };
+        if let Some(want) = &self.equals {
+            if !value.eq_ignore_ascii_case(want) {
+                return false;
+            }
+        }
+        if let Some(no) = &self.not_equals {
+            if value.eq_ignore_ascii_case(no) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Values available to `{{...}}` substitution in a pack.
@@ -172,8 +227,8 @@ pub fn substitute(template: &str, ctx: &TemplateCtx) -> (String, Vec<String>) {
     (out, unknown)
 }
 
-const ALLOWED_MECHANISMS: [&str; 3] = ["cli", "hotkey", "rainmeter_bang"];
-const ALLOWED_CAPTURES: [&str; 2] = ["process_running", "json_file"];
+const ALLOWED_MECHANISMS: [&str; 5] = ["cli", "hotkey", "rainmeter_bang", "process_kill", "process_start"];
+const ALLOWED_CAPTURES: [&str; 3] = ["process_running", "json_file", "target_path"];
 
 impl Pack {
     /// Human-readable problems; an empty list means the pack is valid.
@@ -234,6 +289,9 @@ impl Pack {
                 }
                 if step.mechanism == "cli" && step.exe.is_none() {
                     errs.push(format!("{block} step {i}: cli needs an exe"));
+                }
+                if step.mechanism == "process_start" && step.exe.is_none() {
+                    errs.push(format!("{block} step {i}: process_start needs an exe"));
                 }
                 if step.mechanism == "rainmeter_bang" && step.bang.is_none() {
                     errs.push(format!("{block} step {i}: rainmeter_bang needs a bang"));

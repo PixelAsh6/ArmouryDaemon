@@ -14,6 +14,10 @@ pub enum Request {
     RemoveTrackedApp { exe: String },
     /// Pause / resume all pack switching.
     SetPaused { paused: bool },
+    /// Enable or disable one pack.
+    SetPackEnabled { id: String, enabled: bool },
+    /// Set a pack's dropdown value.
+    SetPackValue { id: String, key: String, value: String },
 }
 
 /// Messages sent from the daemon to a client.
@@ -86,6 +90,7 @@ mod tests {
                 killswitch_active: false,
                 tracked_apps: vec![],
                 tracked_apps_running: vec![],
+                packs: vec![],
             },
         };
         let mut out = Vec::new();

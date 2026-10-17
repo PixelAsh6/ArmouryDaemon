@@ -10,11 +10,20 @@ pub struct AppConfig {
     pub schema_version: u32,
     pub cooldown_seconds: u64,
     pub tracked_apps: Vec<TrackedApp>,
-    /// Per-pack user settings (one dropdown per pack); opaque to the core for now.
-    pub packs: HashMap<String, serde_json::Value>,
+    /// Per-pack user settings: enabled flag + the single dropdown value.
+    pub packs: HashMap<String, PackUserConfig>,
     /// Pause all pack switching (tray menu / dashboard button).
     pub paused: bool,
     pub voice_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackUserConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// setting key -> chosen value
+    #[serde(default)]
+    pub values: HashMap<String, String>,
 }
 
 impl Default for AppConfig {

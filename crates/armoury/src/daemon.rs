@@ -2,11 +2,12 @@
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
 use crate::ipc;
+use crate::packs;
 use crate::watch;
 use armoury_core::config::{AppConfig, TrackedApp};
 use armoury_core::engine::{Engine, EngineState, Transition};
 use armoury_core::protocol::{Request, Response};
-use armoury_core::status::{RunState, StatusSnapshot};
+use armoury_core::status::{PackStatus, RunState, StatusSnapshot};
 use global_hotkey::hotkey::{Code, HotKey};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
@@ -82,6 +83,57 @@ pub fn run() {
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<watch::WatchEvent>();
     watch::start(tracked.clone(), watch_tx, wake_handle);
     let engine = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
+
+    // ---- packs ----
+    let mut search: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search.push(dir.to_path_buf());
+            // dev layout: <repo>/target/release/ArmouryDaemon.exe -> <repo>
+            if let Some(up2) = dir.parent().and_then(|d| d.parent()) {
+                search.push(up2.to_path_buf());
+            }
+        }
+    }
+    let mut installed = packs::load(&search);
+
+    // Rainmeter: guarantee a truly empty layout exists and offer the machine's real layouts.
+    if let Some(empty) = packs::ensure_empty_layout() {
+        let mut values: Vec<String> = packs::rainmeter_layouts()
+            .into_iter()
+            .filter(|l| !l.eq_ignore_ascii_case("@Backup"))
+            .collect();
+        if !values.iter().any(|v| v.eq_ignore_ascii_case(&empty)) {
+            values.push(empty.clone());
+        }
+        values.push("kill".to_string());
+        for p in installed.iter_mut() {
+            if p.pack.id == "rainmeter" {
+                if let Some(setting) = p.pack.settings.first_mut() {
+                    setting.values = values.clone();
+                    if setting.default.is_none() {
+                        setting.default = Some(empty.clone());
+                    }
+                }
+            }
+        }
+        info!(
+            "Rainmeter: empty layout '{empty}' ready; dropdown offers {}",
+            values.join(", ")
+        );
+    }
+
+    let pack_catalog: Vec<PackMeta> = installed
+        .iter()
+        .map(|p| PackMeta {
+            id: p.pack.id.clone(),
+            name: p.pack.name.clone(),
+            setting: p.pack.settings.first().cloned(),
+        })
+        .collect();
+    let (pack_tx, pack_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
+    let (pack_out_tx, pack_out_rx) = crossbeam_channel::unbounded::<packs::PackOutcome>();
+    packs::start(installed, pack_rx, pack_out_tx, wake_handle);
     info!(
         "watching {} tracked app(s); cooldown {}s",
         cfg.tracked_apps.len(),
@@ -147,6 +199,11 @@ pub fn run() {
         tracked,
         running_paths: HashMap::new(),
         engine,
+        pack_tx,
+        pack_out_rx,
+        pack_catalog,
+        applied_packs: Vec::new(),
+        captured_by_pack: HashMap::new(),
         started: Instant::now(),
         clients: HashMap::new(),
         ui_conn: None,
@@ -201,6 +258,12 @@ pub fn run() {
         while let Ok(w) = watch_rx.try_recv() {
             app.on_watch(w);
         }
+        loop {
+            match app.pack_out_rx.try_recv() {
+                Ok(o) => app.on_pack_outcome(o),
+                Err(_) => break,
+            }
+        }
         if quit {
             break true;
         }
@@ -249,10 +312,25 @@ fn make_tray_icon() -> tray_icon::Icon {    let (rgba, w, h) = armoury_core::ico
 
 // ---------------------------------------------------------------------------
 
+/// What the dashboard needs to know about one installed pack.
+pub struct PackMeta {
+    pub id: String,
+    pub name: String,
+    pub setting: Option<armoury_core::pack::Setting>,
+}
+
 struct App {
     cfg: AppConfig,
     /// Tray menu item whose label flips between Pause/Resume.
     pause_item: tray_icon::menu::MenuItem,
+    /// Jobs to the pack worker (apply/revert).
+    pack_tx: crossbeam_channel::Sender<packs::PackJob>,
+    pack_out_rx: crossbeam_channel::Receiver<packs::PackOutcome>,
+    pack_catalog: Vec<PackMeta>,
+    /// Packs currently in the applied (game-mode) state.
+    applied_packs: Vec<String>,
+    /// Journal: per-pack values captured at apply time, replayed on revert.
+    captured_by_pack: HashMap<String, HashMap<String, String>>,
     /// Shared with the watcher thread (single source of truth for what to watch).
     tracked: Arc<Mutex<Vec<TrackedApp>>>,
     /// Tracked key (exe file name, lowercase) -> last resolved image path, for pack templates.
@@ -288,6 +366,37 @@ impl App {
             killswitch_active: false,
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
+            packs: self
+                .pack_catalog
+                .iter()
+                .map(|m| {
+                    let user = self.cfg.packs.get(&m.id);
+                    let enabled = user.map(|u| u.enabled).unwrap_or(false);
+                    let (key, label, values, value) = match &m.setting {
+                        Some(s) => (
+                            Some(s.key.clone()),
+                            Some(s.label.clone()),
+                            s.values.clone(),
+                            Some(
+                                user.and_then(|u| u.values.get(&s.key).cloned())
+                                    .or_else(|| s.default.clone())
+                                    .unwrap_or_default(),
+                            ),
+                        ),
+                        None => (None, None, Vec::new(), None),
+                    };
+                    PackStatus {
+                        id: m.id.clone(),
+                        name: m.name.clone(),
+                        enabled,
+                        setting_key: key,
+                        setting_label: label,
+                        values,
+                        value,
+                        applied: self.applied_packs.contains(&m.id),
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -322,6 +431,24 @@ impl App {
             self.broadcast_status();
             return;
         }
+        // Hand the transition to the pack worker (it owns the mechanisms).
+        let job = packs::PackJob {
+            apply: t == Transition::Applied,
+            enabled: self
+                .cfg
+                .packs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.enabled))
+                .collect(),
+            values: self
+                .cfg
+                .packs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.values.clone()))
+                .collect(),
+            captured: self.captured_by_pack.clone(),
+        };
+        let _ = self.pack_tx.send(job);
         match t {
             Transition::Applied => info!(
                 "packs APPLIED (triggered by {}) [pack execution lands in Phase 3]",
@@ -350,6 +477,89 @@ impl App {
             if paused { "suppressed" } else { "active" }
         );
         self.broadcast_status();
+    }
+
+    fn on_pack_outcome(&mut self, o: packs::PackOutcome) {
+        if o.applied {
+            self.applied_packs = o.applied_ids.clone();
+            // keep the journal so the matching revert restores the right state
+            self.captured_by_pack = o.captured.clone();
+        } else {
+            self.applied_packs.clear();
+            self.captured_by_pack.clear();
+        }
+        for line in &o.succeeded {
+            info!("pack {line}");
+        }
+        for (id, err) in &o.failed {
+            warn!("pack {id} failed: {err}");
+        }
+        self.write_journal(o.applied, &o.failed);
+        self.broadcast_status();
+    }
+
+    fn write_journal(&self, applied: bool, failed: &[(String, String)]) {
+        let path = armoury_core::config::config_dir().join("journal.json");
+        let entry = serde_json::json!({
+            "at": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "applied": applied,
+            "trigger": self.engine.source(),
+            "packs": self.applied_packs,
+            "failed": failed
+                .iter()
+                .map(|(id, e)| serde_json::json!({ "id": id, "error": e }))
+                .collect::<Vec<_>>(),
+        });
+        let mut log: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        log.push(entry);
+        if log.len() > 200 {
+            let drop = log.len() - 200;
+            log.drain(0..drop);
+        }
+        if let Ok(text) = serde_json::to_string_pretty(&log) {
+            let _ = std::fs::write(&path, text);
+        }
+    }
+
+    fn set_pack_enabled(&mut self, id: String, enabled: bool) {
+        if !self.pack_catalog.iter().any(|m| m.id == id) {
+            warn!("unknown pack '{id}'");
+            return;
+        }
+        let entry = self.cfg.packs.entry(id.clone()).or_default();
+        if entry.enabled == enabled {
+            return;
+        }
+        entry.enabled = enabled;
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        info!("pack {id} {}", if enabled { "enabled" } else { "disabled" });
+        self.broadcast_status();
+    }
+
+    fn set_pack_value(&mut self, id: String, key: String, value: String) {
+        if !self.pack_catalog.iter().any(|m| m.id == id) {
+            warn!("unknown pack '{id}'");
+            return;
+        }
+        let entry = self.cfg.packs.entry(id.clone()).or_default();
+        entry.values.insert(key.clone(), value.clone());
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        info!("pack {id}: {key} = {value} (applies on the next trigger)");
+        self.broadcast_status();
+    }
+
+    fn on_pack(&mut self, o: packs::PackOutcome) {
+        self.on_pack_outcome(o);
     }
 
     fn add_tracked_app(&mut self, name: String, exe: String) {
@@ -510,6 +720,8 @@ impl App {
                 Request::AddTrackedApp { name, exe } => self.add_tracked_app(name, exe),
                 Request::RemoveTrackedApp { exe } => self.remove_tracked_app(&exe),
                 Request::SetPaused { paused } => self.set_paused(paused),
+                Request::SetPackEnabled { id, enabled } => self.set_pack_enabled(id, enabled),
+                Request::SetPackValue { id, key, value } => self.set_pack_value(id, key, value),
             },
         }
     }

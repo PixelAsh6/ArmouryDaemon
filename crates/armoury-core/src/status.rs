@@ -25,4 +25,22 @@ pub struct StatusSnapshot {
     pub tracked_apps: Vec<TrackedApp>,
     /// Display names of tracked apps that are currently running.
     pub tracked_apps_running: Vec<String>,
+    /// Installed packs and their state, for the dashboard.
+    #[serde(default)]
+    pub packs: Vec<PackStatus>,
+}
+
+/// One installed pack, as the dashboard sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackStatus {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    /// The pack's single dropdown (v1).
+    pub setting_key: Option<String>,
+    pub setting_label: Option<String>,
+    pub values: Vec<String>,
+    pub value: Option<String>,
+    /// Currently applied (game mode on) per the journal.
+    pub applied: bool,
 }

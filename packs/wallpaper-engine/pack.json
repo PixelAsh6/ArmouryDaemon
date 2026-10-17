@@ -2,7 +2,7 @@
   "spec": 1,
   "id": "wallpaper-engine",
   "name": "Wallpaper Engine",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "order": 10,
   "targets": { "process": ["wallpaper64.exe", "wallpaper32.exe"] },
   "settings": [
@@ -10,25 +10,36 @@
       "key": "action",
       "label": "While a tracked app runs",
       "type": "enum",
-      "values": ["stop", "pause"],
+      "values": ["stop", "pause", "kill"],
       "default": "stop"
     }
   ],
-  "capture": [{ "key": "was_running", "mechanism": "process_running" }],
+  "capture": [
+    { "key": "was_running", "mechanism": "process_running" },
+    { "key": "target_path", "mechanism": "target_path" }
+  ],
   "apply": {
     "guard": { "targetRunning": true },
     "steps": [
-      {
-        "mechanism": "cli",
-        "exe": "{{target.exe}}",
-        "args": ["-control", "{{settings.action}}"]
-      }
+      { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "stop"],
+        "when": { "source": "setting", "equals": "stop" } },
+      { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "pause"],
+        "when": { "source": "setting", "equals": "pause" } },
+      { "mechanism": "process_kill", "exe": "{{captured.target_path}}",
+        "when": { "source": "setting", "equals": "kill" } }
     ]
   },
   "revert": {
-    "guard": { "targetRunning": true },
+    "guard": { "targetRunning": false, "capturedRunning": true },
     "steps": [
-      { "mechanism": "cli", "exe": "{{target.exe}}", "args": ["-control", "play"] }
+      { "mechanism": "process_start", "exe": "{{captured.target_path}}",
+        "when": { "source": "setting", "equals": "kill" } },
+      { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "play"],
+        "sleep_ms": 2500,
+        "when": { "source": "setting", "not_equals": "kill" } },
+      { "mechanism": "cli", "exe": "{{captured.target_path}}", "args": ["-control", "play"],
+        "sleep_ms": 2500,
+        "when": { "source": "setting", "equals": "kill" } }
     ]
   }
 }

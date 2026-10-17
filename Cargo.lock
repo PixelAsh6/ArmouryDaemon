@@ -64,6 +64,7 @@ dependencies = [
  "global-hotkey",
  "interprocess",
  "log",
+ "serde_json",
  "tray-icon",
  "windows",
  "windows-sys 0.61.2",

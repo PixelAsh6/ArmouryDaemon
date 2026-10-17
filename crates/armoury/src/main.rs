@@ -6,6 +6,7 @@
 
 mod daemon;
 mod ipc;
+mod packs;
 mod ui;
 mod watch;
 
