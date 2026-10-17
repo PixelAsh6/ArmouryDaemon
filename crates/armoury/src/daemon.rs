@@ -128,9 +128,11 @@ pub fn run(show_ui_when_running: bool) {
     let menu = Menu::new();
     let open_item = MenuItem::with_id("open", "Open dashboard", true, None);
     let pause_item = MenuItem::with_id("pause_all", "Pause all packs", true, None);
+    let idle_item = MenuItem::with_id("idle", "Idle mode", true, None);
     let kill_item = MenuItem::with_id("killswitch", "Toggle killswitch", true, None);
     let quit_item = MenuItem::with_id("quit", "Quit", true, None);
-    if let Err(e) = menu.append_items(&[&open_item, &pause_item, &kill_item, &quit_item]) {
+    if let Err(e) = menu.append_items(&[&open_item, &pause_item, &idle_item, &kill_item, &quit_item])
+    {
         warn!("failed to build tray menu: {e}");
     }
     let tray: Option<TrayIcon> = match TrayIconBuilder::new()
@@ -180,6 +182,7 @@ pub fn run(show_ui_when_running: bool) {
     let mut app = App {
         cfg,
         pause_item: pause_item.clone(),
+        idle_item: idle_item.clone(),
         kill_item: kill_item.clone(),
         tray,
         icon_normal: make_tray_icon(),
@@ -190,6 +193,7 @@ pub fn run(show_ui_when_running: bool) {
         overlay: overlay::Overlay::default(),
         idle_engage_tick: 0,
         idle_deadline: None,
+        last_idle_beat: None,
         tracked,
         running_paths: HashMap::new(),
         engine,
@@ -236,6 +240,15 @@ pub fn run(show_ui_when_running: bool) {
                 "pause_all" => {
                     let paused = app.cfg.paused;
                     app.set_paused(!paused);
+                }
+                "idle" => {
+                    if app.overlay.is_active() {
+                        info!("idle mode off (tray menu)");
+                        app.exit_idle();
+                    } else {
+                        info!("idle mode on (tray menu)");
+                        app.enter_idle();
+                    }
                 }
                 "killswitch" => app.toggle_killswitch(),
                 "quit" => {
@@ -304,17 +317,22 @@ fn basename_lower(path: &str) -> String {
         .unwrap_or_else(|| path.to_ascii_lowercase())
 }
 
-/// Tick of the last keyboard/mouse input in this session.
-fn last_input_tick() -> u32 {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-    let mut info = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    unsafe {
-        GetLastInputInfo(&mut info);
+/// Did any **key** get pressed since the previous call? Mouse buttons and wheels are skipped on
+/// purpose: idle mode is meant to end on a deliberate keypress, not on a nudged mouse (the user's
+/// decision on 2026-10-17, after a mouse twitch would have woken an AFK session).
+///
+/// `GetAsyncKeyState`'s low bit means "pressed since the previous call", so the caller must
+/// **prime** this once when idle engages, or a keypress from before would dismiss it immediately.
+fn keyboard_pressed_since_last_poll() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let mut pressed = false;
+    // 0x01..=0x07 are the mouse buttons, the wheel and VK_CANCEL: never treated as a wake key.
+    for vk in 0x08..=0xFE {
+        if unsafe { GetAsyncKeyState(vk) } & 0x0001 != 0 {
+            pressed = true; // keep draining every flag, so nothing is reported twice
+        }
     }
-    info.dwTime
+    pressed
 }
 
 fn tick_count() -> u32 {
@@ -407,6 +425,8 @@ struct App {
     cfg: AppConfig,
     /// Tray menu item whose label flips between Pause/Resume.
     pause_item: tray_icon::menu::MenuItem,
+    /// Tray menu item that toggles idle mode (the escape hatch when the UI is unreachable).
+    idle_item: tray_icon::menu::MenuItem,
     /// Tray menu item that toggles the killswitch.
     kill_item: tray_icon::menu::MenuItem,
     /// Owned here so the icon can be swapped while the killswitch is active.
@@ -424,6 +444,8 @@ struct App {
     /// Tick count when idle mode started, so any later input dismisses it.
     idle_engage_tick: u32,
     idle_deadline: Option<Instant>,
+    /// Last "still idle" heartbeat, so the log proves the loop is alive while idle.
+    last_idle_beat: Option<Instant>,
     /// Pack search order (install folder first) — reused when packs are installed/removed.
     search: Vec<std::path::PathBuf>,
     /// Jobs to the pack worker (apply/revert).
@@ -850,6 +872,10 @@ impl App {
             return;
         }
         self.idle_engage_tick = tick_count();
+        self.last_idle_beat = Some(Instant::now());
+        // Drain the "pressed since last poll" flags so only keys pressed from now on wake us.
+        let _ = keyboard_pressed_since_last_poll();
+        self.idle_item.set_text("Wake up");
         self.idle_deadline = if self.cfg.idle_failsafe_enabled {
             Some(Instant::now() + Duration::from_secs(self.cfg.idle_failsafe_minutes.max(1) * 60))
         } else {
@@ -865,11 +891,14 @@ impl App {
 
     fn exit_idle(&mut self) {
         if !self.overlay.is_active() {
+            info!("idle mode is not up — nothing to leave");
             return;
         }
         overlay::hide(&mut self.overlay);
         let _ = std::fs::remove_file(overlay::marker_path());
         self.idle_deadline = None;
+        self.last_idle_beat = None;
+        self.idle_item.set_text("Idle mode");
         // Idle over: re-apply if a tracked app is running at this moment (decision B8).
         if let Some(t) = self.engine.set_idle(false) {
             info!("idle mode over: a tracked app is running, applying the packs again");
@@ -912,17 +941,29 @@ impl App {
     fn on_tick(&mut self) {
         if self.overlay.is_active() {
             overlay::pump();
-            // any input after we went idle dismisses the overlay
-            if last_input_tick().wrapping_sub(self.idle_engage_tick) > 0 {
-                info!("idle overlay dismissed by user input");
+            // A keypress ends idle (keyboard only — a mouse twitch must not wake an AFK session).
+            if keyboard_pressed_since_last_poll() {
+                info!("idle overlay dismissed by a keypress");
                 self.exit_idle();
-            } else if let Some(deadline) = self.idle_deadline {
-                if Instant::now() >= deadline {
-                    warn!(
-                        "idle failsafe fired after {} min — leaving idle mode",
-                        self.cfg.idle_failsafe_minutes
+            } else {
+                if self
+                    .last_idle_beat
+                    .map_or(true, |t| t.elapsed() >= Duration::from_secs(30))
+                {
+                    self.last_idle_beat = Some(Instant::now());
+                    info!(
+                        "idle overlay still on (engaged at tick {}) — waiting for a keypress or the failsafe",
+                        self.idle_engage_tick
                     );
-                    self.exit_idle();
+                }
+                if let Some(deadline) = self.idle_deadline {
+                    if Instant::now() >= deadline {
+                        warn!(
+                            "idle failsafe fired after {} min — leaving idle mode",
+                            self.cfg.idle_failsafe_minutes
+                        );
+                        self.exit_idle();
+                    }
                 }
             }
         }
@@ -1040,6 +1081,7 @@ impl App {
                 Request::SetPackEnabled { id, enabled } => self.set_pack_enabled(id, enabled),
                 Request::SetPackValue { id, key, value } => self.set_pack_value(id, key, value),
                 Request::SetIdle { active } => {
+                    info!("idle request from the UI: active={active}");
                     if active {
                         self.enter_idle();
                     } else {
@@ -1150,13 +1192,20 @@ impl App {
 // Win32 plumbing
 
 /// Drain and dispatch pending window messages (tray icon, hotkey, taskbar restarts).
+/// Bounded: a window that keeps re-posting messages (a missing ValidateRect, a menu loop) must
+/// never stop the main loop from draining pipe requests — that is exactly how the "Wake up
+/// button does nothing" bug happened on 2026-10-17.
 fn pump_win32_messages() {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
     };
     let mut msg: MSG = unsafe { std::mem::zeroed() };
-    unsafe {
-        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) != 0 {
+    for _ in 0..512 {
+        let got = unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) };
+        if got == 0 {
+            break;
+        }
+        unsafe {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

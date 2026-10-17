@@ -54,6 +54,13 @@ struct Shared {
     /// (dashboard rect, own size) the current position was computed for —
     /// lets the settings window follow the dashboard when it grows or moves.
     settings_anchor: Option<(Rect, egui::Vec2)>,
+    /// The size we last asked each child window to take, so content that appears later
+    /// (a new pack row, a longer message) can never be clipped.
+    settings_size: Option<egui::Vec2>,
+    pack_sizes: HashMap<String, egui::Vec2>,
+    /// When each pack window was asked for, so a viewport that never reports its size
+    /// still gets placed and shown instead of hanging invisibly.
+    pack_first_seen: HashMap<String, Instant>,
     /// Requests raised from child viewports, drained by the root App.
     outbox: Option<crossbeam_channel::Sender<Request>>,
     /// File dialogs started from a child viewport report back through this.
@@ -642,6 +649,19 @@ impl eframe::App for App {
             let mut set_value: Option<(String, String, String)> = None;
             for pack in &packs {
                 ui.horizontal(|ui| {
+                    if ui
+                        .small_button("‹")
+                        .on_hover_text("Open this pack's own window")
+                        .clicked()
+                    {
+                        let mut s = self.shared.lock().unwrap();
+                        if !s.open_packs.contains(&pack.id) {
+                            s.open_packs.push(pack.id.clone());
+                            s.pack_windows.remove(&pack.id);
+                            s.pack_first_seen.insert(pack.id.clone(), Instant::now());
+                            log::info!("pack window {} requested", pack.id);
+                        }
+                    }
                     let mut enabled = pack.enabled;
                     if ui
                         .checkbox(&mut enabled, "")
@@ -651,17 +671,6 @@ impl eframe::App for App {
                         set_enabled = Some((pack.id.clone(), enabled));
                     }
                     ui.label(&pack.name);
-                    if ui
-                        .small_button("›")
-                        .on_hover_text("Open this pack's own window")
-                        .clicked()
-                    {
-                        let mut s = self.shared.lock().unwrap();
-                        if !s.open_packs.contains(&pack.id) {
-                            s.open_packs.push(pack.id.clone());
-                            s.pack_windows.remove(&pack.id);
-                        }
-                    }
                     if pack.applied {
                         ui.small("· applied");
                     }
@@ -890,18 +899,52 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: 
         return;
     }
 
-    // auto-fit, then place once to the left of the core (never follows it afterwards)
-    let desired = (ui.min_rect().size() + egui::vec2(4.0, 4.0))
-        .max(egui::vec2(MIN_SETTINGS_WIDTH, 160.0));
+    // auto-fit from intrinsic text measurements (never from min_rect: a right-to-left row
+    // stretches min_rect to the available width, which would grow the window every frame).
+    let title_font = FontId::new(16.0, FontFamily::Proportional);
+    let body_font = TextStyle::Body.resolve(ui.style());
+    let desired = {
+        let p = ui.painter();
+        let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
+        let mut w = tw(&title_font, &pack.name) + 60.0; // title + close button
+        w = w.max(tw(&body_font, "Applies when a tracked app starts.") + 24.0);
+        if let Some(label) = &pack.setting_label {
+            w = w.max(tw(&body_font, label) + 24.0);
+        }
+        // the dropdown is 190 wide, plus its current text and the row padding
+        w = w.max(
+            tw(&body_font, pack.value.as_deref().unwrap_or("")) + 190.0 + 60.0,
+        );
+        egui::vec2(
+            (w + 2.0 * PAD_F + 8.0).max(MIN_SETTINGS_WIDTH),
+            (ui.min_rect().height() + 4.0).max(160.0),
+        )
+    };
     let ctx = ui.ctx();
     let mut s = shared.lock().unwrap();
-    let stage = s.pack_windows.get(id).map(|(st, _)| *st).unwrap_or(0);
-    match stage {
+    let stored = s.pack_windows.get(id).map(|(st, _)| *st).unwrap_or(0);
+    let size_changed = s
+        .pack_sizes
+        .get(id)
+        .map_or(true, |last| (*last - desired).length() > 0.5);
+    match stored {
         0 => {
             let current = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
             let settled = current.map_or(false, |c| (c - desired).length() <= 0.5);
+            // A viewport that never reports a size must not hang the window forever.
+            let waited = s
+                .pack_first_seen
+                .get(id)
+                .map(|t| t.elapsed())
+                .unwrap_or_default();
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-            if settled {
+            s.pack_sizes.insert(id.to_string(), desired);
+            if settled || waited > Duration::from_secs(2) {
+                log::info!(
+                    "pack window {id}: size settled at {:.0}x{:.0} (reported={settled})",
+                    desired.x,
+                    desired.y
+                );
                 s.pack_windows.insert(id.to_string(), (1, None));
             }
         }
@@ -910,13 +953,40 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, index: 
                 let pos = place_left(ctx, core, desired, index);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 s.pack_windows.insert(id.to_string(), (2, Some(pos)));
+                log::info!("pack window {id}: placed at {:.0},{:.0}", pos.x, pos.y);
             }
         }
         2 => {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             s.pack_windows.insert(id.to_string(), (3, None));
+            log::info!("pack window {id}: shown");
         }
-        _ => {}
+        _ => {
+            // Up and running: follow the content if it grows, and re-pin when that pushes the
+            // window off the work area (the same rule the settings window uses).
+            if size_changed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                s.pack_sizes.insert(id.to_string(), desired);
+                log::info!("pack window {id}: resized to {:.0}x{:.0}", desired.x, desired.y);
+                let target = s.pack_windows.get(id).and_then(|(_, p)| *p);
+                let off_screen = match (target, work_area_pts(ctx)) {
+                    (Some(p), Some((left, top, right, bottom))) => {
+                        p.x < left
+                            || p.y < top
+                            || p.x + desired.x > right
+                            || p.y + desired.y > bottom
+                    }
+                    _ => true,
+                };
+                if off_screen {
+                    if let Some(core) = s.core_rect {
+                        let pos = place_left(ctx, core, desired, index);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                        s.pack_windows.insert(id.to_string(), (3, Some(pos)));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1040,18 +1110,14 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
         ui.horizontal(|ui| {
             ui.label("Leave idle after");
-            for preset in [30u64, 60, 180, 360] {
-                if ui
-                    .selectable_label(fs_min == preset, format!("{preset}m"))
-                    .clicked()
-                {
-                    fs_min = preset;
-                    fs_changed = true;
-                }
-            }
             if ui
-                .add(egui::DragValue::new(&mut fs_min).range(1..=1440).suffix(" min"))
-                .on_hover_text("Or type any value from 1 to 1440 minutes")
+                .add(
+                    egui::DragValue::new(&mut fs_min)
+                        .range(1..=1440)
+                        .speed(1.0)
+                        .suffix(" min"),
+                )
+                .on_hover_text("Type any value from 1 to 1440 minutes")
                 .changed()
             {
                 fs_changed = true;
@@ -1185,11 +1251,15 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx();
     let mut s = shared.lock().unwrap();
     let expired = s.settings_deadline.map_or(true, |d| Instant::now() > d);
+    let size_changed = s
+        .settings_size
+        .map_or(true, |last| (last - desired).length() > 0.5);
     match s.settings_stage {
         0 => {
             let cur = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
             let settled = cur.map_or(false, |c| (c - desired).length() <= 0.5);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            s.settings_size = Some(desired);
             if settled || expired {
                 s.settings_stage = 1;
             }
@@ -1216,14 +1286,35 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             if placed || expired {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 s.settings_stage = 3;
-                log::info!("settings window shown");
+                log::info!("settings window shown ({:.0}x{:.0})", desired.x, desired.y);
             } else if let Some(t) = s.settings_target {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(t));
             }
         }
         _ => {
-            // Deliberately no tracking: a child window is positioned once when it opens
-            // and then stays where the user put it.
+            // The window is up. It stays where the user put it, EXCEPT when the content has
+            // grown: then it has to grow too, or the new rows are clipped out of sight.
+            if size_changed {
+                log::info!("settings window resized ({:.0}x{:.0})", desired.x, desired.y);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+                s.settings_size = Some(desired);
+                let off_screen = match (s.settings_target, work_area_pts(ctx)) {
+                    (Some(p), Some((left, top, right, bottom))) => {
+                        p.x < left
+                            || p.y < top
+                            || p.x + desired.x > right
+                            || p.y + desired.y > bottom
+                    }
+                    _ => true,
+                };
+                if off_screen {
+                    if let Some(core) = s.core_rect {
+                        let pos = above_core(ctx, core, desired);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                        s.settings_target = Some(pos);
+                    }
+                }
+            }
         }
     }
     drop(s);
@@ -1665,23 +1756,29 @@ fn bottom_corner(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 {
     egui::pos2(x, y)
 }
 
-/// Position a window above the core window, right edges aligned. If there is no room above,
-/// or the window is taller than the space left, it is pushed back into the work area.
+/// Position the settings window: above the core (right edges aligned) when it fits, otherwise
+/// bottom-aligned to the LEFT of the core, and only overlapping the core as a last resort.
+/// It must never sit on top of the dashboard: the dashboard's body holds the Idle/Wake button.
 fn above_core(ctx: &egui::Context, core: Rect, size: egui::Vec2) -> egui::Pos2 {
     let gap = 8.0;
-    let x = core.right() - size.x;
-    let mut y = core.top() - gap - size.y;
-    if let Some((left, top, right, bottom)) = work_area_pts(ctx) {
-        let margin = 6.0;
-        if y < top + margin {
-            y = core.bottom() + gap; // fall back to below the core
-        }
-        if y + size.y > bottom - margin {
-            // still off-screen (e.g. a tall settings window at the bottom of the desktop)
-            y = (bottom - size.y - margin).max(top + margin);
-        }
-        let x = x.max(left + margin).min(right - size.x - margin);
-        return egui::pos2(x, y);
+    let margin = 6.0;
+    let Some((left, top, right, bottom)) = work_area_pts(ctx) else {
+        return egui::pos2(core.right() - size.x, core.top() - gap - size.y);
+    };
+    let x = (core.right() - size.x).max(left + margin).min(right - size.x - margin);
+
+    let y_above = core.top() - gap - size.y;
+    if y_above >= top + margin {
+        return egui::pos2(x, y_above); // fits above, right edges aligned
     }
-    egui::pos2(x, y)
+    let x_left = core.left() - gap - size.x;
+    if x_left >= left + margin {
+        let y = (core.bottom() - size.y).max(top + margin).min(bottom - size.y - margin);
+        return egui::pos2(x_left, y); // no room above: to the left, bottom-aligned
+    }
+    // nowhere better: keep it inside the work area (it may overlap the core)
+    egui::pos2(
+        x,
+        (bottom - size.y - margin).max(top + margin),
+    )
 }
