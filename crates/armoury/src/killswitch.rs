@@ -7,8 +7,8 @@ use log::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::core::{BOOL, Interface};
 use windows::Win32::Media::Audio::{
-    IAudioSessionControl, IAudioSessionControl2, IAudioSessionEnumerator, IAudioSessionManager2,
-    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eMultimedia, eRender,
+    DEVICE_STATE_ACTIVE, IAudioSessionControl, IAudioSessionControl2, IAudioSessionManager2,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eRender,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
@@ -130,26 +130,47 @@ fn windows_of(pid: u32) -> Vec<isize> {
     ctx.out
 }
 
-fn sessions() -> Option<IAudioSessionEnumerator> {
+/// Every audio session on every active output device (an app can play to a device
+/// that is not the default one).
+fn sessions() -> Vec<IAudioSessionControl> {
+    let mut out = Vec::new();
     unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
-        let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None).ok()?;
-        manager.GetSessionEnumerator().ok()
-    }
-}
-
-/// Mute/unmute every audio session of a process. Returns the previous mute state.
-fn set_mute(pid: u32, mute: bool) -> Option<bool> {
-    unsafe {
-        let list = sessions()?;
-        let count = list.GetCount().ok()?;
-        let mut previous = None;
-        for index in 0..count {
-            let Ok(control) = list.GetSession(index) else {
+        let Ok(enumerator) =
+            CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else {
+            return out;
+        };
+        let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+            return out;
+        };
+        let device_count = collection.GetCount().unwrap_or(0);
+        for index in 0..device_count {
+            let Ok(device) = collection.Item(index) else {
                 continue;
             };
+            let Ok(manager) = device.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None) else {
+                continue;
+            };
+            let Ok(list) = manager.GetSessionEnumerator() else {
+                continue;
+            };
+            let session_count = list.GetCount().unwrap_or(0);
+            for session_index in 0..session_count {
+                if let Ok(control) = list.GetSession(session_index) {
+                    out.push(control);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Mute/unmute every audio session of a process across **all** output devices.
+/// Returns the previous mute state of the last session it touched.
+fn set_mute(pid: u32, mute: bool) -> Option<bool> {
+    let mut previous = None;
+    for control in sessions() {
+        unsafe {
             let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
                 continue;
             };
@@ -164,27 +185,24 @@ fn set_mute(pid: u32, mute: bool) -> Option<bool> {
                 if was != mute {
                     if let Err(e) = volume.SetMute(mute, std::ptr::null()) {
                         warn!("SetMute failed for pid {pid}: {e}");
+                    } else {
+                        info!("killswitch: pid {pid} session {}", if mute { "muted" } else { "unmuted" });
                     }
                 }
                 previous = Some(previous.unwrap_or(was));
             }
         }
-        if previous.is_none() {
-            info!("killswitch: no audio session for pid {pid} (nothing to mute)");
-        }
-        previous
     }
+    if previous.is_none() {
+        info!("killswitch: no audio session for pid {pid} (nothing to mute)");
+    }
+    previous
 }
 
 /// Mute state of a process's sessions (for tests / diagnostics).
 pub fn current_mute(pid: u32) -> Option<bool> {
-    unsafe {
-        let list = sessions()?;
-        let count = list.GetCount().ok()?;
-        for index in 0..count {
-            let Ok(control) = list.GetSession(index) else {
-                continue;
-            };
+    for control in sessions() {
+        unsafe {
             let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
                 continue;
             };
@@ -196,8 +214,8 @@ pub fn current_mute(pid: u32) -> Option<bool> {
             };
             return volume.GetMute().ok().map(|b| b.as_bool());
         }
-        None
     }
+    None
 }
 
 /// Keep the compiler honest about the interface imports we rely on.
