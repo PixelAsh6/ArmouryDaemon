@@ -599,14 +599,21 @@ impl eframe::App for App {
                 // Type here: matching running apps appear right below (no popup to open). A text
                 // field inside a ComboBox popup lost focus when clicked, so the search lives here
                 // and the results are inline (user request 2026-10-18).
+                // The field takes what the dropdown and Browse leave over, so the row stays
+                // inside the window border (fixed widths used to overflow it).
+                let spacing = ui.spacing().item_spacing.x;
+                let combo_w = 96.0;
+                let browse_w = 76.0;
+                let field_w =
+                    (ui.available_width() - combo_w - browse_w - 2.0 * spacing).max(140.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.pick_query)
                         .hint_text("type to search running apps…")
-                        .desired_width(210.0),
+                        .desired_width(field_w),
                 );
                 egui::ComboBox::from_id_salt("pick-app")
                     .selected_text("All apps…")
-                    .width(110.0)
+                    .width(combo_w)
                     .show_ui(ui, |ui| {
                         let mut all: Vec<(String, String, String)> = Vec::new();
                         for (title, exe) in &self.apps {
@@ -626,7 +633,13 @@ impl eframe::App for App {
                             }
                         }
                     });
-                if ui.button("Browse…").clicked() {
+                if ui
+                    .add_sized(
+                        [browse_w, ui.spacing().interact_size.y],
+                        egui::Button::new("Browse…"),
+                    )
+                    .clicked()
+                {
                     spawn_picker(self.pick_tx.clone(), Picker::TrackedApp);
                 }
             });
