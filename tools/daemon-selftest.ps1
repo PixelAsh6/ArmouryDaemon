@@ -243,7 +243,48 @@ try {
     $s = Wait-State 'idle' 10
     Check 'churn settles back to idle' ($s.state -eq 'idle') "state=$($s.state)"
     Check 'churn leaves no countdown behind' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
+    # ---- 16. a spec-2 pack: the daemon compiles and runs its script ----
+    $srcDir = Join-Path $env:TEMP "armoury-scriptpack-$ns"
+    New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+    $scriptPack = @'
+{
+  "spec": 2,
+  "id": "scripttest",
+  "name": "Script test",
+  "version": "1.0.0",
+  "order": 5,
+  "targets": { "process": ["timeout.exe"] },
+  "capture": [ { "key": "was_running", "mechanism": "process_running" } ],
+  "script": {
+    "apply":  "ctx.log(\"script apply ran for \" + ctx.target_name()); ctx.capture(\"note\", \"from the script\");",
+    "revert": "ctx.log(\"script revert ran\");"
+  },
+  "apply": { "steps": [] },
+  "revert": { "guard": { "targetRunning": false, "capturedRunning": true }, "steps": [] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $srcDir 'pack.json'), $scriptPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($srcDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a spec-2 pack installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"set_pack_enabled","id":"scripttest","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p6 = Start-Process 'C:\Windows\System32\timeout.exe' -ArgumentList '40' -PassThru -WindowStyle Hidden
+    $s = Wait-State 'triggered' 6
+    Start-Sleep -Milliseconds 800
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the apply script ran' ($logText -match 'script apply ran for timeout.exe') "no script log line"
+    Check 'the apply script finished' ($logText -match 'scripttest: script apply finished')
+    $p6 | Stop-Process -Force
+    $s = Wait-State 'idle' 10
+    Start-Sleep -Milliseconds 500
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the revert script ran' ($logText -match 'script revert ran')
+    Send-Pipe '{"type":"set_pack_enabled","id":"scripttest","enabled":false}' | Out-Null
+    $op = Send-And-Wait '{"type":"remove_pack","id":"scripttest"}' 'pack_op'
+    Check 'the scripted pack removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Remove-Item -Recurse -Force $srcDir -ErrorAction SilentlyContinue
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {

@@ -30,13 +30,33 @@ pub struct Pack {
     #[serde(default = "default_order")]
     pub order: i32,
     pub targets: Targets,
-    /// Exactly one dropdown in v1.
+    /// Up to four dropdowns (the first one is the primary action).
     #[serde(default)]
     pub settings: Vec<Setting>,
     #[serde(default)]
     pub capture: Vec<CaptureStep>,
+    /// Spec 2: a script per block, run by the daemon after the steps (Rhai, sandboxed).
+    #[serde(default)]
+    pub script: PackScript,
     pub apply: StepBlock,
     pub revert: StepBlock,
+}
+
+/// Scripted blocks (spec 2). The pack carries the source; the daemon interprets it against a
+/// whitelisted host API — a pack never executes anything by itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PackScript {
+    #[serde(default)]
+    pub apply: Option<String>,
+    #[serde(default)]
+    pub revert: Option<String>,
+}
+
+impl PackScript {
+    pub fn is_empty(&self) -> bool {
+        self.apply.as_deref().map_or(true, |s| s.trim().is_empty())
+            && self.revert.as_deref().map_or(true, |s| s.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,8 +284,17 @@ impl Pack {
     /// Human-readable problems; an empty list means the pack is valid.
     pub fn validate(&self) -> Vec<String> {
         let mut errs = Vec::new();
-        if self.spec != 1 {
-            errs.push(format!("unsupported spec {} (expected 1)", self.spec));
+        if self.spec != 1 && self.spec != 2 {
+            errs.push(format!(
+                "unsupported spec {} (expected 1 = data only, 2 = data + script)",
+                self.spec
+            ));
+        }
+        if !self.script.is_empty() && self.spec != 2 {
+            errs.push("a pack with a script must declare \"spec\": 2".into());
+        }
+        if self.script.is_empty() && self.spec == 2 {
+            errs.push("\"spec\": 2 needs a script block (apply and/or revert)".into());
         }
         if self.id.trim().is_empty() {
             errs.push("id must not be empty".into());
@@ -309,9 +338,12 @@ impl Pack {
                 errs.push(format!("capture '{}': json_file needs a path", c.key));
             }
         }
-        for (block, steps) in [("apply", &self.apply.steps), ("revert", &self.revert.steps)] {
-            if steps.is_empty() {
-                errs.push(format!("{block}: must have at least one step"));
+        for (block, steps, script) in [
+            ("apply", &self.apply.steps, &self.script.apply),
+            ("revert", &self.revert.steps, &self.script.revert),
+        ] {
+            if steps.is_empty() && script.as_deref().map_or(true, |s| s.trim().is_empty()) {
+                errs.push(format!("{block}: needs steps or a script"));
             }
             for (i, step) in steps.iter().enumerate() {
                 if !ALLOWED_MECHANISMS.contains(&step.mechanism.as_str()) {
@@ -508,6 +540,35 @@ mod tests {
             .validate()
             .iter()
             .any(|e| e.contains("needs an exe_map")));
+    }
+
+    #[test]
+    fn spec_2_packs_may_carry_a_script() {
+        let text = r#"{ "spec": 2, "id": "s2", "name": "Scripted",
+            "targets": {"process":["x.exe"]},
+            "script": { "apply": "ctx.log(\"hi\");", "revert": "ctx.log(\"bye\");" },
+            "apply": { "steps": [] }, "revert": { "steps": [] } }"#;
+        let pack = Pack::parse(text).expect("a spec-2 pack with scripts is valid");
+        assert!(!pack.script.is_empty());
+
+        // a script on a spec-1 pack is refused
+        let mut p = pack.clone();
+        p.spec = 1;
+        assert!(p.validate().iter().any(|e| e.contains("must declare")));
+
+        // spec 2 without any script is pointless and refused
+        let mut p = pack.clone();
+        p.script = Default::default();
+        assert!(p.validate().iter().any(|e| e.contains("needs a script block")));
+
+        // every block needs steps or a script (build it from a valid pack: parse rejects invalid ones)
+        let mut p = pack.clone();
+        p.script.revert = None;
+        p.revert.steps.clear();
+        assert!(p
+            .validate()
+            .iter()
+            .any(|e| e.contains("revert: needs steps or a script")));
     }
 
     #[test]

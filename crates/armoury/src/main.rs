@@ -11,6 +11,7 @@ mod ipc;
 mod killswitch;
 mod overlay;
 mod packs;
+mod script;
 mod ui;
 mod watch;
 

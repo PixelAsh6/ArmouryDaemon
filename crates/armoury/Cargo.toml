@@ -19,3 +19,4 @@ global-hotkey.workspace = true
 windows.workspace = true
 windows-sys.workspace = true
 eframe.workspace = true
+rhai.workspace = true

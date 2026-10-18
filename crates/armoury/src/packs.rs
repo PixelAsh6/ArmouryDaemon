@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::script;
+
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -52,6 +54,11 @@ pub struct PackOutcome {
     pub failed: Vec<(String, String)>,
 }
 
+/// Text files written on Windows often start with a UTF-8 BOM; serde_json rejects it.
+fn strip_bom(text: &str) -> &str {
+    text.trim_start_matches('\u{feff}')
+}
+
 pub fn load(search_dirs: &[PathBuf]) -> Vec<Installed> {
     let mut found: Vec<Installed> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -70,8 +77,12 @@ pub fn load(search_dirs: &[PathBuf]) -> Vec<Installed> {
                 warn!("cannot read {}", manifest.display());
                 continue;
             };
-            match Pack::parse(&text) {
+            match Pack::parse(strip_bom(&text)) {
                 Ok(pack) => {
+                    if let Err(e) = check_scripts(&pack) {
+                        warn!("pack {} rejected: {e}", manifest.display());
+                        continue;
+                    }
                     if seen.contains(&pack.id) {
                         continue; // a pack in an earlier search dir wins
                     }
@@ -207,16 +218,39 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
             continue;
         }
 
-        // Past the guards: this pack's captures belong in the journal.
-        if job.apply {
-            captured_out.insert(pack.id.clone(), ctx.captured.clone());
+        let setting_key = pack.settings.first().map(|s| s.key.as_str());
+        let mut result = run_block(block, &ctx, setting_key);
+
+        // Spec 2: the block's script runs after its steps, in the same context. A script may
+        // capture values; they are journalled below together with the step captures.
+        let script_src = if job.apply {
+            pack.script.apply.as_deref()
+        } else {
+            pack.script.revert.as_deref()
+        };
+        if let Some(src) = script_src.filter(|s| !s.trim().is_empty()) {
+            match script::run(src, &mut ctx) {
+                Ok(lines) => {
+                    if let Ok(done) = &mut result {
+                        done.extend(lines);
+                    }
+                    info!("{}: script {} finished", pack.id, if job.apply { "apply" } else { "revert" });
+                }
+                Err(e) => {
+                    warn!("{}: script {} failed: {e}", pack.id, if job.apply { "apply" } else { "revert" });
+                    match &mut result {
+                        Ok(_) => result = Err(e),
+                        Err(previous) => previous.push_str(&format!("; {e}")),
+                    }
+                }
+            }
         }
 
-        let setting_key = pack.settings.first().map(|s| s.key.as_str());
-        let result = run_block(block, &ctx, setting_key);
+        // Past the guards: this pack's captures (steps and/or script) belong in the journal.
         if job.apply {
-            // "applied" means the block was started. A pack that failed on its second step has
-            // already changed the machine, so it must be journalled (and reverted) like any other.
+            captured_out.insert(pack.id.clone(), ctx.captured.clone());
+            // "applied" means the block was started. A pack that failed halfway has already changed
+            // the machine, so it must be journalled (and reverted) like any other.
             applied_ids.push(pack.id.clone());
         }
         match result {
@@ -734,7 +768,9 @@ pub fn install_from_path(search_dirs: &[PathBuf], source: &Path) -> Result<(Stri
     }
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let text = strip_bom(&text).to_string();
     let pack = Pack::parse(&text)?; // validates spec/settings/steps
+    check_scripts(&pack)?;          // a scripted pack must compile before it lands on disk
 
     let root = packs_root(search_dirs);
     let target = root.join(&pack.id);
@@ -880,6 +916,43 @@ fn json_pointer(path: &str, pointer: &str) -> Option<String> {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Host API for scripts (spec 3) and the load-time script check
+
+/// `ctx.run_cli(exe, args)` — same rules as a `cli` step: direct spawn, no shell.
+pub(crate) fn script_cli(exe: &str, args: &[String]) -> Result<(), String> {
+    run_cli(exe, args, None)
+}
+
+pub(crate) fn script_process_running(name: &str) -> bool {
+    snapshot_targets().contains_key(&name.to_ascii_lowercase())
+}
+
+pub(crate) fn script_process_kill(name: &str) -> Result<(), String> {
+    kill_by_name(&name.to_ascii_lowercase())
+}
+
+pub(crate) fn script_process_start(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("process_start: empty path".into());
+    }
+    start_process(path)
+}
+
+pub(crate) fn script_json_pointer(path: &str, pointer: &str) -> Option<String> {
+    json_pointer(path, pointer)
+}
+
+/// Reject a pack whose scripts do not compile, before it is loaded or installed.
+fn check_scripts(pack: &Pack) -> Result<(), String> {
+    for (block, src) in [("apply", &pack.script.apply), ("revert", &pack.script.revert)] {
+        if let Some(src) = src.as_deref().filter(|s| !s.trim().is_empty()) {
+            script::compile(src).map_err(|e| format!("{block} {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// exe file name (lowercase) -> (full path, pid) for every process we can query.
