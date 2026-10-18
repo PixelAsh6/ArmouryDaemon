@@ -61,6 +61,32 @@ function Status {
     return ($json | ConvertFrom-Json).status
 }
 
+# The daemon answers a request on the same connection, but status broadcasts can arrive first:
+# read lines until the expected message type shows up.
+function Send-And-Wait([string]$json, [string]$wantType, [int]$timeoutMs = 4000) {
+    try {
+        $p = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+        $p.Connect(2000)
+        $w = New-Object System.IO.StreamWriter($p); $w.AutoFlush = $true
+        $r = New-Object System.IO.StreamReader($p)
+        $w.WriteLine($json)
+        $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+        while ((Get-Date) -lt $deadline) {
+            $t = $r.ReadLineAsync()
+            if (-not $t.Wait(500)) { continue }
+            if (-not $t.Result) { break }
+            $msg = $t.Result | ConvertFrom-Json
+            if ($msg.type -eq $wantType) { $p.Dispose(); return $msg }
+        }
+        $p.Dispose()
+        return $null
+    } catch {
+        return $null
+    } finally {
+        if ($p) { $p.Dispose() }
+    }
+}
+
 function Wait-State([string]$want, [int]$timeoutSec = 6) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -150,7 +176,58 @@ try {
     # ---- 10. config lives in the throw-away folder, not in %APPDATA% ----
     $tempConfig = Join-Path $configDir 'config.json'
     Check 'the test instance used its own config folder' (Test-Path $tempConfig) "expected $tempConfig"
-    Check 'the real config was not touched' (-not (Test-Path (Join-Path $env:APPDATA 'ArmouryDaemon\config.json-test')))
+
+    # ---- 11. settings persist to that config file ----
+    Send-Pipe '{"type":"set_cooldown","seconds":25}' | Out-Null
+    Send-Pipe '{"type":"set_ui_position","x":123.5,"y":-45.0}' | Out-Null
+    Start-Sleep -Milliseconds 400
+    $saved = Get-Content $tempConfig -Raw | ConvertFrom-Json
+    Check 'cooldown persisted' ($saved.cooldown_seconds -eq 25) "got $($saved.cooldown_seconds)"
+    Check 'dashboard position persisted' (($saved.ui_position[0] -eq 123.5) -and ($saved.ui_position[1] -eq -45.0)) "got $($saved.ui_position)"
+
+    # ---- 12. install / remove a pack, strictly inside the build folder ----
+    # packs_root = the first search dir that has a "packs" folder. Creating it beside the test exe
+    # guarantees install/remove can never touch the repository (that mistake deleted a repo pack
+    # once; the check below guards it).
+    $buildPacks = Join-Path (Split-Path $Exe) 'packs'
+    $script:buildPacksExisted = Test-Path $buildPacks
+    New-Item -ItemType Directory -Force -Path $buildPacks | Out-Null
+    $packSource = (Resolve-Path (Join-Path $PSScriptRoot '..\packs\rainmeter\pack.json')).Path
+    $installedDir = Join-Path $buildPacks 'rainmeter'
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($packSource.Replace('\','\\'))`"}" 'pack_op'
+    Check 'install reports success' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'install copied the pack into the build folder' (Test-Path (Join-Path $installedDir 'pack.json')) "expected $installedDir"
+    Check 'install did not touch the repo' (Test-Path $packSource) "missing: $packSource"
+    $op = Send-And-Wait '{"type":"remove_pack","id":"rainmeter"}' 'pack_op'
+    Check 'remove reports success' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'remove deleted the build copy' (-not (Test-Path $installedDir)) "still there: $installedDir"
+    Check 'the repo copy still exists after remove' (Test-Path $packSource) "missing: $packSource"
+
+    # ---- 13. pause is remembered across a restart (and the engine starts frozen) ----
+    Send-Pipe '{"type":"set_paused","paused":true}' | Out-Null
+    Start-Sleep -Milliseconds 300
+    $daemon | Stop-Process -Force
+    Start-Sleep -Seconds 1
+    $daemon = Start-Process $Exe -PassThru -WindowStyle Hidden
+    $s = $null
+    for ($i = 0; $i -lt 40 -and -not $s; $i++) { Start-Sleep -Milliseconds 250; $s = Status }
+    Check 'restarted instance answers' ($null -ne $s)
+    Check 'paused survives a restart' ($s.paused) "paused=$($s.paused)"
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p5 = Start-Process 'C:\Windows\System32\timeout.exe' -ArgumentList '20' -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    $s = Status
+    Check 'a paused restart does not apply on start' ($s.state -eq 'idle') "state=$($s.state)"
+    $p5 | Stop-Process -Force
+    Send-Pipe '{"type":"set_paused","paused":false}' | Out-Null
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+
+    # ---- 14. a second instance with the same namespace leaves the first alone ----
+    $second = Start-Process $Exe -ArgumentList '--autostart' -PassThru -WindowStyle Hidden
+    $exited = $second.WaitForExit(5000)
+    Check 'a duplicate start exits by itself' $exited "still running after 5 s"
+    Check 'the first instance is still up' (-not $daemon.HasExited)
+    Check 'the real config was not touched at all' (-not (Test-Path (Join-Path $env:APPDATA 'ArmouryDaemon\config.json-test')))
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {
@@ -158,6 +235,10 @@ finally {
     }
     Get-Process -Name timeout -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-5) } | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
+    # only remove the build-folder packs dir if this run created it
+    if (-not $script:buildPacksExisted) {
+        Remove-Item -Recurse -Force (Join-Path (Split-Path $Exe) 'packs') -ErrorAction SilentlyContinue
+    }
     Remove-Item Env:\ARMOURY_TEST_NS -ErrorAction SilentlyContinue
 }
 
