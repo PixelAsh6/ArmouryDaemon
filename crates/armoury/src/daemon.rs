@@ -371,7 +371,7 @@ fn make_tray_icon_active() -> tray_icon::Icon {
 
 /// Where packs are looked for: beside the executable first (the install folder), then the
 /// repository root for a dev build (`<repo>/target/release/ArmouryDaemon.exe`).
-fn pack_search_dirs() -> Vec<std::path::PathBuf> {
+pub(crate) fn pack_search_dirs() -> Vec<std::path::PathBuf> {
     let mut search: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {

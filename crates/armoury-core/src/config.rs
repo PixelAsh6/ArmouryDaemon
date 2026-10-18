@@ -20,6 +20,9 @@ pub struct AppConfig {
     /// Where the dashboard was last left (logical points); `None` = the default bottom corner.
     #[serde(default)]
     pub ui_position: Option<[f32; 2]>,
+    /// Pack catalog manifest URL; `None` = the official catalog.
+    #[serde(default)]
+    pub catalog_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -42,6 +45,7 @@ impl Default for AppConfig {
             idle_failsafe_enabled: true,
             idle_failsafe_minutes: 180,
             ui_position: None,
+            catalog_url: None,
         }
     }
 }

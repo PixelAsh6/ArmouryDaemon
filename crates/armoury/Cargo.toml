@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 armoury-core.workspace = true
 log.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 crossbeam-channel.workspace = true
 interprocess.workspace = true
@@ -20,3 +21,5 @@ windows.workspace = true
 windows-sys.workspace = true
 eframe.workspace = true
 rhai.workspace = true
+ureq.workspace = true
+sha2.workspace = true

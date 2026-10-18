@@ -10,6 +10,7 @@ use log::{info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::script;
 
@@ -19,6 +20,13 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How soon after a revert an apply may reuse that revert's captured values instead of reading
+/// them again from disk. The controlled apps write their config with a delay (G-Helper: ~2 s), so a
+/// capture taken right after our own revert reads our own change back as "the state before".
+const CARRY_WINDOW: Duration = Duration::from_secs(10);
+
+type CaptureMap = HashMap<String, HashMap<String, String>>;
 
 pub struct Installed {
     pub pack: Pack,
@@ -113,8 +121,11 @@ pub fn start(
 ) {
     std::thread::spawn(move || {
         info!("pack worker started with {} pack(s)", packs.len());
+        // The previous successful revert's captured values, kept for a short window: an apply that
+        // follows it must restore *those*, not re-read a file the app has not rewritten yet.
+        let mut carry: Option<(Instant, CaptureMap)> = None;
         while let Ok(job) = jobs.recv() {
-            let outcome = run_job(&packs, &job);
+            let outcome = run_job(&packs, &job, &mut carry);
             let _ = outcomes.send(outcome);
             if wake != 0 {
                 unsafe { windows_sys::Win32::System::Threading::SetEvent(wake as _) };
@@ -124,12 +135,14 @@ pub fn start(
     });
 }
 
-fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
+fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, CaptureMap)>) -> PackOutcome {
     let targets = snapshot_targets();
     let mut strings: Vec<String> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
     let mut applied_ids: Vec<String> = Vec::new();
-    let mut captured_out: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut captured_out: CaptureMap = HashMap::new();
+    let mut reverted_captures: CaptureMap = HashMap::new();
+    let mut reused_carry = false;
 
     // apply ascending order, revert descending
     let ordered: Vec<&Installed> = if job.apply {
@@ -174,24 +187,43 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
         // or steps using it would see an empty value and refuse to run.
         fill_defaults(&mut ctx.settings, pack);
 
-        // Apply captures live; a revert replays what the matching apply captured.
+        // Apply captures live — except a file read right after our own revert (see CARRY_WINDOW):
+        // that app writes its config with a delay, so the read would record our own change as the
+        // state before. A revert replays what the matching apply captured.
         if job.apply {
             for step in &pack.capture {
-                let value = match step.mechanism.as_str() {
-                    "process_running" => {
-                        if target_exe.is_empty() { "0" } else { "1" }.to_string()
+                let carried = carry
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() <= CARRY_WINDOW)
+                    .and_then(|(_, caps)| caps.get(&pack.id))
+                    .and_then(|map| map.get(&step.key))
+                    .cloned()
+                    .filter(|_| step.mechanism == "json_file");
+                let value = match carried {
+                    Some(value) => {
+                        reused_carry = true;
+                        info!(
+                            "{}: reusing the capture for {} from the revert just before (that app writes its config with a delay)",
+                            pack.id, step.key
+                        );
+                        value
                     }
-                    "target_path" => target_exe.clone(),
-                    "json_file" => step
-                        .path
-                        .as_deref()
-                        .map(expand_env)
-                        .and_then(|p| json_pointer(&p, step.pointer.as_deref().unwrap_or("/")))
-                        .unwrap_or_default(),
-                    other => {
-                        warn!("{}: unknown capture mechanism '{other}'", pack.id);
-                        String::new()
-                    }
+                    None => match step.mechanism.as_str() {
+                        "process_running" => {
+                            if target_exe.is_empty() { "0" } else { "1" }.to_string()
+                        }
+                        "target_path" => target_exe.clone(),
+                        "json_file" => step
+                            .path
+                            .as_deref()
+                            .map(expand_env)
+                            .and_then(|p| json_pointer(&p, step.pointer.as_deref().unwrap_or("/")))
+                            .unwrap_or_default(),
+                        other => {
+                            warn!("{}: unknown capture mechanism '{other}'", pack.id);
+                            String::new()
+                        }
+                    },
                 };
                 ctx.captured.insert(step.key.clone(), value);
             }
@@ -255,6 +287,11 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
         }
         match result {
             Ok(lines) => {
+                if !job.apply {
+                    // a successful revert leaves the machine in the state the revert restored;
+                    // remember what that was for an apply that follows soon after
+                    reverted_captures.insert(pack.id.clone(), ctx.captured.clone());
+                }
                 for l in lines {
                     strings.push(format!("{}: {l}", pack.id));
                 }
@@ -270,6 +307,15 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
                 failed.push((pack.id.clone(), e));
             }
         }
+    }
+
+    // Carry the revert's values forward for a short window; a used carry is spent (one-shot).
+    if job.apply {
+        if reused_carry {
+            *carry = None;
+        }
+    } else if !reverted_captures.is_empty() {
+        *carry = Some((Instant::now(), reverted_captures));
     }
 
     PackOutcome {
@@ -768,7 +814,20 @@ pub fn install_from_path(search_dirs: &[PathBuf], source: &Path) -> Result<(Stri
     }
     let text = std::fs::read_to_string(&manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
-    let text = strip_bom(&text).to_string();
+    install_text(search_dirs, &text)
+}
+
+/// Install a pack from raw JSON bytes (the catalog path — the bytes were verified against the
+/// manifest just before). Validation and writing are identical to a local file.
+pub fn install_from_bytes(install_dirs: &[PathBuf], bytes: &[u8]) -> Result<(String, bool), String> {
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|e| format!("the pack is not UTF-8 text ({e})"))?;
+    install_text(install_dirs, &text)
+}
+
+/// Install a pack from its JSON text.
+pub fn install_text(search_dirs: &[PathBuf], text: &str) -> Result<(String, bool), String> {
+    let text = strip_bom(text).to_string();
     let pack = Pack::parse(&text)?; // validates spec/settings/steps
     check_scripts(&pack)?;          // a scripted pack must compile before it lands on disk
 
@@ -1301,6 +1360,104 @@ mod tests {
         )
         .unwrap();
         assert!(journal_pending_revert_in(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pack whose "before" state lives in a file (like G-Helper's config), plus a harmless step.
+    fn carry_test_packs(dir: &Path, config_text: &str) -> Vec<Installed> {
+        let cfg = dir.join("ghelper.json");
+        std::fs::write(&cfg, config_text).unwrap();
+        // JSON strings cannot carry Windows backslashes unescaped; forward slashes work fine here
+        let cfg_path = cfg.display().to_string().replace('\\', "/");
+        let json = format!(
+            r#"{{
+  "spec": 1, "id": "carry-test", "name": "Carry test", "version": "1.0.0", "order": 1,
+  "targets": {{ "process": ["carry-test-target.exe"] }},
+  "settings": [
+    {{ "key": "mode", "label": "Mode", "type": "enum", "values": ["Turbo", "Silent"], "default": "Turbo" }}
+  ],
+  "capture": [
+    {{ "key": "prev_mode", "mechanism": "json_file", "path": "{cfg_path}", "pointer": "/performance_mode" }},
+    {{ "key": "was_running", "mechanism": "process_running" }}
+  ],
+  "apply": {{ "guard": {{ "targetRunning": true }},
+              "steps": [ {{ "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] }} ] }},
+  "revert": {{ "guard": {{ "targetRunning": false }},
+               "steps": [ {{ "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] }} ] }}
+}}"#
+        );
+        let pack = Pack::parse(&json).expect("the carry-test pack must be valid");
+        vec![Installed { pack }]
+    }
+
+    fn carry_job(apply: bool) -> PackJob {
+        PackJob {
+            apply,
+            tag: None,
+            enabled: HashMap::from([("carry-test".to_string(), true)]),
+            values: HashMap::new(),
+            captured: if apply {
+                HashMap::new()
+            } else {
+                HashMap::from([(
+                    "carry-test".to_string(),
+                    HashMap::from([
+                        ("prev_mode".to_string(), "2".to_string()),
+                        ("was_running".to_string(), "1".to_string()),
+                    ]),
+                )])
+            },
+        }
+    }
+
+    #[test]
+    fn an_apply_right_after_a_revert_reuses_the_reverts_capture() {
+        let dir = scratch_install("carry");
+        std::fs::create_dir_all(&dir).unwrap();
+        // the file already shows OUR change - in real life the app writes it with a ~2 s delay
+        let packs = carry_test_packs(&dir, r#"{"performance_mode": 1}"#);
+        let mut carry: Option<(Instant, CaptureMap)> = None;
+
+        // 1. the revert (as at startup) restores Silent; that is the truth to carry forward
+        let outcome = run_job(&packs, &carry_job(false), &mut carry);
+        assert!(carry.is_some(), "a successful revert must be kept for a following apply");
+        assert!(!outcome.applied);
+
+        // 2. an apply a moment later must journal Silent ("2"), not the file's own echo ("1")
+        let outcome = run_job(&packs, &carry_job(true), &mut carry);
+        let captured = outcome
+            .captured
+            .get("carry-test")
+            .expect("apply captures are journalled");
+        assert_eq!(captured.get("prev_mode").map(String::as_str), Some("2"));
+        // process state is a live fact, not something to carry
+        assert_eq!(captured.get("was_running").map(String::as_str), Some("0"));
+        assert!(carry.is_none(), "a used carry is spent");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_carry_is_ignored() {
+        let dir = scratch_install("carry-old");
+        std::fs::create_dir_all(&dir).unwrap();
+        let packs = carry_test_packs(&dir, r#"{"performance_mode": 1}"#);
+        // a carry from one second past the window must not be believed
+        let mut carry: Option<(Instant, CaptureMap)> = Some((
+            Instant::now() - CARRY_WINDOW - Duration::from_secs(1),
+            HashMap::from([(
+                "carry-test".to_string(),
+                HashMap::from([("prev_mode".to_string(), "2".to_string())]),
+            )]),
+        ));
+
+        let outcome = run_job(&packs, &carry_job(true), &mut carry);
+        let captured = outcome.captured.get("carry-test").unwrap();
+        assert_eq!(
+            captured.get("prev_mode").map(String::as_str),
+            Some("1"),
+            "outside the window the file is the only truth"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
