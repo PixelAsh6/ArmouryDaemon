@@ -222,12 +222,28 @@ try {
     Send-Pipe '{"type":"set_paused","paused":false}' | Out-Null
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
 
-    # ---- 14. a second instance with the same namespace leaves the first alone ----
+    # ---- 14. a duplicate start leaves the first instance alone ----
     $second = Start-Process $Exe -ArgumentList '--autostart' -PassThru -WindowStyle Hidden
     $exited = $second.WaitForExit(5000)
     Check 'a duplicate start exits by itself' $exited "still running after 5 s"
     Check 'the first instance is still up' (-not $daemon.HasExited)
     Check 'the real config was not touched at all' (-not (Test-Path (Join-Path $env:APPDATA 'ArmouryDaemon\config.json-test')))
+
+    # ---- 15. rapid open/close churn must not leave a phantom state ----
+    Send-Pipe '{"type":"set_paused","paused":false}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    for ($i = 0; $i -lt 5; $i++) {
+        $q = Start-Process 'C:\Windows\System32\timeout.exe' -ArgumentList '20' -PassThru -WindowStyle Hidden
+        Start-Sleep -Milliseconds 700
+        $q | Stop-Process -Force
+        Start-Sleep -Milliseconds 400
+    }
+    # after the last close we are inside a cooldown; it must end in idle, once
+    $s = Wait-State 'idle' 10
+    Check 'churn settles back to idle' ($s.state -eq 'idle') "state=$($s.state)"
+    Check 'churn leaves no countdown behind' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {
