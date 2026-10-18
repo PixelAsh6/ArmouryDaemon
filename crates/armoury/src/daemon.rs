@@ -59,10 +59,9 @@ pub fn run(show_ui_when_running: bool) {
         AppConfig::default()
     });
     info!(
-        "config: cooldown {}s, {} tracked app(s), voice {}",
+        "config: cooldown {}s, {} tracked app(s)",
         cfg.cooldown_seconds,
         cfg.tracked_apps.len(),
-        if cfg.voice_enabled { "on" } else { "off" }
     );
 
     // ---- named-pipe server ----

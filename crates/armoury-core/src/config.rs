@@ -17,7 +17,6 @@ pub struct AppConfig {
     /// Idle overlay safety cap: force-quit after `idle_failsafe_minutes`.
     pub idle_failsafe_enabled: bool,
     pub idle_failsafe_minutes: u64,
-    pub voice_enabled: bool,
     /// Where the dashboard was last left (logical points); `None` = the default bottom corner.
     #[serde(default)]
     pub ui_position: Option<[f32; 2]>,
@@ -42,7 +41,6 @@ impl Default for AppConfig {
             paused: false,
             idle_failsafe_enabled: true,
             idle_failsafe_minutes: 180,
-            voice_enabled: false,
             ui_position: None,
         }
     }
@@ -117,7 +115,6 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.cooldown_seconds, 60);
         assert!(cfg.tracked_apps.is_empty());
-        assert!(!cfg.voice_enabled);
     }
 
     #[test]
