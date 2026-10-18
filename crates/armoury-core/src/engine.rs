@@ -37,6 +37,8 @@ pub struct Engine {
     applied: bool,
     /// Idle mode is up: packs are reverted and stay that way until idle ends.
     idle: bool,
+    /// Paused: automatic switching is frozen (manual actions still run through the daemon).
+    paused: bool,
     /// When the pending revert becomes due (set when the last tracked app closes).
     pending_revert: Option<Instant>,
     /// exe file name (lowercase, the tracked identity) -> (display name, live pids)
@@ -50,6 +52,7 @@ impl Engine {
             cooldown,
             applied: false,
             idle: false,
+            paused: false,
             pending_revert: None,
             running: BTreeMap::new(),
             last_source: None,
@@ -106,6 +109,30 @@ impl Engine {
 
     pub fn is_idle_mode(&self) -> bool {
         self.idle
+    }
+
+    /// Freeze/thaw *automatic* switching. Pausing drops any pending revert (the packs stay as they
+    /// are); unpausing catches up — apply at once if a tracked app is running, otherwise start the
+    /// revert cooldown. Manual actions never go through here (the daemon forces them).
+    pub fn set_paused(&mut self, paused: bool, now: Instant) -> Option<Transition> {
+        if self.paused == paused {
+            return None;
+        }
+        self.paused = paused;
+        if paused {
+            self.pending_revert = None;
+            return None;
+        }
+        if !self.running.is_empty() {
+            if !self.applied {
+                self.applied = true;
+                self.last_source = Some(self.source_label());
+                return Some(Transition::Applied);
+            }
+        } else if self.applied {
+            self.pending_revert = Some(now + self.cooldown);
+        }
+        None
     }
 
     /// Enter or leave idle mode (black screens + muted audio). Entering reverts whatever is
@@ -174,6 +201,10 @@ impl Engine {
         if self.idle {
             return None;
         }
+        // While paused, automatic switching is frozen (the app is still tracked).
+        if self.paused {
+            return None;
+        }
         if self.applied {
             // Already on: a reopen cancels the pending revert (the packs stay applied).
             self.pending_revert = None;
@@ -202,6 +233,9 @@ impl Engine {
         if self.idle {
             return None;
         }
+        if self.paused {
+            return None;
+        }
 
         // Every tracked app closed → start the countdown (once; reopening cancels it).
         if self.running.is_empty() && self.applied && self.pending_revert.is_none() {
@@ -213,6 +247,9 @@ impl Engine {
     /// Advance time (called ~1/s). Returns `Reverted` exactly when the cooldown expires with
     /// nothing running.
     pub fn tick(&mut self, now: Instant) -> Option<Transition> {
+        if self.paused {
+            return None;
+        }
         let Some(deadline) = self.pending_revert else {
             return None;
         };
@@ -408,6 +445,41 @@ mod tests {
         assert!(e.is_applied());
         assert_eq!(e.state(), EngineState::Triggered);
         assert_eq!(e.source().as_deref(), Some("b.exe"));
+    }
+
+    #[test]
+    fn pause_freezes_automatic_switching_and_unpause_catches_up() {
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+
+        // pause before anything runs: a start does nothing (the app is still tracked)
+        e.set_paused(true, now);
+        assert_eq!(e.on_started("game.exe", "game.exe", 1, now), None);
+        assert!(!e.is_applied());
+        assert!(e.running_names().contains(&"game.exe".to_string()));
+
+        // unpausing with the app running applies at once
+        assert_eq!(e.set_paused(false, now), Some(Transition::Applied));
+        assert!(e.is_applied());
+
+        // pause with a pending revert: the revert is dropped, the packs stay applied
+        e.on_stopped("game.exe", 1, now);
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+        e.set_paused(true, now);
+        assert_eq!(e.cooldown_remaining(now), None);
+        assert_eq!(e.tick(now + Duration::from_secs(5 * C)), None);
+        assert!(e.is_applied());
+
+        // closing while paused starts no countdown either
+        e.on_started("game.exe", "game.exe", 2, now);
+        e.on_stopped("game.exe", 2, now);
+        assert_eq!(e.cooldown_remaining(now), None);
+
+        // unpausing with nothing running schedules the revert, which then fires normally
+        e.set_paused(false, now);
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Reverted));
+        assert!(!e.is_applied());
     }
 
     #[test]

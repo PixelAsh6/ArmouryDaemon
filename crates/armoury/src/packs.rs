@@ -161,13 +161,7 @@ fn run_job(packs: &[Installed], job: &PackJob) -> PackOutcome {
         // A pack can gain a dropdown after the user's config was written (Wallpaper Engine got the
         // "binary" choice that way): fill anything the config does not know yet with its default,
         // or steps using it would see an empty value and refuse to run.
-        for setting in &pack.settings {
-            if !ctx.settings.contains_key(&setting.key) {
-                if let Some(default) = &setting.default {
-                    ctx.settings.insert(setting.key.clone(), default.clone());
-                }
-            }
-        }
+        fill_defaults(&mut ctx.settings, pack);
 
         // Apply captures live; a revert replays what the matching apply captured.
         if job.apply {
@@ -289,6 +283,18 @@ fn describe_step(step: &Step, ctx: &TemplateCtx) -> String {
             None => "registry_set".to_string(),
         },
         other => other.to_string(),
+    }
+}
+
+/// Fill dropdown values the user's config does not know yet with the pack's defaults, so a pack
+/// that gains a setting keeps working on an older config (the Wallpaper Engine bug of 2026-10-18).
+fn fill_defaults(settings: &mut HashMap<String, String>, pack: &Pack) {
+    for setting in &pack.settings {
+        if !settings.contains_key(&setting.key) {
+            if let Some(default) = &setting.default {
+                settings.insert(setting.key.clone(), default.clone());
+            }
+        }
     }
 }
 
@@ -1073,6 +1079,61 @@ mod tests {
         "apply": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-stop"] } ] },
         "revert": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-play"] } ] }
     }"#;
+
+    #[test]
+    fn exe_from_setting_picks_the_mapped_binary() {
+        let step: Step = serde_json::from_str(
+            r#"{"mechanism":"cli","exe_from_setting":"binary",
+                "exe_map":{"auto":"{{captured.target_path}}",
+                           "64-bit":"{{target.dir}}\\wallpaper64.exe",
+                           "32-bit":"{{target.dir}}\\wallpaper32.exe"},
+                "args":["-control","stop"]}"#,
+        )
+        .unwrap();
+        let mut ctx = TemplateCtx {
+            target_dir: "C:\\WE".into(),
+            ..Default::default()
+        };
+        ctx.captured
+            .insert("target_path".into(), "C:\\WE\\wallpaper64.exe".into());
+        ctx.settings.insert("binary".into(), "auto".into());
+        assert_eq!(
+            resolve_exe(&step, &ctx).unwrap(),
+            "C:\\WE\\wallpaper64.exe",
+            "auto must call the running binary"
+        );
+        ctx.settings.insert("binary".into(), "32-bit".into());
+        assert_eq!(resolve_exe(&step, &ctx).unwrap(), "C:\\WE\\wallpaper32.exe");
+        ctx.settings.insert("binary".into(), "bogus".into());
+        assert!(resolve_exe(&step, &ctx).is_err());
+        // no value at all must be an error, never a silent empty exe
+        ctx.settings.remove("binary");
+        assert!(resolve_exe(&step, &ctx).is_err());
+        // a step without exe_from_setting still uses its own template
+        let plain: Step =
+            serde_json::from_str(r#"{"mechanism":"cli","exe":"{{target.name}}"}"#).unwrap();
+        ctx.target_name = "app.exe".into();
+        assert_eq!(resolve_exe(&plain, &ctx).unwrap(), "app.exe");
+    }
+
+    #[test]
+    fn missing_dropdown_values_are_filled_from_defaults() {
+        // exactly the 2026-10-18 bug: an old config only knows "action", the pack now also has
+        // "binary"; without the default the WE steps refused to run.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("packs/wallpaper-engine/pack.json"))
+            .expect("the shipped WE pack must exist");
+        let pack = Pack::parse(&text).unwrap();
+        let mut settings: HashMap<String, String> = HashMap::new();
+        settings.insert("action".into(), "pause".into());
+        fill_defaults(&mut settings, &pack);
+        assert_eq!(settings.get("action").unwrap(), "pause", "the user's value wins");
+        assert_eq!(
+            settings.get("binary").unwrap(),
+            "auto",
+            "the new dropdown gets its default"
+        );
+    }
 
     #[test]
     fn pack_ids_must_be_plain_folder_names() {

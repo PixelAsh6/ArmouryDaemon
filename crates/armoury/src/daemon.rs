@@ -66,7 +66,8 @@ pub fn run(show_ui_when_running: bool) {
     );
 
     // ---- named-pipe server ----
-    let name = match armoury_core::PIPE_NAME.to_ns_name::<GenericNamespaced>() {
+    let pipe_name = armoury_core::pipe_name();
+    let name = match pipe_name.as_str().to_ns_name::<GenericNamespaced>() {
         Ok(n) => n,
         Err(e) => {
             error!("invalid pipe name: {e}");
@@ -91,13 +92,20 @@ pub fn run(show_ui_when_running: bool) {
     let wake_handle = wake as usize;
 
     ipc::start(listener, pipe_tx, wake_handle);
-    info!("pipe server ready ({})", armoury_core::PIPE_NAME);
+    info!("pipe server ready ({})", pipe_name);
 
     // ---- tracked-app watcher + trigger engine ----
     let tracked = Arc::new(Mutex::new(cfg.tracked_apps.clone()));
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<watch::WatchEvent>();
     watch::start(tracked.clone(), watch_tx, wake_handle);
-    let engine = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
+    let engine = {
+        let mut e = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
+        if cfg.paused {
+            // start frozen, exactly as the user left it
+            e.set_paused(true, Instant::now());
+        }
+        e
+    };
 
     // ---- packs ----
     let search = pack_search_dirs();
@@ -636,6 +644,11 @@ impl App {
             if paused { "paused" } else { "resumed" },
             if paused { "suppressed" } else { "active" }
         );
+        // Freeze/thaw the engine itself, so a pause never leaves a phantom countdown behind and
+        // resuming catches up with whatever is running (2026-10-18).
+        if let Some(t) = self.engine.set_paused(paused, Instant::now()) {
+            self.on_transition(t);
+        }
         self.broadcast_status();
     }
 
@@ -1386,9 +1399,20 @@ enum Singleton {
 fn acquire_singleton() -> Singleton {
     use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows::Win32::System::Threading::CreateMutexW;
-    use windows::core::w;
+    use windows::core::PCWSTR;
 
-    let handle = unsafe { CreateMutexW(None, false, w!("Local\\ArmouryDaemon.Singleton")) };
+    // `ARMOURY_TEST_NS` also namespaces the mutex, so the integration harness can run a real
+    // daemon next to the installed one.
+    let suffix = match std::env::var("ARMOURY_TEST_NS") {
+        Ok(ns) if !ns.trim().is_empty() => format!("-{}", ns.trim()),
+        _ => String::new(),
+    };
+    let name: Vec<u16> = format!("Local\\ArmouryDaemon.Singleton{suffix}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         return Singleton::AlreadyRunning;
     }
@@ -1403,8 +1427,9 @@ fn acquire_singleton() -> Singleton {
 
 /// Second instance: ask the running daemon to show its UI, then exit.
 fn nudge_existing_instance() {
+    let pipe = armoury_core::pipe_name();
     for attempt in 0..5 {
-        let Ok(name) = armoury_core::PIPE_NAME.to_ns_name::<GenericNamespaced>() else {
+        let Ok(name) = pipe.as_str().to_ns_name::<GenericNamespaced>() else {
             return;
         };
         match ConnectOptions::new().name(name).connect_sync() {

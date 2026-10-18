@@ -83,9 +83,10 @@ pub fn run() {
     log::info!("ui starting (v{})", armoury_core::VERSION);
 
     // ---- connect to the daemon (retry briefly: the daemon just spawned us) ----
+    let pipe_name = armoury_core::pipe_name();
     let mut stream = None;
     for attempt in 0..50 {
-        let Ok(name) = armoury_core::PIPE_NAME.to_ns_name::<GenericNamespaced>() else {
+        let Ok(name) = pipe_name.as_str().to_ns_name::<GenericNamespaced>() else {
             break;
         };
         match ConnectOptions::new().name(name).connect_sync() {
@@ -595,50 +596,73 @@ impl eframe::App for App {
 
             let mut pick: Option<(String, String)> = None;
             ui.horizontal(|ui| {
-                // The search box sits in the dashboard body, NOT inside the popup: a text field
-                // inside a ComboBox popup loses focus when clicked (reported 2026-10-18), which
-                // made the picker unusable.
+                // Type here: matching running apps appear right below (no popup to open). A text
+                // field inside a ComboBox popup lost focus when clicked, so the search lives here
+                // and the results are inline (user request 2026-10-18).
                 ui.add(
                     egui::TextEdit::singleline(&mut self.pick_query)
-                        .hint_text("search…")
-                        .desired_width(110.0),
+                        .hint_text("type to search running apps…")
+                        .desired_width(210.0),
                 );
                 egui::ComboBox::from_id_salt("pick-app")
-                    .selected_text("Pick an app…")
-                    .width(140.0)
+                    .selected_text("All apps…")
+                    .width(110.0)
                     .show_ui(ui, |ui| {
-                        let query = self.pick_query.trim().to_ascii_lowercase();
-                        let mut matches: Vec<(String, String, String)> = Vec::new();
+                        let mut all: Vec<(String, String, String)> = Vec::new();
                         for (title, exe) in &self.apps {
                             if tracked.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)) {
                                 continue;
                             }
-                            let name = file_name(exe);
-                            if query.is_empty()
-                                || name.to_ascii_lowercase().contains(&query)
-                                || title.to_ascii_lowercase().contains(&query)
-                            {
-                                matches.push((name, exe.clone(), title.clone()));
-                            }
+                            all.push((file_name(exe), exe.clone(), title.clone()));
                         }
-                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        for (name, exe, title) in &matches {
-                            let label = format!("{name}  —  {title}");
+                        for (name, exe, title) in &all {
+                            let label = if title.is_empty() {
+                                name.clone()
+                            } else {
+                                format!("{name}  —  {title}")
+                            };
                             if ui.selectable_label(false, label).clicked() {
                                 pick = Some((name.clone(), exe.clone()));
                             }
-                        }
-                        if matches.is_empty() {
-                            ui.label("(no match)");
-                        } else if matches.len() == 1 && enter {
-                            // half-typed name + a single candidate → Enter selects it
-                            pick = Some((matches[0].0.clone(), matches[0].1.clone()));
                         }
                     });
                 if ui.button("Browse…").clicked() {
                     spawn_picker(self.pick_tx.clone(), Picker::TrackedApp);
                 }
             });
+
+            // Live results for what was typed. Enter (or a click) takes the single match.
+            let query = self.pick_query.trim().to_ascii_lowercase();
+            if !query.is_empty() {
+                let matches: Vec<(String, String, String)> = self
+                    .apps
+                    .iter()
+                    .filter(|(_, exe)| !tracked.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)))
+                    .map(|(title, exe)| (file_name(exe), exe.clone(), title.clone()))
+                    .filter(|(name, _, title)| {
+                        name.to_ascii_lowercase().contains(&query)
+                            || title.to_ascii_lowercase().contains(&query)
+                    })
+                    .collect();
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if matches.is_empty() {
+                    ui.small("No running app matches — it has to be open, or use Browse…");
+                } else {
+                    for (name, exe, title) in matches.iter().take(8) {
+                        let label = if title.is_empty() {
+                            name.clone()
+                        } else {
+                            format!("{name}  —  {title}")
+                        };
+                        if ui.selectable_label(false, label).clicked() {
+                            pick = Some((name.clone(), exe.clone()));
+                        }
+                    }
+                    if matches.len() == 1 && enter {
+                        pick = Some((matches[0].0.clone(), matches[0].1.clone()));
+                    }
+                }
+            }
             if pick.is_some() {
                 self.pick_query.clear();
             }

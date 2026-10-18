@@ -55,7 +55,14 @@ pub struct TrackedApp {
 }
 
 /// %APPDATA%\ArmouryDaemon (falls back to ./ArmouryDaemon if APPDATA is missing).
+/// `ARMOURY_TEST_NS` redirects everything to a throw-away folder (integration harness only).
 pub fn config_dir() -> PathBuf {
+    if let Ok(ns) = std::env::var("ARMOURY_TEST_NS") {
+        if !ns.trim().is_empty() {
+            let base = std::env::temp_dir();
+            return base.join(format!("ArmouryDaemon-test-{}", ns.trim()));
+        }
+    }
     let base = std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -131,5 +138,19 @@ mod tests {
         let back: AppConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back.tracked_apps.len(), 1);
         assert_eq!(back.tracked_apps[0].exe, "demo.exe");
+    }
+
+    #[test]
+    fn ui_position_roundtrips_and_older_configs_still_load() {
+        let mut cfg = AppConfig::default();
+        cfg.ui_position = Some([120.0, 340.5]);
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.ui_position, Some([120.0, 340.5]));
+
+        // a config written before the field existed must still load (None, not an error)
+        let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
+        assert_eq!(old.cooldown_seconds, 30);
+        assert_eq!(old.ui_position, None);
     }
 }

@@ -116,6 +116,26 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_ui_position() {
+        let mut out = Vec::new();
+        write_msg(
+            &mut out,
+            &Request::SetUiPosition {
+                x: 10.5,
+                y: -20.0,
+            },
+        )
+        .unwrap();
+        let back: Request = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
+        match back {
+            Request::SetUiPosition { x, y } => {
+                assert!((x - 10.5).abs() < 0.001 && (y + 20.0).abs() < 0.001);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn roundtrip_response() {
         let resp = Response::Status {
             status: StatusSnapshot {
