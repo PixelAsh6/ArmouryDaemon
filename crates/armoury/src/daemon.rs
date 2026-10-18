@@ -210,6 +210,7 @@ pub fn run(show_ui_when_running: bool) {
         ui_child: None,
         spawning_ui: false,
         last_broadcast: Instant::now(),
+        last_tooltip: String::new(),
         wake: wake_handle,
     };
     let mut last_housekeeping = Instant::now();
@@ -473,6 +474,8 @@ struct App {
     ui_child: Option<Child>,
     spawning_ui: bool,
     last_broadcast: Instant,
+    /// Last text set on the tray tooltip (avoid a Win32 call every second).
+    last_tooltip: String,
     /// The wake event every producer signals (handed to each pack worker).
     wake: usize,
 }
@@ -577,7 +580,14 @@ impl App {
     }
 
     fn on_transition(&mut self, t: Transition) {
-        if self.cfg.paused {
+        self.send_transition(t, false);
+    }
+
+    /// `force` = a manual action (entering idle, removing the last tracked app) that must take
+    /// effect even while the daemon is paused (user decision 2026-10-18: pause stops *automatic*
+    /// switching, not the user's own actions).
+    fn send_transition(&mut self, t: Transition, force: bool) {
+        if self.cfg.paused && !force {
             info!("paused — skipping the {:?} transition", t);
             self.broadcast_status();
             return;
@@ -869,10 +879,11 @@ impl App {
             // If that was the only tracked app holding the packs applied, revert now instead of
             // waiting out the cooldown — the user just said this app no longer matters
             // (feedback 2026-10-17: "it only made the changes after it entered another cooldown").
+            // Manual action: it happens even while paused.
             let key = basename_lower(exe);
             if let Some(t) = self.engine.on_untracked(&key) {
                 info!("nothing tracked is running any more — reverting the packs immediately");
-                self.on_transition(t);
+                self.send_transition(t, true);
             }
         }
     }
@@ -945,10 +956,11 @@ impl App {
         } else {
             None
         };
-        // Idle cancels switching: whatever is applied reverts now (decision B8).
+        // Idle cancels switching: whatever is applied reverts now (decision B8). This is a manual
+        // action, so it happens even while paused.
         if let Some(t) = self.engine.set_idle(true) {
             info!("idle mode: tracked apps are normal apps again");
-            self.on_transition(t);
+            self.send_transition(t, true);
         }
         self.broadcast_status();
     }
@@ -1086,6 +1098,7 @@ impl App {
         }
         if self.last_broadcast.elapsed() >= Duration::from_secs(1) {
             self.last_broadcast = Instant::now();
+            self.update_tooltip();
             self.broadcast_status();
             self.reap_ui_child();
         }
@@ -1101,6 +1114,36 @@ impl App {
                 status: status.clone(),
             });
         }
+    }
+
+    /// Tray tooltip: the product name plus what is happening right now (user request 2026-10-18).
+    /// Called from the 1 Hz housekeeping tick; only touches the tray when the text changes.
+    fn update_tooltip(&mut self) {
+        let text = if self.cfg.paused {
+            "ArmouryDaemon — paused".to_string()
+        } else {
+            match self.engine.state() {
+                EngineState::Idle => "ArmouryDaemon — idle".to_string(),
+                EngineState::Triggered => match self.engine.source() {
+                    Some(src) => format!("ArmouryDaemon — {src}"),
+                    None => "ArmouryDaemon — triggered".to_string(),
+                },
+                EngineState::Cooldown => match self.engine.cooldown_remaining(Instant::now()) {
+                    Some(left) => format!("ArmouryDaemon — reverting in {}s", left.as_secs()),
+                    None => "ArmouryDaemon — cooldown".to_string(),
+                },
+            }
+        };
+        if text == self.last_tooltip {
+            return;
+        }
+        if let Some(tray) = &self.tray {
+            if let Err(e) = tray.set_tooltip(Some(&text)) {
+                warn!("tray tooltip update failed: {e}");
+                return;
+            }
+        }
+        self.last_tooltip = text;
     }
 
     fn reap_ui_child(&mut self) {
@@ -1211,6 +1254,15 @@ impl App {
                     }
                     info!("cooldown set to {}s", self.cfg.cooldown_seconds);
                     self.broadcast_status();
+                }
+                Request::SetUiPosition { x, y } => {
+                    // The UI only sends this after the window has been still for a moment.
+                    if self.cfg.ui_position != Some([x, y]) {
+                        self.cfg.ui_position = Some([x, y]);
+                        if let Err(e) = armoury_core::config::save(&self.cfg) {
+                            warn!("failed to save the dashboard position: {e}");
+                        }
+                    }
                 }
                 Request::SetIdleFailsafe { enabled, minutes } => {
                     self.cfg.idle_failsafe_enabled = enabled;

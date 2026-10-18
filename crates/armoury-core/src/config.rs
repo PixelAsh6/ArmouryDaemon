@@ -18,6 +18,9 @@ pub struct AppConfig {
     pub idle_failsafe_enabled: bool,
     pub idle_failsafe_minutes: u64,
     pub voice_enabled: bool,
+    /// Where the dashboard was last left (logical points); `None` = the default bottom corner.
+    #[serde(default)]
+    pub ui_position: Option<[f32; 2]>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -40,6 +43,7 @@ impl Default for AppConfig {
             idle_failsafe_enabled: true,
             idle_failsafe_minutes: 180,
             voice_enabled: false,
+            ui_position: None,
         }
     }
 }

@@ -24,6 +24,8 @@ pub enum Request {
     SetIdleFailsafe { enabled: bool, minutes: u64 },
     /// Change the revert cooldown.
     SetCooldown { seconds: u64 },
+    /// The user moved the dashboard: remember its top-left (logical points).
+    SetUiPosition { x: f32, y: f32 },
     /// Install a pack from a local `pack.json` (or a folder holding one).
     InstallPack { source: String },
     /// Remove an installed pack (its folder under `<install>\packs`).

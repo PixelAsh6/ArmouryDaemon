@@ -153,7 +153,11 @@ pub fn run() {
 
     // Geometry is computed before the window exists: the very first frame is already in
     // the final spot, because eframe reveals the window right after its first frame.
-    let (initial_size, initial_pos) = initial_geometry();
+    // A position the user left the dashboard at wins over the automatic bottom corner.
+    let (initial_size, default_pos) = initial_geometry();
+    let initial_pos = stored_ui_position()
+        .map(|[x, y]| egui::pos2(x, y))
+        .unwrap_or(default_pos);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ArmouryDaemon")
@@ -181,6 +185,7 @@ pub fn run() {
                 pick_tx,
                 pick_rx,
                 req_rx,
+                stored_ui_position().map(|[x, y]| egui::pos2(x, y)),
             ));
             Ok(app)
         }),
@@ -204,6 +209,14 @@ struct App {
     pick_tx: crossbeam_channel::Sender<Picked>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
+    /// Where the dashboard's top-left is anchored. `None` = the automatic bottom corner; `Some`
+    /// once the user (or a stored position) put it somewhere, so it grows downwards and is
+    /// remembered across runs.
+    anchor: Option<egui::Pos2>,
+    /// Last position the daemon was told about (avoid a request every frame).
+    last_sent_pos: Option<egui::Pos2>,
+    /// When the window last moved, so the position is only saved after it settles.
+    still_since: Instant,
 }
 
 impl App {
@@ -214,6 +227,7 @@ impl App {
         pick_tx: crossbeam_channel::Sender<Picked>,
         pick_rx: Receiver<Picked>,
         req_rx: Receiver<Request>,
+        anchor: Option<egui::Pos2>,
     ) -> Self {
         Self {
             rx,
@@ -227,6 +241,9 @@ impl App {
             pick_query: String::new(),
             styled: false,
             last_desired: None,
+            anchor,
+            last_sent_pos: anchor,
+            still_since: Instant::now(),
         }
     }
 
@@ -672,19 +689,10 @@ impl eframe::App for App {
             let mut set_value: Option<(String, String, String)> = None;
             for pack in &packs {
                 ui.horizontal(|ui| {
-                    if ui
+                    let mut open_this = ui
                         .small_button("‹")
-                        .on_hover_text("Open this pack's own window")
-                        .clicked()
-                    {
-                        let mut s = self.shared.lock().unwrap();
-                        if !s.open_packs.contains(&pack.id) {
-                            s.open_packs.push(pack.id.clone());
-                            s.pack_windows.remove(&pack.id);
-                            s.pack_first_seen.insert(pack.id.clone(), Instant::now());
-                            log::info!("pack window {} requested", pack.id);
-                        }
-                    }
+                        .on_hover_text("Open this pack's own window (or double-click the name)")
+                        .clicked();
                     let mut enabled = pack.enabled;
                     if ui
                         .checkbox(&mut enabled, "")
@@ -693,7 +701,21 @@ impl eframe::App for App {
                     {
                         set_enabled = Some((pack.id.clone(), enabled));
                     }
-                    ui.label(&pack.name);
+                    let name = ui.add(
+                        egui::Label::new(&pack.name).sense(egui::Sense::click()),
+                    );
+                    if name.double_clicked() {
+                        open_this = true;
+                    }
+                    if open_this {
+                        let mut s = self.shared.lock().unwrap();
+                        if !s.open_packs.contains(&pack.id) {
+                            s.open_packs.push(pack.id.clone());
+                            s.pack_windows.remove(&pack.id);
+                            s.pack_first_seen.insert(pack.id.clone(), Instant::now());
+                            log::info!("pack window {} requested", pack.id);
+                        }
+                    }
                     if pack.applied {
                         ui.small("· applied");
                     }
@@ -753,14 +775,38 @@ impl eframe::App for App {
             // to the bottom-right corner. The settings window follows automatically,
             // because it is positioned from this window's rect (see `settings_ui`).
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(bottom_corner(
-                ctx, desired,
-            )));
+            // A window the user placed grows downwards from its top-left; the automatic one stays
+            // pinned to the bottom corner.
+            let pos = self.anchor.unwrap_or_else(|| bottom_corner(ctx, desired));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             self.last_desired = Some(desired);
         }
 
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
             self.shared.lock().unwrap().core_rect = Some(outer);
+            let pos = outer.min;
+            match self.anchor {
+                None => {
+                    // The user dragged it away from the automatic corner: anchor it there.
+                    let auto = bottom_corner(ctx, self.last_desired.unwrap_or(desired));
+                    if (pos - auto).length() > 4.0 {
+                        self.anchor = Some(pos);
+                        self.still_since = Instant::now();
+                    }
+                }
+                Some(prev) => {
+                    if (pos - prev).length() > 2.0 {
+                        self.anchor = Some(pos);
+                        self.still_since = Instant::now();
+                    } else if self.still_since.elapsed() >= Duration::from_secs(1)
+                        && self.last_sent_pos != Some(pos)
+                    {
+                        // Remember it once it has stopped moving (the daemon owns config.json).
+                        self.last_sent_pos = Some(pos);
+                        self.request(&Request::SetUiPosition { x: pos.x, y: pos.y });
+                    }
+                }
+            }
         }
 
         // ---- settings viewport (deferred window above the core) ----
@@ -1651,6 +1697,14 @@ fn file_name(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
+}
+
+/// Where the user last left the dashboard, read straight from the config file (the daemon is the
+/// only writer; the UI just needs it before the window exists).
+fn stored_ui_position() -> Option<[f32; 2]> {
+    let text = std::fs::read_to_string(armoury_core::config::config_path()).ok()?;
+    let cfg: armoury_core::config::AppConfig = serde_json::from_str(&text).ok()?;
+    cfg.ui_position
 }
 
 /// Which native dialog to open.
