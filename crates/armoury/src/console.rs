@@ -1,7 +1,8 @@
 //! Controller watch for console mode: a thread polls the XInput slots and reports connects and
 //! disconnects. The daemon decides what to do with them (open the launcher, log).
 //!
-//! Polling on purpose: XInput has no notification API, and two queries a second cost nothing.
+//! Polling on purpose: XInput has no notification API, and the queries are microseconds when no
+//! pad answers them.
 
 use crossbeam_channel::Sender;
 use std::time::Duration;
@@ -15,8 +16,9 @@ pub enum PadEvent {
     Disconnected { slot: u32 },
 }
 
-/// Poll interval — quick enough that a freshly plugged pad's launcher feels immediate.
-const EVERY: Duration = Duration::from_secs(2);
+/// Poll interval — the launcher feels immediate on a fresh plug, and the daemon's own loop adds
+/// up to a second of wait on top, so this poll is the term that has to stay small.
+const EVERY: Duration = Duration::from_millis(500);
 
 pub fn start(tx: Sender<PadEvent>, wake: usize) {
     std::thread::spawn(move || {

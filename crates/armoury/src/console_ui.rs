@@ -255,6 +255,9 @@ impl eframe::App for App {
             crate::ui::install_fonts(&ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // The moment the window comes up was not on record before; the handshake line
+            // ("got the app list") lands around the same time, not before it.
+            log::info!("window shown");
             self.first_frame = false;
         }
         ctx.request_repaint(); // the pad is polled per frame
