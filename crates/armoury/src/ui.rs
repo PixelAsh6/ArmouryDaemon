@@ -26,8 +26,12 @@ const MIN_SETTINGS_WIDTH: f32 = 330.0;
 const PAD: i8 = 10;
 const PAD_F: f32 = PAD as f32;
 /// Distance from the work area's right and bottom edges when a window opens above the tray.
-/// Zero: the window sits flush in the corner, right on top of the system tray.
+/// Zero: the window sits flush in the corner, right on top of the system tray. The chain's
+/// windows are clamped with the same margin, so the whole chain stands on the dashboard's
+/// bottom edge.
 const UI_MARGIN: f32 = 0.0;
+/// The gap between the windows of the chain, in physical pixels: 5 px, i.e. 4 pt at 125%.
+const CHAIN_GAP_PX: f32 = 5.0;
 
 /// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
 /// packs lists as a built-in row with one dropdown.
@@ -1055,29 +1059,36 @@ fn send_request(shared: &Arc<Mutex<Shared>>, req: &Request) {
     }
 }
 
+/// The chain's gap in points: 5 physical pixels, whatever the display's scale is.
+fn chain_gap(ctx: &egui::Context) -> f32 {
+    CHAIN_GAP_PX / ctx.pixels_per_point().max(0.5)
+}
+
 /// Bottom-aligned to the left of an anchor edge; `anchor_left` is the left edge of the leftmost
 /// window we already have on screen (the dashboard when nothing else is open).
 fn place_left(ctx: &egui::Context, anchor_left: f32, core: Rect, size: egui::Vec2) -> egui::Pos2 {
+    let gap = chain_gap(ctx);
     match work_area_pts(ctx) {
         Some((left, top, right, bottom)) => place_left_in(
             Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom)),
             anchor_left,
             core,
             size,
+            gap,
         ),
-        None => egui::pos2(anchor_left - 8.0 - size.x, core.bottom() - size.y),
+        None => egui::pos2(anchor_left - gap - size.x, core.bottom() - size.y),
     }
 }
 
 /// The chain: the new window goes immediately to the left of `anchor_left`, bottom-aligned to
 /// the dashboard, and is clamped to the work area so it never lands off-screen.
-fn place_left_in(work: Rect, anchor_left: f32, core: Rect, size: egui::Vec2) -> egui::Pos2 {
-    let gap = 8.0;
-    let margin = 6.0;
-    let x = (anchor_left - gap - size.x).max(work.left() + margin);
+fn place_left_in(work: Rect, anchor_left: f32, core: Rect, size: egui::Vec2, gap: f32) -> egui::Pos2 {
+    let x = (anchor_left - gap - size.x).max(work.left() + UI_MARGIN);
+    // The bottom edge comes from the dashboard, so the whole chain stands on one line. The
+    // clamp only kicks in when the window does not fit the work area.
     let y = (core.bottom() - size.y)
-        .max(work.top() + margin)
-        .min(work.bottom() - size.y - margin);
+        .max(work.top() + UI_MARGIN)
+        .min(work.bottom() - size.y - UI_MARGIN);
     egui::pos2(x, y)
 }
 
@@ -1164,14 +1175,14 @@ struct ChainWindow {
 /// The chain rule: every window goes immediately left of the one to its right, bottom-aligned
 /// to the dashboard and clamped to the work area. A window the user dragged keeps its place
 /// and still anchors the window to its left. The order of `windows` (right to left) is kept.
-fn reanchor_chain(work: Rect, core: Rect, windows: &[ChainWindow]) -> Vec<(ChainItem, egui::Pos2)> {
+fn reanchor_chain(work: Rect, core: Rect, windows: &[ChainWindow], gap: f32) -> Vec<(ChainItem, egui::Pos2)> {
     let mut out = Vec::with_capacity(windows.len());
     let mut edges: Vec<f32> = Vec::with_capacity(windows.len());
     for w in windows {
         let pos = if w.dragged {
             w.current
         } else {
-            place_left_in(work, chain_anchor(core, &edges), core, w.size)
+            place_left_in(work, chain_anchor(core, &edges), core, w.size, gap)
         };
         edges.push(pos.x);
         out.push((w.item.clone(), pos));
@@ -1187,6 +1198,7 @@ fn reanchor(ctx: &egui::Context, s: &mut Shared, core: Rect) {
         return;
     };
     let work = Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom));
+    let gap = chain_gap(ctx);
     let now = Instant::now();
     let mut windows: Vec<ChainWindow> = Vec::new();
     for item in s.chain.clone() {
@@ -1218,7 +1230,7 @@ fn reanchor(ctx: &egui::Context, s: &mut Shared, core: Rect) {
             dragged,
         });
     }
-    for (w, (item, pos)) in windows.iter().zip(reanchor_chain(work, core, &windows)) {
+    for (w, (item, pos)) in windows.iter().zip(reanchor_chain(work, core, &windows, gap)) {
         if w.dragged {
             // The user owns this window: it keeps its place and its slot stays where it is.
             continue;
@@ -3125,17 +3137,19 @@ mod tests {
         // The dashboard sits in the bottom-right corner, flush with the work area.
         let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
         let size = egui::vec2(420.0, 500.0);
+        // 5 physical pixels between two windows: 4 pt at 125%.
+        let gap = 4.0;
 
         // Nothing else open: the settings goes immediately left of the dashboard.
-        let pos = place_left_in(work, chain_anchor(core, &[]), core, size);
-        // x = core.left() - 8 - width = 1668 - 8 - 420, y = core.bottom() - height, less the
-        // 6 pt the work-area clamp keeps below every window in the chain.
-        assert!((pos.x - 1240.0).abs() < 1e-3);
-        assert!((pos.y - 598.0).abs() < 1e-3);
-        // 8 pt clear of the dashboard.
-        assert!((pos.x + size.x - (core.left() - 8.0)).abs() < 1e-3);
-        // Bottom-aligned with the dashboard: both bottoms 6 pt above the work area's bottom.
-        assert!((pos.y + size.y - (core.bottom() - 6.0)).abs() < 1e-3);
+        let pos = place_left_in(work, chain_anchor(core, &[]), core, size, gap);
+        // x = core.left() - gap - width = 1668 - 4 - 420, y = core.bottom() - height: the
+        // settings stands on the dashboard's bottom edge.
+        assert!((pos.x - 1244.0).abs() < 1e-3);
+        assert!((pos.y - 604.0).abs() < 1e-3);
+        // 4 pt clear of the dashboard.
+        assert!((pos.x + size.x - (core.left() - gap)).abs() < 1e-3);
+        // Bottom-aligned with the dashboard: the very same bottom edge.
+        assert!((pos.y + size.y - core.bottom()).abs() < 1e-3);
         // Beside the dashboard, never above it: the vertical spans overlap, the horizontal ones
         // do not.
         assert!(pos.y < core.bottom() && pos.y + size.y > core.top());
@@ -3147,27 +3161,27 @@ mod tests {
         // A pack window is already open, to the left of the dashboard: the settings has to
         // clear that one too and goes to its left.
         let pack = Rect::from_min_max(egui::pos2(1200.0, 700.0), egui::pos2(1580.0, 1104.0));
-        let pos = place_left_in(work, chain_anchor(core, &[pack.left()]), core, size);
-        // x = pack.left() - 8 - width = 1200 - 8 - 420, still bottom-aligned.
-        assert!((pos.x - 772.0).abs() < 1e-3);
-        assert!((pos.y - 598.0).abs() < 1e-3);
-        assert!((pos.x + size.x - (pack.left() - 8.0)).abs() < 1e-3);
+        let pos = place_left_in(work, chain_anchor(core, &[pack.left()]), core, size, gap);
+        // x = pack.left() - gap - width = 1200 - 4 - 420, still bottom-aligned.
+        assert!((pos.x - 776.0).abs() < 1e-3);
+        assert!((pos.y - 604.0).abs() < 1e-3);
+        assert!((pos.x + size.x - (pack.left() - gap)).abs() < 1e-3);
         // The order from the right is: dashboard, pack, settings.
         assert!(core.left() > pack.left() && pack.left() > pos.x);
 
         // The settings was open first, a pack window opens after it: the pack goes to the left
         // of the settings, so the order from the right is: dashboard, settings, pack.
-        let settings = place_left_in(work, chain_anchor(core, &[]), core, size);
-        let new_pack = place_left_in(work, chain_anchor(core, &[settings.x]), core, egui::vec2(380.0, 300.0));
-        assert!((new_pack.x - (settings.x - 8.0 - 380.0)).abs() < 1e-3);
-        assert!((new_pack.x + 380.0 - (settings.x - 8.0)).abs() < 1e-3);
+        let settings = place_left_in(work, chain_anchor(core, &[]), core, size, gap);
+        let new_pack = place_left_in(work, chain_anchor(core, &[settings.x]), core, egui::vec2(380.0, 300.0), gap);
+        assert!((new_pack.x - (settings.x - gap - 380.0)).abs() < 1e-3);
+        assert!((new_pack.x + 380.0 - (settings.x - gap)).abs() < 1e-3);
         assert!(core.left() > settings.x && settings.x > new_pack.x);
 
         // A dashboard filling the whole work area leaves no room on the left: the settings stays
         // on the screen anyway.
         let full = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
-        let pos = place_left_in(work, chain_anchor(full, &[]), full, size);
-        assert!((pos.x - 6.0).abs() < 1e-3);
+        let pos = place_left_in(work, chain_anchor(full, &[]), full, size, gap);
+        assert!((pos.x - 0.0).abs() < 1e-3);
         assert!(pos.x >= work.left() && pos.x + size.x <= work.right());
         assert!(pos.y >= work.top() && pos.y + size.y <= work.bottom());
     }
@@ -3177,7 +3191,7 @@ mod tests {
         // 2560x1380 px work area at 125% -> 2048 x 1104 pt on the primary monitor.
         let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
         let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
-        let pos = place_left_in(work, chain_anchor(core, &[]), core, egui::vec2(420.0, 500.0));
+        let pos = place_left_in(work, chain_anchor(core, &[]), core, egui::vec2(420.0, 500.0), 4.0);
 
         // The content grows but the window still fits: the stored position is kept as it is.
         let kept = clamp_to_work_area(pos, work, egui::vec2(420.0, 500.0));
@@ -3185,7 +3199,7 @@ mod tests {
         assert!((kept.y - pos.y).abs() < 1e-3);
         // A pack window opened after the settings sits to its left; a resize does not change
         // that order, because the settings never re-anchors against another window.
-        let pack = place_left_in(work, chain_anchor(core, &[pos.x]), core, egui::vec2(380.0, 300.0));
+        let pack = place_left_in(work, chain_anchor(core, &[pos.x]), core, egui::vec2(380.0, 300.0), 4.0);
         assert!(pack.x + 380.0 <= pos.x);
         let grown = clamp_to_work_area(pos, work, egui::vec2(420.0, 560.0));
         assert!((grown.x - pos.x).abs() < 1e-3);
@@ -3215,8 +3229,8 @@ mod tests {
         let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
         let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
         // The pack opened first, the settings after it: the settings sits to the left of the pack.
-        let pack = place_left_in(work, chain_anchor(core, &[]), core, egui::vec2(380.0, 300.0));
-        let settings = place_left_in(work, chain_anchor(core, &[pack.x]), core, egui::vec2(420.0, 500.0));
+        let pack = place_left_in(work, chain_anchor(core, &[]), core, egui::vec2(380.0, 300.0), 4.0);
+        let settings = place_left_in(work, chain_anchor(core, &[pack.x]), core, egui::vec2(420.0, 500.0), 4.0);
         assert!(core.left() > pack.x && pack.x > settings.x);
 
         // The pack grows: the position is kept as it is, only clamped into the work area.
@@ -3255,31 +3269,35 @@ mod tests {
         // The dashboard sits in the bottom-right corner, flush with the work area.
         let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
         let size = egui::vec2(420.0, 500.0);
+        // 5 physical pixels between the windows: 4 pt at 125%.
+        let gap = 4.0;
         // The settings is immediately left of the dashboard, the pack window to its left.
-        let settings = chain_window(ChainItem::Settings, size, egui::pos2(1240.0, 598.0));
+        let settings = chain_window(ChainItem::Settings, size, egui::pos2(1244.0, 604.0));
         let pack = chain_window(
             ChainItem::Pack("g-helper".to_string()),
             egui::vec2(380.0, 300.0),
-            egui::pos2(852.0, 798.0),
+            egui::pos2(860.0, 804.0),
         );
         // The chain as it stands: every window touches the one to its right.
-        let out = reanchor_chain(work, core, &[settings.clone(), pack.clone()]);
-        assert!((out[0].1.x - 1240.0).abs() < 1e-3);
-        assert!((out[1].1.x - 852.0).abs() < 1e-3);
-        assert!((out[0].1.x + 420.0 - (core.left() - 8.0)).abs() < 1e-3);
-        assert!((out[1].1.x + 380.0 - (out[0].1.x - 8.0)).abs() < 1e-3);
+        let out = reanchor_chain(work, core, &[settings.clone(), pack.clone()], gap);
+        assert!((out[0].1.x - 1244.0).abs() < 1e-3);
+        assert!((out[1].1.x - 860.0).abs() < 1e-3);
+        assert!((out[0].1.x + 420.0 - (core.left() - gap)).abs() < 1e-3);
+        assert!((out[1].1.x + 380.0 - (out[0].1.x - gap)).abs() < 1e-3);
+        // The whole chain stands on the dashboard's bottom edge.
+        assert!((out[0].1.y + 500.0 - core.bottom()).abs() < 1e-3);
 
         // The dashboard changed: the chain is re-anchored against its new rect.
         let wider = Rect::from_min_max(egui::pos2(1500.0, 700.0), egui::pos2(2048.0, 1104.0));
-        let out = reanchor_chain(work, wider, &[settings, pack]);
+        let out = reanchor_chain(work, wider, &[settings, pack], gap);
         let (settings_pos, pack_pos) = (out[0].1, out[1].1);
         // The order from the right is kept: the settings, then the pack window.
         assert!(wider.left() > settings_pos.x && settings_pos.x > pack_pos.x);
-        // Every window sits immediately left of the one to its right, with the 8 pt gap.
-        assert!((settings_pos.x + 420.0 - (wider.left() - 8.0)).abs() < 1e-3);
-        assert!((pack_pos.x + 380.0 - (settings_pos.x - 8.0)).abs() < 1e-3);
+        // Every window sits immediately left of the one to its right, with the gap.
+        assert!((settings_pos.x + 420.0 - (wider.left() - gap)).abs() < 1e-3);
+        assert!((pack_pos.x + 380.0 - (settings_pos.x - gap)).abs() < 1e-3);
         // Bottom-aligned with the dashboard.
-        assert!((settings_pos.y + 500.0 - (wider.bottom() - 6.0)).abs() < 1e-3);
+        assert!((settings_pos.y + 500.0 - wider.bottom()).abs() < 1e-3);
     }
 
     #[test]
@@ -3287,7 +3305,7 @@ mod tests {
         let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
         let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
         let size = egui::vec2(420.0, 500.0);
-        let slot = egui::pos2(1240.0, 598.0);
+        let slot = egui::pos2(1244.0, 604.0);
         // The user drags the settings window away from its slot: `classify` sees the drag.
         let dragged_to = egui::pos2(300.0, 400.0);
         let now = Instant::now();
@@ -3313,7 +3331,7 @@ mod tests {
         let mut window = chain_window(ChainItem::Settings, size, slot);
         window.current = dragged_to;
         window.dragged = dragged;
-        let out = reanchor_chain(work, core, &[window]);
+        let out = reanchor_chain(work, core, &[window], 4.0);
         assert!((out[0].1 - dragged_to).length() < 1e-3);
     }
 
@@ -3322,13 +3340,13 @@ mod tests {
         let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
         // A dashboard that fills the whole work area leaves no room on the left.
         let core = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
-        let settings = chain_window(ChainItem::Settings, egui::vec2(420.0, 500.0), egui::pos2(6.0, 598.0));
+        let settings = chain_window(ChainItem::Settings, egui::vec2(420.0, 500.0), egui::pos2(0.0, 604.0));
         let pack = chain_window(
             ChainItem::Pack("g-helper".to_string()),
             egui::vec2(380.0, 300.0),
-            egui::pos2(6.0, 798.0),
+            egui::pos2(0.0, 804.0),
         );
-        let out = reanchor_chain(work, core, &[settings, pack]);
+        let out = reanchor_chain(work, core, &[settings, pack], 4.0);
         for ((_, pos), size) in out
             .iter()
             .zip([egui::vec2(420.0, 500.0), egui::vec2(380.0, 300.0)])
@@ -3345,8 +3363,9 @@ mod tests {
             &[chain_window(
                 ChainItem::Settings,
                 egui::vec2(420.0, 500.0),
-                egui::pos2(1240.0, 598.0),
+                egui::pos2(1244.0, 604.0),
             )],
+            4.0,
         );
         for ((_, pos), size) in out.iter().zip([egui::vec2(420.0, 500.0)]) {
             assert!(pos.x >= work.left() && pos.x + size.x <= work.right());
