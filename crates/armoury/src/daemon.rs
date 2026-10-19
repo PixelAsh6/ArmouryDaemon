@@ -5,6 +5,7 @@ use crate::console;
 use crate::ipc;
 use crate::killswitch;
 use crate::overlay;
+use crate::pad;
 use crate::packs;
 use crate::watch;
 use armoury_core::config::{AppConfig, ConsoleApp, TrackedApp};
@@ -1207,19 +1208,26 @@ impl App {
         match ev {
             console::PadEvent::Connected { slot } => {
                 info!("controller connected (slot {slot})");
-                if !self.cfg.console_enabled {
-                    return;
-                }
-                if !self.engine.running_names().is_empty() {
-                    info!("console mode: kept closed — a tracked app is running");
-                    return;
-                }
-                self.show_console();
+                self.open_console_if_allowed();
             }
             console::PadEvent::Disconnected { slot } => {
                 info!("controller disconnected (slot {slot})");
             }
         }
+    }
+
+    /// Open the launcher unless console mode is off or a tracked app is running. Shared by a
+    /// fresh connect and by turning the feature on while a pad already sits in a slot — that
+    /// moment never produces a connect event (the watcher seeds the current slots at startup).
+    fn open_console_if_allowed(&mut self) {
+        if !self.cfg.console_enabled {
+            return;
+        }
+        if !self.engine.running_names().is_empty() {
+            info!("console mode: kept closed — a tracked app is running");
+            return;
+        }
+        self.show_console();
     }
 
     /// Open the console launcher now (tray menu / settings preview / a fresh pad connect).
@@ -1378,6 +1386,14 @@ impl App {
                         warn!("failed to save config: {e}");
                     }
                     info!("console mode {}", if enabled { "on" } else { "off" });
+                    // A pad that is already connected will not send a fresh connect event, so
+                    // turning the feature on with one present counts as that connect.
+                    if enabled {
+                        if let Some(slot) = pad::first_connected() {
+                            info!("controller already connected (slot {slot})");
+                            self.open_console_if_allowed();
+                        }
+                    }
                     self.broadcast_status();
                 }
                 Request::AddConsoleApp { name, exe } => {
