@@ -6,8 +6,9 @@
 use std::time::{Duration, Instant};
 
 use windows::Win32::UI::Input::XboxController::{
-    XInputGetState, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_DPAD_LEFT,
-    XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_STATE,
+    XInputGetState, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_DPAD_DOWN,
+    XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP,
+    XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE,
 };
 
 pub const SLOTS: u32 = 4;
@@ -20,8 +21,13 @@ const DEADZONE: i16 = 16_000;
 pub struct Pad {
     pub a: bool,
     pub b: bool,
+    /// X / Y face buttons, carried for the next round of pad actions (no ui use yet).
+    pub x: bool,
+    pub y: bool,
     /// -1 / 0 / +1: d-pad or left stick horizontal intent.
     pub move_x: i8,
+    /// -1 / 0 / +1: d-pad or left stick vertical intent. Screen coordinates: up is -1.
+    pub move_y: i8,
 }
 
 /// Read slot `slot` (0..SLOTS). `None` when no pad is connected there.
@@ -38,10 +44,18 @@ pub fn read(slot: u32) -> Option<Pad> {
     Some(Pad {
         a: g.wButtons.0 & XINPUT_GAMEPAD_A.0 != 0,
         b: g.wButtons.0 & XINPUT_GAMEPAD_B.0 != 0,
+        x: g.wButtons.0 & XINPUT_GAMEPAD_X.0 != 0,
+        y: g.wButtons.0 & XINPUT_GAMEPAD_Y.0 != 0,
         move_x: nav_x(
             g.wButtons.0 & XINPUT_GAMEPAD_DPAD_LEFT.0 != 0,
             g.wButtons.0 & XINPUT_GAMEPAD_DPAD_RIGHT.0 != 0,
             g.sThumbLX,
+        ),
+        // The same helper, fed up as the negative key and down as the positive one.
+        move_y: nav_x(
+            g.wButtons.0 & XINPUT_GAMEPAD_DPAD_UP.0 != 0,
+            g.wButtons.0 & XINPUT_GAMEPAD_DPAD_DOWN.0 != 0,
+            g.sThumbLY,
         ),
     })
 }

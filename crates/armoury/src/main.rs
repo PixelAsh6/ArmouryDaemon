@@ -9,6 +9,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod art;
 mod catalog;
 mod console;
 mod console_ui;

@@ -39,6 +39,8 @@ pub enum Request {
     AddConsoleApp { name: String, exe: String },
     /// Unpin an app from the console launcher.
     RemoveConsoleApp { exe: String },
+    /// Keep a tracked app out of the console band (it stays tracked and triggers as usual).
+    HideFromConsole { exe: String },
     /// Launch an app from the console; the daemon does the spawning and logging.
     LaunchApp { exe: String },
     /// Open the console launcher now (tray menu / settings preview), pad or not.
@@ -174,6 +176,8 @@ mod tests {
                 packs: vec![],
                 console_enabled: false,
                 console_apps: vec![],
+                console_hidden: vec![],
+                last_played: Default::default(),
             },
         };
         let mut out = Vec::new();
@@ -202,6 +206,13 @@ mod tests {
         write_msg(&mut out, &Request::ShowConsole).unwrap();
         write_msg(
             &mut out,
+            &Request::HideFromConsole {
+                exe: "C:\\Games\\doom.exe".into(),
+            },
+        )
+        .unwrap();
+        write_msg(
+            &mut out,
             &Response::ConsoleOp {
                 ok: true,
                 message: "added".into(),
@@ -213,6 +224,8 @@ mod tests {
         assert!(matches!(req, Request::AddConsoleApp { .. }));
         let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(req, Request::ShowConsole));
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(req, Request::HideFromConsole { .. }));
         let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(resp, Response::ConsoleOp { ok: true, .. }));
     }

@@ -1,21 +1,27 @@
-//! Console launcher (`--console`): the pad-driven tile strip the daemon spawns on a fresh
+//! Console launcher (`--console`): the pad-driven cover-art strip the daemon spawns on a fresh
 //! controller connect (the tray menu and the settings preview can open it too).
 //!
 //! Its own process, like `--ui`: it connects to the daemon over the same JSONL pipe, receives
 //! status broadcasts (which carry the app lists) and sends launch / add requests back.
 //! Input is XInput polled per frame; transitions ride egui's `animate_*` helpers.
+//! Covers are fetched by the daemon into `%APPDATA%\ArmouryDaemon\art`; this side only reads
+//! that folder (hand-dropped files win) and falls back to the exe icon, then a monogram.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use armoury_core::config::TrackedApp;
 use armoury_core::protocol::{read_msg, write_msg, Request, Response};
 use armoury_core::status::StatusSnapshot;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
+use eframe::egui::epaint::{CornerRadius, Mesh, RectShape};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
 
+use crate::art;
 use crate::pad;
 
 /// The launcher's fixed window: a bottom-anchored band, console style.
@@ -25,8 +31,15 @@ const TILE_W: f32 = 196.0;
 const TILE_H: f32 = 240.0;
 const GAP: f32 = 18.0;
 const SIDE: f32 = 48.0;
+const TILE_RADIUS: f32 = 16.0;
+/// Fallback icon box inside a tile (square covers and exe icons).
+const ICON: f32 = 108.0;
 /// How far above the work-area bottom the band sits.
 const BOTTOM_LIFT: f32 = 56.0;
+/// Hero background: how long the crossfade to a newly selected entry takes.
+const BG_FADE: f32 = 0.30;
+/// Hero background: how tall the bottom gradient (the hint line's dark bed) is.
+const BG_GRADIENT: f32 = 140.0;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(9, 10, 13);
 const TILE: egui::Color32 = egui::Color32::from_rgb(24, 26, 32);
@@ -40,11 +53,29 @@ enum Ev {
     Eof,
 }
 
+/// Decoded cover art from the worker: the key plus RGBA pixels (`None` = nothing readable yet).
+struct ArtMsg {
+    key: String,
+    image: Option<(Vec<u8>, u32, u32)>,
+}
+
+/// Extracted exe icon from the worker.
+struct IconMsg {
+    key: String,
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
 pub fn run() {
     if let Err(e) = armoury_core::logging::init("console") {
         eprintln!("logging init failed: {e}");
     }
     log::info!("console starting (v{})", armoury_core::VERSION);
+    if console_already_open() {
+        log::info!("another console is already open — exiting");
+        return;
+    }
 
     // ---- connect to the daemon (retry briefly: the daemon just spawned us) ----
     let pipe_name = armoury_core::pipe_name();
@@ -73,7 +104,12 @@ pub fn run() {
     };
 
     let (recv_half, mut send_half) = stream.split();
-    if let Err(e) = write_msg(&mut send_half, &Request::ConsoleHello { pid: std::process::id() }) {
+    if let Err(e) = write_msg(
+        &mut send_half,
+        &Request::ConsoleHello {
+            pid: std::process::id(),
+        },
+    ) {
         log::error!("hello failed: {e}");
         std::process::exit(1);
     }
@@ -124,9 +160,7 @@ pub fn run() {
     let _ = eframe::run_native(
         "ArmouryDaemon Console",
         options,
-        Box::new(move |_cc| {
-            Ok(Box::new(App::new(rx, Box::new(send_half))) as Box<dyn eframe::App>)
-        }),
+        Box::new(move |_cc| Ok(Box::new(App::new(rx, Box::new(send_half))) as Box<dyn eframe::App>)),
     );
 }
 
@@ -162,6 +196,39 @@ fn console_position(size: egui::Vec2) -> egui::Pos2 {
     )
 }
 
+/// One console at a time: a tray open racing a pad connect (or a manual run) must not stack
+/// windows. The mutex is held for the process lifetime — the OS releases it on exit.
+fn console_already_open() -> bool {
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::PCWSTR;
+    let name: Vec<u16> = "Local\\ArmouryDaemonConsole"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    match unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) } {
+        Ok(_held) => unsafe { GetLastError() == ERROR_ALREADY_EXISTS },
+        Err(_) => false,
+    }
+}
+
+/// The Windows "Animation effects" setting (SPI_GETCLIENTAREAANIMATION). Defaults to on.
+fn animations_enabled() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+    };
+    let mut on: i32 = 1;
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            &mut on as *mut i32 as *mut core::ffi::c_void,
+            0,
+        )
+    };
+    ok != 0 && on != 0
+}
+
 struct App {
     rx: Receiver<Ev>,
     out: Box<dyn Write>,
@@ -170,15 +237,43 @@ struct App {
     repeat: pad::Repeat,
     prev_a: bool,
     prev_b: bool,
+    prev_x: bool,
+    prev_y: bool,
     pad_slot: Option<u32>,
     entering: bool,
     leaving: bool,
     first_frame: bool,
     add_dialog: Option<Receiver<PathBuf>>,
+    /// Windows "reduce motion" honored: everything lands instantly.
+    reduced: bool,
+    /// Art/icon textures live on the UI thread; workers deliver decoded pixels.
+    arts: HashMap<String, egui::TextureHandle>,
+    /// Hero textures for the band background, keyed like `arts`.
+    heros: HashMap<String, egui::TextureHandle>,
+    icons: HashMap<String, egui::TextureHandle>,
+    art_tx: Sender<ArtMsg>,
+    art_rx: Receiver<ArtMsg>,
+    hero_tx: Sender<ArtMsg>,
+    hero_rx: Receiver<ArtMsg>,
+    icon_tx: Sender<IconMsg>,
+    icon_rx: Receiver<IconMsg>,
+    art_want: HashSet<String>,
+    hero_want: HashSet<String>,
+    icon_want: HashSet<String>,
+    /// Hero crossfade: the fading-out key, the incoming one, and its progress (0..=1).
+    bg_prev: Option<String>,
+    bg_key: Option<String>,
+    bg_fade: f32,
+    /// Which status we last ran the art/icon passes for (0 = none yet).
+    ensured_for: u64,
+    status_serial: u64,
 }
 
 impl App {
     fn new(rx: Receiver<Ev>, out: Box<dyn Write>) -> Self {
+        let (art_tx, art_rx) = crossbeam_channel::unbounded();
+        let (hero_tx, hero_rx) = crossbeam_channel::unbounded();
+        let (icon_tx, icon_rx) = crossbeam_channel::unbounded();
         Self {
             rx,
             out,
@@ -187,11 +282,31 @@ impl App {
             repeat: pad::Repeat::default(),
             prev_a: false,
             prev_b: false,
+            prev_x: false,
+            prev_y: false,
             pad_slot: None,
             entering: false,
             leaving: false,
             first_frame: true,
             add_dialog: None,
+            reduced: !animations_enabled(),
+            arts: HashMap::new(),
+            heros: HashMap::new(),
+            icons: HashMap::new(),
+            art_tx,
+            art_rx,
+            hero_tx,
+            hero_rx,
+            icon_tx,
+            icon_rx,
+            art_want: HashSet::new(),
+            hero_want: HashSet::new(),
+            icon_want: HashSet::new(),
+            bg_prev: None,
+            bg_key: None,
+            bg_fade: 1.0,
+            ensured_for: 0,
+            status_serial: 0,
         }
     }
 
@@ -202,11 +317,15 @@ impl App {
     }
 
     /// The launchable list: tracked apps first, then console-only additions (deduplicated by
-    /// file name). The `＋ Add app…` tile trails it in the UI without being an entry here.
+    /// file name), ordered by recency — recently played first, never-played keep config order.
+    /// Tracked apps the user hid sit the round out.
     fn entries(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         if let Some(s) = &self.status {
             for a in &s.tracked_apps {
+                if s.console_hidden.contains(&basename_lower(&a.exe)) {
+                    continue;
+                }
                 out.push((a.name.clone(), a.exe.clone()));
             }
             for a in &s.console_apps {
@@ -215,37 +334,169 @@ impl App {
                     out.push((a.name.clone(), a.exe.clone()));
                 }
             }
+            let played = |exe: &str| s.last_played.get(&basename_lower(exe)).copied().unwrap_or(0);
+            out.sort_by_key(|(_, exe)| std::cmp::Reverse(played(exe)));
         }
         out
     }
 
-    /// A lands here: launch the selected app, or open the file dialog on the add tile.
+    /// Queue cover-art reads for entries not loaded yet. Cheap: keys nothing has on disk are
+    /// skipped (the daemon's next status broadcast re-checks after a fetch).
+    fn ensure_art(&mut self, entries: &[(String, String)]) {
+        let mut missing: Vec<String> = Vec::new();
+        for (_, exe) in entries {
+            let key = art::key(exe);
+            if self.arts.contains_key(&key) || self.art_want.contains(&key) {
+                continue;
+            }
+            if art::cached(&key).is_none() {
+                continue;
+            }
+            self.art_want.insert(key.clone());
+            missing.push(key);
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let tx = self.art_tx.clone();
+        thread::spawn(move || {
+            for key in missing {
+                let image = art::cached(&key).and_then(|path| {
+                    let bytes = std::fs::read(&path).ok()?;
+                    let img = image::load_from_memory(&bytes).ok()?;
+                    // 2× of the biggest tile keeps it crisp and the texture small.
+                    let img = img.resize(560, 560, image::imageops::FilterType::Triangle);
+                    let rgba = img.to_rgba8();
+                    Some((rgba.as_raw().clone(), rgba.width(), rgba.height()))
+                });
+                if tx.send(ArtMsg { key, image }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Queue hero reads (the band background) for entries not loaded yet.
+    fn ensure_heros(&mut self, entries: &[(String, String)]) {
+        let mut missing: Vec<String> = Vec::new();
+        for (_, exe) in entries {
+            let key = art::key(exe);
+            if self.heros.contains_key(&key) || self.hero_want.contains(&key) {
+                continue;
+            }
+            if art::cached_hero(&key).is_none() {
+                continue;
+            }
+            self.hero_want.insert(key.clone());
+            missing.push(key);
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let tx = self.hero_tx.clone();
+        thread::spawn(move || {
+            for key in missing {
+                let image = art::cached_hero(&key).and_then(|path| {
+                    let bytes = std::fs::read(&path).ok()?;
+                    let img = image::load_from_memory(&bytes).ok()?;
+                    // Hero art is wide (~3:1); 1600 across fits the band with room to spare.
+                    let img = img.resize(1600, 1600, image::imageops::FilterType::Triangle);
+                    let rgba = img.to_rgba8();
+                    Some((rgba.as_raw().clone(), rgba.width(), rgba.height()))
+                });
+                if tx.send(ArtMsg { key, image }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// Queue exe-icon extraction for any entry we haven't fetched yet.
+    fn ensure_icons(&mut self, entries: &[(String, String)]) {
+        let mut missing: Vec<(String, String)> = Vec::new();
+        for (_, exe) in entries {
+            let key = basename_lower(exe);
+            if !self.icons.contains_key(&key) && !self.icon_want.contains(&key) {
+                self.icon_want.insert(key.clone());
+                missing.push((key, exe.clone()));
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let tx = self.icon_tx.clone();
+        thread::spawn(move || {
+            for (key, exe) in missing {
+                if let Some((rgba, w, h)) =
+                    armoury_core::icon::exe_icon_rgba(std::path::Path::new(&exe))
+                {
+                    if tx.send(IconMsg { key, rgba, w, h }).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// A lands here: launch the selected app.
     fn activate(&mut self, entries: &[(String, String)]) {
         if self.leaving {
             return;
         }
-        match entries.get(self.selected) {
-            Some((_, exe)) => {
-                log::info!("launching {exe}");
-                self.send(Request::LaunchApp { exe: exe.clone() });
-                self.leaving = true; // the game is starting; slide away
-            }
-            None => {
-                // the ＋ Add app… tile
-                let (tx, rx) = crossbeam_channel::bounded(1);
-                thread::spawn(move || {
-                    if let Some(path) = crate::pick::open_dialog(
-                        "Pick an app for the console",
-                        "Applications",
-                        "*.exe",
-                    ) {
-                        let _ = tx.send(path);
-                    }
-                });
-                self.add_dialog = Some(rx);
-            }
+        if let Some((_, exe)) = entries.get(self.selected) {
+            log::info!("launching {exe}");
+            self.send(Request::LaunchApp { exe: exe.clone() });
+            self.leaving = true; // the game is starting; slide away
         }
     }
+
+    /// X lands here: pick an exe and pin it (the gamepad button instead of a strip tile).
+    fn open_add_dialog(&mut self) {
+        if self.add_dialog.is_some() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        thread::spawn(move || {
+            if let Some(path) =
+                crate::pick::open_dialog("Pick an app for the console", "Applications", "*.exe")
+            {
+                let _ = tx.send(path);
+            }
+        });
+        self.add_dialog = Some(rx);
+        log::info!("add-app picker opened");
+    }
+
+    /// Y lands here: take the selected entry off the band only. A tracked app is hidden (the
+    /// daemon keeps tracking it); a console-only pin is unpinned for good.
+    fn remove_selected(&mut self, entries: &[(String, String)]) {
+        let Some((_, exe)) = entries.get(self.selected) else {
+            return;
+        };
+        let tracked = self
+            .status
+            .as_ref()
+            .map(|s| s.tracked_apps.as_slice())
+            .unwrap_or(&[]);
+        log::info!("removing {exe} from the band");
+        self.send(remove_request(tracked, exe));
+    }
+}
+
+/// Which request "remove" sends for an entry: a tracked app is only hidden from the band (the
+/// daemon keeps tracking it), a console-only pin is unpinned for good.
+fn remove_request(tracked: &[TrackedApp], exe: &str) -> Request {
+    if is_tracked(tracked, exe) {
+        Request::HideFromConsole { exe: exe.to_string() }
+    } else {
+        Request::RemoveConsoleApp { exe: exe.to_string() }
+    }
+}
+
+/// Does the status's tracked list hold this exe, matched by base name like the band matches?
+fn is_tracked(tracked: &[TrackedApp], exe: &str) -> bool {
+    let base = basename_lower(exe);
+    tracked.iter().any(|a| basename_lower(&a.exe) == base)
 }
 
 impl eframe::App for App {
@@ -255,8 +506,7 @@ impl eframe::App for App {
             crate::ui::install_fonts(&ctx);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            // The moment the window comes up was not on record before; the handshake line
-            // ("got the app list") lands around the same time, not before it.
+            // The visibility anchor for latency forensics.
             log::info!("window shown");
             self.first_frame = false;
         }
@@ -267,9 +517,13 @@ impl eframe::App for App {
             match ev {
                 Ev::Response(Response::HelloAck { status, .. }) => {
                     self.status = Some(status);
+                    self.status_serial += 1;
                     log::info!("got the app list");
                 }
-                Ev::Response(Response::Status { status }) => self.status = Some(status),
+                Ev::Response(Response::Status { status }) => {
+                    self.status = Some(status);
+                    self.status_serial += 1;
+                }
                 Ev::Response(Response::Focus) => {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -279,6 +533,61 @@ impl eframe::App for App {
                     std::process::exit(0);
                 }
             }
+        }
+
+        // ---- cover art from the worker ----
+        while let Ok(m) = self.art_rx.try_recv() {
+            match m.image {
+                Some((rgba, w, h)) => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        &rgba,
+                    );
+                    let handle = ctx.load_texture(
+                        format!("console-art:{}", m.key),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.arts.insert(m.key, handle);
+                }
+                None => {
+                    // Unreadable file: forget the wish so the next status can re-try.
+                    log::info!("cover art: {} unreadable; using the icon", m.key);
+                    self.art_want.remove(&m.key);
+                }
+            }
+        }
+
+        // ---- hero art from the worker (the band background) ----
+        while let Ok(m) = self.hero_rx.try_recv() {
+            match m.image {
+                Some((rgba, w, h)) => {
+                    let img =
+                        egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    let handle = ctx.load_texture(
+                        format!("console-hero:{}", m.key),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.heros.insert(m.key, handle);
+                }
+                None => {
+                    // Unreadable file: forget the wish so the next status can re-try.
+                    log::info!("hero art: {} unreadable; using the flat band", m.key);
+                    self.hero_want.remove(&m.key);
+                }
+            }
+        }
+
+        // ---- exe icons from the worker ----
+        while let Ok(m) = self.icon_rx.try_recv() {
+            let img = egui::ColorImage::from_rgba_unmultiplied([m.w as usize, m.h as usize], &m.rgba);
+            let handle = ctx.load_texture(
+                format!("console-icon:{}", m.key),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            self.icons.insert(m.key, handle);
         }
 
         // ---- file dialog result: pin the app ----
@@ -305,8 +614,18 @@ impl eframe::App for App {
         }
 
         let entries = self.entries();
-        let tiles = entries.len() + 1; // + the add tile
-        self.selected = self.selected.min(tiles.saturating_sub(1));
+        let n = entries.len();
+        if n == 0 {
+            self.selected = 0;
+        } else if self.selected >= n {
+            self.selected = n - 1;
+        }
+        if self.ensured_for != self.status_serial {
+            self.ensured_for = self.status_serial;
+            self.ensure_art(&entries);
+            self.ensure_heros(&entries);
+            self.ensure_icons(&entries);
+        }
 
         // ---- input: pad first, keyboard as the desktop fallback ----
         let had_pad = self.pad_slot.is_some();
@@ -341,60 +660,90 @@ impl eframe::App for App {
         };
         let step = self.repeat.tick(dir, Instant::now());
         if step != 0 {
-            let last = tiles.saturating_sub(1) as i32;
-            self.selected = (self.selected as i32 + step as i32).clamp(0, last) as usize;
+            self.selected = wrap(self.selected, step.into(), n);
         }
 
         let a = pad_state.map(|p| p.a).unwrap_or(false);
         let b = pad_state.map(|p| p.b).unwrap_or(false);
+        let x = pad_state.map(|p| p.x).unwrap_or(false);
+        let y = pad_state.map(|p| p.y).unwrap_or(false);
         if (a && !self.prev_a) || key_enter {
             self.activate(&entries);
+        }
+        if x && !self.prev_x {
+            self.open_add_dialog();
+        }
+        if y && !self.prev_y {
+            self.remove_selected(&entries);
         }
         if (b && !self.prev_b) || key_esc {
             self.leaving = true;
         }
         self.prev_a = a;
         self.prev_b = b;
+        self.prev_x = x;
+        self.prev_y = y;
 
         if !self.entering && !self.leaving {
             self.entering = true;
         }
-        let enter = ctx.animate_bool_with_time(
-            egui::Id::unique("console-enter"),
-            self.entering && !self.leaving,
-            0.28,
-        );
+        let slow = if self.reduced { 0.001 } else { 0.28 };
+        let enter = ctx.animate_bool_with_time(egui::Id::unique("console-enter"), self.entering && !self.leaving, slow);
         if self.leaving && enter < 0.03 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
-        // ---- render: one horizontal strip, selection glides, scroll follows ----
+        // ---- background: the selected entry's hero, crossfading on selection ----
+        // A missing hero falls back to the flat band, so the outgoing one is dropped too.
+        let hero_key = entries
+            .get(self.selected)
+            .map(|(_, exe)| art::key(exe))
+            .filter(|key| self.heros.contains_key(key));
+        if hero_key != self.bg_key {
+            self.bg_prev = std::mem::replace(&mut self.bg_key, hero_key);
+            self.bg_fade = if self.reduced { 1.0 } else { 0.0 };
+        }
+        if self.bg_key.is_none() {
+            self.bg_prev = None;
+        }
+        if !self.reduced {
+            self.bg_fade = (self.bg_fade + ctx.input(|i| i.stable_dt) / BG_FADE).min(1.0);
+        }
+
+        // ---- render: one horizontal strip, selection glides, the row wraps around ----
         // The band itself is solid (the OS window pops instantly); the content fades and
         // rises into place on entry and dips out again on the way to a launch or close.
-        ui.painter().rect_filled(ui.max_rect(), 0.0, BG);
-        ui.set_opacity(enter.max(0.01));
+        let bg = ui.painter().clone();
         let full = ui.max_rect();
-        let rise = (1.0 - enter) * 40.0;
+        bg.rect_filled(full, 0.0, BG);
+        if let Some(tex) = self.bg_prev.as_ref().and_then(|k| self.heros.get(k)) {
+            paint_hero(&bg, full, tex, 1.0); // the outgoing hero stays put underneath
+        }
+        if let Some(tex) = self.bg_key.as_ref().and_then(|k| self.heros.get(k)) {
+            paint_hero(&bg, full, tex, self.bg_fade);
+            paint_band_dim(&bg, full);
+        }
+        ui.set_opacity(enter.max(0.01));
+        let rise = if self.reduced { 0.0 } else { (1.0 - enter) * 40.0 };
 
         let view_w = (full.width() - 2.0 * SIDE).max(TILE_W);
         let view_left = full.left() + SIDE;
         let pitch = TILE_W + GAP;
-        let total = tiles as f32 * pitch - GAP;
+        let total = n as f32 * pitch - GAP;
         let target_off = if total <= view_w {
             -(view_w - total) / 2.0
         } else {
             (self.selected as f32 * pitch + TILE_W / 2.0 - view_w / 2.0)
                 .clamp(0.0, total - view_w)
         };
-        let off = ctx.animate_value_with_time(egui::Id::unique("console-scroll"), target_off, 0.22);
+        let scroll_time = if self.reduced { 0.001 } else { 0.22 };
+        let off = ctx.animate_value_with_time(egui::Id::unique("console-scroll"), target_off, scroll_time);
         let center_y = full.center().y - 14.0 + rise;
+        let sel_time = if self.reduced { 0.001 } else { 0.18 };
 
-        for i in 0..tiles {
-            let sel = ctx.animate_bool_with_time(
-                egui::Id::unique(("console-sel", i)),
-                i == self.selected,
-                0.18,
-            );
+        for i in 0..n {
+            let (name, exe) = &entries[i];
+            let sel = ctx.animate_bool_with_time(egui::Id::unique(("console-sel", i)), i == self.selected, sel_time);
             let scale = 1.0 + 0.055 * sel;
             let size = egui::vec2(TILE_W, TILE_H) * scale;
             let x = view_left + i as f32 * pitch + TILE_W / 2.0 - off;
@@ -404,53 +753,74 @@ impl eframe::App for App {
                 continue; // off the visible strip: don't paint or catch clicks
             }
 
-            let response = ui.interact(
-                rect,
-                egui::Id::unique(("console-tile", i)),
-                egui::Sense::click(),
-            );
+            let response = ui.interact(rect, egui::Id::unique(("console-tile", i)), egui::Sense::click());
             let glow = (sel * 0.8 + if response.hovered() { 0.5 } else { 0.0 }).min(1.0);
 
-            ui.painter().rect_filled(
-                rect,
-                16.0,
-                if i == self.selected { TILE_SEL } else { TILE },
-            );
-            if glow > 0.01 {
-                ui.painter().rect_stroke(
-                    rect,
-                    16.0,
-                    egui::Stroke::new(2.0, ACCENT.gamma_multiply(glow)),
-                    egui::StrokeKind::Outside,
-                );
-            }
+            ui.painter().rect_filled(rect, TILE_RADIUS, if i == self.selected { TILE_SEL } else { TILE });
 
-            match entries.get(i) {
-                Some((name, _)) => {
+            let icon_key = basename_lower(exe);
+            let cover = self.arts.get(&art::key(exe));
+            match cover {
+                Some(tex) => {
+                    // Center-crop the 2:3 art into the tile; scrim + name keep it readable.
+                    let (uv_min, uv_max) = cover_uv(tex.size_vec2(), rect);
+                    let uv = egui::Rect::from_min_max(uv_min, uv_max);
+                    ui.painter().add(
+                        RectShape::filled(rect, CornerRadius::from(TILE_RADIUS), egui::Color32::WHITE)
+                            .with_texture(tex.id(), uv),
+                    );
+                    paint_scrim(ui.painter(), rect);
                     ui.painter().text(
-                        rect.center(),
+                        egui::pos2(rect.center().x, rect.bottom() - 24.0),
                         egui::Align2::CENTER_CENTER,
-                        short_name(name, 16),
-                        egui::FontId::proportional(22.0),
-                        TEXT,
+                        short_name(name, 20),
+                        egui::FontId::proportional(17.0),
+                        TEXT.gamma_multiply(0.86 + 0.14 * sel),
                     );
                 }
                 None => {
-                    ui.painter().text(
-                        rect.center() - egui::vec2(0.0, 18.0),
-                        egui::Align2::CENTER_CENTER,
-                        "+",
-                        egui::FontId::proportional(44.0),
-                        MUTED,
+                    let icon_rect = egui::Rect::from_center_size(
+                        egui::pos2(rect.center().x, rect.center().y - 24.0),
+                        egui::vec2(ICON, ICON) * scale,
                     );
+                    match self.icons.get(&icon_key) {
+                        Some(tex) => {
+                            let uv = egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(1.0, 1.0),
+                            );
+                            ui.painter().add(
+                                RectShape::filled(icon_rect, CornerRadius::from(12.0), egui::Color32::WHITE)
+                                    .with_texture(tex.id(), uv),
+                            );
+                        }
+                        None => {
+                            ui.painter().text(
+                                icon_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                first_char(name),
+                                egui::FontId::proportional(64.0),
+                                TEXT.gamma_multiply(0.55 + 0.45 * sel),
+                            );
+                        }
+                    }
                     ui.painter().text(
-                        rect.center() + egui::vec2(0.0, 26.0),
+                        egui::pos2(rect.center().x, rect.bottom() - 28.0),
                         egui::Align2::CENTER_CENTER,
-                        "Add app…",
+                        short_name(name, 20),
                         egui::FontId::proportional(17.0),
-                        MUTED,
+                        TEXT.gamma_multiply(0.80 + 0.20 * sel),
                     );
                 }
+            }
+
+            if glow > 0.01 {
+                ui.painter().rect_stroke(
+                    rect,
+                    TILE_RADIUS,
+                    egui::Stroke::new(2.0, ACCENT.gamma_multiply(glow)),
+                    egui::StrokeKind::Outside,
+                );
             }
 
             if response.clicked() {
@@ -461,18 +831,107 @@ impl eframe::App for App {
 
         // ---- the hint bar ----
         let hint = if self.pad_slot.is_some() {
-            "A  open      B  close      D-pad / left stick  scroll"
+            "A  open      B  close      X  add app      Y  remove      D-pad / left stick  scroll"
         } else {
             "No controller — connect one, or open this from the tray"
         };
+        let hint_y = if n == 0 {
+            full.center().y
+        } else {
+            full.bottom() - 18.0 + rise * 0.5
+        };
+        let hint_text = if n == 0 {
+            "No apps yet — press X to add one"
+        } else {
+            hint
+        };
         ui.painter().text(
-            egui::pos2(full.center().x, full.bottom() - 18.0 + rise * 0.5),
+            egui::pos2(full.center().x, hint_y),
             egui::Align2::CENTER_CENTER,
-            hint,
-            egui::FontId::proportional(14.0),
+            hint_text,
+            egui::FontId::proportional(if n == 0 { 18.0 } else { 14.0 }),
             MUTED,
         );
     }
+}
+
+/// One hero texture across the whole band, center-cropped and faded by `alpha` (the crossfade).
+/// Radius 0: the band's own rectangle.
+fn paint_hero(painter: &egui::Painter, rect: egui::Rect, tex: &egui::TextureHandle, alpha: f32) {
+    let (uv_min, uv_max) = cover_uv(tex.size_vec2(), rect);
+    let uv = egui::Rect::from_min_max(uv_min, uv_max);
+    let tint = egui::Color32::from_white_alpha((255.0 * alpha.clamp(0.0, 1.0)) as u8);
+    painter.add(RectShape::filled(rect, CornerRadius::ZERO, tint).with_texture(tex.id(), uv));
+}
+
+/// Keep the strip readable over a hero: a flat dim over the whole band, then a stronger
+/// gradient toward the hint line. Tiles and hints draw on top of both.
+fn paint_band_dim(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_black_alpha(150));
+    let mut m = Mesh::default();
+    let top = rect.bottom() - BG_GRADIENT;
+    m.colored_vertex(egui::pos2(rect.left(), top), egui::Color32::TRANSPARENT);
+    m.colored_vertex(egui::pos2(rect.right(), top), egui::Color32::TRANSPARENT);
+    m.colored_vertex(
+        egui::pos2(rect.left(), rect.bottom()),
+        egui::Color32::from_black_alpha(210),
+    );
+    m.colored_vertex(
+        egui::pos2(rect.right(), rect.bottom()),
+        egui::Color32::from_black_alpha(210),
+    );
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(2, 1, 3);
+    painter.add(egui::Shape::mesh(m));
+}
+
+/// Move the selection by `step` with wrap-around (the endless scroll through the row).
+fn wrap(selected: usize, step: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (selected as i32 + step).rem_euclid(len as i32) as usize
+}
+
+/// Center-crop uv so cover art fills the tile without squashing.
+fn cover_uv(image: egui::Vec2, rect: egui::Rect) -> (egui::Pos2, egui::Pos2) {
+    let img_aspect = image.x / image.y.max(1.0);
+    let tile_aspect = rect.width() / rect.height().max(1.0);
+    if img_aspect > tile_aspect {
+        let keep = tile_aspect / img_aspect;
+        let dx = (1.0 - keep) / 2.0;
+        (egui::pos2(dx, 0.0), egui::pos2(1.0 - dx, 1.0))
+    } else {
+        let keep = img_aspect / tile_aspect;
+        let dy = (1.0 - keep) / 2.0;
+        (egui::pos2(0.0, dy), egui::pos2(1.0, 1.0 - dy))
+    }
+}
+
+/// Fade the cover into the tile's bottom so the name stays readable. Two layers: a rounded
+/// solid near the bottom edge (matches the tile corners) under a soft gradient above it.
+fn paint_scrim(painter: &egui::Painter, rect: egui::Rect) {
+    const SOLID: f32 = 54.0;
+    const FADE: f32 = 74.0;
+    let solid = egui::Rect::from_min_max(
+        egui::pos2(rect.left(), rect.bottom() - SOLID),
+        egui::pos2(rect.right(), rect.bottom()),
+    );
+    painter.add(RectShape::filled(
+        solid,
+        CornerRadius::from(TILE_RADIUS),
+        egui::Color32::from_black_alpha(168),
+    ));
+    let mut m = Mesh::default();
+    let top = rect.bottom() - SOLID - FADE;
+    let bottom = rect.bottom() - SOLID + 2.0;
+    m.colored_vertex(egui::pos2(rect.left(), top), egui::Color32::TRANSPARENT);
+    m.colored_vertex(egui::pos2(rect.right(), top), egui::Color32::TRANSPARENT);
+    m.colored_vertex(egui::pos2(rect.left(), bottom), egui::Color32::from_black_alpha(168));
+    m.colored_vertex(egui::pos2(rect.right(), bottom), egui::Color32::from_black_alpha(168));
+    m.add_triangle(0, 1, 2);
+    m.add_triangle(2, 1, 3);
+    painter.add(egui::Shape::mesh(m));
 }
 
 fn basename_lower(path: &str) -> String {
@@ -491,6 +950,14 @@ fn short_name(name: &str, max: usize) -> String {
     out
 }
 
+/// The monogram fallback: the first character, upper-cased.
+fn first_char(name: &str) -> String {
+    name.chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,6 +967,55 @@ mod tests {
         assert_eq!(short_name("RainbowSix", 16), "RainbowSix");
         assert_eq!(short_name("Rainbow Six Extraction", 16), "Rainbow Six Extr…");
         // unicode-safe: never split a multi-byte character
-        assert_eq!(short_name("Æther 全角テスト長い名前", 12), "Æther 全角テスト長…");
+        assert_eq!(short_name("Æther 全角テスト", 8), "Æther 全角…");
+    }
+
+    #[test]
+    fn selection_wraps_both_ways() {
+        assert_eq!(wrap(0, -1, 3), 2); // left from the first lands on the last
+        assert_eq!(wrap(2, 1, 3), 0); // right from the last lands on the first
+        assert_eq!(wrap(1, 1, 3), 2);
+        assert_eq!(wrap(0, 1, 0), 0); // empty list stays put
+        assert_eq!(wrap(5, 0, 3), 2); // stale index folds back into range
+    }
+
+    #[test]
+    fn tracked_apps_match_by_base_name() {
+        let tracked = vec![TrackedApp {
+            name: "Rainbow Six".into(),
+            exe: "C:\\Games\\RainbowSix.exe".into(),
+        }];
+        assert!(is_tracked(&tracked, "D:\\Elsewhere\\rainbowsix.EXE"));
+        assert!(!is_tracked(&tracked, "C:\\Games\\Notepad.exe"));
+        assert!(!is_tracked(&[], "C:\\Games\\RainbowSix.exe"));
+    }
+
+    #[test]
+    fn remove_hides_tracked_apps_and_unpins_console_pins() {
+        let tracked = vec![TrackedApp {
+            name: "Notepad".into(),
+            exe: "C:\\Windows\\notepad.exe".into(),
+        }];
+        assert!(matches!(
+            remove_request(&tracked, "D:\\Portable\\Notepad.exe"),
+            Request::HideFromConsole { .. }
+        ));
+        assert!(matches!(
+            remove_request(&tracked, "C:\\Other\\Steam.exe"),
+            Request::RemoveConsoleApp { .. }
+        ));
+    }
+
+    #[test]
+    fn cover_uv_crops_the_long_side() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(196.0, 240.0));
+        // a 2:3 portrait is taller than the 0.82 tile: crop the top/bottom equally
+        let (min, max) = cover_uv(egui::vec2(600.0, 900.0), tile);
+        assert!((min.x - 0.0).abs() < 1e-6 && (max.x - 1.0).abs() < 1e-6);
+        assert!(min.y > 0.0 && (min.y - (1.0 - max.y)).abs() < 1e-6);
+        // a wide image is cropped left/right instead
+        let (min, max) = cover_uv(egui::vec2(1920.0, 620.0), tile);
+        assert!(min.x > 0.0 && (min.x - (1.0 - max.x)).abs() < 1e-6);
+        assert!((min.y - 0.0).abs() < 1e-6 && (max.y - 1.0).abs() < 1e-6);
     }
 }

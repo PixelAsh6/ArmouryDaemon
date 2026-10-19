@@ -51,6 +51,12 @@ pub struct StatusSnapshot {
     /// Apps pinned to the console launcher.
     #[serde(default)]
     pub console_apps: Vec<ConsoleApp>,
+    /// Console: exe base names (lowercase) the band hides — tracked apps kept out of the strip.
+    #[serde(default)]
+    pub console_hidden: Vec<String>,
+    /// Console: exe base name (lowercase) -> unix seconds of the last play (band recency order).
+    #[serde(default)]
+    pub last_played: std::collections::HashMap<String, u64>,
 }
 
 /// One installed pack, as the dashboard sees it.

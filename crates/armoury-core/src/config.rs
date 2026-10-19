@@ -18,6 +18,9 @@ pub struct AppConfig {
     pub console_enabled: bool,
     /// Apps pinned to the console launcher without being tracked.
     pub console_apps: Vec<ConsoleApp>,
+    /// Exe base names (lowercase) the console band hides: tracked apps kept out of the strip.
+    #[serde(default)]
+    pub console_hidden: Vec<String>,
     /// Idle overlay safety cap: force-quit after `idle_failsafe_minutes`.
     pub idle_failsafe_enabled: bool,
     pub idle_failsafe_minutes: u64,
@@ -27,6 +30,12 @@ pub struct AppConfig {
     /// Pack catalog manifest URL; `None` = the official catalog.
     #[serde(default)]
     pub catalog_url: Option<String>,
+    /// Console launcher recency: exe base name (lowercase) -> unix seconds of the last play.
+    #[serde(default)]
+    pub last_played: HashMap<String, u64>,
+    /// SteamGridDB API key for cover art (https://www.steamgriddb.com/profile/preferences).
+    #[serde(default)]
+    pub sgdb_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -48,10 +57,13 @@ impl Default for AppConfig {
             paused: false,
             console_enabled: false,
             console_apps: Vec::new(),
+            console_hidden: Vec::new(),
             idle_failsafe_enabled: true,
             idle_failsafe_minutes: 180,
             ui_position: None,
             catalog_url: None,
+            last_played: HashMap::new(),
+            sgdb_api_key: None,
         }
     }
 }
@@ -177,15 +189,18 @@ mod tests {
             name: "Notepad".into(),
             exe: "C:\\Windows\\notepad.exe".into(),
         });
+        cfg.console_hidden.push("notepad.exe".into());
         let text = serde_json::to_string(&cfg).unwrap();
         let back: AppConfig = serde_json::from_str(&text).unwrap();
         assert!(back.console_enabled);
         assert_eq!(back.console_apps[0].exe, "C:\\Windows\\notepad.exe");
+        assert_eq!(back.console_hidden, vec!["notepad.exe".to_string()]);
 
         // a config written before console mode existed must load with console defaults
         let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
         assert_eq!(old.cooldown_seconds, 30);
         assert!(!old.console_enabled);
         assert!(old.console_apps.is_empty());
+        assert!(old.console_hidden.is_empty());
     }
 }

@@ -23,3 +23,4 @@ eframe.workspace = true
 rhai.workspace = true
 ureq.workspace = true
 sha2.workspace = true
+image.workspace = true

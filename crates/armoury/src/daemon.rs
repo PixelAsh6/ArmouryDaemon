@@ -1,6 +1,7 @@
 //! Daemon mode: single instance, tray icon + menu, Scroll Lock global hotkey,
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
+use crate::art;
 use crate::console;
 use crate::ipc;
 use crate::killswitch;
@@ -102,6 +103,8 @@ pub fn run(show_ui_when_running: bool) {
 
     // ---- controller watch (console mode) ----
     let (pad_tx, pad_rx) = crossbeam_channel::unbounded::<console::PadEvent>();
+    // Cover-art worker -> main loop: a key with fresh art, or "" when a pass finished.
+    let (art_tx, art_rx) = crossbeam_channel::unbounded::<String>();
     console::start(pad_tx, wake_handle);
     let engine = {
         let mut e = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
@@ -232,6 +235,9 @@ pub fn run(show_ui_when_running: bool) {
         spawning_ui: false,
         console_child: None,
         pad_rx,
+        art_tx,
+        art_rx,
+        art_busy: false,
         last_broadcast: Instant::now(),
         last_tooltip: String::new(),
         wake: wake_handle,
@@ -242,6 +248,7 @@ pub fn run(show_ui_when_running: bool) {
         info!("starting paused (packs will not switch until resumed)");
     }
     info!("daemon ready");
+    app.ensure_art(); // tracked apps get their covers even before the console opens
 
     let quit = loop {
         pump_win32_messages();
@@ -300,6 +307,9 @@ pub fn run(show_ui_when_running: bool) {
         }
         while let Ok(ev) = app.pad_rx.try_recv() {
             app.on_pad(ev);
+        }
+        while let Ok(key) = app.art_rx.try_recv() {
+            app.on_art(key);
         }
         loop {
             match app.pack_out_rx.try_recv() {
@@ -507,11 +517,34 @@ struct App {
     console_child: Option<Child>,
     /// Pad hotplug events from the controller watch.
     pad_rx: crossbeam_channel::Receiver<console::PadEvent>,
+    /// Cover-art passes: worker -> main loop (a ready key, or "" when a pass finished).
+    art_tx: crossbeam_channel::Sender<String>,
+    art_rx: crossbeam_channel::Receiver<String>,
+    art_busy: bool,
     last_broadcast: Instant,
     /// Last text set on the tray tooltip (avoid a Win32 call every second).
     last_tooltip: String,
     /// The wake event every producer signals (handed to each pack worker).
     wake: usize,
+}
+
+/// The console launcher's entry list: tracked apps first, then console-only pins (deduped by
+/// exe base name) — the same merge the console itself performs. Hidden tracked apps stay out.
+fn launcher_entries(cfg: &AppConfig) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for a in &cfg.tracked_apps {
+        if cfg.console_hidden.contains(&basename_lower(&a.exe)) {
+            continue; // hidden from the band only: the daemon still tracks it
+        }
+        out.push((a.name.clone(), a.exe.clone()));
+    }
+    for a in &cfg.console_apps {
+        let base = basename_lower(&a.exe);
+        if !out.iter().any(|(_, exe)| basename_lower(exe) == base) {
+            out.push((a.name.clone(), a.exe.clone()));
+        }
+    }
+    out
 }
 
 impl App {
@@ -547,6 +580,8 @@ impl App {
             tracked_apps_running: self.engine.running_names(),
             console_enabled: self.cfg.console_enabled,
             console_apps: self.cfg.console_apps.clone(),
+            console_hidden: self.cfg.console_hidden.clone(),
+            last_played: self.cfg.last_played.clone(),
             packs: self
                 .pack_catalog
                 .iter()
@@ -591,6 +626,7 @@ impl App {
             } => {
                 self.running_paths.insert(key.clone(), path);
                 self.running_pids.entry(key.clone()).or_default().push(pid);
+                self.record_played(&key); // recency order for the console band
                 if self.killswitch.is_active() {
                     // a tracked app started while the killswitch is on: hide + mute it too
                     info!("killswitch: {display} started while active — hiding it");
@@ -1273,10 +1309,90 @@ impl App {
         }
     }
 
+    /// Cover-art pass for the launcher's apps. Cheap when the cache is warm: the worker stats
+    /// files and only hits the network for keys with nothing cached.
+    fn ensure_art(&mut self) {
+        if self.art_busy {
+            return;
+        }
+        let wants: Vec<art::Want> = launcher_entries(&self.cfg)
+            .into_iter()
+            .map(|(name, exe)| art::Want {
+                key: art::key(&exe),
+                name,
+                exe,
+            })
+            .collect();
+        if wants.is_empty() {
+            return;
+        }
+        self.art_busy = true;
+        let tx = self.art_tx.clone();
+        let api_key = self.cfg.sgdb_api_key.clone();
+        thread::spawn(move || {
+            art::ensure_all(wants, api_key, |key| {
+                let _ = tx.send(key.to_string());
+            });
+            let _ = tx.send(String::new()); // the pass finished
+        });
+    }
+
+    fn on_art(&mut self, key: String) {
+        if key.is_empty() {
+            self.art_busy = false;
+            return;
+        }
+        info!("cover art: {key} is ready");
+        self.broadcast_status(); // the console re-reads the art folder on status updates
+    }
+
+    /// Remember when an app was last played, for the console's recency order. `exe` may be a
+    /// full path or a bare exe base name; keys are exe base names, lowercased.
+    fn record_played(&mut self, exe: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let key = basename_lower(exe);
+        if self
+            .cfg
+            .last_played
+            .get(&key)
+            .map(|t| now.saturating_sub(*t) < 5)
+            .unwrap_or(false)
+        {
+            return; // the same launch seen twice (console request + watcher): keep the file quiet
+        }
+        self.cfg.last_played.insert(key, now);
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        self.broadcast_status();
+    }
+
     /// Pin an app to the console launcher. False when it is already in the list (by file name).
+    /// A tracked app that was hidden from the band counts as a pin: adding it back un-hides it.
     fn add_console_app(&mut self, name: String, exe: String) -> bool {
         // Matching in the console is by file name, so dedupe on that, like tracked apps.
         let base = basename_lower(&exe);
+        if self
+            .cfg
+            .tracked_apps
+            .iter()
+            .any(|a| basename_lower(&a.exe) == base)
+        {
+            let before = self.cfg.console_hidden.len();
+            self.cfg.console_hidden.retain(|h| h != &base);
+            if self.cfg.console_hidden.len() == before {
+                info!("console app already in the list (by name): {base}");
+                return false;
+            }
+            if let Err(e) = armoury_core::config::save(&self.cfg) {
+                warn!("failed to save config: {e}");
+            }
+            info!("console app shown again: {exe}");
+            return true;
+        }
         if self
             .cfg
             .console_apps
@@ -1378,6 +1494,7 @@ impl App {
                             status,
                         });
                     }
+                    self.ensure_art(); // the band is up: make sure its covers exist
                 }
                 Request::ShowConsole => self.show_console(),
                 Request::SetConsoleEnabled { enabled } => {
@@ -1398,6 +1515,9 @@ impl App {
                 }
                 Request::AddConsoleApp { name, exe } => {
                     let ok = self.add_console_app(name, exe);
+                    if ok {
+                        self.ensure_art();
+                    }
                     if let Some(push) = self.clients.get(&id) {
                         let _ = push.send(Response::ConsoleOp {
                             ok,
@@ -1426,15 +1546,53 @@ impl App {
                     }
                     self.broadcast_status();
                 }
+                Request::HideFromConsole { exe } => {
+                    // The band hides a tracked app without untracking it; a pin for the same
+                    // exe would show it right back, so that goes too.
+                    let base = basename_lower(&exe);
+                    if !self.cfg.console_hidden.contains(&base) {
+                        self.cfg.console_hidden.push(base.clone());
+                    }
+                    self.cfg
+                        .console_apps
+                        .retain(|a| basename_lower(&a.exe) != base);
+                    if let Err(e) = armoury_core::config::save(&self.cfg) {
+                        warn!("failed to save config: {e}");
+                    }
+                    info!("console app hidden: {exe}");
+                    if let Some(push) = self.clients.get(&id) {
+                        let _ = push.send(Response::ConsoleOp {
+                            ok: true,
+                            message: "hidden".into(),
+                        });
+                    }
+                    self.broadcast_status();
+                }
                 Request::LaunchApp { exe } => {
                     // The daemon spawns; for a tracked app the watcher then triggers the packs
                     // exactly as if the user had opened it by hand.
-                    match Command::new(&exe).spawn() {
-                        Ok(child) => info!("console: launched {exe} (pid {})", child.id()),
+                    // Launch like Explorer does: CWD = the exe's own folder. Plenty of games
+                    // (and repack launchers) resolve data files relative to the working
+                    // directory — inheriting the daemon's folder breaks them.
+                    let mut cmd = Command::new(&exe);
+                    if let Some(dir) = std::path::Path::new(&exe)
+                        .parent()
+                        .filter(|d| !d.as_os_str().is_empty())
+                    {
+                        cmd.current_dir(dir);
+                    }
+                    match cmd.spawn() {
+                        Ok(child) => {
+                            info!("console: launched {exe} (pid {})", child.id());
+                            self.record_played(&exe);
+                        }
                         Err(e) => warn!("console: cannot launch {exe}: {e}"),
                     }
                 }
-                Request::AddTrackedApp { name, exe } => self.add_tracked_app(name, exe),
+                Request::AddTrackedApp { name, exe } => {
+                    self.add_tracked_app(name, exe);
+                    self.ensure_art();
+                }
                 Request::RemoveTrackedApp { exe } => self.remove_tracked_app(&exe),
                 Request::SetPaused { paused } => self.set_paused(paused),
                 Request::SetPackEnabled { id, enabled } => self.set_pack_enabled(id, enabled),
@@ -1635,5 +1793,36 @@ fn nudge_existing_instance() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launcher_entries_drop_hidden_tracked_apps_and_dedupe_pins() {
+        let mut cfg = AppConfig::default();
+        cfg.tracked_apps.push(TrackedApp {
+            name: "Demo".into(),
+            exe: "C:\\games\\demo.exe".into(),
+        });
+        cfg.tracked_apps.push(TrackedApp {
+            name: "Hidden".into(),
+            exe: "C:\\games\\Hidden.exe".into(),
+        });
+        cfg.console_hidden.push("hidden.exe".into());
+        cfg.console_apps.push(ConsoleApp {
+            name: "Pin".into(),
+            exe: "D:\\tools\\pin.exe".into(),
+        });
+        cfg.console_apps.push(ConsoleApp {
+            name: "Tracked again".into(),
+            exe: "D:\\copy\\DEMO.exe".into(),
+        });
+        let entries = launcher_entries(&cfg);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].1, "C:\\games\\demo.exe"); // the tracked copy wins
+        assert_eq!(entries[1].1, "D:\\tools\\pin.exe");
     }
 }
