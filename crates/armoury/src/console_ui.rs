@@ -24,9 +24,10 @@ use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
 use crate::art;
 use crate::pad;
 
-/// The launcher's fixed window: a bottom-anchored band, console style.
-const WIN_W: f32 = 1200.0;
-const WIN_H: f32 = 360.0;
+/// The launcher's window is the band itself: nearly the full work-area width, console style.
+const BAND_H: f32 = 400.0;
+/// Side margin between the band and the work-area edges: 5% each side (96 px at 1920).
+const BAND_MARGIN: f32 = 0.05;
 const TILE_W: f32 = 196.0;
 const TILE_H: f32 = 240.0;
 const GAP: f32 = 18.0;
@@ -34,8 +35,13 @@ const SIDE: f32 = 48.0;
 const TILE_RADIUS: f32 = 16.0;
 /// Fallback icon box inside a tile (square covers and exe icons).
 const ICON: f32 = 108.0;
-/// How far above the work-area bottom the band sits.
-const BOTTOM_LIFT: f32 = 56.0;
+/// How far above the work-area bottom the band sits. The old band sat 56 up; growing it 20 pt
+/// each way drops the bottom edge 20 and raises the top 20.
+const BOTTOM_LIFT: f32 = 36.0;
+/// Gap under the tiles before the hint line (the names sit inside the tiles).
+const HINT_GAP: f32 = 14.0;
+/// Reserved height of the one-line hint: tiles + gap + hint center as one block.
+const HINT_H: f32 = 18.0;
 /// Hero background: how long the crossfade to a newly selected entry takes.
 const BG_FADE: f32 = 0.30;
 /// Hero background: how tall the bottom gradient (the hint line's dark bed) is.
@@ -139,7 +145,8 @@ pub fn run() {
         }
     });
 
-    let size = egui::vec2(WIN_W, WIN_H);
+    let band = band_rect(work_area());
+    let size = band.size();
     let (icon_rgba, icon_w, icon_h) = armoury_core::icon::rgba_icon(32);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -149,7 +156,7 @@ pub fn run() {
             .with_visible(false)
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
             .with_inner_size([size.x, size.y])
-            .with_position(console_position(size))
+            .with_position(band.min)
             .with_icon(egui::IconData {
                 rgba: icon_rgba,
                 width: icon_w,
@@ -164,8 +171,29 @@ pub fn run() {
     );
 }
 
-/// Center-bottom of the primary work area, in logical points, before any window exists.
-fn console_position(size: egui::Vec2) -> egui::Pos2 {
+/// The band inside a work area (logical points): 5% margins each side, `BAND_H` tall, its
+/// bottom edge `BOTTOM_LIFT` above the work-area bottom.
+fn band_rect(work: egui::Rect) -> egui::Rect {
+    let mx = work.width() * BAND_MARGIN;
+    egui::Rect::from_min_max(
+        egui::pos2(work.left() + mx, work.bottom() - BOTTOM_LIFT - BAND_H),
+        egui::pos2(work.right() - mx, work.bottom() - BOTTOM_LIFT),
+    )
+}
+
+/// Whole tiles that fit the strip's inner width with the inter-tile gap: at least one, and
+/// never one more than the width holds.
+fn visible_tiles(inner_w: f32) -> usize {
+    (((inner_w + GAP) / (TILE_W + GAP)).floor() as usize).max(1)
+}
+
+/// The tile row's centre line. Tiles + hint gap + hint are one block, centred vertically.
+fn row_center_y(band: egui::Rect) -> f32 {
+    band.center().y - (HINT_GAP + HINT_H) / 2.0
+}
+
+/// Primary work area in logical points, before any window exists.
+fn work_area() -> egui::Rect {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
@@ -182,17 +210,12 @@ fn console_position(size: egui::Vec2) -> egui::Pos2 {
         )
     };
     if ok == 0 {
-        return egui::pos2(200.0, 400.0);
+        // No query (unlikely): a 1080p work area keeps the band on-screen.
+        return egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0));
     }
-    let (l, t, r, b) = (
-        work.left as f32 / scale,
-        work.top as f32 / scale,
-        work.right as f32 / scale,
-        work.bottom as f32 / scale,
-    );
-    egui::pos2(
-        (l + (r - l - size.x) / 2.0).max(l + 8.0),
-        (b - size.y - BOTTOM_LIFT).max(t + 8.0),
+    egui::Rect::from_min_max(
+        egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
+        egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
     )
 }
 
@@ -730,7 +753,7 @@ impl eframe::App for App {
         let view_left = full.left() + SIDE;
         let pitch = TILE_W + GAP;
         let total = n as f32 * pitch - GAP;
-        let target_off = if total <= view_w {
+        let target_off = if n <= visible_tiles(view_w) {
             -(view_w - total) / 2.0
         } else {
             (self.selected as f32 * pitch + TILE_W / 2.0 - view_w / 2.0)
@@ -738,7 +761,9 @@ impl eframe::App for App {
         };
         let scroll_time = if self.reduced { 0.001 } else { 0.22 };
         let off = ctx.animate_value_with_time(egui::Id::unique("console-scroll"), target_off, scroll_time);
-        let center_y = full.center().y - 14.0 + rise;
+        // Tiles + hint travel as one block, centered both ways in the band.
+        let center_y = row_center_y(full) + rise;
+        let hint_y = center_y + TILE_H / 2.0 + HINT_GAP + HINT_H / 2.0;
         let sel_time = if self.reduced { 0.001 } else { 0.18 };
 
         for i in 0..n {
@@ -829,17 +854,13 @@ impl eframe::App for App {
             }
         }
 
-        // ---- the hint bar ----
+        // ---- the hint bar: hugs the names, moving with the row ----
         let hint = if self.pad_slot.is_some() {
             "A  open      B  close      X  add app      Y  remove      D-pad / left stick  scroll"
         } else {
             "No controller — connect one, or open this from the tray"
         };
-        let hint_y = if n == 0 {
-            full.center().y
-        } else {
-            full.bottom() - 18.0 + rise * 0.5
-        };
+        let hint_y = if n == 0 { full.center().y } else { hint_y };
         let hint_text = if n == 0 {
             "No apps yet — press X to add one"
         } else {
@@ -990,6 +1011,35 @@ mod tests {
         assert_eq!(wrap(1, 1, 3), 2);
         assert_eq!(wrap(0, 1, 0), 0); // empty list stays put
         assert_eq!(wrap(5, 0, 3), 2); // stale index folds back into range
+    }
+
+    #[test]
+    fn band_rect_takes_five_percent_margins_and_four_hundred_height() {
+        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0));
+        let band = band_rect(work);
+        // 5% each side (96 px at 1920), so 90% wide and centered
+        assert_eq!((band.left(), band.right()), (96.0, 1824.0));
+        assert_eq!(band.width(), 1728.0);
+        assert_eq!(band.height(), 400.0);
+        // bottom edge stays 36 above the work-area bottom: top 604, bottom 1004
+        assert_eq!((band.top(), band.bottom()), (604.0, 1004.0));
+        // centered on a non-zero work-area origin too
+        let shifted = band_rect(work.translate(egui::vec2(-1000.0, 40.0)));
+        assert!((shifted.center().x - (work.center().x - 1000.0)).abs() < 1e-3);
+        assert_eq!(shifted.height(), 400.0);
+    }
+
+    #[test]
+    fn visible_tiles_never_exceeds_the_inner_width() {
+        let pitch = TILE_W + GAP;
+        for inner in [TILE_W, 400.0, 700.0, 1104.0, 1632.0, 2560.0] {
+            let n = visible_tiles(inner);
+            assert!(n >= 1);
+            assert!(n as f32 * pitch - GAP <= inner);
+            assert!((n as f32 + 1.0) * pitch - GAP > inner);
+        }
+        // a narrow band still shows the focused tile rather than nothing
+        assert_eq!(visible_tiles(10.0), 1);
     }
 
     #[test]
