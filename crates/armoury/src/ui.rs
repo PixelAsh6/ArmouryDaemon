@@ -639,41 +639,18 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 // Type here: matching running apps appear right below (no popup to open). A text
                 // field inside a ComboBox popup lost focus when clicked, so the search lives here
-                // and the results are inline (user request 2026-10-18).
-                // The field takes what the dropdown and Browse leave over, so the row stays
-                // inside the window border (fixed widths used to overflow it).
+                // and the results are inline (user request 2026-10-18). The "All apps…" dropdown
+                // was removed on 2026-10-19 (user request): the field covers it.
+                // The field takes what Browse leaves over, so the row stays inside the window
+                // border (fixed widths used to overflow it).
                 let spacing = ui.spacing().item_spacing.x;
-                let combo_w = 96.0;
                 let browse_w = 76.0;
-                let field_w =
-                    (ui.available_width() - combo_w - browse_w - 2.0 * spacing).max(140.0);
+                let field_w = (ui.available_width() - browse_w - spacing).max(140.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.pick_query)
                         .hint_text("type to search running apps…")
                         .desired_width(field_w),
                 );
-                egui::ComboBox::from_id_salt("pick-app")
-                    .selected_text("All apps…")
-                    .width(combo_w)
-                    .show_ui(ui, |ui| {
-                        let mut all: Vec<(String, String, String)> = Vec::new();
-                        for (title, exe) in &self.apps {
-                            if tracked.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)) {
-                                continue;
-                            }
-                            all.push((file_name(exe), exe.clone(), title.clone()));
-                        }
-                        for (name, exe, title) in &all {
-                            let label = if title.is_empty() {
-                                name.clone()
-                            } else {
-                                format!("{name}  —  {title}")
-                            };
-                            if ui.selectable_label(false, label).clicked() {
-                                pick = Some((name.clone(), exe.clone()));
-                            }
-                        }
-                    });
                 if ui
                     .add_sized(
                         [browse_w, ui.spacing().interact_size.y],
