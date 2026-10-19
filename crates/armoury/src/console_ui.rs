@@ -908,30 +908,43 @@ fn cover_uv(image: egui::Vec2, rect: egui::Rect) -> (egui::Pos2, egui::Pos2) {
     }
 }
 
-/// Fade the cover into the tile's bottom so the name stays readable. Two layers: a rounded
-/// solid near the bottom edge (matches the tile corners) under a soft gradient above it.
+/// Fade the cover into the tile's bottom so the name stays readable: one continuous vertical
+/// gradient, transparent `H` above the bottom edge up to black_alpha(200) at it. The bottom
+/// rows trace the tile's corner arcs, so the fill stays rounded instead of squaring off.
 fn paint_scrim(painter: &egui::Painter, rect: egui::Rect) {
-    const SOLID: f32 = 54.0;
-    const FADE: f32 = 74.0;
-    let solid = egui::Rect::from_min_max(
-        egui::pos2(rect.left(), rect.bottom() - SOLID),
-        egui::pos2(rect.right(), rect.bottom()),
-    );
-    painter.add(RectShape::filled(
-        solid,
-        CornerRadius::from(TILE_RADIUS),
-        egui::Color32::from_black_alpha(168),
-    ));
     let mut m = Mesh::default();
-    let top = rect.bottom() - SOLID - FADE;
-    let bottom = rect.bottom() - SOLID + 2.0;
-    m.colored_vertex(egui::pos2(rect.left(), top), egui::Color32::TRANSPARENT);
-    m.colored_vertex(egui::pos2(rect.right(), top), egui::Color32::TRANSPARENT);
-    m.colored_vertex(egui::pos2(rect.left(), bottom), egui::Color32::from_black_alpha(168));
-    m.colored_vertex(egui::pos2(rect.right(), bottom), egui::Color32::from_black_alpha(168));
-    m.add_triangle(0, 1, 2);
-    m.add_triangle(2, 1, 3);
+    for (y, left, right, a) in scrim_rows(rect) {
+        let c = egui::Color32::from_black_alpha(a);
+        m.colored_vertex(egui::pos2(left, y), c);
+        m.colored_vertex(egui::pos2(right, y), c);
+    }
+    for q in 0..(m.vertices.len() as u32 / 2) - 1 {
+        let a = q * 2;
+        m.add_triangle(a, a + 1, a + 2);
+        m.add_triangle(a + 2, a + 1, a + 3);
+    }
     painter.add(egui::Shape::mesh(m));
+}
+
+/// The scrim's vertex rows, top to bottom as `(y, left_x, right_x, alpha)`. Straight sides above
+/// the corners; the last rows inset by the corner arc so they never paint past the rounding.
+fn scrim_rows(rect: egui::Rect) -> Vec<(f32, f32, f32, u8)> {
+    const H: f32 = 120.0; // gradient height above the tile bottom
+    const TOP_A: f32 = 200.0; // alpha at the bottom edge
+    const ARC: usize = 8; // rows tracing a 16 px corner arc
+    let (r, top, corner) = (TILE_RADIUS, rect.bottom() - H, rect.bottom() - TILE_RADIUS);
+    let alpha = |y: f32| ((y - top) / H * TOP_A).clamp(0.0, 255.0) as u8;
+    let mut rows = vec![
+        (top, rect.left(), rect.right(), alpha(top)),
+        (corner, rect.left(), rect.right(), alpha(corner)),
+    ];
+    for k in 1..=ARC {
+        let y = corner + r * k as f32 / ARC as f32;
+        let dy = y - corner;
+        let inset = r - (r * r - dy * dy).max(0.0).sqrt();
+        rows.push((y, rect.left() + inset, rect.right() - inset, alpha(y)));
+    }
+    rows
 }
 
 fn basename_lower(path: &str) -> String {
@@ -1004,6 +1017,23 @@ mod tests {
             remove_request(&tracked, "C:\\Other\\Steam.exe"),
             Request::RemoveConsoleApp { .. }
         ));
+    }
+
+    #[test]
+    fn scrim_rows_fade_and_round_the_corners() {
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(196.0, 240.0));
+        let rows = scrim_rows(tile);
+        // starts transparent 120 px up, ends at alpha 200 exactly on the bottom edge
+        assert_eq!(rows[0], (120.0, 0.0, 196.0, 0));
+        let last = *rows.last().unwrap();
+        assert_eq!((last.0, last.3), (240.0, 200));
+        // the bottom row is inset by the corner radius, so no square corners get painted
+        assert_eq!((last.1, last.2), (16.0, 180.0));
+        // monotonic gradient, every row inside the tile
+        for w in rows.windows(2) {
+            assert!(w[0].3 <= w[1].3);
+            assert!(w[1].1 >= w[0].1 && w[1].2 <= w[0].2);
+        }
     }
 
     #[test]
