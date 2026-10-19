@@ -7,7 +7,7 @@
 //!
 //! This module is transport + verification only; the UI and the protocol wiring build on it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -81,6 +81,18 @@ pub fn install(install_dirs: &[PathBuf], catalog_url: &str, id: &str) -> Result<
     let bytes = fetch_bytes(&join_url(catalog_url, &entry.file))?;
     verify(&bytes, &entry.sha256, entry.size)?;
     packs::install_from_bytes(install_dirs, &bytes)
+}
+
+/// Download one catalog entry to `dest`, verified against the manifest.
+///
+/// The settings window uses this: the UI does the network round trip on its own thread and
+/// hands the verified file to the daemon through the normal `InstallPack` request, so the
+/// daemon keeps owning validation and installation.
+pub fn download_to(catalog_url: &str, entry: &CatalogPack, dest: &Path) -> Result<(), String> {
+    let bytes = fetch_bytes(&join_url(catalog_url, &entry.file))?;
+    verify(&bytes, &entry.sha256, entry.size)?;
+    std::fs::write(dest, &bytes)
+        .map_err(|e| format!("catalog: cannot write {} ({e})", dest.display()))
 }
 
 /// Check a downloaded pack against the manifest.
@@ -163,6 +175,18 @@ pub fn url_or_default(configured: Option<&str>) -> String {
         .unwrap_or_else(|| DEFAULT_URL.to_string())
 }
 
+/// True when `candidate` is a newer version than `current`: dotted numbers compared
+/// numerically ("1.10.0" is newer than "1.9.9"), any suffix after `-`/`+` ignored.
+pub fn is_newer(candidate: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Vec<u64> {
+        v.trim_start_matches(['v', ' '])
+            .split(['.', '-', '+'])
+            .map(|p| p.trim().parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    parts(candidate) > parts(current)
+}
+
 /// List installed pack ids (for the "update available" comparison in the UI).
 pub fn installed_ids(search_dirs: &[PathBuf]) -> Vec<String> {
     packs::load(search_dirs)
@@ -239,6 +263,16 @@ mod tests {
         assert_eq!(url_or_default(None), DEFAULT_URL);
         assert_eq!(url_or_default(Some("   ")), DEFAULT_URL);
         assert_eq!(url_or_default(Some("https://example.com/c.json")), "https://example.com/c.json");
+    }
+
+    #[test]
+    fn version_comparison_finds_updates() {
+        assert!(is_newer("1.4.0", "1.3.1"));
+        assert!(is_newer("1.10.0", "1.9.9"), "numeric, not a string compare");
+        assert!(is_newer("2.0.0", "1.99.99"));
+        assert!(!is_newer("1.3.1", "1.3.1"));
+        assert!(!is_newer("1.2.0", "1.3.1"));
+        assert!(!is_newer("garbage", "1.0.0"));
     }
 
     #[test]

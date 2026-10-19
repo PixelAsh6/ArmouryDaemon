@@ -3,6 +3,7 @@
 //! placed at the bottom exterior corner of the primary monitor, above the taskbar.
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
+use crate::catalog::{self, CatalogPack};
 use armoury_core::config::TrackedApp;
 use armoury_core::protocol::{read_msg, write_msg, Request, Response};
 use armoury_core::status::{PackStatus, RunState, StatusSnapshot};
@@ -70,6 +71,14 @@ struct Shared {
     pick_tx: Option<crossbeam_channel::Sender<Picked>>,
     /// Result of the last pack install/remove, shown in the settings window.
     last_pack_op: Option<(bool, String)>,
+    /// Catalog (Phase 8) state for the settings window: the last check's result, whether a
+    /// check is in flight, the pack id being downloaded, and the verified temp file waiting
+    /// for the daemon's install request.
+    catalog: Option<Result<Vec<CatalogPack>, String>>,
+    catalog_check_requested: bool,
+    catalog_checking: bool,
+    catalog_installing: Option<String>,
+    catalog_install_path: Option<PathBuf>,
     /// Per-pack windows: ids in open order.
     open_packs: Vec<String>,
     /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
@@ -309,7 +318,9 @@ impl eframe::App for App {
                 }
                 UiEvent::Response(Response::PackOp { ok, message }) => {
                     log::info!("pack op result: {message}");
-                    self.shared.lock().unwrap().last_pack_op = Some((ok, message));
+                    let mut s = self.shared.lock().unwrap();
+                    s.last_pack_op = Some((ok, message));
+                    s.catalog_installing = None;
                 }
                 UiEvent::Eof => {
                     log::info!("daemon went away — exiting");
@@ -343,6 +354,36 @@ impl eframe::App for App {
                     });
                 }
             }
+        }
+
+        // Catalog: the settings window asked for a check. HTTPS runs on this thread, never
+        // on the UI's — the result lands in Shared and the settings window picks it up.
+        let check = {
+            let mut s = self.shared.lock().unwrap();
+            std::mem::take(&mut s.catalog_check_requested)
+        };
+        if check {
+            let shared = Arc::clone(&self.shared);
+            thread::spawn(move || {
+                let configured = armoury_core::config::load_or_create()
+                    .ok()
+                    .and_then(|cfg| cfg.catalog_url);
+                let url = catalog::url_or_default(configured.as_deref());
+                log::info!("catalog: checking {url}");
+                let result = catalog::fetch(&url);
+                let mut s = shared.lock().unwrap();
+                s.catalog_checking = false;
+                s.catalog = Some(result.map(|catalog| catalog.packs));
+            });
+        }
+        // A verified catalog file waiting for the daemon: installing still goes through the
+        // daemon's normal request (it validates and owns the packs folder).
+        let ready = self.shared.lock().unwrap().catalog_install_path.take();
+        if let Some(path) = ready {
+            log::info!("installing catalog pack from {}", path.display());
+            self.request(&Request::InstallPack {
+                source: path.display().to_string(),
+            });
         }
 
         // Keep the running-app list fresh for the picker (~2 s is plenty).
@@ -1248,14 +1289,20 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 s.failsafe_text.clone(),
             )
         };
-        let (packs, last_op) = {
+        let (packs, last_op, catalog_state, catalog_checking, catalog_installing) = {
             let s = shared.lock().unwrap();
             let packs = s
                 .status
                 .as_ref()
                 .map(|st| st.packs.clone())
                 .unwrap_or_default();
-            (packs, s.last_pack_op.clone())
+            (
+                packs,
+                s.last_pack_op.clone(),
+                s.catalog.clone(),
+                s.catalog_checking,
+                s.catalog_installing.clone(),
+            )
         };
         ui.add_space(8.0);
         ui.separator();
@@ -1395,6 +1442,84 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             );
         }
 
+        // ---- catalog: check for pack updates, install or update from the repo ----
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("Catalog").strong());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("Check for updates")
+                .on_hover_text("Fetch the pack catalog and compare versions")
+                .clicked()
+                && !catalog_checking
+            {
+                let mut s = shared.lock().unwrap();
+                s.catalog_check_requested = true;
+                s.catalog_checking = true;
+                ui.ctx().request_repaint();
+            }
+            if catalog_checking {
+                ui.small(RichText::new("Checking…").weak());
+            }
+        });
+        match &catalog_state {
+            None => {}
+            Some(Err(message)) => {
+                ui.add_space(2.0);
+                ui.small(RichText::new(message).color(Color32::from_rgb(248, 113, 113)));
+            }
+            Some(Ok(entries)) => {
+                ui.add_space(2.0);
+                egui::Grid::new("settings-catalog")
+                    .num_columns(2)
+                    .spacing(egui::vec2(10.0, 4.0))
+                    .show(ui, |ui| {
+                        for entry in entries {
+                            ui.horizontal(|ui| {
+                                ui.label(if entry.name.is_empty() {
+                                    &entry.id
+                                } else {
+                                    &entry.name
+                                });
+                                if !entry.version.is_empty() {
+                                    ui.small(RichText::new(format!("v{}", entry.version)).weak());
+                                }
+                            });
+                            if catalog_installing.as_deref() == Some(entry.id.as_str()) {
+                                ui.small(RichText::new("installing…").weak());
+                            } else if let Some(pack) = packs.iter().find(|p| p.id == entry.id) {
+                                if catalog::is_newer(&entry.version, &pack.version) {
+                                    if ui
+                                        .small_button("Update")
+                                        .on_hover_text(format!(
+                                            "installed v{} → v{}",
+                                            pack.version, entry.version
+                                        ))
+                                        .clicked()
+                                    {
+                                        start_catalog_install(shared, entry);
+                                    }
+                                } else {
+                                    ui.small(
+                                        RichText::new(format!("v{} installed", pack.version))
+                                            .weak(),
+                                    );
+                                }
+                            } else if ui
+                                .small_button("Install")
+                                .on_hover_text("Download, verify and install this pack")
+                                .clicked()
+                            {
+                                start_catalog_install(shared, entry);
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+        }
+
         // ---- logs + config ----
         ui.add_space(8.0);
         ui.separator();
@@ -1428,12 +1553,17 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             "Open config folder",
             "Leave idle after",
             "Install pack…",
+            "Check for updates",
             "Applies when a tracked app starts.",
         ] {
             w = w.max(tw(&body_font, text) + 24.0);
         }
         // one pack row: name + version bubble + the Remove button
         w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&body_font, "Remove") + 24.0);
+        // one catalog row: name + version bubble + the status text
+        w = w.max(
+            tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&body_font, "v9.9.9 installed") + 24.0,
+        );
         for (k, v) in &rows {
             w = w.max(tw(&body_font, k) + 32.0 + tw(&body_font, v));
         }
@@ -1751,6 +1881,35 @@ enum Picker {
     TrackedApp,
     /// A `pack.json` to install.
     PackJson,
+}
+
+/// Download one catalog pack on its own thread, then hand the file to the daemon: the App
+/// drains `catalog_install_path` and sends the normal install request (the daemon still
+/// verifies and owns the packs folder).
+fn start_catalog_install(shared: &Arc<Mutex<Shared>>, entry: &CatalogPack) {
+    let shared = Arc::clone(shared);
+    let entry = entry.clone();
+    {
+        let mut s = shared.lock().unwrap();
+        s.catalog_installing = Some(entry.id.clone());
+    }
+    thread::spawn(move || {
+        let configured = armoury_core::config::load_or_create()
+            .ok()
+            .and_then(|cfg| cfg.catalog_url);
+        let url = catalog::url_or_default(configured.as_deref());
+        let dest = std::env::temp_dir().join(format!("armoury-catalog-{}.json", entry.id));
+        log::info!("catalog: downloading {}", entry.id);
+        let result = catalog::download_to(&url, &entry, &dest);
+        let mut s = shared.lock().unwrap();
+        match result {
+            Ok(()) => s.catalog_install_path = Some(dest),
+            Err(e) => {
+                s.catalog_installing = None;
+                s.last_pack_op = Some((false, e));
+            }
+        }
+    });
 }
 
 /// Run the native picker on a worker thread: the dialog runs its own modal loop, and
