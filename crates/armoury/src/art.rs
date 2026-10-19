@@ -299,16 +299,37 @@ fn steam_url(appid: u32, file: &str) -> String {
 }
 
 /// The Steam appid of an installed game, via the `appmanifest_*.acf` beside its exe.
-fn steam_appid(exe: &Path) -> Option<u32> {
+pub fn steam_appid(exe: &Path) -> Option<u32> {
+    steam_app(exe).map(|app| app.appid)
+}
+
+/// A Steam install an exe belongs to.
+pub struct SteamApp {
+    /// The Steam appid (the number in `appmanifest_<appid>.acf`).
+    pub appid: u32,
+    /// The install root: `<steamapps>\common\<installdir>`.
+    pub install_dir: PathBuf,
+    /// The Steam directory: the parent of `steamapps`.
+    pub steam_dir: PathBuf,
+}
+
+impl SteamApp {
+    /// The Steam client of this install.
+    pub fn steam_exe(&self) -> PathBuf {
+        self.steam_dir.join("steam.exe")
+    }
+}
+
+/// The Steam app an exe belongs to: the folder right after `common` in the exe's path,
+/// matched against the `installdir` of the library's `appmanifest_*.acf` files. `None` when
+/// the exe is not in a Steam library, or when its app is not installed.
+pub fn steam_app(exe: &Path) -> Option<SteamApp> {
     let chain: Vec<&Path> = exe.ancestors().collect();
     let common = chain
         .iter()
         .position(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("common")))?;
-    let installdir = chain
-        .get(common.checked_sub(1)?)?
-        .file_name()?
-        .to_string_lossy()
-        .to_string();
+    let install_dir = chain.get(common.checked_sub(1)?)?.to_path_buf();
+    let installdir = install_dir.file_name()?.to_string_lossy().to_string();
     let steamapps = chain.get(common)?.parent()?;
     for entry in fs::read_dir(steamapps).ok()?.flatten() {
         let file = entry.file_name().to_string_lossy().to_ascii_lowercase();
@@ -327,8 +348,14 @@ fn steam_appid(exe: &Path) -> Option<u32> {
                 dir = v.to_string();
             }
         }
-        if appid.is_some() && dir.eq_ignore_ascii_case(&installdir) {
-            return appid;
+        if let Some(appid) = appid {
+            if dir.eq_ignore_ascii_case(&installdir) {
+                return Some(SteamApp {
+                    appid,
+                    install_dir,
+                    steam_dir: steamapps.parent()?.to_path_buf(),
+                });
+            }
         }
     }
     None
@@ -543,6 +570,38 @@ mod tests {
         );
         assert_eq!(quoted_value("\t\"appid\"\t\t\"12345\"", "name"), None);
         assert_eq!(quoted_value("not a keyvalues line", "appid"), None);
+    }
+
+    #[test]
+    fn a_steam_game_resolves_its_appid_and_its_steam_client() {
+        let root = std::env::temp_dir().join(format!("armoury-steam-app-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let game = root.join("Steam/steamapps/common/Some Game/sub");
+        fs::create_dir_all(&game).unwrap();
+        fs::write(
+            root.join("Steam/steamapps/appmanifest_12345.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"12345\"\n\t\"installdir\"\t\t\"Some Game\"\n}\n",
+        )
+        .unwrap();
+
+        // the folder right after `common` is the installdir the manifest names
+        let app = steam_app(&game.join("game.exe")).expect("the app resolves");
+        assert_eq!(app.appid, 12345);
+        assert_eq!(app.install_dir, root.join("Steam/steamapps/common/Some Game"));
+        assert_eq!(app.steam_dir, root.join("Steam"));
+        assert_eq!(app.steam_exe(), root.join("Steam/steam.exe"));
+        assert_eq!(steam_appid(&game.join("game.exe")), Some(12345));
+
+        // a path that is not under a `steamapps\common\...` folder is not a Steam game
+        assert!(steam_app(&root.join("elsewhere/game.exe")).is_none());
+        assert_eq!(steam_appid(&root.join("elsewhere/game.exe")), None);
+
+        // a Steam folder whose installdir no manifest names is not an installed app
+        let other = root.join("Steam/steamapps/common/Other Game");
+        fs::create_dir_all(&other).unwrap();
+        assert!(steam_app(&other.join("game.exe")).is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

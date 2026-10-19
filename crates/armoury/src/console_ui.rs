@@ -55,20 +55,54 @@ const FOCUS_TO: egui::Color32 = egui::Color32::from_rgb(233, 84, 190);
 const FOCUS_MID: egui::Color32 = egui::Color32::from_rgb(200, 96, 222);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(232, 236, 244);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(128, 134, 148);
+/// A failed launch: the reason has to stand out against the muted hint line.
+const WARN: egui::Color32 = egui::Color32::from_rgb(255, 138, 122);
 
 const PAD_HINT: &str =
     "A  open      B  close      X  add app      Y  remove      D-pad / left stick  scroll";
 const KEY_HINT: &str = "Arrows / WASD move · Enter open · Esc close · Delete remove";
 const EMPTY_HINT: &str = "No apps yet — press X to add one";
+const LAUNCHING_HINT: &str = "starting…";
 
-/// The hint line plus the font size it is painted at.
-fn hint_line(n: usize, pad: bool) -> (&'static str, f32) {
-    if n == 0 {
-        (EMPTY_HINT, 18.0)
-    } else if pad {
-        (PAD_HINT, 14.0)
+/// How long the band waits for the daemon's answer before it gives up on a launch.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The band's launch state: nothing asked for, a launch in flight, or a failure to show.
+#[derive(Debug, Clone, PartialEq)]
+enum Launch {
+    Idle,
+    Pending,
+    Failed(String),
+}
+
+/// Apply the daemon's answer to a launch request. True = the band closes (the game
+/// started); false = it stays open and shows why the launch failed.
+fn apply_launch_ack(state: &mut Launch, ok: bool, message: String) -> bool {
+    if ok {
+        *state = Launch::Idle;
+        true
     } else {
-        (KEY_HINT, 14.0)
+        *state = Launch::Failed(message);
+        false
+    }
+}
+
+/// The hint line, its font size and its colour. A launch in flight and a failed launch
+/// take the line over: the user has to see that the game did not start.
+fn hint_line(n: usize, pad: bool, launch: &Launch) -> (String, f32, egui::Color32) {
+    match launch {
+        Launch::Failed(message) => (shorten(message, 140), 16.0, WARN),
+        Launch::Pending => (LAUNCHING_HINT.to_string(), 16.0, MUTED),
+        Launch::Idle => {
+            let (text, size) = if n == 0 {
+                (EMPTY_HINT, 18.0)
+            } else if pad {
+                (PAD_HINT, 14.0)
+            } else {
+                (KEY_HINT, 14.0)
+            };
+            (text.to_string(), size, MUTED)
+        }
     }
 }
 
@@ -342,6 +376,10 @@ struct App {
     pad_slot: Option<u32>,
     entering: bool,
     leaving: bool,
+    /// The launch the daemon is being asked about (and the failure it reported).
+    launch: Launch,
+    /// When the pending launch was asked for (the band gives up after `LAUNCH_TIMEOUT`).
+    launch_since: Option<Instant>,
     first_frame: bool,
     add_dialog: Option<Receiver<PathBuf>>,
     /// Windows "reduce motion" honored: everything lands instantly.
@@ -389,6 +427,8 @@ impl App {
             pad_slot: None,
             entering: false,
             leaving: false,
+            launch: Launch::Idle,
+            launch_since: None,
             first_frame: true,
             add_dialog: None,
             reduced: !animations_enabled(),
@@ -542,14 +582,18 @@ impl App {
     }
 
     /// A lands here: launch the selected app.
+    ///
+    /// The band waits for the daemon's answer: a game that did not start must not close
+    /// the band silently, or the user only sees the band slide away and nothing happens.
     fn activate(&mut self, entries: &[(String, String)]) {
-        if self.leaving {
+        if self.leaving || self.launch == Launch::Pending {
             return;
         }
         if let Some((_, exe)) = entries.get(self.selected) {
             log::info!("launching {exe}");
+            self.launch = Launch::Pending;
+            self.launch_since = Some(Instant::now());
             self.send(Request::LaunchApp { exe: exe.clone() });
-            self.leaving = true; // the game is starting; slide away
         }
     }
 
@@ -613,24 +657,51 @@ impl eframe::App for App {
         // ---- daemon events ----
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                Ev::Response(Response::HelloAck { status, .. }) => {
-                    self.status = Some(status);
-                    self.status_serial += 1;
-                    log::info!("got the app list");
+                Ev::Response(resp) => {
+                    // The answer to a launch request rides the console-op variant; the
+                    // marker tells it apart from the add/remove answers.
+                    let ack = armoury_core::protocol::as_launch_ack(&resp)
+                        .map(|(ok, text)| (ok, text.to_string()));
+                    match ack {
+                        Some((ok, message)) => {
+                            log::info!("launch result: ok={ok} {message}");
+                            if apply_launch_ack(&mut self.launch, ok, message) {
+                                self.leaving = true; // the game started: slide away
+                            }
+                        }
+                        None => match resp {
+                            Response::HelloAck { status, .. } => {
+                                self.status = Some(status);
+                                self.status_serial += 1;
+                                log::info!("got the app list");
+                            }
+                            Response::Status { status } => {
+                                self.status = Some(status);
+                                self.status_serial += 1;
+                            }
+                            Response::Focus => {
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            }
+                            Response::PackOp { .. } | Response::ConsoleOp { .. } => {}
+                        },
+                    }
                 }
-                Ev::Response(Response::Status { status }) => {
-                    self.status = Some(status);
-                    self.status_serial += 1;
-                }
-                Ev::Response(Response::Focus) => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                Ev::Response(Response::PackOp { .. } | Response::ConsoleOp { .. }) => {}
                 Ev::Eof => {
                     log::info!("daemon went away — exiting");
                     std::process::exit(0);
                 }
             }
+        }
+
+        // A launch that gets no answer must not leave the band waiting forever.
+        if self.launch == Launch::Pending
+            && self
+                .launch_since
+                .map(|since| since.elapsed() > LAUNCH_TIMEOUT)
+                .unwrap_or(false)
+        {
+            log::info!("the daemon did not answer the launch request");
+            self.launch = Launch::Failed("the daemon did not answer the launch request".into());
         }
 
         // ---- cover art from the worker ----
@@ -831,7 +902,7 @@ impl eframe::App for App {
         }
 
         // ---- window: sized and positioned once at startup; just reveal it on the first frame ----
-        let (hint, hint_font) = hint_line(n, self.pad_slot.is_some());
+        let (hint, hint_font, hint_color) = hint_line(n, self.pad_slot.is_some(), &self.launch);
         let tile = tile_size(self.screen.y);
         if self.first_frame {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -981,7 +1052,7 @@ impl eframe::App for App {
             egui::Align2::CENTER_CENTER,
             hint,
             egui::FontId::proportional(hint_font),
-            MUTED,
+            hint_color,
         );
     }
 }
@@ -1165,6 +1236,17 @@ fn short_name(name: &str, max: usize) -> String {
     out
 }
 
+/// Trim a long message so it still fits the band.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() > max {
+        let mut out: String = text.chars().take(max).collect();
+        out.push('…');
+        out
+    } else {
+        text.to_string()
+    }
+}
+
 /// The monogram fallback: the first character, upper-cased.
 fn first_char(name: &str) -> String {
     name.chars()
@@ -1183,6 +1265,41 @@ mod tests {
         assert_eq!(short_name("Rainbow Six Extraction", 16), "Rainbow Six Extr…");
         // unicode-safe: never split a multi-byte character
         assert_eq!(short_name("Æther 全角テスト", 8), "Æther 全角…");
+    }
+
+    #[test]
+    fn the_band_closes_only_when_the_game_really_started() {
+        let mut launch = Launch::Idle;
+        // a failed launch keeps the band open and shows the reason
+        assert!(!apply_launch_ack(
+            &mut launch,
+            false,
+            "RainbowSix.exe exited right away (exit code 0); the game did not start".into()
+        ));
+        assert_eq!(
+            launch,
+            Launch::Failed(
+                "RainbowSix.exe exited right away (exit code 0); the game did not start".into()
+            )
+        );
+        // a started game closes it
+        assert!(apply_launch_ack(&mut launch, true, "launched game.exe (pid 42)".into()));
+        assert_eq!(launch, Launch::Idle);
+    }
+
+    #[test]
+    fn the_hint_line_shows_the_launch_state() {
+        // the usual hints
+        let (text, _, color) = hint_line(2, false, &Launch::Idle);
+        assert_eq!(text, KEY_HINT);
+        assert_eq!(color, MUTED);
+        // a launch in flight
+        let (text, _, _) = hint_line(2, false, &Launch::Pending);
+        assert_eq!(text, LAUNCHING_HINT);
+        // a failure: the reason, in the warning colour
+        let (text, _, color) = hint_line(2, false, &Launch::Failed("it did not start".into()));
+        assert_eq!(text, "it did not start");
+        assert_eq!(color, WARN);
     }
 
     #[test]

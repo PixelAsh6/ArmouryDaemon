@@ -70,6 +70,32 @@ pub enum Response {
     ConsoleOp { ok: bool, message: String },
 }
 
+/// The marker that turns a `ConsoleOp` into the answer to a launch request. The console-app
+/// ops (`added`, `removed`, `hidden`) share the variant, so the band has to tell them apart.
+pub const LAUNCH_ACK: &str = "launch: ";
+
+/// The answer to a launch request: did the game start, and if not, why not.
+///
+/// It rides the `ConsoleOp` variant: the `Response` enum is matched exhaustively by the
+/// dashboard, so a new variant would need a second change in a file the launcher does not
+/// own. The marker keeps the two apart.
+pub fn launch_ack(ok: bool, message: &str) -> Response {
+    Response::ConsoleOp {
+        ok,
+        message: format!("{LAUNCH_ACK}{message}"),
+    }
+}
+
+/// The launch answer inside a response, if this response is one.
+pub fn as_launch_ack(resp: &Response) -> Option<(bool, &str)> {
+    match resp {
+        Response::ConsoleOp { ok, message } => message
+            .strip_prefix(LAUNCH_ACK)
+            .map(|text| (*ok, text)),
+        _ => None,
+    }
+}
+
 /// Serialize `msg` as one JSON line and write it (flushing immediately).
 pub fn write_msg<W: Write, T: Serialize>(w: &mut W, msg: &T) -> io::Result<()> {
     let mut buf = serde_json::to_vec(msg).map_err(io::Error::other)?;
@@ -255,6 +281,30 @@ mod tests {
         assert!(matches!(req, Request::HideFromConsole { .. }));
         let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(resp, Response::ConsoleOp { ok: true, .. }));
+    }
+
+    #[test]
+    fn the_launch_answer_travels_as_a_console_op_with_a_marker() {
+        let ack = launch_ack(false, "the game did not start");
+        assert!(matches!(ack, Response::ConsoleOp { ok: false, .. }));
+        let (ok, message) = as_launch_ack(&ack).expect("the launch answer");
+        assert!(!ok);
+        assert_eq!(message, "the game did not start");
+
+        // a plain console op is not a launch answer
+        let op = Response::ConsoleOp {
+            ok: true,
+            message: "hidden".into(),
+        };
+        assert!(as_launch_ack(&op).is_none());
+
+        // and it survives the wire
+        let mut out = Vec::new();
+        write_msg(&mut out, &launch_ack(true, "started (pid 42)")).unwrap();
+        let back: Response = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
+        let (ok, message) = as_launch_ack(&back).expect("the launch answer");
+        assert!(ok);
+        assert_eq!(message, "started (pid 42)");
     }
 
     #[test]

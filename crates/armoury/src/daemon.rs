@@ -22,14 +22,26 @@ use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use log::{error, info, warn};
 use std::collections::HashMap;
+use std::os::windows::process::CommandExt;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
-use windows_sys::Win32::System::Threading::CreateEventW;
+use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, QS_ALLINPUT};
+
+/// CREATE_NO_WINDOW: the child gets no console window, so nothing flashes on the desktop.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// DETACHED_PROCESS: the child is not tied to the daemon's console and outlives the daemon.
+const DETACHED_PROCESS: u32 = 0x0000_0008;
+/// The creation flags for a game the daemon starts.
+const GAME_FLAGS: u32 = CREATE_NO_WINDOW | DETACHED_PROCESS;
+/// How long a started process gets to stay up before the launch counts as failed. Long
+/// enough to catch the games that die in their first second, short enough not to be felt.
+const LAUNCH_GRACE: Duration = Duration::from_millis(600);
 
 pub fn run(show_ui_when_running: bool) {
     if let Err(e) = armoury_core::logging::init("daemon") {
@@ -117,6 +129,8 @@ pub fn run(show_ui_when_running: bool) {
     let (pad_tx, pad_rx) = crossbeam_channel::unbounded::<console::PadEvent>();
     // Cover-art worker -> main loop: a key with fresh art, or "" when a pass finished.
     let (art_tx, art_rx) = crossbeam_channel::unbounded::<String>();
+    // Launch worker -> main loop: a finished launch and the client that asked for it.
+    let (launch_tx, launch_rx) = crossbeam_channel::unbounded::<LaunchEvent>();
     console::start(pad_tx, wake_handle);
     let engine = {
         let mut e = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
@@ -236,6 +250,8 @@ pub fn run(show_ui_when_running: bool) {
         art_tx,
         art_rx,
         art_busy: false,
+        launch_tx,
+        launch_rx,
         // A pass with the old (keyless) key may still be running: it leaves miss markers.
         art_retry_after_pass: false,
         last_error: None,
@@ -315,6 +331,9 @@ pub fn run(show_ui_when_running: bool) {
         }
         while let Ok(key) = app.art_rx.try_recv() {
             app.on_art(key);
+        }
+        while let Ok(ev) = app.launch_rx.try_recv() {
+            app.on_launch(ev);
         }
         loop {
             match app.pack_out_rx.try_recv() {
@@ -549,6 +568,9 @@ struct App {
     art_tx: crossbeam_channel::Sender<String>,
     art_rx: crossbeam_channel::Receiver<String>,
     art_busy: bool,
+    /// Launch results: the worker thread -> the main loop (the client gets the answer).
+    launch_tx: crossbeam_channel::Sender<LaunchEvent>,
+    launch_rx: crossbeam_channel::Receiver<LaunchEvent>,
     /// A pass with the old (keyless) SteamGridDB key is still running: it leaves miss markers
     /// behind, so they have to be cleared again when that pass ends.
     art_retry_after_pass: bool,
@@ -600,6 +622,217 @@ fn launcher_entries(cfg: &AppConfig) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// What a finished launch means for the daemon.
+enum LaunchAction {
+    /// The game started: remember it as played.
+    Played,
+    /// The launch failed: show the reason, remember nothing.
+    Failed(String),
+}
+
+/// The action a finished launch leads to. A launch that failed must not count as played:
+/// the "last played" stamp re-sorts the band, and the user would keep landing on the game
+/// that never even started.
+fn launch_action(outcome: &LaunchOutcome) -> LaunchAction {
+    if outcome.ok {
+        LaunchAction::Played
+    } else {
+        LaunchAction::Failed(outcome.message.clone())
+    }
+}
+
+/// ---------------------------------------------------------------------------
+/// Starting a game
+/// ---------------------------------------------------------------------------
+
+/// How an app is started.
+enum LaunchPlan {
+    /// A Steam app: the Steam client starts it (`steam.exe -applaunch <appid>`).
+    Steam {
+        appid: u32,
+        steam_exe: std::path::PathBuf,
+        steam_dir: std::path::PathBuf,
+        /// The install root — its name is the game's name in Steam.
+        install_dir: std::path::PathBuf,
+    },
+    /// A standalone exe: it is started directly.
+    Direct { exe: std::path::PathBuf },
+}
+
+/// The launch plan for an exe: through Steam when it is an installed Steam app, directly
+/// otherwise.
+///
+/// A Steam game must be started by the Steam client. The exe in the install folder is the
+/// innermost payload of a launcher chain (the BattlEye wrapper, the uplay loader, the game
+/// itself); started on its own it dies within a second, because the data it needs lives in
+/// the install root and the chain never ran. Steam runs the chain with the install root as
+/// the working directory, so that is what the daemon does too.
+fn launch_plan(exe: &std::path::Path, app: Option<art::SteamApp>) -> LaunchPlan {
+    match app {
+        Some(app) => LaunchPlan::Steam {
+            appid: app.appid,
+            steam_exe: app.steam_exe(),
+            steam_dir: app.steam_dir,
+            install_dir: app.install_dir,
+        },
+        None => LaunchPlan::Direct {
+            exe: exe.to_path_buf(),
+        },
+    }
+}
+
+/// The result of a launch attempt.
+struct LaunchOutcome {
+    /// Did the app start?
+    ok: bool,
+    /// What the log says and what the band shows.
+    message: String,
+}
+
+/// A finished launch on its way back to the client that asked for it.
+struct LaunchEvent {
+    /// The pipe client that asked for the launch.
+    client: u64,
+    /// The exe that was launched.
+    exe: String,
+    /// How it went.
+    outcome: LaunchOutcome,
+}
+
+/// Start an app and find out whether it really started.
+fn run_launch(exe: &str) -> LaunchOutcome {
+    let path = std::path::Path::new(exe);
+    match launch_plan(path, art::steam_app(path)) {
+        LaunchPlan::Steam {
+            appid,
+            steam_exe,
+            steam_dir,
+            install_dir,
+        } => {
+            if !steam_exe.is_file() {
+                warn!(
+                    "console: no Steam client at {} — starting the exe directly",
+                    steam_exe.display()
+                );
+                return launch_direct(path);
+            }
+            let game = install_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| exe.to_string());
+            launch_via_steam(appid, &steam_exe, &steam_dir, &game)
+        }
+        LaunchPlan::Direct { exe } => launch_direct(&exe),
+    }
+}
+
+/// Start the exe itself and check that it stays up.
+///
+/// The working directory is the exe's own folder, like Explorer does it: plenty of games
+/// (and repack launchers) resolve their data files relative to it, and inheriting the
+/// daemon's folder breaks them.
+fn launch_direct(exe: &std::path::Path) -> LaunchOutcome {
+    let mut cmd = Command::new(exe);
+    if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
+        cmd.current_dir(dir);
+    }
+    cmd.creation_flags(GAME_FLAGS);
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let pid = child.id();
+            thread::sleep(LAUNCH_GRACE);
+            match child.try_wait() {
+                Ok(None) => LaunchOutcome {
+                    ok: true,
+                    message: format!("launched {} (pid {pid})", exe.display()),
+                },
+                Ok(Some(status)) => LaunchOutcome {
+                    ok: false,
+                    message: format!(
+                        "{} exited right away ({}); the game did not start",
+                        exe.display(),
+                        exit_code(&status)
+                    ),
+                },
+                Err(e) => LaunchOutcome {
+                    ok: true,
+                    message: format!("launched {} (pid {pid}, state unknown: {e})", exe.display()),
+                },
+            }
+        }
+        Err(e) => LaunchOutcome {
+            ok: false,
+            message: format!("cannot start {}: {e}", exe.display()),
+        },
+    }
+}
+
+/// Start a Steam game the way Steam starts it: `steam.exe -applaunch <appid>`, with the
+/// Steam directory as the working directory.
+///
+/// The client hands the request to the running instance and leaves, so the game is never a
+/// child of the daemon. The game itself is not waited for: Steam shows its own screens
+/// (updates, the uplay login) long before the process appears.
+fn launch_via_steam(
+    appid: u32,
+    steam_exe: &std::path::Path,
+    steam_dir: &std::path::Path,
+    game: &str,
+) -> LaunchOutcome {
+    let mut cmd = Command::new(steam_exe);
+    cmd.arg("-applaunch").arg(appid.to_string());
+    cmd.current_dir(steam_dir);
+    cmd.creation_flags(GAME_FLAGS);
+    match cmd.spawn() {
+        Ok(mut child) => {
+            let pid = child.id();
+            thread::sleep(LAUNCH_GRACE);
+            match child.try_wait() {
+                // the client is still up: it is starting the game
+                Ok(None) => LaunchOutcome {
+                    ok: true,
+                    message: format!("Steam is starting {game} (appid {appid}, client pid {pid})"),
+                },
+                // the client took the request and left: the game starts on its own
+                Ok(Some(status)) if status.success() => LaunchOutcome {
+                    ok: true,
+                    message: format!("Steam took the launch of {game} (appid {appid})"),
+                },
+                Ok(Some(status)) => LaunchOutcome {
+                    ok: false,
+                    message: format!(
+                        "Steam refused the launch of {game} (appid {appid}, {})",
+                        exit_code(&status)
+                    ),
+                },
+                Err(e) => LaunchOutcome {
+                    ok: true,
+                    message: format!("Steam is starting {game} (appid {appid}, state unknown: {e})"),
+                },
+            }
+        }
+        Err(e) => LaunchOutcome {
+            ok: false,
+            message: format!("cannot start Steam ({}): {e}", steam_exe.display()),
+        },
+    }
+}
+
+/// The exit code of a finished child, for the failure message.
+fn exit_code(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "no exit code".to_string(),
+    }
+}
+
+/// Wake the main loop: the raw Win32 event handle every producer signals.
+fn signal_wake(wake: usize) {
+    if wake != 0 {
+        unsafe { SetEvent(wake as HANDLE) };
+    }
 }
 
 impl App {
@@ -673,6 +906,47 @@ impl App {
                 .collect(),
             last_error: self.last_error.clone(),
         }
+    }
+
+    /// Start an app and report the result to the client that asked for it.
+    ///
+    /// The work happens on a worker thread: the check waits for the process to stay up,
+    /// and the daemon's main loop must not block on that. For a tracked app the watcher
+    /// then triggers the packs exactly as if the user had opened the game by hand.
+    fn launch_app(&mut self, client: u64, exe: String) {
+        let tx = self.launch_tx.clone();
+        let wake = self.wake;
+        thread::spawn(move || {
+            let outcome = run_launch(&exe);
+            let _ = tx.send(LaunchEvent {
+                client,
+                exe,
+                outcome,
+            });
+            signal_wake(wake);
+        });
+    }
+
+    /// The launch finished: the client that asked gets the answer, and only a game that
+    /// really started counts as played.
+    fn on_launch(&mut self, ev: LaunchEvent) {
+        match launch_action(&ev.outcome) {
+            LaunchAction::Played => {
+                info!("console: {}", ev.outcome.message);
+                self.record_played(&ev.exe);
+            }
+            LaunchAction::Failed(message) => {
+                warn!("console: {message}");
+                remember_error(&mut self.last_error, "launch", &message);
+            }
+        }
+        if let Some(push) = self.clients.get(&ev.client) {
+            let _ = push.send(armoury_core::protocol::launch_ack(
+                ev.outcome.ok,
+                &ev.outcome.message,
+            ));
+        }
+        self.broadcast_status();
     }
 
     fn on_watch(&mut self, ev: watch::WatchEvent) {
@@ -1339,8 +1613,6 @@ impl App {
             info!("console launcher is already running");
             return;
         }
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        use std::os::windows::process::CommandExt;
 
         let exe = match std::env::current_exe() {
             Ok(exe) => exe,
@@ -1504,9 +1776,6 @@ impl App {
 
         // The UI is this same executable, started with `--ui`.
         // CREATE_NO_WINDOW: never flash a console, even in debug builds.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        use std::os::windows::process::CommandExt;
-
         let exe = std::env::current_exe();
         let Some(exe) = exe.ok() else {
             warn!("cannot resolve own executable path");
@@ -1679,25 +1948,10 @@ impl App {
                     self.broadcast_status();
                 }
                 Request::LaunchApp { exe } => {
-                    // The daemon spawns; for a tracked app the watcher then triggers the packs
-                    // exactly as if the user had opened it by hand.
-                    // Launch like Explorer does: CWD = the exe's own folder. Plenty of games
-                    // (and repack launchers) resolve data files relative to the working
-                    // directory — inheriting the daemon's folder breaks them.
-                    let mut cmd = Command::new(&exe);
-                    if let Some(dir) = std::path::Path::new(&exe)
-                        .parent()
-                        .filter(|d| !d.as_os_str().is_empty())
-                    {
-                        cmd.current_dir(dir);
-                    }
-                    match cmd.spawn() {
-                        Ok(child) => {
-                            info!("console: launched {exe} (pid {})", child.id());
-                            self.record_played(&exe);
-                        }
-                        Err(e) => warn!("console: cannot launch {exe}: {e}"),
-                    }
+                    // The daemon spawns and checks the result: a Steam game is started
+                    // through the Steam client, and a process that dies right away is a
+                    // failed launch, not a started game. The client is told either way.
+                    self.launch_app(id, exe);
                 }
                 Request::AddTrackedApp { name, exe } => {
                     self.add_tracked_app(name, exe);
@@ -2055,6 +2309,65 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, "C:\\games\\demo.exe"); // the tracked copy wins
         assert_eq!(entries[1].1, "D:\\tools\\pin.exe");
+    }
+
+    #[test]
+    fn a_steam_game_is_started_through_steam_and_a_standalone_game_directly() {
+        let root = std::env::temp_dir().join(format!("armoury-launch-plan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let game = root.join("Steam/steamapps/common/Some Game/sub");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::write(
+            root.join("Steam/steamapps/appmanifest_12345.acf"),
+            "\"AppState\"\n{\n\t\"appid\"\t\t\"12345\"\n\t\"installdir\"\t\t\"Some Game\"\n}\n",
+        )
+        .unwrap();
+
+        // the folder right after `common` is the installdir the manifest names
+        let exe = game.join("game.exe");
+        match launch_plan(&exe, art::steam_app(&exe)) {
+            LaunchPlan::Steam {
+                appid,
+                steam_exe,
+                steam_dir,
+                install_dir,
+            } => {
+                assert_eq!(appid, 12345);
+                assert_eq!(steam_exe, root.join("Steam/steam.exe"));
+                assert_eq!(steam_dir, root.join("Steam"));
+                assert_eq!(install_dir, root.join("Steam/steamapps/common/Some Game"));
+            }
+            LaunchPlan::Direct { .. } => panic!("a Steam game must be started through Steam"),
+        }
+
+        // a game that is not in a Steam library is started directly
+        let plain = std::path::Path::new("C:\\Games\\AlanWake2.exe");
+        match launch_plan(plain, art::steam_app(plain)) {
+            LaunchPlan::Direct { exe } => assert_eq!(exe, plain),
+            LaunchPlan::Steam { .. } => panic!("a standalone game must be started directly"),
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_launch_is_not_played_but_a_started_one_is() {
+        let started = LaunchOutcome {
+            ok: true,
+            message: "launched game.exe (pid 42)".into(),
+        };
+        assert!(matches!(launch_action(&started), LaunchAction::Played));
+
+        let failed = LaunchOutcome {
+            ok: false,
+            message: "game.exe exited right away (exit code 0); the game did not start".into(),
+        };
+        match launch_action(&failed) {
+            LaunchAction::Failed(message) => {
+                assert!(message.contains("did not start"), "{message}");
+            }
+            LaunchAction::Played => panic!("a failed launch must not count as played"),
+        }
     }
 
     #[test]
