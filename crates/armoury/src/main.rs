@@ -1,6 +1,8 @@
-//! ArmouryDaemon — single executable, four entry paths.
+//! ArmouryDaemon — single executable, five entry paths.
 //! Without arguments: the resident daemon (tray, hotkey, pipe server, UI lifecycle).
 //! With `--ui`: the on-demand GUI process (spawned by the daemon from this same file).
+//! With `--console`: the pad-driven console launcher (spawned by the daemon on a controller
+//! connect; the tray menu and the settings preview can open it too).
 //! With `--autostart`: the scheduled task's start — identical to the daemon, except that an
 //! already-running instance is left completely alone (no dashboard pops up on resume from sleep).
 //! With `--catalog-list` / `--catalog-install <id>`: pack-catalog maintenance, print and exit.
@@ -8,11 +10,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod catalog;
+mod console;
+mod console_ui;
 mod daemon;
 mod ipc;
 mod killswitch;
 mod overlay;
+mod pad;
 mod packs;
+mod pick;
 mod script;
 mod ui;
 mod watch;
@@ -77,7 +83,9 @@ fn main() {
         return;
     }
 
-    if has("--ui") {
+    if has("--console") {
+        console_ui::run();
+    } else if has("--ui") {
         ui::run();
     } else {
         // The scheduler (logon, resume) must never disturb a daemon that is already up.

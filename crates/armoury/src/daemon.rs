@@ -1,12 +1,13 @@
 //! Daemon mode: single instance, tray icon + menu, Scroll Lock global hotkey,
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
+use crate::console;
 use crate::ipc;
 use crate::killswitch;
 use crate::overlay;
 use crate::packs;
 use crate::watch;
-use armoury_core::config::{AppConfig, TrackedApp};
+use armoury_core::config::{AppConfig, ConsoleApp, TrackedApp};
 use armoury_core::engine::{Engine, EngineState, Transition};
 use armoury_core::protocol::{Request, Response};
 use armoury_core::status::{PackSettingStatus, PackStatus, RunState, StatusSnapshot};
@@ -97,6 +98,10 @@ pub fn run(show_ui_when_running: bool) {
     let tracked = Arc::new(Mutex::new(cfg.tracked_apps.clone()));
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<watch::WatchEvent>();
     watch::start(tracked.clone(), watch_tx, wake_handle);
+
+    // ---- controller watch (console mode) ----
+    let (pad_tx, pad_rx) = crossbeam_channel::unbounded::<console::PadEvent>();
+    console::start(pad_tx, wake_handle);
     let engine = {
         let mut e = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
         if cfg.paused {
@@ -137,8 +142,16 @@ pub fn run(show_ui_when_running: bool) {
     let pause_item = MenuItem::with_id("pause_all", "Pause all packs", true, None);
     let idle_item = MenuItem::with_id("idle", "Idle mode", true, None);
     let kill_item = MenuItem::with_id("killswitch", "Toggle killswitch", true, None);
+    let console_item = MenuItem::with_id("console", "Console mode", true, None);
     let quit_item = MenuItem::with_id("quit", "Quit", true, None);
-    if let Err(e) = menu.append_items(&[&open_item, &pause_item, &idle_item, &kill_item, &quit_item])
+    if let Err(e) = menu.append_items(&[
+        &open_item,
+        &pause_item,
+        &idle_item,
+        &kill_item,
+        &console_item,
+        &quit_item,
+    ])
     {
         warn!("failed to build tray menu: {e}");
     }
@@ -216,6 +229,8 @@ pub fn run(show_ui_when_running: bool) {
         ui_conn: None,
         ui_child: None,
         spawning_ui: false,
+        console_child: None,
+        pad_rx,
         last_broadcast: Instant::now(),
         last_tooltip: String::new(),
         wake: wake_handle,
@@ -259,6 +274,7 @@ pub fn run(show_ui_when_running: bool) {
                     }
                 }
                 "killswitch" => app.toggle_killswitch(),
+                "console" => app.show_console(),
                 "quit" => {
                     info!("quit requested from tray menu");
                     // "Quit means close everything" (user decision 2026-10-18): put the apps back
@@ -280,6 +296,9 @@ pub fn run(show_ui_when_running: bool) {
         }
         while let Ok(w) = watch_rx.try_recv() {
             app.on_watch(w);
+        }
+        while let Ok(ev) = app.pad_rx.try_recv() {
+            app.on_pad(ev);
         }
         loop {
             match app.pack_out_rx.try_recv() {
@@ -317,6 +336,9 @@ pub fn run(show_ui_when_running: bool) {
         }
     }
     if let Some(mut child) = app.ui_child.take() {
+        let _ = child.kill();
+    }
+    if let Some(mut child) = app.console_child.take() {
         let _ = child.kill();
     }
     log::logger().flush();
@@ -480,6 +502,10 @@ struct App {
     ui_conn: Option<u64>,
     ui_child: Option<Child>,
     spawning_ui: bool,
+    /// The console-launcher process (spawned by a fresh pad connect or from the tray).
+    console_child: Option<Child>,
+    /// Pad hotplug events from the controller watch.
+    pad_rx: crossbeam_channel::Receiver<console::PadEvent>,
     last_broadcast: Instant,
     /// Last text set on the tray tooltip (avoid a Win32 call every second).
     last_tooltip: String,
@@ -518,6 +544,8 @@ impl App {
             idle_failsafe_minutes: self.cfg.idle_failsafe_minutes,
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
+            console_enabled: self.cfg.console_enabled,
+            console_apps: self.cfg.console_apps.clone(),
             packs: self
                 .pack_catalog
                 .iter()
@@ -1113,6 +1141,7 @@ impl App {
             self.update_tooltip();
             self.broadcast_status();
             self.reap_ui_child();
+            self.reap_console_child();
         }
     }
 
@@ -1170,6 +1199,94 @@ impl App {
                 Err(e) => warn!("UI process wait failed: {e}"),
             }
         }
+    }
+
+    /// Pad hotplug: a fresh connect opens the console launcher when the feature is on and no
+    /// tracked app is running (user decision 2026-10-19).
+    fn on_pad(&mut self, ev: console::PadEvent) {
+        match ev {
+            console::PadEvent::Connected { slot } => {
+                info!("controller connected (slot {slot})");
+                if !self.cfg.console_enabled {
+                    return;
+                }
+                if !self.engine.running_names().is_empty() {
+                    info!("console mode: kept closed — a tracked app is running");
+                    return;
+                }
+                self.show_console();
+            }
+            console::PadEvent::Disconnected { slot } => {
+                info!("controller disconnected (slot {slot})");
+            }
+        }
+    }
+
+    /// Open the console launcher now (tray menu / settings preview / a fresh pad connect).
+    fn show_console(&mut self) {
+        self.reap_console_child();
+        if self.console_child.is_some() {
+            info!("console launcher is already running");
+            return;
+        }
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        use std::os::windows::process::CommandExt;
+
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(e) => {
+                warn!("cannot resolve own executable path: {e}");
+                return;
+            }
+        };
+        match Command::new(&exe)
+            .arg("--console")
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            Ok(child) => {
+                info!("spawned console launcher (pid {})", child.id());
+                self.console_child = Some(child);
+            }
+            Err(e) => warn!("failed to spawn the console launcher: {e}"),
+        }
+    }
+
+    fn reap_console_child(&mut self) {
+        if let Some(child) = &mut self.console_child {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    info!("console launcher exited ({exit})");
+                    self.console_child = None;
+                }
+                Ok(None) => {}
+                Err(e) => warn!("console launcher wait failed: {e}"),
+            }
+        }
+    }
+
+    /// Pin an app to the console launcher. False when it is already in the list (by file name).
+    fn add_console_app(&mut self, name: String, exe: String) -> bool {
+        // Matching in the console is by file name, so dedupe on that, like tracked apps.
+        let base = basename_lower(&exe);
+        if self
+            .cfg
+            .console_apps
+            .iter()
+            .any(|a| basename_lower(&a.exe) == base)
+        {
+            info!("console app already in the list (by name): {base}");
+            return false;
+        }
+        self.cfg.console_apps.push(ConsoleApp {
+            name,
+            exe: exe.clone(),
+        });
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        info!("console app added: {exe}");
+        true
     }
 
     /// Tray click / menu "Open dashboard": focus the UI if it is connected, else spawn it.
@@ -1244,6 +1361,63 @@ impl App {
                     }
                 }
                 Request::ShowUi => self.on_open(),
+                Request::ConsoleHello { pid } => {
+                    info!("console hello (pid {pid}) on connection {id}");
+                    let status = self.status();
+                    if let Some(push) = self.clients.get(&id) {
+                        let _ = push.send(Response::HelloAck {
+                            daemon_version: armoury_core::VERSION.to_string(),
+                            status,
+                        });
+                    }
+                }
+                Request::ShowConsole => self.show_console(),
+                Request::SetConsoleEnabled { enabled } => {
+                    self.cfg.console_enabled = enabled;
+                    if let Err(e) = armoury_core::config::save(&self.cfg) {
+                        warn!("failed to save config: {e}");
+                    }
+                    info!("console mode {}", if enabled { "on" } else { "off" });
+                    self.broadcast_status();
+                }
+                Request::AddConsoleApp { name, exe } => {
+                    let ok = self.add_console_app(name, exe);
+                    if let Some(push) = self.clients.get(&id) {
+                        let _ = push.send(Response::ConsoleOp {
+                            ok,
+                            message: if ok { "added" } else { "already in the list" }.into(),
+                        });
+                    }
+                    self.broadcast_status();
+                }
+                Request::RemoveConsoleApp { exe } => {
+                    let before = self.cfg.console_apps.len();
+                    self.cfg
+                        .console_apps
+                        .retain(|a| !a.exe.eq_ignore_ascii_case(&exe));
+                    let ok = self.cfg.console_apps.len() != before;
+                    if ok {
+                        if let Err(e) = armoury_core::config::save(&self.cfg) {
+                            warn!("failed to save config: {e}");
+                        }
+                        info!("console app removed: {exe}");
+                    }
+                    if let Some(push) = self.clients.get(&id) {
+                        let _ = push.send(Response::ConsoleOp {
+                            ok,
+                            message: if ok { "removed" } else { "not in the list" }.into(),
+                        });
+                    }
+                    self.broadcast_status();
+                }
+                Request::LaunchApp { exe } => {
+                    // The daemon spawns; for a tracked app the watcher then triggers the packs
+                    // exactly as if the user had opened it by hand.
+                    match Command::new(&exe).spawn() {
+                        Ok(child) => info!("console: launched {exe} (pid {})", child.id()),
+                        Err(e) => warn!("console: cannot launch {exe}: {e}"),
+                    }
+                }
                 Request::AddTrackedApp { name, exe } => self.add_tracked_app(name, exe),
                 Request::RemoveTrackedApp { exe } => self.remove_tracked_app(&exe),
                 Request::SetPaused { paused } => self.set_paused(paused),

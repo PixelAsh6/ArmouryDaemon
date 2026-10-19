@@ -14,6 +14,10 @@ pub struct AppConfig {
     pub packs: HashMap<String, PackUserConfig>,
     /// Pause all pack switching (tray menu / dashboard button).
     pub paused: bool,
+    /// Controller "console mode": the pad's connect opens the console launcher.
+    pub console_enabled: bool,
+    /// Apps pinned to the console launcher without being tracked.
+    pub console_apps: Vec<ConsoleApp>,
     /// Idle overlay safety cap: force-quit after `idle_failsafe_minutes`.
     pub idle_failsafe_enabled: bool,
     pub idle_failsafe_minutes: u64,
@@ -42,6 +46,8 @@ impl Default for AppConfig {
             tracked_apps: Vec::new(),
             packs: HashMap::new(),
             paused: false,
+            console_enabled: false,
+            console_apps: Vec::new(),
             idle_failsafe_enabled: true,
             idle_failsafe_minutes: 180,
             ui_position: None,
@@ -52,6 +58,14 @@ impl Default for AppConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedApp {
+    pub name: String,
+    pub exe: String,
+}
+
+/// An app pinned to the console launcher. Launchable from the pad UI but never tracked, so it
+/// triggers no pack switching.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleApp {
     pub name: String,
     pub exe: String,
 }
@@ -153,5 +167,25 @@ mod tests {
         let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
         assert_eq!(old.cooldown_seconds, 30);
         assert_eq!(old.ui_position, None);
+    }
+
+    #[test]
+    fn console_fields_roundtrip_and_old_configs_still_load() {
+        let mut cfg = AppConfig::default();
+        cfg.console_enabled = true;
+        cfg.console_apps.push(ConsoleApp {
+            name: "Notepad".into(),
+            exe: "C:\\Windows\\notepad.exe".into(),
+        });
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert!(back.console_enabled);
+        assert_eq!(back.console_apps[0].exe, "C:\\Windows\\notepad.exe");
+
+        // a config written before console mode existed must load with console defaults
+        let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
+        assert_eq!(old.cooldown_seconds, 30);
+        assert!(!old.console_enabled);
+        assert!(old.console_apps.is_empty());
     }
 }

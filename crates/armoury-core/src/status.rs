@@ -1,4 +1,4 @@
-use crate::config::TrackedApp;
+use crate::config::{ConsoleApp, TrackedApp};
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon state machine (Phase 1: always Idle).
@@ -45,6 +45,12 @@ pub struct StatusSnapshot {
     /// Installed packs and their state, for the dashboard.
     #[serde(default)]
     pub packs: Vec<PackStatus>,
+    /// Console mode: whether a controller connect opens the launcher.
+    #[serde(default)]
+    pub console_enabled: bool,
+    /// Apps pinned to the console launcher.
+    #[serde(default)]
+    pub console_apps: Vec<ConsoleApp>,
 }
 
 /// One installed pack, as the dashboard sees it.

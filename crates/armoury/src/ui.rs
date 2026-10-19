@@ -71,6 +71,8 @@ struct Shared {
     pick_tx: Option<crossbeam_channel::Sender<Picked>>,
     /// Result of the last pack install/remove, shown in the settings window.
     last_pack_op: Option<(bool, String)>,
+    /// Result of the last console-app add/remove, shown in the settings window.
+    last_console_op: Option<(bool, String)>,
     /// Catalog (Phase 8) state for the settings window: the last check's result, whether a
     /// check is in flight, the pack id being downloaded, and the verified temp file waiting
     /// for the daemon's install request.
@@ -321,6 +323,11 @@ impl eframe::App for App {
                     let mut s = self.shared.lock().unwrap();
                     s.last_pack_op = Some((ok, message));
                     s.catalog_installing = None;
+                }
+                UiEvent::Response(Response::ConsoleOp { ok, message }) => {
+                    log::info!("console op result: {message}");
+                    let mut s = self.shared.lock().unwrap();
+                    s.last_console_op = Some((ok, message));
                 }
                 UiEvent::Eof => {
                     log::info!("daemon went away — exiting");
@@ -1266,7 +1273,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 s.failsafe_text.clone(),
             )
         };
-        let (packs, last_op, catalog_state, catalog_checking, catalog_installing) = {
+        let (packs, last_op, last_console_op, catalog_state, catalog_checking, catalog_installing) = {
             let s = shared.lock().unwrap();
             let packs = s
                 .status
@@ -1276,6 +1283,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             (
                 packs,
                 s.last_pack_op.clone(),
+                s.last_console_op.clone(),
                 s.catalog.clone(),
                 s.catalog_checking,
                 s.catalog_installing.clone(),
@@ -1497,6 +1505,82 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             }
         }
 
+        // ---- console mode: the pad-driven launcher ----
+        let (console_enabled, console_apps) = {
+            let s = shared.lock().unwrap();
+            let st = s.status.as_ref();
+            (
+                st.map(|x| x.console_enabled).unwrap_or(false),
+                st.map(|x| x.console_apps.clone()).unwrap_or_default(),
+            )
+        };
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("Console mode").strong());
+        ui.add_space(4.0);
+        let mut console_on = console_enabled;
+        if ui
+            .checkbox(&mut console_on, "Open on controller connect")
+            .on_hover_text(
+                "A freshly connected controller opens the launcher — unless a tracked app is running",
+            )
+            .changed()
+        {
+            send_request(shared, &Request::SetConsoleEnabled { enabled: console_on });
+            ui.ctx().request_repaint();
+        }
+        ui.small(RichText::new("XInput pads. A tracked app already running keeps it closed.").weak());
+        ui.add_space(4.0);
+        let mut remove_console: Option<String> = None;
+        if console_apps.is_empty() {
+            ui.small(
+                RichText::new("No console apps yet — add them from the launcher's \"Add app…\" tile.")
+                    .weak(),
+            );
+        } else {
+            egui::Grid::new("settings-console-apps")
+                .num_columns(2)
+                .spacing(egui::vec2(10.0, 4.0))
+                .show(ui, |ui| {
+                    for a in &console_apps {
+                        ui.horizontal(|ui| {
+                            ui.label(&a.name);
+                            ui.small(RichText::new(file_name(&a.exe)).weak());
+                        });
+                        if ui
+                            .small_button("Remove")
+                            .on_hover_text("Remove from the launcher (tracking is unaffected)")
+                            .clicked()
+                        {
+                            remove_console = Some(a.exe.clone());
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+        if let Some(exe) = remove_console {
+            send_request(shared, &Request::RemoveConsoleApp { exe });
+        }
+        ui.add_space(4.0);
+        if ui
+            .button("Open console now")
+            .on_hover_text("Show the launcher without a controller")
+            .clicked()
+        {
+            send_request(shared, &Request::ShowConsole);
+        }
+        if let Some((ok, message)) = last_console_op {
+            ui.add_space(2.0);
+            ui.small(
+                RichText::new(message).color(if ok {
+                    Color32::from_rgb(52, 211, 153)
+                } else {
+                    Color32::from_rgb(248, 113, 113)
+                }),
+            );
+        }
+
         // ---- logs + config ----
         ui.add_space(8.0);
         ui.separator();
@@ -1531,6 +1615,10 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             "Leave idle after",
             "Install pack…",
             "Check for updates",
+            "Open console now",
+            "Open on controller connect",
+            "XInput pads. A tracked app already running keeps it closed.",
+            "No console apps yet — add them from the launcher's \"Add app…\" tile.",
             "Applies when a tracked app starts.",
         ] {
             w = w.max(tw(&body_font, text) + 24.0);
@@ -1801,7 +1889,7 @@ fn initial_geometry() -> (egui::Vec2, egui::Pos2) {
 /// Use the machine's own fonts instead of egui's embedded ones: Segoe UI Variable Text
 /// (Windows 11) → Segoe UI → Arial. Exactly one file is loaded (the first that exists) and
 /// it also backs the monospace family, so nothing extra is kept in memory.
-fn install_fonts(ctx: &egui::Context) {
+pub(crate) fn install_fonts(ctx: &egui::Context) {
     const CANDIDATES: [(&str, &str); 3] = [
         ("C:\\Windows\\Fonts\\SegUIVar.ttf", "Segoe UI Variable Text"),
         ("C:\\Windows\\Fonts\\segoeui.ttf", "Segoe UI"),
@@ -1903,56 +1991,17 @@ fn spawn_picker(tx: crossbeam_channel::Sender<Picked>, kind: Picker) {
     });
 }
 
-/// Modern common item dialog (`IFileDialog`) — no extra dependencies.
+/// The picker's dialogs, by kind.
 fn pick_dialog(kind: Picker) -> Option<PathBuf> {
-    use windows::Win32::System::Com::{
-        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
-        CoInitializeEx, CoTaskMemFree, CoUninitialize,
-    };
-    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
-    use windows::Win32::UI::Shell::{
-        FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FileOpenDialog, IFileOpenDialog,
-        SIGDN_FILESYSPATH,
-    };
-    use windows::core::w;
-
-    let (name, spec, title) = match kind {
-        Picker::TrackedApp => (w!("Applications"), w!("*.exe"), w!("Pick an application to track")),
-        Picker::PackJson => (
-            w!("ArmouryDaemon packs"),
-            w!("pack.json"),
-            w!("Pick a pack.json to install"),
-        ),
-    };
-
-    unsafe {
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        let result = (|| -> Option<PathBuf> {
-            let dialog: IFileOpenDialog =
-                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-            if let Ok(opts) = dialog.GetOptions() {
-                let _ = dialog.SetOptions(
-                    opts | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM,
-                );
-            }
-            let _ = dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
-                pszName: name,
-                pszSpec: spec,
-            }]);
-            let _ = dialog.SetTitle(title);
-            if dialog.Show(None).is_err() {
-                return None; // cancelled
-            }
-            let item = dialog.GetResult().ok()?;
-            let display = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-            let path = display.to_string().ok().map(PathBuf::from);
-            CoTaskMemFree(Some(display.0 as *const core::ffi::c_void));
-            path
-        })();
-        if hr.is_ok() {
-            CoUninitialize();
+    match kind {
+        Picker::TrackedApp => {
+            crate::pick::open_dialog("Pick an application to track", "Applications", "*.exe")
         }
-        result
+        Picker::PackJson => crate::pick::open_dialog(
+            "Pick a pack.json to install",
+            "ArmouryDaemon packs",
+            "pack.json",
+        ),
     }
 }
 

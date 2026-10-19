@@ -8,6 +8,9 @@ use std::io::{self, BufRead, Write};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     UiHello { pid: u32 },
+    /// The console launcher says hello. Kept apart from `UiHello` so the daemon never focuses or
+    /// kills it as if it were the dashboard.
+    ConsoleHello { pid: u32 },
     GetStatus,
     ShowUi,
     AddTrackedApp { name: String, exe: String },
@@ -30,6 +33,16 @@ pub enum Request {
     InstallPack { source: String },
     /// Remove an installed pack (its folder under `<install>\packs`).
     RemovePack { id: String },
+    /// Turn console mode on/off (a controller connect then opens the launcher).
+    SetConsoleEnabled { enabled: bool },
+    /// Pin an app to the console launcher (not tracked).
+    AddConsoleApp { name: String, exe: String },
+    /// Unpin an app from the console launcher.
+    RemoveConsoleApp { exe: String },
+    /// Launch an app from the console; the daemon does the spawning and logging.
+    LaunchApp { exe: String },
+    /// Open the console launcher now (tray menu / settings preview), pad or not.
+    ShowConsole,
 }
 
 /// Messages sent from the daemon to a client.
@@ -46,6 +59,8 @@ pub enum Response {
     Focus,
     /// Result of an install/remove request, for the settings window.
     PackOp { ok: bool, message: String },
+    /// Result of a console-app request, for the settings window.
+    ConsoleOp { ok: bool, message: String },
 }
 
 /// Serialize `msg` as one JSON line and write it (flushing immediately).
@@ -157,6 +172,8 @@ mod tests {
                 tracked_apps: vec![],
                 tracked_apps_running: vec![],
                 packs: vec![],
+                console_enabled: false,
+                console_apps: vec![],
             },
         };
         let mut out = Vec::new();
@@ -169,6 +186,35 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn roundtrip_console_requests() {
+        let mut out = Vec::new();
+        write_msg(
+            &mut out,
+            &Request::AddConsoleApp {
+                name: "Notepad".into(),
+                exe: "C:\\Windows\\notepad.exe".into(),
+            },
+        )
+        .unwrap();
+        write_msg(&mut out, &Request::ShowConsole).unwrap();
+        write_msg(
+            &mut out,
+            &Response::ConsoleOp {
+                ok: true,
+                message: "added".into(),
+            },
+        )
+        .unwrap();
+        let mut reader = &out[..];
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(req, Request::AddConsoleApp { .. }));
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(req, Request::ShowConsole));
+        let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(resp, Response::ConsoleOp { ok: true, .. }));
     }
 
     #[test]
