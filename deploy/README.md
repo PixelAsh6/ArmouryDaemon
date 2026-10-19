@@ -6,7 +6,8 @@ A small always-on Windows daemon that reacts to the apps you care about.
 - **Packs** - Wallpaper Engine, G-Helper and Rainmeter. A pack may expose up to four dropdowns
   (what it should do while a tracked app runs, and how); Wallpaper Engine ships with two
   (`action` and `binary`). When the app closes, everything reverts to the state it was in before
-  (after a cooldown you choose; reopening cancels the revert).
+  (after the `Revert after` lockout you choose in Settings; a quick reopen keeps the packs
+  applied).
 - **Killswitch** - **End** hides + mutes the running tracked apps; press again to restore. The key
   still reaches the app you are typing in (it is a low-level keyboard hook, not a registered hotkey).
 - **Idle mode** - **Home** blacks out every screen and mutes all audio; any input brings it back
@@ -16,7 +17,7 @@ A small always-on Windows daemon that reacts to the apps you care about.
 - **Pause** - stop all pack switching without uninstalling anything.
 - **Console band** - a launcher strip along the bottom of the screen with the cover art of your
   tracked and pinned apps. Open it from the tray, let it pop up on a controller connect, or keep
-  it out of the way.
+  it out of the way. A game that does not start keeps the band open and shows you why.
 
 Everything is local. No telemetry. The only network traffic is the optional pack catalog and the
 cover art (Steam, or SteamGridDB when you set a key).
@@ -142,13 +143,21 @@ hand when you are done.
 
 Packs are data (see `packs/*/pack.json`): a target process, up to four dropdowns, what to capture
 before acting, and ordered steps to apply and to revert. Available mechanisms: `cli`, `hotkey`,
-`rainmeter_bang`, `process_kill`, `process_start`, `registry_set`, `script`; captures:
-`process_running`, `target_path`, `json_file`.
+`process_kill`, `process_start`, `registry_set`; captures: `process_running`, `target_path`,
+`json_file`.
 
 A spec-2 pack may carry a **script**: a small Rhai program that the daemon interprets against a
-whitelisted host API (`ctx.log`, `ctx.capture`, `ctx.setting`, `run_cli`, `write_file`, ...), with
-an operation limit and a 10 s budget. The script is data, not compiled code - it cannot reach
-outside the allowed folders - but it is not "no code" either.
+whitelisted host API, with an operation limit and a 10 s budget. The script is data, not compiled
+code - it cannot reach outside the allowed folders - but it is not "no code" either.
+
+What the daemon can run for a script: `ctx.log`, `ctx.capture` / `ctx.captured`, `ctx.setting`,
+`ctx.target_name` / `ctx.target_exe` / `ctx.target_dir`, `ctx.run_cli`, `ctx.hotkey`,
+**`ctx.window_message(class, title, payload)`**, `ctx.sleep`, `ctx.process_running` /
+`ctx.process_kill` / `ctx.process_start`, `ctx.read_file` / `ctx.write_file` / `ctx.read_json` /
+`ctx.read_ini`. `ctx.window_message` is the generic one: it finds a window of another app by class
+and/or title (an empty field matches any) and sends it the payload as a `WM_COPYDATA` message, with
+a 2 s timeout so a hung app cannot block the daemon. That is how the shipped Rainmeter pack loads
+a layout - the bang and the window class are pack data, not daemon knowledge.
 
 Settings -> **Install pack...** copies a `pack.json` into this folder's `packs\<id>\` (the daemon
 validates it first and reloads), **Remove** deletes a pack again.
