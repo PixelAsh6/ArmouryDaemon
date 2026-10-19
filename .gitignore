@@ -7,3 +7,18 @@
 
 # Logs
 *.log
+
+# Keys and secrets (never version these)
+*.key
+*.env
+.env*
+*.pem
+*secret*
+config.json
+
+# Test files (local harness)
+*test*.ps1
+
+# Markdown stays local; only README*.md is versioned
+*.md
+!README*.md
