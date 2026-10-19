@@ -128,6 +128,26 @@ function Stop-DaemonInFolder([string]$folder) {
     return $true
 }
 
+# The SHA256 of a file as lowercase hex, computed through .NET.
+#
+# Get-FileHash is NOT used on purpose: the global PSModulePath on this machine puts the PowerShell
+# 7 Modules folder ahead of the Windows PowerShell one, so a powershell.exe (5.1) session
+# autoloads the PS7 Microsoft.PowerShell.Utility - which exports nothing - and the cmdlet is not
+# there at all (it stays missing even after Import-Module "succeeds"). The .NET call does not care
+# about the module path, so it works in every session.
+function Get-Sha256Hex([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $bytes = $sha.ComputeHash($stream)
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        $sha.Dispose()
+    }
+    return ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+}
+
 
 # ---------------------------------------------------------------------------
 # what is being installed
@@ -151,7 +171,7 @@ $hash = ''
 $hashFile = "$exe.sha256"
 $sidecarOk = $false
 try {
-    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe -ErrorAction Stop).Hash
+    $hash = Get-Sha256Hex $exe
     Set-Content -LiteralPath $hashFile -Value ("{0}  {1}" -f $hash, (Split-Path $exe -Leaf)) -Encoding ASCII -ErrorAction Stop
     $sidecarOk = $true
     Write-Host "Recorded the exe hash: $hash"
@@ -159,7 +179,8 @@ try {
 } catch {
     Write-Warning "The hash sidecar $hashFile was NOT written: $($_.Exception.Message)"
     Write-Warning "The exe hash is not recorded, so a swapped binary would not be detectable. Write it by hand later:"
-    Write-Warning "  Set-Content -Path '$hashFile' -Value ((Get-FileHash '$exe' -Algorithm SHA256).Hash + '  ArmouryDaemon.exe') -Encoding ASCII"
+    Write-Warning "  `$sha = [System.Security.Cryptography.SHA256]::Create(); `$fs = [System.IO.File]::OpenRead('$exe'); `$h = ([System.BitConverter]::ToString(`$sha.ComputeHash(`$fs)) -replace '-', '').ToLowerInvariant(); `$fs.Dispose(); `$sha.Dispose()"
+    Write-Warning "  Set-Content -Path '$hashFile' -Value (`$h + '  ArmouryDaemon.exe') -Encoding ASCII"
 }
 
 
@@ -331,7 +352,7 @@ Write-Host "  Task registered : yes - '$taskName' (logon + resume from sleep, hi
 Write-Host "  Hash sidecar    : $sidecarState"
 Write-Host "  Folder ACL      : $aclState"
 Write-Host "  Daemon running  : $daemonState"
-Write-Host "Look for the amber 'A' icon in the tray (hidden icons area)."
+Write-Host "Look for the purple squircle with a white 'A' in the tray (hidden icons area)."
 Write-Host "Config + logs: $env:APPDATA\ArmouryDaemon"
 
 # Only the daemon itself not coming up is a failure of the script. A missing ACL or sidecar
