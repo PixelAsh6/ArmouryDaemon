@@ -1,16 +1,44 @@
-//! App icons: the procedurally generated tray/window icon (dark disc with an amber "A"),
-//! and `exe_icon_rgba`, which lifts a real executable's shell icon for the console tiles.
+//! App icons: the procedurally generated tray/window icon (a purple-magenta squircle with a
+//! bold "A"), and `exe_icon_rgba`, which lifts a real executable's shell icon for the console
+//! tiles.
+//!
+//! The tray shows the icon at 16-20 px, so everything is drawn for that size: a filled
+//! squircle instead of a thin disc, and a letter with strokes thick enough to survive the
+//! downscale.
 
 use std::path::Path;
 
+/// Squircle with a vertical gradient and a bold "A" - the normal tray icon.
 pub fn rgba_icon(size: u32) -> (Vec<u8>, u32, u32) {
     let u = size as f32 / 32.0;
-    let (cx, cy, r) = (16.0 * u, 16.0 * u, 15.0 * u);
-    let bg = (24.0_f32, 30.0_f32, 44.0_f32);
-    let accent = (245.0_f32, 158.0_f32, 11.0_f32);
-    let soft = 1.4 * u;
-    let stroke_half = 1.6 * u;
-    let stroke_soft = 1.2 * u;
+    let top = (150.0_f32, 95.0_f32, 255.0_f32);
+    let bottom = (233.0_f32, 84.0_f32, 190.0_f32);
+    draw_mark(size, u, top, bottom)
+}
+
+/// The killswitch variant: the same mark in red.
+pub fn rgba_icon_active(size: u32) -> (Vec<u8>, u32, u32) {
+    let u = size as f32 / 32.0;
+    let top = (176.0_f32, 34.0_f32, 48.0_f32);
+    let bottom = (255.0_f32, 108.0_f32, 88.0_f32);
+    draw_mark(size, u, top, bottom)
+}
+
+/// A rounded square filled with a vertical gradient, with a white "A" on top.
+fn draw_mark(
+    size: u32,
+    u: f32,
+    top: (f32, f32, f32),
+    bottom: (f32, f32, f32),
+) -> (Vec<u8>, u32, u32) {
+    let cx = 16.0 * u;
+    let cy = 16.0 * u;
+    let half = 15.0 * u;
+    let radius = 7.5 * u;
+    let stroke_half = 2.15 * u;
+    let stroke_soft = 0.9 * u;
+    let edge_soft = 0.8 * u;
+    let white = (250.0_f32, 250.0_f32, 255.0_f32);
 
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     for y in 0..size {
@@ -18,80 +46,40 @@ pub fn rgba_icon(size: u32) -> (Vec<u8>, u32, u32) {
             let px = x as f32 + 0.5;
             let py = y as f32 + 0.5;
 
-            let d_center = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-            let a_bg = ((r - d_center) / soft).clamp(0.0, 1.0);
+            // Squircle: signed distance, negative inside.
+            let qx = (px - cx).abs() - (half - radius);
+            let qy = (py - cy).abs() - (half - radius);
+            let sd = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt()
+                + qx.max(qy).min(0.0)
+                - radius;
+            let a_bg = ((0.5 - sd) / edge_soft).clamp(0.0, 1.0);
 
             // Letter "A": two legs + crossbar, soft-edged strokes.
             let d_letter = [
-                seg(px, py, 10.5 * u, 23.0 * u, 16.0 * u, 9.0 * u),
-                seg(px, py, 16.0 * u, 9.0 * u, 21.5 * u, 23.0 * u),
-                seg(px, py, 12.4 * u, 18.4 * u, 19.6 * u, 18.4 * u),
+                seg(px, py, 10.6 * u, 23.2 * u, 16.0 * u, 8.8 * u),
+                seg(px, py, 16.0 * u, 8.8 * u, 21.4 * u, 23.2 * u),
+                seg(px, py, 12.6 * u, 18.6 * u, 19.4 * u, 18.6 * u),
             ]
             .into_iter()
             .fold(f32::INFINITY, f32::min);
             let a_letter = ((stroke_half - d_letter) / stroke_soft).clamp(0.0, 1.0);
 
-            let mut col = bg;
+            let t = (py / (32.0 * u)).clamp(0.0, 1.0);
+            let mut col = (
+                top.0 + (bottom.0 - top.0) * t,
+                top.1 + (bottom.1 - top.1) * t,
+                top.2 + (bottom.2 - top.2) * t,
+            );
             let mut a = a_bg;
             if a_letter > 0.0 {
                 col = (
-                    col.0 + (accent.0 - col.0) * a_letter,
-                    col.1 + (accent.1 - col.1) * a_letter,
-                    col.2 + (accent.2 - col.2) * a_letter,
+                    col.0 + (white.0 - col.0) * a_letter,
+                    col.1 + (white.1 - col.1) * a_letter,
+                    col.2 + (white.2 - col.2) * a_letter,
                 );
                 a += a_letter * (1.0 - a);
             }
 
-            rgba.extend_from_slice(&[col.0 as u8, col.1 as u8, col.2 as u8, (a * 255.0) as u8]);
-        }
-    }
-    (rgba, size, size)
-}
-
-/// The killswitch variant: same disc, red diagonal bar across the "A".
-pub fn rgba_icon_active(size: u32) -> (Vec<u8>, u32, u32) {
-    let u = size as f32 / 32.0;
-    let (cx, cy, r) = (16.0 * u, 16.0 * u, 15.0 * u);
-    let bg = (24.0_f32, 30.0_f32, 44.0_f32);
-    let accent = (245.0_f32, 158.0_f32, 11.0_f32);
-    let danger = (239.0_f32, 68.0_f32, 68.0_f32);
-    let soft = 1.4 * u;
-    let stroke_half = 1.6 * u;
-    let stroke_soft = 1.2 * u;
-
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-    for y in 0..size {
-        for x in 0..size {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let d_center = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
-            let a_bg = ((r - d_center) / soft).clamp(0.0, 1.0);
-
-            let d_letter = [
-                seg(px, py, 10.5 * u, 23.0 * u, 16.0 * u, 9.0 * u),
-                seg(px, py, 16.0 * u, 9.0 * u, 21.5 * u, 23.0 * u),
-                seg(px, py, 12.4 * u, 18.4 * u, 19.6 * u, 18.4 * u),
-            ]
-            .into_iter()
-            .fold(f32::INFINITY, f32::min);
-            let a_letter = ((stroke_half - d_letter) / stroke_soft).clamp(0.0, 1.0);
-
-            // red slash, bottom-left to top-right
-            let d_slash = seg(px, py, 6.0 * u, 26.0 * u, 26.0 * u, 6.0 * u);
-            let a_slash = ((2.2 * u - d_slash) / stroke_soft).clamp(0.0, 1.0);
-
-            let mut col = bg;
-            let mut a = a_bg;
-            for (colour, alpha) in [(accent, a_letter), (danger, a_slash)] {
-                if alpha > 0.0 {
-                    col = (
-                        col.0 + (colour.0 - col.0) * alpha,
-                        col.1 + (colour.1 - col.1) * alpha,
-                        col.2 + (colour.2 - col.2) * alpha,
-                    );
-                    a += alpha * (1.0 - a);
-                }
-            }
             rgba.extend_from_slice(&[col.0 as u8, col.1 as u8, col.2 as u8, (a * 255.0) as u8]);
         }
     }

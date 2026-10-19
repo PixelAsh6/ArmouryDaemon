@@ -1,6 +1,6 @@
 //! UI mode (`--ui`): the dashboard window plus a settings viewport.
 //! Undecorated (custom title bar: title, settings gear, close), auto-fitting,
-//! placed at the bottom exterior corner of the primary monitor, above the taskbar.
+//! placed at the bottom-right corner of the primary monitor, above the taskbar.
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
 use crate::catalog::{self, CatalogPack};
@@ -25,6 +25,9 @@ const MIN_SETTINGS_WIDTH: f32 = 330.0;
 /// Inner padding of every window (text must never hug the border).
 const PAD: i8 = 10;
 const PAD_F: f32 = PAD as f32;
+/// Distance from the work area's right and bottom edges when a window opens above the tray.
+/// Zero: the window sits flush in the corner, right on top of the system tray.
+const UI_MARGIN: f32 = 0.0;
 
 /// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
 /// packs lists as a built-in row with one dropdown.
@@ -72,9 +75,6 @@ struct Shared {
     /// Safety valve: reveal anyway if placement cannot be confirmed in time.
     settings_deadline: Option<Instant>,
     settings_target: Option<egui::Pos2>,
-    /// (dashboard rect, own size) the current position was computed for —
-    /// lets the settings window follow the dashboard when it grows or moves.
-    settings_anchor: Option<(Rect, egui::Vec2)>,
     /// The size we last asked each child window to take, so content that appears later
     /// (a new pack row, a longer message) can never be clipped.
     settings_size: Option<egui::Vec2>,
@@ -187,11 +187,8 @@ pub fn run() {
 
     // Geometry is computed before the window exists: the very first frame is already in
     // the final spot, because eframe reveals the window right after its first frame.
-    // A position the user left the dashboard at wins over the automatic bottom corner.
-    let (initial_size, default_pos) = initial_geometry();
-    let initial_pos = stored_ui_position()
-        .map(|[x, y]| egui::pos2(x, y))
-        .unwrap_or(default_pos);
+    // The dashboard always opens at the work area's bottom-right corner, above the tray.
+    let (initial_size, initial_pos) = initial_geometry();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ArmouryDaemon")
@@ -219,7 +216,6 @@ pub fn run() {
                 pick_tx,
                 pick_rx,
                 req_rx,
-                stored_ui_position().map(|[x, y]| egui::pos2(x, y)),
             ));
             Ok(app)
         }),
@@ -244,9 +240,14 @@ struct App {
     styled: bool,
     last_desired: Option<egui::Vec2>,
     /// Where the dashboard's top-left is anchored. `None` = the automatic bottom corner; `Some`
-    /// once the user (or a stored position) put it somewhere, so it grows downwards and is
-    /// remembered across runs.
+    /// once the user dragged it away, so it grows downwards from there for the rest of the run.
     anchor: Option<egui::Pos2>,
+    /// The position this window last asked for. A window that sits somewhere else was moved by
+    /// the user - not by our own resize, which also changes the position.
+    auto_pos: Option<egui::Pos2>,
+    /// Whether the window has reached the position we asked for at least once. Only then can a
+    /// deviation be read as the user dragging it.
+    settled: bool,
     /// Last position the daemon was told about (avoid a request every frame).
     last_sent_pos: Option<egui::Pos2>,
     /// When the window last moved, so the position is only saved after it settles.
@@ -261,7 +262,6 @@ impl App {
         pick_tx: crossbeam_channel::Sender<Picked>,
         pick_rx: Receiver<Picked>,
         req_rx: Receiver<Request>,
-        anchor: Option<egui::Pos2>,
     ) -> Self {
         Self {
             rx,
@@ -275,8 +275,10 @@ impl App {
             pick_query: String::new(),
             styled: false,
             last_desired: None,
-            anchor,
-            last_sent_pos: anchor,
+            anchor: None,
+            auto_pos: None,
+            settled: false,
+            last_sent_pos: None,
             still_since: Instant::now(),
         }
     }
@@ -615,7 +617,6 @@ impl eframe::App for App {
                                 .unwrap_or_default();
                             s.settings_stage = 0;
                             s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
-                            s.settings_anchor = None;
                         }
                     }
                 });
@@ -916,6 +917,7 @@ impl eframe::App for App {
             let pos = self.anchor.unwrap_or_else(|| bottom_corner(ctx, desired));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             self.last_desired = Some(desired);
+            self.auto_pos = Some(pos);
         }
 
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
@@ -923,9 +925,16 @@ impl eframe::App for App {
             let pos = outer.min;
             match self.anchor {
                 None => {
-                    // The user dragged it away from the automatic corner: anchor it there.
-                    let auto = bottom_corner(ctx, self.last_desired.unwrap_or(desired));
-                    if (pos - auto).length() > 4.0 {
+                    // Only a move away from the position we asked for counts as the user
+                    // dragging it. Our own resize moves the window too, so the window has to
+                    // have reached that position first.
+                    let ours = self
+                        .auto_pos
+                        .unwrap_or_else(|| bottom_corner(ctx, self.last_desired.unwrap_or(desired)));
+                    if (pos - ours).length() <= 4.0 {
+                        self.settled = true;
+                    } else if self.settled {
+                        // The user dragged it away from the automatic corner: anchor it there.
                         self.anchor = Some(pos);
                         self.still_since = Instant::now();
                     }
@@ -1634,17 +1643,14 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.label(RichText::new("Console mode").strong());
         ui.add_space(4.0);
         ui.small(
-            RichText::new(
-                "Auto-open is set on the console row under Packs. A tracked app already running \
-                 keeps it closed.",
-            )
-            .weak(),
+            RichText::new("Auto-open is set on the console row under Packs.")
+                .weak(),
         );
         ui.add_space(4.0);
         let mut remove_console: Option<String> = None;
         if console_apps.is_empty() {
             ui.small(
-                RichText::new("No console apps yet — add them from the launcher's \"Add app…\" tile.")
+                RichText::new("No console apps yet — add one from the launcher's \"Add app…\" tile.")
                     .weak(),
             );
         } else {
@@ -1714,7 +1720,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.horizontal(|ui| {
             let spacing = ui.spacing().item_spacing.x;
             let save_w = 52.0;
-            let field_w = (ui.available_width() - save_w - spacing).max(120.0);
+            // The key is masked, so the field stays narrow and does not stretch the window.
+            let field_w = 190.0_f32.min((ui.available_width() - save_w - spacing).max(120.0));
             // Masked: the key is never shown in the clear.
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut sgdb_text)
@@ -1763,36 +1770,57 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // ---- shrink-wrap, position above the core window, then show ----
     let title_font = FontId::new(16.0, FontFamily::Proportional);
     let body_font = TextStyle::Body.resolve(ui.style());
+    let small_font = TextStyle::Small.resolve(ui.style());
+    let button_font = TextStyle::Button.resolve(ui.style());
     let desired = {
         let p = ui.painter();
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
-        let mut w = tw(&title_font, "Settings") + 60.0;
-        // the widest fixed strings in the body decide the width
+        // Pack names are dynamic, so read them from the status snapshot for the width probe.
+        let pack_names: Vec<String> = shared
+            .lock()
+            .unwrap()
+            .status
+            .as_ref()
+            .map(|st| st.packs.iter().map(|pack| pack.name.clone()).collect())
+            .unwrap_or_default();
+        // The title sits beside its close button.
+        let mut w = tw(&title_font, "Settings") + 24.0 + 20.0;
+        // Helper lines are drawn with `ui.small(...)`: measuring them at the body font (as this
+        // used to) inflated the window by ~30%. Measure each string at the font it is drawn in.
         for text in [
-            "Open packs folder",
-            "Reveal logs",
-            "Open config folder",
-            "Leave idle after",
-            "Install pack…",
-            "Check for updates",
-            "Open console now",
-            "Auto-open is set on the console row under Packs. A tracked app already running keeps it closed.",
-            "No console apps yet — add them from the launcher's \"Add app…\" tile.",
+            "Auto-open is set on the console row under Packs.",
+            "Cover and hero art for games Steam doesn't know (steamgriddb.com API key).",
+            "No console apps yet — add one from the launcher's \"Add app…\" tile.",
             "Applies when a tracked app starts.",
+            "No key set.",
         ] {
-            w = w.max(tw(&body_font, text) + 24.0);
+            w = w.max(tw(&small_font, text));
         }
-        // one pack row: name + version bubble + the Remove button
-        w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&body_font, "Remove") + 24.0);
-        // one catalog row: name + version bubble + the status text
+        for text in ["Leave idle after", "Revert after", "Idle failsafe"] {
+            w = w.max(tw(&body_font, text));
+        }
+        // Two buttons share a row, so the pair has to fit side by side.
+        for [a, b] in [
+            ["Install pack…", "Open packs folder"],
+            ["Reveal logs", "Open config folder"],
+        ] {
+            w = w.max(tw(&button_font, a) + 24.0 + tw(&button_font, b) + 24.0 + 8.0);
+        }
+        // The built-in console row: name + "(built-in)" + its 120 pt dropdown.
         w = w.max(
-            tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&body_font, "v9.9.9 installed") + 24.0,
+            tw(&body_font, CONSOLE_FEATURE) + 10.0 + tw(&small_font, "(built-in)") + 10.0 + 120.0,
         );
-        for (k, v) in &rows {
-            w = w.max(tw(&body_font, k) + 32.0 + tw(&body_font, v));
+        // A pack row: name + version bubble + the Remove button.
+        w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&button_font, "Remove") + 24.0);
+        for pack in &pack_names {
+            w = w.max(tw(&body_font, pack) + 32.0 + tw(&button_font, "Remove") + 24.0);
+        }
+        // Values are right-aligned, so a long status could still be clipped rather than widen.
+        for (key, value) in &rows {
+            w = w.max(tw(&body_font, key)).max(tw(&body_font, value));
         }
         egui::vec2(
-            (w + 2.0 * PAD_F + 8.0).max(MIN_SETTINGS_WIDTH),
+            snug_width(w, work_area_pts(ui.ctx()).map(|(left, _, right, _)| right - left)),
             (ui.min_rect().height() + 4.0).max(170.0),
         )
     };
@@ -1814,13 +1842,10 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             }
         }
         1 => {
-            if let Some(core) = s.core_rect {
-                let pos = above_core(ctx, core, desired);
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                s.settings_target = Some(pos);
-                s.settings_anchor = Some((core, desired));
-                s.settings_stage = 2;
-            }
+            let pos = bottom_right(work_area(ctx), desired, UI_MARGIN);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            s.settings_target = Some(pos);
+            s.settings_stage = 2;
         }
         2 => {
             // Same rule as the dashboard: only show once the OS reports the position.
@@ -1857,11 +1882,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     _ => true,
                 };
                 if off_screen {
-                    if let Some(core) = s.core_rect {
-                        let pos = above_core(ctx, core, desired);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                        s.settings_target = Some(pos);
-                    }
+                    let pos = bottom_right(work_area(ctx), desired, UI_MARGIN);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    s.settings_target = Some(pos);
                 }
             }
         }
@@ -2008,41 +2031,9 @@ fn work_area_physical_px() -> Option<(i32, i32, i32, i32)> {
 /// Size and position for the dashboard computed without a window, so the first
 /// visible frame is already the final one.
 fn initial_geometry() -> (egui::Vec2, egui::Pos2) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    };
-
     const EST_HEIGHT: f32 = 218.0; // measured height with padding and the four status rows
     let size = egui::vec2(MIN_WINDOW_WIDTH, EST_HEIGHT);
-
-    let scale = system_scale().max(0.5);
-    let (l, t, r, b) = work_area_physical_px().unwrap_or((40, 40, 1920, 1040));
-    let (l, t, r, b) = (
-        l as f32 / scale,
-        t as f32 / scale,
-        r as f32 / scale,
-        b as f32 / scale,
-    );
-
-    let (vl, vw) = unsafe {
-        (
-            GetSystemMetrics(SM_XVIRTUALSCREEN),
-            GetSystemMetrics(SM_CXVIRTUALSCREEN),
-        )
-    };
-    let vl = vl as f32 / scale;
-    let vr = vl + vw as f32 / scale;
-    let exterior_left = (l - vl).abs() < 1.0 && (r - vr).abs() > 1.0;
-
-    let margin_x = ((r - l) * 0.005).max(6.0);
-    let margin_y = ((b - t) * 0.005).max(6.0);
-    let x = if exterior_left {
-        l + margin_x
-    } else {
-        r - size.x - margin_x
-    };
-    let y = (b - size.y - margin_y).max(t + margin_y);
-    (size, egui::pos2(x, y))
+    (size, bottom_right(work_area_rect(), size, UI_MARGIN))
 }
 
 /// Use the machine's own fonts instead of egui's embedded ones: Segoe UI Variable Text
@@ -2088,14 +2079,6 @@ fn file_name(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
-}
-
-/// Where the user last left the dashboard, read straight from the config file (the daemon is the
-/// only writer; the UI just needs it before the window exists).
-fn stored_ui_position() -> Option<[f32; 2]> {
-    let text = std::fs::read_to_string(armoury_core::config::config_path()).ok()?;
-    let cfg: armoury_core::config::AppConfig = serde_json::from_str(&text).ok()?;
-    cfg.ui_position
 }
 
 /// Which native dialog to open.
@@ -2296,64 +2279,94 @@ fn work_area_pts(ctx: &egui::Context) -> Option<(f32, f32, f32, f32)> {
     ))
 }
 
-/// Bottom corner of the primary monitor.
-/// Single monitor → bottom-right. Multiple monitors → the exterior corner:
-/// if the primary is the leftmost monitor, its bottom-left, otherwise bottom-right.
-fn bottom_corner(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    };
-
-    let Some((left, top, right, bottom)) = work_area_pts(ctx) else {
-        return egui::pos2(100.0, 100.0);
-    };
-    let (vl, vr) = unsafe {
-        let vl = GetSystemMetrics(SM_XVIRTUALSCREEN) as f32;
-        (
-            vl,
-            vl + GetSystemMetrics(SM_CXVIRTUALSCREEN) as f32,
-        )
-    };
-    let ppp = ctx.pixels_per_point().max(0.5) as f32;
-    let (vl, vr) = (vl / ppp, vr / ppp);
-
-    let exterior_left = (left - vl).abs() < 1.0 && (right - vr).abs() > 1.0;
-
-    let margin_x = ((right - left) * 0.005).max(6.0);
-    let margin_y = ((bottom - top) * 0.005).max(6.0);
-
-    let x = if exterior_left {
-        left + margin_x
-    } else {
-        right - size.x - margin_x
-    };
-    let y = (bottom - size.y - margin_y).max(top + margin_y);
-    egui::pos2(x, y)
+/// Primary monitor's work area in logical points, before any window exists (the DPI scale is the
+/// system one). Falls back to the console band's synthetic 1080p work area if the query fails.
+fn work_area_rect() -> Rect {
+    let scale = system_scale().max(0.5);
+    let (left, top, right, bottom) = work_area_physical_px().unwrap_or((0, 0, 1920, 1040));
+    Rect::from_min_max(
+        egui::pos2(left as f32 / scale, top as f32 / scale),
+        egui::pos2(right as f32 / scale, bottom as f32 / scale),
+    )
 }
 
-/// Position the settings window: above the core (right edges aligned) when it fits, otherwise
-/// bottom-aligned to the LEFT of the core, and only overlapping the core as a last resort.
-/// It must never sit on top of the dashboard: the dashboard's body holds the Idle/Wake button.
-fn above_core(ctx: &egui::Context, core: Rect, size: egui::Vec2) -> egui::Pos2 {
-    let gap = 8.0;
-    let margin = 6.0;
-    let Some((left, top, right, bottom)) = work_area_pts(ctx) else {
-        return egui::pos2(core.right() - size.x, core.top() - gap - size.y);
-    };
-    let x = (core.right() - size.x).max(left + margin).min(right - size.x - margin);
+/// Primary monitor's work area in the running window's logical points.
+fn work_area(ctx: &egui::Context) -> Rect {
+    match work_area_pts(ctx) {
+        Some((left, top, right, bottom)) => Rect::from_min_max(
+            egui::pos2(left, top),
+            egui::pos2(right, bottom),
+        ),
+        None => work_area_rect(),
+    }
+}
 
-    let y_above = core.top() - gap - size.y;
-    if y_above >= top + margin {
-        return egui::pos2(x, y_above); // fits above, right edges aligned
-    }
-    let x_left = core.left() - gap - size.x;
-    if x_left >= left + margin {
-        let y = (core.bottom() - size.y).max(top + margin).min(bottom - size.y - margin);
-        return egui::pos2(x_left, y); // no room above: to the left, bottom-aligned
-    }
-    // nowhere better: keep it inside the work area (it may overlap the core)
+/// Top-left corner for a window of `size` in `work`'s bottom-right corner, `margin` points in
+/// from the right and bottom edges (i.e. the spot directly above the system tray).
+fn bottom_right(work: Rect, size: egui::Vec2, margin: f32) -> egui::Pos2 {
     egui::pos2(
-        x,
-        (bottom - size.y - margin).max(top + margin),
+        (work.right() - size.x - margin).max(work.left()),
+        (work.bottom() - size.y - margin).max(work.top()),
     )
+}
+
+/// Bottom-right corner of the primary monitor: right-aligned and bottom-aligned to the work area,
+/// so the window opens directly above the system tray.
+fn bottom_corner(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 {
+    bottom_right(work_area(ctx), size, UI_MARGIN)
+}
+
+/// Snug width for a panel: the longest line plus the frame padding, clamped to the shared minimum
+/// and to the work area (keeping `UI_MARGIN` free on each side).
+fn snug_width(longest_line: f32, work_width: Option<f32>) -> f32 {
+    let wanted = longest_line + 2.0 * PAD_F + 8.0;
+    let cap = work_width
+        .map(|w| (w - 2.0 * UI_MARGIN).max(MIN_SETTINGS_WIDTH))
+        .unwrap_or(f32::INFINITY);
+    wanted.clamp(MIN_SETTINGS_WIDTH, cap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snug_width_follows_the_content_and_the_screen() {
+        // A ~382 pt helper line plus the frame padding is the snug width.
+        assert!((snug_width(382.0, Some(1638.4)) - 410.0).abs() < 1e-3);
+        // Narrow content still gets the shared minimum.
+        assert!((snug_width(10.0, Some(1638.4)) - MIN_SETTINGS_WIDTH).abs() < 1e-3);
+        // Wide content is capped so the window still fits inside the work area.
+        assert!((snug_width(5000.0, Some(1638.4)) - (1638.4 - 2.0 * UI_MARGIN)).abs() < 1e-3);
+        // A work area narrower than the minimum cannot push the width below it.
+        assert!((snug_width(5000.0, Some(300.0)) - MIN_SETTINGS_WIDTH).abs() < 1e-3);
+        // No work area (the query failed) means no cap.
+        assert!((snug_width(5000.0, None) - 5028.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bottom_right_sits_flush_in_the_work_area_corner() {
+        // 2560x1380 px work area at 125% → 2048 x 1104 pt on the primary monitor.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let size = egui::vec2(475.0, 749.0);
+        let pos = bottom_right(work, size, UI_MARGIN);
+        // both edges sit exactly on the work area's right and bottom edges
+        assert!((pos.x + size.x - work.right()).abs() < 1e-3);
+        assert!((pos.y + size.y - work.bottom()).abs() < 1e-3);
+        assert!((pos.x - 1573.0).abs() < 1e-3);
+        assert!((pos.y - 355.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn growing_the_window_keeps_the_bottom_edge() {
+        // The window is anchored by its bottom edge: when the content grows, the top moves up
+        // and the bottom stays on the work area - the window never drops off the screen.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let small = bottom_right(work, egui::vec2(475.0, 400.0), UI_MARGIN);
+        let large = bottom_right(work, egui::vec2(475.0, 749.0), UI_MARGIN);
+        assert!((small.y + 400.0 - work.bottom()).abs() < 1e-3);
+        assert!((large.y + 749.0 - work.bottom()).abs() < 1e-3);
+        // the top edge moved up by exactly the growth
+        assert!((small.y - large.y - 349.0).abs() < 1e-3);
+    }
 }
