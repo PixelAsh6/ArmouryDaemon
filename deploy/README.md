@@ -50,11 +50,18 @@ cover art (Steam, or SteamGridDB when you set a key).
 
    It also records the SHA256 of `ArmouryDaemon.exe` in `ArmouryDaemon.exe.sha256` and in the
    description of the scheduled task, so a swapped binary is detectable. To check it later, compare
-   the sidecar with a fresh hash:
-   `Get-FileHash <install folder>\ArmouryDaemon.exe -Algorithm SHA256`.
+   the sidecar with a fresh hash. The script computes it through .NET, because `Get-FileHash` is
+   not available in a Windows PowerShell 5.1 session on this machine (the global `PSModulePath`
+   puts the PowerShell 7 modules folder first, and the PS7 `Microsoft.PowerShell.Utility` exports
+   nothing):
 
-3. The tray icon is the amber **A**. Left-click it for the dashboard; right-click for the menu
-   (Open dashboard / Pause all packs / Idle mode / Toggle killswitch / Console mode / Quit).
+   ```powershell
+   $sha = [System.Security.Cryptography.SHA256]::Create(); $fs = [System.IO.File]::OpenRead('<install folder>\ArmouryDaemon.exe'); $h = ([System.BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant(); $fs.Dispose(); $sha.Dispose(); $h
+   ```
+
+3. The tray icon is a **purple squircle with a bold white A**. Left-click it for the dashboard;
+   right-click for the menu (Open dashboard / Pause all packs / Idle mode / Toggle killswitch /
+   Console mode / Quit).
 
 ## Where things live
 
@@ -88,7 +95,7 @@ The running exe is locked, so it cannot be overwritten while the daemon is up - 
 cannot replace it either: the script installs and starts, it never copies a binary. The order is
 therefore fixed.
 
-1. **Stop the daemon.** Right-click the amber **A** in the tray -> **Quit**. That reverts the
+1. **Stop the daemon.** Right-click the purple squircle in the tray -> **Quit**. That reverts the
    packs first, so the wallpaper, the G-Helper mode and the Rainmeter layout are back to normal
    before the daemon goes away. A script can ask it to quit over the pipe instead - that is what
    `setup.ps1` and `uninstall.ps1` do - but the pipe is only reachable from an elevated shell.
