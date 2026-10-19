@@ -1,7 +1,7 @@
 //! Pack execution: loads data-only packs and runs their mechanisms.
 //!
 //! Runs on its own worker thread — the daemon's main loop must stay responsive, and
-//! CLI/bang calls block for tens to hundreds of milliseconds.
+//! CLI calls block for tens to hundreds of milliseconds.
 //! Nothing here ever goes through a shell, and packs can only use whitelisted mechanisms.
 
 use armoury_core::pack::{Pack, Step, StepBlock, TemplateCtx, substitute};
@@ -469,11 +469,6 @@ fn run_step(
             }
             Ok(Some(format!("hotkey {}", chord.unwrap_or_default())))
         }
-        "rainmeter_bang" => {
-            let bang = substitute_checked(step.bang.as_deref().unwrap_or(""), ctx, pack_id);
-            send_rainmeter_bang(&bang, &ctx.target_exe)?;
-            Ok(Some(format!("bang {bang}")))
-        }
         other => Err(format!("unsupported mechanism '{other}'")),
     }
 }
@@ -713,83 +708,6 @@ fn log_output(exe: &str, stream: &str, bytes: &[u8]) {
     };
     let line: String = line.trim().chars().take(200).collect();
     info!("{exe} {stream}: {line}");
-}
-
-/// Rainmeter bangs. Preferred path is a WM_COPYDATA message to Rainmeter's hidden
-/// `DummyRainWClass` window; the CLI is the documented fallback.
-fn send_rainmeter_bang(bang: &str, target_exe: &str) -> Result<(), String> {
-    if copy_data_bang(bang) {
-        return Ok(());
-    }
-    let exe = if target_exe.is_empty() {
-        "Rainmeter.exe".to_string()
-    } else {
-        target_exe.to_string()
-    };
-    let args = split_bang(bang);
-    if args.is_empty() {
-        return Err("empty bang".into());
-    }
-    run_cli(&exe, &args, None)
-}
-
-/// Split `!LoadLayout "Empty"` into argv while honouring quotes.
-fn split_bang(bang: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    for ch in bang.chars() {
-        match ch {
-            '"' => quoted = !quoted,
-            ' ' if !quoted => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(ch),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-fn copy_data_bang(bang: &str) -> bool {
-    use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
-    use windows_sys::Win32::Foundation::LPARAM;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SendMessageW, WM_COPYDATA};
-
-    // Rainmeter's bang window: class DummyRainWClass, literally named "Rainmeter control window".
-    let class: Vec<u16> = "DummyRainWClass\0".encode_utf16().collect();
-    let name: Vec<u16> = "Rainmeter control window\0".encode_utf16().collect();
-    let hwnd = unsafe { FindWindowW(class.as_ptr(), name.as_ptr()) };
-    if hwnd.is_null() {
-        // fall back to class-only in case a build changed the window name
-        let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
-        if hwnd.is_null() {
-            return false;
-        }
-    }
-
-    // Rainmeter expects dwData == 1 and a UTF-16 bang string.
-    let mut wide: Vec<u16> = bang.encode_utf16().collect();
-    wide.push(0);
-    let bytes = wide.len() * std::mem::size_of::<u16>();
-    let mut data = COPYDATASTRUCT {
-        dwData: 1,
-        cbData: bytes as u32,
-        lpData: wide.as_mut_ptr() as *mut core::ffi::c_void,
-    };
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_COPYDATA,
-            0 as _,
-            &mut data as *mut COPYDATASTRUCT as LPARAM,
-        );
-    }
-    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,7 +1043,7 @@ pub(crate) fn script_json_pointer(path: &str, pointer: &str) -> Option<String> {
 }
 
 /// Reject a pack whose scripts do not compile, before it is loaded or installed.
-fn check_scripts(pack: &Pack) -> Result<(), String> {
+pub(crate) fn check_scripts(pack: &Pack) -> Result<(), String> {
     for (block, src) in [("apply", &pack.script.apply), ("revert", &pack.script.revert)] {
         if let Some(src) = src.as_deref().filter(|s| !s.trim().is_empty()) {
             script::compile(src).map_err(|e| format!("{block} {e}"))?;
@@ -1261,15 +1179,6 @@ mod tests {
         assert!(parse_chord("ctrl+nope").is_err());
     }
 
-    #[test]
-    fn bang_splitting() {
-        assert_eq!(
-            split_bang("!LoadLayout \"Empty\""),
-            vec!["!LoadLayout".to_string(), "Empty".to_string()]
-        );
-        assert_eq!(split_bang("!ToggleMeter \"Some Meter\"").len(), 2);
-    }
-
     /// A child that never finishes on its own, for the deadline test.
     fn a_child_that_never_finishes() -> (String, Vec<String>) {
         let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
@@ -1391,6 +1300,15 @@ mod tests {
         "apply": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-stop"] } ] },
         "revert": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-play"] } ] }
     }"#;
+
+    #[test]
+    fn the_rainmeter_pack_scripts_compile() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("packs/rainmeter/pack.json"))
+            .expect("the shipped Rainmeter pack must exist");
+        let pack = Pack::parse(&text).expect("the Rainmeter pack must be valid");
+        check_scripts(&pack).expect("the Rainmeter pack's scripts must compile");
+    }
 
     #[test]
     fn exe_from_setting_picks_the_mapped_binary() {

@@ -1,8 +1,8 @@
 {
-  "spec": 1,
+  "spec": 2,
   "id": "rainmeter",
   "name": "Rainmeter",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "order": 30,
   "targets": { "process": ["Rainmeter.exe"] },
   "settings": [
@@ -18,11 +18,13 @@
     { "key": "was_running", "mechanism": "process_running" },
     { "key": "target_path", "mechanism": "target_path" }
   ],
+  "script": {
+    "apply": "let layout = ctx.setting(\"layout\"); if layout != \"kill\" { ctx.window_message(\"DummyRainWClass\", \"\", \"!LoadLayout \\\"\" + layout + \"\\\"\"); }",
+    "revert": "let layout = ctx.setting(\"layout\"); if layout == \"kill\" { ctx.sleep(3000); } ctx.window_message(\"DummyRainWClass\", \"\", \"!LoadLayout \\\"@Backup\\\"\");"
+  },
   "apply": {
     "guard": { "targetRunning": true },
     "steps": [
-      { "mechanism": "rainmeter_bang", "bang": "!LoadLayout \"{{settings.layout}}\"",
-        "when": { "source": "setting", "not_equals": "kill" } },
       { "mechanism": "process_kill", "exe": "{{captured.target_path}}",
         "when": { "source": "setting", "equals": "kill" } }
     ]
@@ -31,11 +33,6 @@
     "guard": { "targetRunning": false, "capturedRunning": true },
     "steps": [
       { "mechanism": "process_start", "exe": "{{captured.target_path}}",
-        "when": { "source": "setting", "equals": "kill" } },
-      { "mechanism": "rainmeter_bang", "bang": "!LoadLayout \"@Backup\"",
-        "when": { "source": "setting", "not_equals": "kill" } },
-      { "mechanism": "rainmeter_bang", "bang": "!LoadLayout \"@Backup\"",
-        "sleep_ms": 3000,
         "when": { "source": "setting", "equals": "kill" } }
     ]
   }

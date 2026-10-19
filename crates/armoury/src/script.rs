@@ -185,6 +185,20 @@ fn engine() -> Engine {
             crate::packs::send_chord(chord).map_err(err)
         },
     );
+    engine.register_fn(
+        "window_message",
+        |host: &mut ScriptHost,
+         class: &str,
+         title: &str,
+         payload: &str|
+         -> Result<(), Box<EvalAltResult>> {
+            host.note(format!("window_message {class} / {title}: {payload}"));
+            send_window_message(class, title, payload).map_err(|e| {
+                host.note(format!("window_message {class} REFUSED: {e}"));
+                err(e)
+            })
+        },
+    );
     engine.register_fn("sleep", |host: &mut ScriptHost, ms: i64| {
         let ms = ms.clamp(0, 10_000) as u64;
         host.note(format!("sleep {ms} ms"));
@@ -279,6 +293,77 @@ fn engine() -> Engine {
     );
 
     engine
+}
+
+// ---------------------------------------------------------------------------
+// Talking to another app's window
+
+/// How long a pack's message may wait for the other app. A round trip to a live app takes
+/// well under a millisecond; an app that has not answered in this long is not going to.
+const MESSAGE_TIMEOUT_MS: u32 = 2000;
+
+/// Send a `WM_COPYDATA` message to a window of another app. `class` and `title` are matched
+/// exactly; an empty string means "any" for that field, so a class alone finds the window.
+/// The payload travels as a UTF-16 string. This is how a pack reaches an app the daemon knows
+/// nothing about.
+///
+/// The send is synchronous but bounded: it gives up after [`MESSAGE_TIMEOUT_MS`], so an app that
+/// has stopped pumping its queue cannot hold the pack worker. The window gets its own copy of
+/// the payload, so this buffer is safe to drop either way.
+pub fn send_window_message(class: &str, title: &str, payload: &str) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{GetLastError, LPARAM};
+    use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SendMessageTimeoutW, SMTO_BLOCK, WM_COPYDATA,
+    };
+
+    // an empty field matches any window: FindWindowW wants a null pointer for that
+    let class_w = wide(class);
+    let title_w = wide(title);
+    let class_p = if class.is_empty() { std::ptr::null() } else { class_w.as_ptr() };
+    let title_p = if title.is_empty() { std::ptr::null() } else { title_w.as_ptr() };
+
+    let hwnd = unsafe { FindWindowW(class_p, title_p) };
+    if hwnd.is_null() {
+        return Err(format!("no window with class '{class}' and title '{title}'"));
+    }
+
+    // the payload is a UTF-16 string, dwData 1 (what the receiving app expects)
+    let mut data_w: Vec<u16> = payload.encode_utf16().collect();
+    data_w.push(0);
+    let bytes = data_w.len() * std::mem::size_of::<u16>();
+    let mut data = COPYDATASTRUCT {
+        dwData: 1,
+        cbData: bytes as u32,
+        lpData: data_w.as_mut_ptr() as *mut core::ffi::c_void,
+    };
+
+    // SMTO_BLOCK keeps the send synchronous (as SendMessageW is) but gives up after
+    // MESSAGE_TIMEOUT_MS: a hung app must not block the pack worker forever. PostMessage is
+    // not an option here: the system cannot post a marshalled WM_COPYDATA.
+    let sent = unsafe {
+        SendMessageTimeoutW(
+            hwnd,
+            WM_COPYDATA,
+            0 as _,
+            &mut data as *mut COPYDATASTRUCT as LPARAM,
+            SMTO_BLOCK,
+            MESSAGE_TIMEOUT_MS,
+            std::ptr::null_mut(),
+        )
+    };
+    if sent == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(format!(
+            "the app did not answer the message to class '{class}' and title '{title}' within {MESSAGE_TIMEOUT_MS} ms (error {code})"
+        ));
+    }
+    Ok(())
+}
+
+/// A NUL-terminated UTF-16 string.
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Writes are limited to the places app configs actually live, plus the app's own folder.
@@ -434,6 +519,12 @@ pub(crate) fn allowed_roots(target_dir: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, PostMessageW,
+        RegisterClassW, TranslateMessage, WNDCLASSW, WM_COPYDATA, WM_QUIT,
+    };
 
     fn ctx() -> TemplateCtx {
         let mut ctx = TemplateCtx {
@@ -676,5 +767,228 @@ mod tests {
     fn allowed_roots_include_the_target_folder() {
         let roots = allowed_roots("C:\\Games\\App");
         assert!(roots.iter().any(|r| r == Path::new("C:\\Games\\App")));
+    }
+
+    #[test]
+    fn a_message_to_a_window_that_does_not_exist_fails_clearly() {
+        let mut ctx = ctx();
+        // the shape a pack uses: a conditional call with a quoted payload
+        let result = run(
+            r#"let layout = ctx.setting("mode");
+               if layout != "kill" {
+                   ctx.window_message("ArmouryDaemonNoSuchWindowClass", "", "!LoadLayout \"" + layout + "\"");
+               }"#,
+            &mut ctx,
+        );
+        let err = result.expect_err("a window that does not exist must fail");
+        assert!(err.contains("ArmouryDaemonNoSuchWindowClass"), "{err}");
+        assert!(err.contains("title"), "the error must name the title: {err}");
+    }
+
+    #[test]
+    fn the_rainmeter_pack_script_compiles_against_the_host_api() {
+        // the shipped pack reaches another app through ctx.window_message: the script compiles
+        // and the pack passes the schema, and the host API is a closed list
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let text = std::fs::read_to_string(root.join("packs/rainmeter/pack.json"))
+            .expect("the shipped Rainmeter pack must exist");
+        let pack = armoury_core::pack::Pack::parse(&text).expect("the Rainmeter pack must be valid");
+        let errors = pack.validate();
+        assert!(errors.is_empty(), "the Rainmeter pack must pass validation: {errors:?}");
+        let apply = pack
+            .script
+            .apply
+            .as_deref()
+            .expect("the pack must carry an apply script");
+        assert!(
+            apply.contains("window_message"),
+            "the apply script must use the host function"
+        );
+        crate::packs::check_scripts(&pack).expect("the Rainmeter pack's scripts must compile");
+        // a host function that does not exist must fail: the host API is a closed list
+        let mut ctx = ctx();
+        let err = run("ctx.no_such_host_function();", &mut ctx)
+            .expect_err("a host function that does not exist must fail");
+        assert!(err.contains("no_such_host_function"), "{err}");
+    }
+
+    /// The payload the test window received.
+    static RECEIVED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Creates a hidden window of `class` on this thread and returns its handle.
+    fn create_window(
+        class: &str,
+        wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    ) -> usize {
+        let class_w: Vec<u16> = class.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut wc: WNDCLASSW = unsafe { std::mem::zeroed() };
+        wc.lpfnWndProc = Some(wndproc);
+        wc.hInstance = std::ptr::null_mut();
+        wc.lpszClassName = class_w.as_ptr();
+        let atom = unsafe { RegisterClassW(&wc) };
+        assert_ne!(atom, 0, "RegisterClassW failed: {}", unsafe { GetLastError() });
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_w.as_ptr(),
+                std::ptr::null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert!(!hwnd.is_null(), "CreateWindowExW failed: {}", unsafe { GetLastError() });
+        hwnd as usize
+    }
+
+    /// A hidden window of `class` on a thread of its own, like an app that owns one. The thread
+    /// pumps its messages, so a message sent to the window is answered. It reports the window
+    /// through `ready` and the end of its pump through `done`.
+    fn pumping_window(
+        class: &'static str,
+        wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+        ready: std::sync::mpsc::Sender<usize>,
+        done: std::sync::mpsc::Sender<()>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let hwnd = create_window(class, wndproc);
+            let _ = ready.send(hwnd);
+            let mut msg: MSG = unsafe { std::mem::zeroed() };
+            while unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) } > 0 {
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let _ = done.send(());
+        })
+    }
+
+    /// A hidden window of `class` whose thread never answers: an app that stopped pumping.
+    /// The thread is given a bounded life so that it cannot outlive the suite.
+    fn hung_window(
+        class: &'static str,
+        wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+        ready: std::sync::mpsc::Sender<usize>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let hwnd = create_window(class, wndproc);
+            let _ = ready.send(hwnd);
+            std::thread::sleep(Duration::from_secs(30));
+        })
+    }
+
+    /// The round trip on a worker thread: the window is pumped by a thread of its own, the
+    /// message goes out, the payload comes back and the window is shut down. Every step is
+    /// bounded, so this always returns.
+    fn exchange_with_a_window(
+        class: &'static str,
+        wndproc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    ) -> Result<String, String> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = pumping_window(class, wndproc, ready_tx, done_tx);
+        let hwnd = ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "the window must be created".to_string())?;
+
+        let payload = "!LoadLayout \"Empty\"";
+        send_window_message(class, "", payload)?;
+
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(text) = RECEIVED.lock().unwrap().clone() {
+                got = Some(text);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let got = got.ok_or("the payload must arrive".to_string())?;
+
+        // shut the window down: the thread says it is done, and only then is it joined
+        unsafe { PostMessageW(hwnd as HWND, WM_QUIT, 0, 0) };
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "the window thread must stop".to_string())?;
+        thread.join().map_err(|_| "the window thread panicked".to_string())?;
+        Ok(got)
+    }
+
+    #[test]
+    fn a_message_reaches_a_real_window() {
+        const CLASS: &str = "ArmouryDaemonWindowMessageTest";
+
+        unsafe extern "system" fn wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe {
+                if msg == WM_COPYDATA {
+                    let cds = &*(lparam as *const COPYDATASTRUCT);
+                    let words = std::slice::from_raw_parts(
+                        cds.lpData as *const u16,
+                        cds.cbData as usize / std::mem::size_of::<u16>(),
+                    );
+                    *RECEIVED.lock().unwrap() = Some(String::from_utf16_lossy(words));
+                    return 1;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+
+        // The whole exchange runs on a thread of its own and every wait is a timeout: a window
+        // that never answers can fail this test but can never wedge the suite.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+        std::thread::spawn(move || {
+            let _ = tx.send(exchange_with_a_window(CLASS, wndproc));
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the exchange must finish")
+            .expect("the exchange must succeed");
+        assert_eq!(got.trim_end_matches('\0'), "!LoadLayout \"Empty\"");
+    }
+
+    #[test]
+    fn a_hung_window_gives_up() {
+        const CLASS: &str = "ArmouryDaemonHungWindowTest";
+
+        unsafe extern "system" fn wndproc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        // a window whose thread never answers: the send must give up instead of hanging
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<usize>();
+        let thread = hung_window(CLASS, wndproc, ready_tx);
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the window must be created");
+
+        // the send runs on a thread of its own, so that a send that does not give up fails this
+        // test instead of wedging the suite
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let _ = tx.send(send_window_message(CLASS, "", "hello"));
+        });
+        let result = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the send must give up instead of hanging");
+        let err = result.expect_err("a window that never answers must fail");
+        assert!(err.contains(CLASS), "{err}");
+        // the window's thread is asleep and detached: it must not hold the test up
+        drop(thread);
     }
 }

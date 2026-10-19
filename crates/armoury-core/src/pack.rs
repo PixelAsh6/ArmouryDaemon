@@ -121,7 +121,7 @@ impl Default for Guard {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
-    /// "cli" | "hotkey" | "rainmeter_bang"
+    /// "cli" | "hotkey" | "process_kill" | "process_start" | "registry_set"
     pub mechanism: String,
     #[serde(default)]
     pub exe: Option<String>,
@@ -134,8 +134,6 @@ pub struct Step {
     pub exe_map: HashMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub bang: Option<String>,
     /// For hotkey steps: value -> key chord.
     #[serde(default)]
     pub map: HashMap<String, String>,
@@ -270,10 +268,9 @@ pub fn substitute(template: &str, ctx: &TemplateCtx) -> (String, Vec<String>) {
     (out, unknown)
 }
 
-const ALLOWED_MECHANISMS: [&str; 6] = [
+const ALLOWED_MECHANISMS: [&str; 5] = [
     "cli",
     "hotkey",
-    "rainmeter_bang",
     "process_kill",
     "process_start",
     "registry_set",
@@ -367,9 +364,6 @@ impl Pack {
                 if step.mechanism == "registry_set" && step.registry.is_none() {
                     errs.push(format!("{block} step {i}: registry_set needs a registry block"));
                 }
-                if step.mechanism == "rainmeter_bang" && step.bang.is_none() {
-                    errs.push(format!("{block} step {i}: rainmeter_bang needs a bang"));
-                }
                 if step.mechanism == "hotkey" && step.map.is_empty() {
                     errs.push(format!("{block} step {i}: hotkey needs a map"));
                 }
@@ -438,12 +432,24 @@ mod tests {
     fn shipped_packs_are_valid() {
         for (label, text) in [("wallpaper-engine", WE), ("g-helper", GH), ("rainmeter", RM)] {
             let pack = Pack::parse(text).unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert_eq!(pack.spec, 1);
+            assert!(pack.spec == 1 || pack.spec == 2, "{label}: spec {}", pack.spec);
             assert!(!pack.targets.process.is_empty());
             assert!(!pack.settings.is_empty());
-            assert!(!pack.apply.steps.is_empty());
-            assert!(!pack.revert.steps.is_empty());
+            assert!(!pack.apply.steps.is_empty() || pack.script.apply.is_some());
+            assert!(!pack.revert.steps.is_empty() || pack.script.revert.is_some());
         }
+    }
+
+    #[test]
+    fn the_rainmeter_pack_is_spec_2_and_valid() {
+        let pack = Pack::parse(RM).expect("the Rainmeter pack must be valid");
+        assert_eq!(pack.spec, 2);
+        assert!(pack.script.apply.is_some());
+        assert!(pack.script.revert.is_some());
+        // the "kill" option still runs through the steps
+        assert!(pack.apply.steps.iter().any(|s| s.mechanism == "process_kill"));
+        assert!(pack.revert.steps.iter().any(|s| s.mechanism == "process_start"));
+        assert!(pack.validate().is_empty());
     }
 
     #[test]
