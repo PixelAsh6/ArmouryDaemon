@@ -2,27 +2,49 @@ use crate::config::{ConsoleApp, TrackedApp, default_console_open};
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon state machine (Phase 1: always Idle).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
+    #[default]
     Idle,
     Triggered,
     Cooldown,
 }
 
+/// The last thing that went wrong, so the dashboard can say so instead of only the log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastError {
+    /// Unix seconds.
+    pub at: u64,
+    /// Where it came from, e.g. "pack:g-helper", "catalog", "art".
+    pub source: String,
+    /// The human-readable message.
+    pub message: String,
+}
+
 /// Snapshot of daemon status sent to clients over the pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
+    #[serde(default)]
     pub daemon_version: String,
+    #[serde(default)]
     pub uptime_secs: u64,
+    #[serde(default)]
     pub state: RunState,
+    #[serde(default)]
     pub trigger_source: Option<String>,
+    #[serde(default)]
     pub cooldown_remaining_ms: Option<u64>,
-    /// While in Cooldown: what the pending switch will do — `"apply"` or `"revert"`.
+    /// Always `None`. The engine no longer plans a switch: it only knows the lockout, which
+    /// `cooldown_remaining_ms` reports as the time that is left. The field stays in the wire
+    /// format so that older clients keep loading.
     #[serde(default)]
     pub cooldown_action: Option<String>,
+    #[serde(default)]
     pub cooldown_seconds: u64,
+    #[serde(default)]
     pub paused: bool,
+    #[serde(default)]
     pub killswitch_active: bool,
     /// How many tracked apps the killswitch is currently hiding/muting.
     #[serde(default)]
@@ -39,8 +61,10 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub idle_failsafe_minutes: u64,
     /// The user's configured tracked-app list.
+    #[serde(default)]
     pub tracked_apps: Vec<TrackedApp>,
     /// Display names of tracked apps that are currently running.
+    #[serde(default)]
     pub tracked_apps_running: Vec<String>,
     /// Installed packs and their state, for the dashboard.
     #[serde(default)]
@@ -65,6 +89,9 @@ pub struct StatusSnapshot {
     /// local-only and the key already lives in a local config.json.
     #[serde(default)]
     pub sgdb_api_key: String,
+    /// The last failure (a pack step, the catalog, the cover art); `None` = nothing went wrong.
+    #[serde(default)]
+    pub last_error: Option<LastError>,
 }
 
 /// One installed pack, as the dashboard sees it.
@@ -90,4 +117,37 @@ pub struct PackSettingStatus {
     pub label: String,
     pub values: Vec<String>,
     pub value: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_status_from_an_older_daemon_still_loads() {
+        let s: StatusSnapshot = serde_json::from_str(r#"{"daemon_version":"1.0.0"}"#).unwrap();
+        assert_eq!(s.daemon_version, "1.0.0");
+        assert_eq!(s.state, RunState::Idle);
+        assert!(s.last_error.is_none());
+        assert!(s.tracked_apps.is_empty());
+        assert_eq!(s.cooldown_seconds, 0);
+    }
+
+    #[test]
+    fn the_last_error_round_trips() {
+        let err = LastError {
+            at: 1_700_000_000,
+            source: "pack:g-helper".into(),
+            message: "hotkey did not land".into(),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(
+            json,
+            r#"{"at":1700000000,"source":"pack:g-helper","message":"hotkey did not land"}"#
+        );
+        let back: LastError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.at, 1_700_000_000);
+        assert_eq!(back.source, "pack:g-helper");
+        assert_eq!(back.message, "hotkey did not land");
+    }
 }

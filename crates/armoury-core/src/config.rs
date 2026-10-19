@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CONSOLE_OPEN_ALWAYS: &str = "always";
 pub const CONSOLE_OPEN_PAD: &str = "pad";
@@ -28,6 +29,12 @@ where
     let raw = String::deserialize(d)?;
     Ok(normalize_console_open(&raw).to_string())
 }
+
+/// The config schema this build understands and writes.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// How many `config.json.bad.N` copies are kept before a timestamped name is used.
+const MAX_BACKUPS: usize = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -63,6 +70,10 @@ pub struct AppConfig {
     /// SteamGridDB API key for cover art (https://www.steamgriddb.com/profile/preferences).
     #[serde(default)]
     pub sgdb_api_key: Option<String>,
+    /// The keys this build does not know. They are written back untouched, so a config
+    /// written by a newer build is not silently truncated by the next save.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -91,6 +102,7 @@ impl Default for AppConfig {
             catalog_url: None,
             last_played: HashMap::new(),
             sgdb_api_key: None,
+            extra: Default::default(),
         }
     }
 }
@@ -129,56 +141,160 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Load the config; create the file with defaults if missing.
-/// A malformed file is preserved on disk (never clobbered) and defaults are used in memory.
+/// A malformed file is never destroyed: its bytes are kept next to it (`config.json.bad`)
+/// and the defaults are used in memory.
 pub fn load_or_create() -> io::Result<AppConfig> {
-    let path = config_path();
+    load_or_create_at(&config_path())
+}
+
+fn load_or_create_at(path: &Path) -> io::Result<AppConfig> {
     if !path.exists() {
         let cfg = AppConfig::default();
-        save(&cfg)?;
+        save_at(path, &cfg)?;
         return Ok(cfg);
     }
-    let text = fs::read_to_string(&path)?;
+    let text = fs::read_to_string(path)?;
     match serde_json::from_str::<AppConfig>(&text) {
-        Ok(cfg) => Ok(cfg),
+        Ok(mut cfg) => {
+            if cfg.schema_version > SUPPORTED_SCHEMA_VERSION {
+                log::warn!(
+                    "config at {} has schema version {} — this build supports {SUPPORTED_SCHEMA_VERSION} and will not write the file back",
+                    path.display(),
+                    cfg.schema_version
+                );
+            } else if cfg.schema_version < SUPPORTED_SCHEMA_VERSION {
+                cfg.schema_version = SUPPORTED_SCHEMA_VERSION;
+            }
+            Ok(cfg)
+        }
         Err(e) => {
-            log::warn!(
-                "config at {} is malformed ({e}); using defaults in memory, file left untouched",
-                path.display()
-            );
+            match backup_malformed(path) {
+                Ok(backup) => log::warn!(
+                    "config at {} is malformed ({e}); the original bytes were kept at {} — the daemon is running on defaults and the file itself will be overwritten by the next save",
+                    path.display(),
+                    backup.display()
+                ),
+                Err(err) => log::error!(
+                    "config at {} is malformed ({e}) and the backup failed ({err}) — the daemon is running on defaults and the file itself will be overwritten by the next save",
+                    path.display()
+                ),
+            }
             Ok(AppConfig::default())
         }
     }
 }
 
 /// Atomic-ish save: write a temp file, then replace the target.
+/// A config from a newer build is never overwritten: this binary does not know its fields.
 pub fn save(cfg: &AppConfig) -> io::Result<()> {
-    let path = config_path();
+    save_at(&config_path(), cfg)
+}
+
+fn save_at(path: &Path, cfg: &AppConfig) -> io::Result<()> {
+    if cfg.schema_version > SUPPORTED_SCHEMA_VERSION {
+        log::error!(
+            "refusing to write the config: its schema version ({}) is newer than this build supports ({SUPPORTED_SCHEMA_VERSION}) — an older binary does not overwrite a newer config",
+            cfg.schema_version
+        );
+        return Err(io::Error::other(format!(
+            "config schema version {} is newer than the supported version {SUPPORTED_SCHEMA_VERSION}",
+            cfg.schema_version
+        )));
+    }
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(cfg).map_err(io::Error::other)?;
     fs::write(&tmp, text)?;
-    fs::rename(&tmp, &path)?;
+    fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Keep the bytes of a malformed config next to it, so the next save cannot destroy them.
+fn backup_malformed(path: &Path) -> io::Result<PathBuf> {
+    let backup = backup_path(path)?;
+    fs::copy(path, &backup)?;
+    Ok(backup)
+}
+
+/// A free name for the backup: `config.json.bad`, then `config.json.bad.2`, `config.json.bad.3`,
+/// ... and a timestamped name once those are used up. An existing backup is never overwritten.
+fn backup_path(path: &Path) -> io::Result<PathBuf> {
+    let first = with_suffix(path, ".bad");
+    if !first.exists() {
+        return Ok(first);
+    }
+    for n in 2..=MAX_BACKUPS {
+        let candidate = with_suffix(path, &format!(".bad.{n}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let stamped = with_suffix(path, &format!(".bad.{millis}"));
+    if !stamped.exists() {
+        return Ok(stamped);
+    }
+    for n in 2..100 {
+        let candidate = with_suffix(path, &format!(".bad.{millis}.{n}"));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    Err(io::Error::other("no free name for the malformed-config backup"))
+}
+
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A throw-away directory of its own, so a concurrent test run cannot collide with it.
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "armoury-config-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn default_config_values() {
         let cfg = AppConfig::default();
         assert_eq!(cfg.cooldown_seconds, 60);
         assert!(cfg.tracked_apps.is_empty());
+        assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION);
+        assert!(cfg.extra.is_empty());
     }
 
     #[test]
     fn missing_fields_get_defaults() {
         let cfg: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.cooldown_seconds, 60);
-        assert_eq!(cfg.schema_version, 1);
+        assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(cfg.ui_position, None);
+        assert_eq!(cfg.catalog_url, None);
+        assert_eq!(cfg.sgdb_api_key, None);
+        assert!(cfg.console_apps.is_empty());
+        assert!(cfg.console_hidden.is_empty());
+        assert!(cfg.last_played.is_empty());
+        assert!(cfg.packs.is_empty());
+        assert!(!cfg.paused);
+        assert!(cfg.idle_failsafe_enabled);
+        assert_eq!(cfg.idle_failsafe_minutes, 180);
+        assert_eq!(cfg.console_open, "pad");
+        assert!(cfg.extra.is_empty());
     }
 
     #[test]
@@ -253,5 +369,137 @@ mod tests {
         assert_eq!(odd.console_open, "pad");
         let empty: AppConfig = serde_json::from_str(r#"{"console_open": ""}"#).unwrap();
         assert_eq!(empty.console_open, "pad");
+    }
+
+    #[test]
+    fn a_malformed_config_is_kept_and_the_defaults_are_used() {
+        let dir = temp_dir("malformed");
+        let path = dir.join("config.json");
+        let broken = "{ \"tracked_apps\": [ , }";
+        fs::write(&path, broken).unwrap();
+
+        let cfg = load_or_create_at(&path).unwrap();
+        assert!(cfg.tracked_apps.is_empty());
+        assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION);
+
+        // the bytes are safe next to the file, and the file itself is still the user's
+        let backup = dir.join("config.json.bad");
+        assert!(backup.exists());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), broken);
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_backup_never_overwrites_an_earlier_one() {
+        let dir = temp_dir("backups");
+        let path = dir.join("config.json");
+        fs::write(&path, "first").unwrap();
+        load_or_create_at(&path).unwrap();
+        fs::write(&path, "second").unwrap();
+        load_or_create_at(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(dir.join("config.json.bad")).unwrap(), "first");
+        assert_eq!(
+            fs::read_to_string(dir.join("config.json.bad.2")).unwrap(),
+            "second"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_config_from_a_newer_build_is_never_overwritten() {
+        let dir = temp_dir("newer");
+        let path = dir.join("config.json");
+        let newer = format!(r#"{{"schema_version": {}, "cooldown_seconds": 30}}"#, SUPPORTED_SCHEMA_VERSION + 1);
+        fs::write(&path, &newer).unwrap();
+
+        // loaded as-is, so the refusal below can trigger
+        let cfg = load_or_create_at(&path).unwrap();
+        assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION + 1);
+
+        let before = fs::read(&path).unwrap();
+        assert!(save_at(&path, &cfg).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loading_stamps_the_current_schema_version() {
+        let dir = temp_dir("version");
+        let path = dir.join("config.json");
+        fs::write(&path, r#"{"schema_version": 0, "cooldown_seconds": 30}"#).unwrap();
+
+        let cfg = load_or_create_at(&path).unwrap();
+        assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION);
+        assert_eq!(cfg.cooldown_seconds, 30);
+
+        // a normal load-and-save round trip keeps the current version
+        save_at(&path, &cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.schema_version, SUPPORTED_SCHEMA_VERSION);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_fields_survive_a_load_and_save() {
+        let dir = temp_dir("unknown");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"cooldown_seconds": 30, "future_setting": 42, "future_flag": true}"#,
+        )
+        .unwrap();
+
+        let cfg = load_or_create_at(&path).unwrap();
+        assert_eq!(cfg.cooldown_seconds, 30);
+        assert_eq!(cfg.extra.get("future_setting"), Some(&serde_json::json!(42)));
+        assert_eq!(cfg.extra.get("future_flag"), Some(&serde_json::json!(true)));
+
+        save_at(&path, &cfg).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back.get("future_setting"), Some(&serde_json::json!(42)));
+        assert_eq!(back.get("future_flag"), Some(&serde_json::json!(true)));
+        assert_eq!(back.get("cooldown_seconds"), Some(&serde_json::json!(30)));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_field_still_round_trips_with_the_catch_all() {
+        let mut cfg = AppConfig {
+            cooldown_seconds: 42,
+            paused: true,
+            idle_failsafe_enabled: false,
+            idle_failsafe_minutes: 5,
+            ui_position: Some([1.5, 2.5]),
+            catalog_url: Some("https://example.invalid/catalog.json".into()),
+            sgdb_api_key: Some("key".into()),
+            console_open: "never".into(),
+            ..Default::default()
+        };
+        cfg.console_hidden.push("x.exe".into());
+        cfg.last_played.insert("y.exe".into(), 99);
+        cfg.tracked_apps.push(TrackedApp {
+            name: "Demo".into(),
+            exe: "demo.exe".into(),
+        });
+        cfg.packs.insert("gh".into(), PackUserConfig::default());
+
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.cooldown_seconds, 42);
+        assert!(back.paused);
+        assert!(!back.idle_failsafe_enabled);
+        assert_eq!(back.idle_failsafe_minutes, 5);
+        assert_eq!(back.ui_position, Some([1.5, 2.5]));
+        assert_eq!(back.catalog_url.as_deref(), Some("https://example.invalid/catalog.json"));
+        assert_eq!(back.sgdb_api_key.as_deref(), Some("key"));
+        assert_eq!(back.console_open, "never");
+        assert_eq!(back.console_hidden, vec!["x.exe".to_string()]);
+        assert_eq!(back.last_played.get("y.exe"), Some(&99));
+        assert_eq!(back.tracked_apps[0].exe, "demo.exe");
+        assert!(back.packs.contains_key("gh"));
+        assert!(back.extra.is_empty());
     }
 }

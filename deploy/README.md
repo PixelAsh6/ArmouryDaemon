@@ -2,18 +2,24 @@
 
 A small always-on Windows daemon that reacts to the apps you care about.
 
-- **Tracked apps** — pick them from your running windows or browse for an exe (matched by exe name).
-- **Packs** — Wallpaper Engine, G-Helper and Rainmeter. Each has exactly one dropdown: what it
-  should do while a tracked app runs. When the app closes, everything reverts to the state it was
-  in before (after a cooldown you choose; reopening cancels the revert).
-- **Killswitch** — Scroll Lock hides + mutes the running tracked apps; press again to restore.
-- **Idle mode** — one click blacks out every screen and mutes all audio; any input brings it back
+- **Tracked apps** - pick them from your running windows or browse for an exe (matched by exe name).
+- **Packs** - Wallpaper Engine, G-Helper and Rainmeter. A pack may expose up to four dropdowns
+  (what it should do while a tracked app runs, and how); Wallpaper Engine ships with two
+  (`action` and `binary`). When the app closes, everything reverts to the state it was in before
+  (after a cooldown you choose; reopening cancels the revert).
+- **Killswitch** - **End** hides + mutes the running tracked apps; press again to restore. The key
+  still reaches the app you are typing in (it is a low-level keyboard hook, not a registered hotkey).
+- **Idle mode** - **Home** blacks out every screen and mutes all audio; any input brings it back
   (with an optional 3 h failsafe). While idle is up, pack switching is cancelled: tracked apps are
   treated as ordinary apps, and the packs are applied again when you wake it with a tracked app
   still running.
-- **Pause** — stop all pack switching without uninstalling anything.
+- **Pause** - stop all pack switching without uninstalling anything.
+- **Console band** - a launcher strip along the bottom of the screen with the cover art of your
+  tracked and pinned apps. Open it from the tray, let it pop up on a controller connect, or keep
+  it out of the way.
 
-Everything is local. No telemetry, no network calls except the optional pack catalog.
+Everything is local. No telemetry. The only network traffic is the optional pack catalog and the
+cover art (Steam, or SteamGridDB when you set a key).
 
 ## Install
 
@@ -29,8 +35,25 @@ Everything is local. No telemetry, no network calls except the optional pack cat
    immediately. It also removes the leftover disabled `\Armoury Daemon` task from an older install
    if one is still registered.
 
+   The script locks the install folder down after it registers the task: Administrators and
+   SYSTEM keep full control, the account you are logged in with keeps *modify* (the daemon writes
+   the `packs` folder there), everybody else gets **read and execute only**. Without that, any
+   other local account could swap the exe and inherit the elevated task at the next logon.
+   The task is registered **first** on purpose: a failing ACL (or a failing hash sidecar) only
+   warns and the script carries on to start the daemon - it can no longer leave the daemon down.
+
+   The applied ACL is exactly: Administrators **full**, SYSTEM **full**, the account you are
+   logged in with **modify**, `Authenticated Users` and `Users` **read and execute only** - the
+   permissions inherited from `C:\` are removed, so nothing outside that list is left over. Check
+   it any time with `(Get-Acl <install folder>).Access`.
+
+   It also records the SHA256 of `ArmouryDaemon.exe` in `ArmouryDaemon.exe.sha256` and in the
+   description of the scheduled task, so a swapped binary is detectable. To check it later, compare
+   the sidecar with a fresh hash:
+   `Get-FileHash <install folder>\ArmouryDaemon.exe -Algorithm SHA256`.
+
 3. The tray icon is the amber **A**. Left-click it for the dashboard; right-click for the menu
-   (Open dashboard / Pause / Toggle killswitch / Quit).
+   (Open dashboard / Pause all packs / Idle mode / Toggle killswitch / Console mode / Quit).
 
 ## Where things live
 
@@ -38,13 +61,69 @@ Everything is local. No telemetry, no network calls except the optional pack cat
 |---|---|
 | Program + packs | the folder you installed into |
 | Config | `%APPDATA%\ArmouryDaemon\config.json` |
-| Logs | `%APPDATA%\ArmouryDaemon\logs\daemon.log`, `ui.log` |
+| Logs | `%APPDATA%\ArmouryDaemon\logs\daemon.log`, `ui.log`, `console.log` |
+| Cover art cache | `%APPDATA%\ArmouryDaemon\art` |
 | Pack journal | `%APPDATA%\ArmouryDaemon\journal.json` |
+
+Each log is rotated: the current file, then `daemon.log.1` and `daemon.log.2` (512 KiB per
+generation, the oldest one is dropped).
+
+## Cover art
+
+The console band shows the cover art of your apps. Games Steam knows get it from the Steam CDN,
+the rest from SteamGridDB - for that you paste an API key into Settings -> **SteamGridDB**. The
+key is stored in the config and never shown in the clear. Without a key the band falls back to
+the exe icon and then to a monogram.
+
+## The pack catalog
+
+Settings -> **Catalog** -> **Check for updates** fetches the catalog manifest and lists what is
+on offer. **Install** and **Update** download the pack, check it against the hash in the
+manifest and hand it to the daemon, which validates it and reloads.
 
 ## Updating
 
-Quit from the tray menu, replace `ArmouryDaemon.exe` (and `packs`), start it again. The config
-survives.
+The running exe is locked, so it cannot be overwritten while the daemon is up - and `setup.ps1`
+cannot replace it either: the script installs and starts, it never copies a binary. The order is
+therefore fixed.
+
+1. **Stop the daemon.** Right-click the amber **A** in the tray -> **Quit**. That reverts the
+   packs first, so the wallpaper, the G-Helper mode and the Rainmeter layout are back to normal
+   before the daemon goes away. A script can ask it to quit over the pipe instead - that is what
+   `setup.ps1` and `uninstall.ps1` do - but the pipe is only reachable from an elevated shell.
+
+2. **Copy the new files into the install folder** (e.g. `C:\Apps\ArmouryDaemon`): the new
+   `ArmouryDaemon.exe`, the `packs\` folder and the three files from `deploy\` (`setup.ps1`,
+   `uninstall.ps1`, `README.md`).
+
+   ```powershell
+   Copy-Item -Path 'D:\Armoury Daemon\target\release\ArmouryDaemon.exe' -Destination 'C:\Apps\ArmouryDaemon\' -Force
+   Copy-Item -Path 'D:\Armoury Daemon\packs\*' -Destination 'C:\Apps\ArmouryDaemon\packs\' -Recurse -Force
+   Copy-Item -Path 'D:\Armoury Daemon\deploy\setup.ps1','D:\Armoury Daemon\deploy\uninstall.ps1','D:\Armoury Daemon\deploy\README.md' -Destination 'C:\Apps\ArmouryDaemon\' -Force
+   ```
+
+   The copy has to happen **after** the daemon is stopped - while it runs the exe is locked and
+   the copy fails with a sharing violation.
+
+3. **Run `setup.ps1` in the install folder, from an elevated PowerShell:**
+
+   ```powershell
+   cd C:\Apps\ArmouryDaemon
+   powershell -ExecutionPolicy Bypass -File .\setup.ps1
+   ```
+
+   It has to be **elevated** (it registers the task with highest privileges and it sets the
+   folder ACL), and it has to run **after** the copy - it cannot replace a locked running exe
+   itself.
+
+   The daemon is already stopped, so `setup.ps1` finds nothing to stop and then: writes
+   `ArmouryDaemon.exe.sha256`, registers the task (logon + resume from sleep, highest
+   privileges), applies the folder ACL and starts it. The order is deliberate - the task is
+   registered before anything that could fail, and a failing ACL or a failing hash sidecar only
+   warns. At the end the script checks that the daemon really came up and prints the final state
+   (task / sidecar / ACL / running process).
+
+The config survives an update.
 
 ## Uninstall
 
@@ -53,12 +132,37 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1            # keeps conf
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -PurgeConfig
 ```
 
+The uninstall asks the daemon to quit over its pipe first, so the packs are reverted instead of
+being left in game mode. `-PurgeConfig` deletes `%APPDATA%\ArmouryDaemon` completely - that holds
+your settings **and the SteamGridDB API key**, so you have to paste the key again in Settings if
+you want the cover art back. The install folder itself is left behind on purpose: delete it by
+hand when you are done.
+
 ## Writing a pack
 
-Packs are data-only JSON (see `packs/*/pack.json`): a target process, exactly one dropdown, what
-to capture before acting, and ordered steps to apply and to revert. Available mechanisms: `cli`,
-`hotkey`, `rainmeter_bang`, `process_kill`, `process_start`, `registry_set`; captures:
-`process_running`, `target_path`, `json_file`. No pack can execute arbitrary code.
+Packs are data (see `packs/*/pack.json`): a target process, up to four dropdowns, what to capture
+before acting, and ordered steps to apply and to revert. Available mechanisms: `cli`, `hotkey`,
+`rainmeter_bang`, `process_kill`, `process_start`, `registry_set`, `script`; captures:
+`process_running`, `target_path`, `json_file`.
 
-Settings → **Install pack…** copies a `pack.json` into this folder's `packs\<id>\` (the daemon
+A spec-2 pack may carry a **script**: a small Rhai program that the daemon interprets against a
+whitelisted host API (`ctx.log`, `ctx.capture`, `ctx.setting`, `run_cli`, `write_file`, ...), with
+an operation limit and a 10 s budget. The script is data, not compiled code - it cannot reach
+outside the allowed folders - but it is not "no code" either.
+
+Settings -> **Install pack...** copies a `pack.json` into this folder's `packs\<id>\` (the daemon
 validates it first and reloads), **Remove** deletes a pack again.
+
+## The self-test
+
+`tools/daemon-selftest.ps1` drives a throw-away daemon instance (its own pipe, config folder and
+single-instance guard) through the whole engine and prints one line per check. It needs no admin
+rights and no Wallpaper Engine, G-Helper or Rainmeter:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1
+```
+
+It refuses to run against an installed copy: the daemon resolves its packs folder to the first
+folder that already has one, and the install/remove checks would overwrite and then delete a pack
+of the running installation. Only an exe inside the repository is allowed.

@@ -1,8 +1,9 @@
-//! Tracked-app watcher — tiered and budget-aware:
-//!   1. a 1 s `GetPerformanceInfo` process-count probe (~0.03 ms),
-//!   2. only when that count changes: one `EnumProcesses` call (PIDs only) diffed against
-//!      the previous sample — new PIDs get their full image path resolved and matched
-//!      against the tracked list (a handful of cheap calls, never a full name walk),
+//! Tracked-app watcher — one process walk per second, diffed by PID:
+//!   1. a `CreateToolhelp32Snapshot` walk (~13 ms) hands over every process's PID and
+//!      exe file name in one call — the PID *set* is the change detector, so a start and
+//!      an unrelated exit in the same second can never cancel each other out,
+//!   2. a PID that appeared is matched by exe file name against the tracked list (the
+//!      user's rule); only the few matches get their full image path resolved,
 //!   3. one process handle per running tracked app, waited on with `WaitForMultipleObjects`
 //!      so exits are exact (a signaled handle means *that* process object exited) and
 //!      PID-reuse safe.
@@ -11,15 +12,18 @@ use armoury_core::config::TrackedApp;
 use crossbeam_channel::Sender;
 use log::{info, warn};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::System::ProcessStatus::{
-    EnumProcesses, GetPerformanceInfo, PERFORMANCE_INFORMATION,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::SystemServices::MAXIMUM_WAIT_OBJECTS;
 use windows_sys::Win32::System::Threading::{
@@ -44,7 +48,12 @@ pub enum WatchEvent {
 
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// One process sample: PID -> lowercased exe file name.
+type Sample = BTreeMap<u32, String>;
+
 struct Running {
+    /// unique per entry, so a recycled PID cannot be mistaken for the old process
+    id: u64,
     handle: HANDLE,
     exe: String,
     name: String,
@@ -62,74 +71,88 @@ pub fn start(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake:
 
 fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize) {
     let mut running: HashMap<u32, Running> = HashMap::new();
-    let mut last_count: u32 = u32::MAX;
-    let mut last_hash: u64 = 0;
-    let mut last_pids: Vec<u32> = Vec::new();
+    let mut next_id: u64 = 0;
+    let mut version: u64 = 0; // bumps whenever `running` changes
+    let mut pairs: Vec<(u32, u64, HANDLE)> = Vec::new();
+    let mut pairs_version: u64 = u64::MAX; // forces the first build
+    let mut last_hash: Option<u64> = None;
+    let mut wanted: Vec<Wanted> = Vec::new();
+    let mut previous: Sample = Sample::new();
     info!("watcher started");
 
     loop {
-        // ---- 1. cheap probe, and a PID-level diff only when something changed ----
-        let (hash, wanted) = tracked_snapshot(&tracked);
-        let list_changed = hash != last_hash;
-        let count = process_count();
-        let count_changed = count != last_count;
-
-        if count_changed || list_changed {
-            let pids = enum_pids();
-            if list_changed {
-                // The tracked list changed: re-check everything currently running, and
-                // forget handles for apps that are no longer tracked.
-                for &pid in &pids {
-                    consider(pid, &wanted, &mut running, &tx, wake);
-                }
-                let stale: Vec<u32> = running
-                    .iter()
-                    .filter(|(_, r)| !wanted.iter().any(|w| w.base == r.exe))
-                    .map(|(pid, _)| *pid)
-                    .collect();
-                for pid in stale {
-                    if let Some(r) = running.remove(&pid) {
-                        let _ = tx.send(WatchEvent::Stopped {
-                            key: r.exe.clone(),
-                            pid,
-                        });
-                        signal(wake);
-                    }
-                }
-            } else {
-                // Only the PIDs that appeared since the previous sample can be starts.
-                let previous: HashSet<u32> = last_pids.iter().copied().collect();
-                for &pid in &pids {
-                    if !previous.contains(&pid) {
-                        consider(pid, &wanted, &mut running, &tx, wake);
-                    }
-                }
-                // Belt and braces: a watched PID that vanished is a stop (the handle wait
-                // normally reports it first).
-                let current: HashSet<u32> = pids.iter().copied().collect();
-                let gone: Vec<u32> = running
-                    .keys()
-                    .copied()
-                    .filter(|pid| !current.contains(pid))
-                    .collect();
-                for pid in gone {
-                    if let Some(r) = running.remove(&pid) {
-                        let _ = tx.send(WatchEvent::Stopped {
-                            key: r.exe.clone(),
-                            pid,
-                        });
-                        signal(wake);
-                    }
-                }
-            }
-            last_pids = pids;
-            last_count = count;
-            last_hash = hash;
+        // ---- 1. the tracked list, rebuilt only when it actually changed ----
+        let hash = tracked_hash(&tracked);
+        let list_changed = last_hash != Some(hash);
+        if list_changed {
+            wanted = tracked_wanted(&tracked);
+            last_hash = Some(hash);
         }
 
-        // ---- 2. wait for exits (exact, one handle per running tracked app) ----
-        let mut pairs: Vec<(u32, HANDLE)> = running.iter().map(|(pid, r)| (*pid, r.handle)).collect();
-        pairs.sort_unstable_by_key(|(pid, _)| *pid);
+        // ---- 2. one walk per tick; the PID set is the change detector ----
+        let current = enum_processes();
+        let (started, gone) = diff_samples(&previous, &current);
+        if list_changed {
+            // The tracked list changed: re-check everything currently running, so an
+            // app added to the list while it was already running is picked up.
+            for (pid, name) in &current {
+                if consider(
+                    *pid,
+                    name,
+                    &wanted,
+                    &mut running,
+                    &mut next_id,
+                    &tx,
+                    wake,
+                ) {
+                    version += 1;
+                }
+            }
+        } else {
+            // Only the PIDs that appeared since the previous sample can be starts.
+            for (pid, name) in &started {
+                if consider(
+                    *pid,
+                    name,
+                    &wanted,
+                    &mut running,
+                    &mut next_id,
+                    &tx,
+                    wake,
+                ) {
+                    version += 1;
+                }
+            }
+        }
+        // Belt and braces: a watched PID that vanished is a stop (the handle wait
+        // normally reports it first).
+        for pid in gone {
+            if forget(pid, &mut running, &tx, wake) {
+                version += 1;
+            }
+        }
+        if list_changed {
+            // forget handles for apps that are no longer tracked
+            let stale: Vec<u32> = running
+                .iter()
+                .filter(|(_, r)| !wanted.iter().any(|w| w.base == r.exe))
+                .map(|(pid, _)| *pid)
+                .collect();
+            for pid in stale {
+                if forget(pid, &mut running, &tx, wake) {
+                    version += 1;
+                }
+            }
+        }
+        previous = current;
+
+        // ---- 3. wait for exits (exact, one handle per running tracked app) ----
+        if pairs_version != version {
+            pairs.clear();
+            pairs.extend(running.iter().map(|(pid, r)| (*pid, r.id, r.handle)));
+            pairs.sort_unstable_by_key(|(pid, _, _)| *pid);
+            pairs_version = version;
+        }
 
         if pairs.is_empty() {
             thread::sleep(PROBE_INTERVAL);
@@ -137,7 +160,7 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
         }
 
         for chunk in pairs.chunks(MAXIMUM_WAIT_OBJECTS as usize) {
-            let handles: Vec<HANDLE> = chunk.iter().map(|(_, h)| *h).collect();
+            let handles: Vec<HANDLE> = chunk.iter().map(|(_, _, h)| *h).collect();
             let r = unsafe {
                 WaitForMultipleObjects(
                     handles.len() as u32,
@@ -149,22 +172,16 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
             if r == WAIT_TIMEOUT {
                 continue;
             }
-            if r >= WAIT_OBJECT_0 && r < WAIT_OBJECT_0 + handles.len() as u32 {
-                let (pid, _) = chunk[(r - WAIT_OBJECT_0) as usize];
-                if let Some(run) = running.remove(&pid) {
-                    info!("tracked app stopped: {} (pid {pid})", run.name);
-                    let _ = tx.send(WatchEvent::Stopped {
-                        key: run.exe.clone(),
-                        pid,
-                    });
-                    signal(wake);
+            if r < handles.len() as u32 {
+                let (pid, id, _) = chunk[(r - WAIT_OBJECT_0) as usize];
+                // the id guards against a PID that was recycled meanwhile
+                if running.get(&pid).map(|e| e.id) == Some(id)
+                    && forget(pid, &mut running, &tx, wake)
+                {
+                    version += 1;
                 }
-                // force a fresh PID sample next tick: a start in the same second could
-                // have cancelled out the process-count probe
-                last_count = u32::MAX;
             } else {
                 warn!("WaitForMultipleObjects failed ({r}); re-sampling");
-                last_count = u32::MAX;
                 break;
             }
         }
@@ -180,29 +197,43 @@ fn signal(wake: usize) {
 /// Is this PID one of the tracked apps we are not watching yet?
 /// Matching is by **file name** (the user's choice): any process whose exe name is in
 /// the tracked list counts, regardless of where it runs from.
+/// Returns true when the watch list changed.
 fn consider(
     pid: u32,
+    name: &str,
     wanted: &[Wanted],
     running: &mut HashMap<u32, Running>,
+    next_id: &mut u64,
     tx: &Sender<WatchEvent>,
     wake: usize,
-) {
-    if wanted.is_empty() || pid == 0 || running.contains_key(&pid) {
-        return;
+) -> bool {
+    if wanted.is_empty() || pid == 0 {
+        return false;
     }
-    let Some(path) = process_path(pid) else {
-        return; // protected/exiting process
+    let mut changed = false;
+    if let Some(old) = running.get(&pid) {
+        if old.exe == name {
+            return false; // already watched
+        }
+        // the PID was recycled: the old process is gone, this is a new one
+        forget(pid, running, tx, wake);
+        changed = true;
+    }
+    let Some(w) = wanted.iter().find(|w| w.base == name) else {
+        return changed; // not one of ours
     };
-    let base = base_name(&path);
-    let Some(w) = wanted.iter().find(|w| w.base == base) else {
-        return; // not one of ours
+    // Only the matches need their full path (pack templates).
+    let Some(path) = process_path(pid) else {
+        return changed; // protected/exiting process
     };
     match open_for_wait(pid) {
         Some(handle) => {
             info!("tracked app started: {} (pid {pid})", w.display);
+            *next_id += 1;
             running.insert(
                 pid,
                 Running {
+                    id: *next_id,
                     handle,
                     exe: w.base.clone(),
                     name: w.display.clone(),
@@ -215,13 +246,67 @@ fn consider(
                 pid,
             });
             signal(wake);
+            true
         }
-        None => warn!("cannot watch {} (pid {pid}) for exit: access denied", w.display),
+        None => {
+            warn!("cannot watch {} (pid {pid}) for exit: access denied", w.display);
+            changed
+        }
     }
 }
 
-/// The tracked list, lowercased, plus a hash that changes on any edit.
-fn tracked_snapshot(tracked: &Arc<Mutex<Vec<TrackedApp>>>) -> (u64, Vec<Wanted>) {
+/// Drop a PID from the watch list and report it as stopped. True when it was watched.
+fn forget(
+    pid: u32,
+    running: &mut HashMap<u32, Running>,
+    tx: &Sender<WatchEvent>,
+    wake: usize,
+) -> bool {
+    let Some(r) = running.remove(&pid) else {
+        return false;
+    };
+    info!("tracked app stopped: {} (pid {pid})", r.name);
+    let _ = tx.send(WatchEvent::Stopped {
+        key: r.exe.clone(),
+        pid,
+    });
+    signal(wake);
+    true
+}
+
+/// What changed between two samples: the PIDs that appeared (the only possible starts)
+/// and the PIDs that vanished (the only possible stops). A start and an unrelated exit
+/// cancel out in the process *count*, never in the PID set.
+fn diff_samples(previous: &Sample, current: &Sample) -> (Vec<(u32, String)>, Vec<u32>) {
+    let mut started: Vec<(u32, String)> = Vec::new();
+    for (pid, name) in current {
+        if previous.get(pid) != Some(name) {
+            started.push((*pid, name.clone()));
+        }
+    }
+    let mut gone: Vec<u32> = Vec::new();
+    for pid in previous.keys() {
+        if !current.contains_key(pid) {
+            gone.push(*pid);
+        }
+    }
+    (started, gone)
+}
+
+/// A cheap fingerprint of the tracked list — it changes on any edit.
+fn tracked_hash(tracked: &Arc<Mutex<Vec<TrackedApp>>>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    if let Ok(list) = tracked.lock() {
+        for app in list.iter() {
+            app.exe.hash(&mut hasher);
+            app.name.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// The tracked list, lowercased — rebuilt only when the hash above changes.
+fn tracked_wanted(tracked: &Arc<Mutex<Vec<TrackedApp>>>) -> Vec<Wanted> {
     let list = tracked.lock().map(|g| g.clone()).unwrap_or_default();
     let mut wanted: Vec<Wanted> = list
         .iter()
@@ -232,9 +317,7 @@ fn tracked_snapshot(tracked: &Arc<Mutex<Vec<TrackedApp>>>) -> (u64, Vec<Wanted>)
         })
         .collect();
     wanted.sort_by(|a, b| a.exe.cmp(&b.exe));
-    let mut hasher = DefaultHasher::new();
-    wanted.hash(&mut hasher);
-    (hasher.finish(), wanted)
+    wanted
 }
 
 /// One tracked app, pre-chewed for the watcher.
@@ -264,34 +347,31 @@ fn display_name(app: &TrackedApp) -> String {
         .unwrap_or_else(|| app.exe.clone())
 }
 
-/// All PIDs, growing the buffer once if the system has more processes than expected.
-fn enum_pids() -> Vec<u32> {
-    let mut buf: Vec<u32> = vec![0; 2048];
-    loop {
-        let mut needed: u32 = 0;
-        let bytes = (buf.len() * std::mem::size_of::<u32>()) as u32;
-        let ok = unsafe { EnumProcesses(buf.as_mut_ptr(), bytes, &mut needed) };
-        if ok == 0 {
-            return Vec::new();
-        }
-        let count = (needed as usize) / std::mem::size_of::<u32>();
-        if count < buf.len() {
-            buf.truncate(count);
-            return buf;
-        }
-        buf.resize(buf.len() * 2, 0);
+/// One walk of the process list: PID -> lowercased exe file name.
+fn enum_processes() -> Sample {
+    let mut out = Sample::new();
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap.is_null() || snap == INVALID_HANDLE_VALUE {
+        return out;
     }
-}
-
-fn process_count() -> u32 {
-    let mut info: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
-    let ok = unsafe {
-        GetPerformanceInfo(
-            &mut info,
-            std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32,
-        )
-    };
-    if ok != 0 { info.ProcessCount as u32 } else { 0 }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut ok = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+    while ok {
+        let pid = entry.th32ProcessID;
+        if pid != 0 {
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            out.insert(pid, name.to_ascii_lowercase());
+        }
+        ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snap) };
+    out
 }
 
 pub fn process_path(pid: u32) -> Option<String> {
@@ -299,17 +379,34 @@ pub fn process_path(pid: u32) -> Option<String> {
     if handle.is_null() {
         return None;
     }
-    let mut buf = vec![0u16; 32768];
-    let mut len = buf.len() as u32;
-    let ok =
-        unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) }
-            != 0;
+    let path = image_path(handle);
     unsafe { CloseHandle(handle) };
-    if !ok {
+    path
+}
+
+/// The full image path of a process. 1024 characters cover every realistic path; the
+/// buffer only grows when Windows asks for more.
+fn image_path(handle: HANDLE) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) }
+        != 0
+    {
+        return Some(String::from_utf16_lossy(&buf[..(len as usize).min(buf.len())]));
+    }
+    if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
         return None;
     }
-    buf.truncate(len as usize);
-    Some(String::from_utf16_lossy(&buf))
+    // the call reported the size it needs (terminator included)
+    let need = (len as usize).saturating_add(1).max(buf.len() + 1);
+    let mut big = vec![0u16; need];
+    len = big.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, big.as_mut_ptr(), &mut len) }
+        != 0
+    {
+        return Some(String::from_utf16_lossy(&big[..(len as usize).min(big.len())]));
+    }
+    None
 }
 
 fn open_for_wait(pid: u32) -> Option<HANDLE> {
@@ -326,4 +423,100 @@ fn open_for_wait(pid: u32) -> Option<HANDLE> {
     // Fall back to the minimal right needed for waiting.
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if handle.is_null() { None } else { Some(handle) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn sample(pairs: &[(u32, &str)]) -> Sample {
+        pairs.iter().map(|(pid, name)| (*pid, name.to_string())).collect()
+    }
+
+    #[test]
+    fn a_start_offset_by_an_exit_is_still_seen() {
+        let previous = sample(&[(10, "explorer.exe"), (11, "notepad.exe")]);
+        let current = sample(&[(10, "explorer.exe"), (12, "game.exe")]);
+        assert_eq!(previous.len(), current.len(), "the process count is unchanged");
+        let (started, gone) = diff_samples(&previous, &current);
+        assert_eq!(started, vec![(12, "game.exe".to_string())]);
+        assert_eq!(gone, vec![11]);
+    }
+
+    #[test]
+    fn an_unchanged_sample_reports_nothing() {
+        let previous = sample(&[(10, "explorer.exe")]);
+        let current = sample(&[(10, "explorer.exe")]);
+        let (started, gone) = diff_samples(&previous, &current);
+        assert!(started.is_empty(), "{started:?}");
+        assert!(gone.is_empty(), "{gone:?}");
+    }
+
+    #[test]
+    fn a_recycled_pid_counts_as_a_new_process() {
+        let previous = sample(&[(10, "notepad.exe")]);
+        let current = sample(&[(10, "game.exe")]);
+        let (started, gone) = diff_samples(&previous, &current);
+        assert_eq!(started, vec![(10, "game.exe".to_string())]);
+        assert!(gone.is_empty(), "{gone:?}");
+    }
+
+    #[test]
+    fn tracked_apps_match_by_file_name() {
+        let tracked = Arc::new(Mutex::new(vec![TrackedApp {
+            name: "Game".into(),
+            exe: "C:\\Games\\Steam\\bin\\game.exe".into(),
+        }]));
+        let wanted = tracked_wanted(&tracked);
+        assert_eq!(wanted[0].base, "game.exe");
+        // a moved copy still matches ...
+        let moved = TrackedApp {
+            name: "Game".into(),
+            exe: "D:\\Elsewhere\\game.exe".into(),
+        };
+        assert_eq!(base_name(&moved.exe), wanted[0].base);
+        // ... a renamed exe does not
+        let renamed = TrackedApp {
+            name: "Game".into(),
+            exe: "C:\\Games\\Steam\\bin\\game2.exe".into(),
+        };
+        assert_ne!(base_name(&renamed.exe), wanted[0].base);
+    }
+
+    #[test]
+    fn the_tracked_hash_follows_the_list() {
+        let tracked = Arc::new(Mutex::new(Vec::new()));
+        let before = tracked_hash(&tracked);
+        tracked.lock().unwrap().push(TrackedApp {
+            name: "Notepad".into(),
+            exe: "C:\\Windows\\System32\\notepad.exe".into(),
+        });
+        assert_ne!(tracked_hash(&tracked), before);
+    }
+
+    #[test]
+    fn process_path_resolves_a_live_process() {
+        let probe = std::path::Path::new("C:\\Windows\\System32\\ping.exe");
+        if !probe.is_file() {
+            return;
+        }
+        let mut child = Command::new(probe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ping.exe starts");
+        let path = process_path(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        let path = path.expect("the image path resolves");
+        let file = std::path::Path::new(&path);
+        assert!(file.is_file(), "{path}");
+        assert_eq!(
+            file.file_name().map(|s| s.to_string_lossy().to_ascii_lowercase()),
+            Some("ping.exe".to_string()),
+            "{path}"
+        );
+    }
 }

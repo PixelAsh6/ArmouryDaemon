@@ -48,6 +48,8 @@ pub enum Request {
     LaunchApp { exe: String },
     /// Open the console launcher now (tray menu / settings preview), pad or not.
     ShowConsole,
+    /// Quit the daemon: revert the packs, then exit. Same as the tray menu's "Quit".
+    Quit,
 }
 
 /// Messages sent from the daemon to a client.
@@ -169,7 +171,7 @@ mod tests {
     fn roundtrip_response() {
         let resp = Response::Status {
             status: StatusSnapshot {
-                daemon_version: "0.1.0".into(),
+                daemon_version: "1.0.0".into(),
                 uptime_secs: 7,
                 state: RunState::Idle,
                 trigger_source: None,
@@ -193,6 +195,7 @@ mod tests {
                 last_played: Default::default(),
                 sgdb_api_key_set: false,
                 sgdb_api_key: String::new(),
+                last_error: None,
             },
         };
         let mut out = Vec::new();
@@ -265,5 +268,23 @@ mod tests {
         let data = b"\n\r\n{\"type\":\"get_status\"}\n";
         let back: Request = read_msg(&mut &data[..], &mut String::new()).unwrap().unwrap();
         assert!(matches!(back, Request::GetStatus));
+    }
+
+    #[test]
+    fn quit_round_trips() {
+        let mut out = Vec::new();
+        write_msg(&mut out, &Request::Quit).unwrap();
+        assert_eq!(String::from_utf8(out.clone()).unwrap(), "{\"type\":\"quit\"}\n");
+
+        let back: Request = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
+        assert!(matches!(back, Request::Quit));
+    }
+
+    #[test]
+    fn quit_deserialises_from_its_json() {
+        let back: Request = serde_json::from_str(r#"{"type":"quit"}"#).unwrap();
+        assert!(matches!(back, Request::Quit));
+        let text = serde_json::to_string(&Request::Quit).unwrap();
+        assert_eq!(text, r#"{"type":"quit"}"#);
     }
 }

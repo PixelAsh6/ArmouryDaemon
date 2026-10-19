@@ -1,0 +1,512 @@
+<#
+    ArmouryDaemon - headless self-test.
+
+    Starts a **throw-away daemon instance** next to the installed one (its own pipe, config folder
+    and single-instance mutex, via ARMOURY_TEST_NS), drives it over the pipe and asserts the engine
+    behaviour. All packs are disabled for the run, so nothing on the desktop moves.
+
+    Usage (no admin needed as long as the installed daemon runs at a different privilege - the test
+    instance uses its own pipe):
+        powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1
+        powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1 -Exe ..\target\debug\ArmouryDaemon.exe
+
+    The exe has to live inside this repository. The daemon resolves its packs folder to the first
+    search folder that already has one, and the install/remove checks write into that folder and
+    delete the pack again - against a live install that would overwrite and then remove
+    C:\Apps\ArmouryDaemon\packs\<id>. A run outside the repository is refused.
+
+    Exit code 0 = every check passed.
+#>
+param(
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\ArmouryDaemon.exe')
+)
+
+$ErrorActionPreference = 'Stop'
+
+if (-not (Test-Path $Exe)) { throw "daemon exe not found: $Exe" }
+$Exe = (Resolve-Path $Exe).Path
+
+# ---- refuse to run against a live install -----------------------------------
+
+# The daemon picks its packs folder like this: the first search folder that already has a
+# "packs" folder, else "packs" beside the exe (packs::packs_root). The install/remove checks
+# below write into that folder and then delete the pack again, so the resolved root has to sit
+# inside this repository. Anything else (C:\Apps\..., a copy next to a running daemon) is a live
+# install and the run is refused before a single byte is written.
+$exeDir = Split-Path $Exe -Parent
+$searchDirs = @($exeDir)
+$up2 = Split-Path (Split-Path $exeDir -Parent) -Parent
+if ($up2) { $searchDirs += $up2 }
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+
+function Get-PacksRoot([string[]]$dirs) {
+    foreach ($d in $dirs) {
+        $candidate = [IO.Path]::GetFullPath((Join-Path $d 'packs'))
+        if (Test-Path -LiteralPath $candidate -PathType Container) { return $candidate }
+    }
+    return [IO.Path]::GetFullPath((Join-Path $dirs[0] 'packs'))
+}
+
+function Test-Under([string]$root, [string]$path) {
+    return $path.StartsWith(($root.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+$packsRoot = Get-PacksRoot $searchDirs
+if (-not (Test-Under $repoRoot $packsRoot)) {
+    throw ("refusing to run: the daemon would use the packs folder '$packsRoot', which is outside the repository" +
+        " ('$repoRoot'). Point -Exe at a build inside the repository (e.g. ..\target\release\ArmouryDaemon.exe)," +
+        " never at an installed copy.")
+}
+# the scratch folder the harness installs into: beside the test exe, never the repository's own packs
+$buildPacks = [IO.Path]::GetFullPath((Join-Path $exeDir 'packs'))
+if (-not (Test-Under $repoRoot $buildPacks) -or $buildPacks -eq (Join-Path $repoRoot 'packs')) {
+    throw "refusing to run: the harness would install into '$buildPacks', which is not a scratch folder of this repository."
+}
+
+$ns = 'selftest-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$env:ARMOURY_TEST_NS = $ns
+$configDir = Join-Path ([IO.Path]::GetTempPath()) "ArmouryDaemon-test-$ns"
+$pipeName = "armoury-daemon.pipe-$ns"
+# The log of the throw-away instance. It is the only place where the harness can see that the
+# packs really changed: the status reports the state, the log reports the change.
+$logPath = Join-Path $configDir 'logs\daemon.log'
+$script:failures = 0
+$script:children = New-Object System.Collections.ArrayList
+$script:buildPacksExisted = $true
+$script:parkedPack = $null
+
+function Check([string]$name, [bool]$ok, [string]$detail = '') {
+    if ($ok) {
+        "PASS  $name"
+    } else {
+        "FAIL  $name   $detail"
+        $script:failures++
+    }
+}
+
+# Start a process the harness keeps track of. The finally block kills exactly these - never
+# every timeout.exe on the machine, which would take a build script or a terminal with it.
+function Start-Tracked([string]$file, [string]$arguments) {
+    $p = Start-Process $file -ArgumentList $arguments -PassThru -WindowStyle Hidden
+    [void]$script:children.Add($p)
+    return $p
+}
+
+# The SHA256 of a file, or '' when it does not exist.
+function Get-FileSha([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return '' }
+    try { return (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash } catch { return 'unreadable' }
+}
+
+function Send-Pipe([string]$json) {
+    for ($i = 0; $i -lt 3; $i++) {
+        try {
+            $p = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+            $p.Connect(2000)
+            $w = New-Object System.IO.StreamWriter($p); $w.AutoFlush = $true
+            $r = New-Object System.IO.StreamReader($p)
+            $w.WriteLine($json)
+            $t = $r.ReadLineAsync()
+            $out = if ($t.Wait(2000)) { $t.Result } else { '' }
+            $p.Dispose()
+            return $out
+        } catch {
+            Start-Sleep -Milliseconds 300
+        }
+    }
+    return ''
+}
+
+function Status {
+    $json = Send-Pipe '{"type":"get_status"}'
+    if (-not $json) { return $null }
+    return ($json | ConvertFrom-Json).status
+}
+
+# The daemon answers a request on the same connection, but status broadcasts can arrive first:
+# read lines until the expected message type shows up.
+function Send-And-Wait([string]$json, [string]$wantType, [int]$timeoutMs = 4000) {
+    try {
+        $p = New-Object System.IO.Pipes.NamedPipeClientStream('.', $pipeName, [System.IO.Pipes.PipeDirection]::InOut)
+        $p.Connect(2000)
+        $w = New-Object System.IO.StreamWriter($p); $w.AutoFlush = $true
+        $r = New-Object System.IO.StreamReader($p)
+        $w.WriteLine($json)
+        $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+        while ((Get-Date) -lt $deadline) {
+            $t = $r.ReadLineAsync()
+            if (-not $t.Wait(500)) { continue }
+            if (-not $t.Result) { break }
+            $msg = $t.Result | ConvertFrom-Json
+            if ($msg.type -eq $wantType) { $p.Dispose(); return $msg }
+        }
+        $p.Dispose()
+        return $null
+    } catch {
+        return $null
+    } finally {
+        if ($p) { $p.Dispose() }
+    }
+}
+
+function Wait-State([string]$want, [int]$timeoutSec = 6) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $s = Status
+        if ($s -and $s.state -eq $want) { return $s }
+        Start-Sleep -Milliseconds 250
+    }
+    return (Status)
+}
+
+# The times at which the daemon really changed the packs: 'apply' for an apply, 'revert' for a
+# revert. The log has a resolution of one second, which is enough for a cooldown of 5 s.
+function Get-ChangeTimes([string]$what) {
+    $times = @()
+    if (-not (Test-Path -LiteralPath $logPath)) { return $times }
+    $pattern = if ($what -eq 'apply') { 'packs applied \(triggered by' } else { 'packs reverted' }
+    $lines = @()
+    try { $lines = Get-Content -LiteralPath $logPath } catch { return $times }
+    foreach ($line in $lines) {
+        if ($line -notmatch $pattern) { continue }
+        if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+            $times += [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return $times
+}
+
+# Wait until the daemon log shows more changes of that kind than $count. Returns all of them.
+function Wait-Change([string]$what, [int]$count, [int]$timeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $times = @(Get-ChangeTimes $what)
+        if ($times.Count -gt $count) { return $times }
+        Start-Sleep -Milliseconds 200
+    }
+    return @(Get-ChangeTimes $what)
+}
+
+# The seconds between two moments. A moment that never happened counts as "never" (9999), so a
+# check that needs a real distance fails instead of passing on a missing value.
+function Get-Gap($from, $to) {
+    if ($null -eq $from -or $null -eq $to) { return 9999 }
+    return ($to - $from).TotalSeconds
+}
+
+# The real config of the installed daemon must not change during the run: the test instance
+# writes into a temp folder (ARMOURY_TEST_NS), so the file has to be byte-identical afterwards.
+$realConfig = Join-Path $env:APPDATA 'ArmouryDaemon\config.json'
+$script:realConfigBefore = Get-FileSha $realConfig
+
+"=== ArmouryDaemon self-test (namespace $ns) ==="
+"=== packs root: $packsRoot | scratch: $buildPacks ==="
+$daemon = Start-Process $Exe -PassThru -WindowStyle Hidden
+try {
+    # ---- 1. the instance comes up and answers ----
+    $s = $null
+    for ($i = 0; $i -lt 40 -and -not $s; $i++) { Start-Sleep -Milliseconds 250; $s = Status }
+    Check 'daemon answers on its own pipe' ($null -ne $s)
+    if (-not $s) { throw 'no status reply' }
+
+    # ---- 2. a fresh config starts idle, with no tracked apps ----
+    Check 'fresh instance is idle' ($s.state -eq 'idle') "state=$($s.state)"
+    Check 'fresh instance has no tracked apps' (@($s.tracked_apps).Count -eq 0) "count=$(@($s.tracked_apps).Count)"
+    Check 'packs are loaded from the repo' (@($s.packs).Count -ge 3) "count=$(@($s.packs).Count)"
+    $we = $s.packs | Where-Object { $_.id -eq 'wallpaper-engine' }
+    Check 'wallpaper-engine exposes two dropdowns' (@($we.settings).Count -eq 2) "count=$(@($we.settings).Count)"
+    $binary = $we.settings | Where-Object { $_.key -eq 'binary' }
+    Check 'its binary dropdown defaults to auto' ($binary.value -eq 'auto') "value=$($binary.value)"
+
+    # ---- 3. quiet the packs so nothing on the desktop moves ----
+    foreach ($id in 'wallpaper-engine', 'g-helper', 'rainmeter') {
+        Send-Pipe "{`"type`":`"set_pack_enabled`",`"id`":`"$id`",`"enabled`":false}" | Out-Null
+    }
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $s = Status
+    Check 'packs disabled + cooldown 5 s' ((@($s.packs | Where-Object enabled).Count -eq 0) -and ($s.cooldown_seconds -eq 5))
+
+    # ---- 4. a tracked app start applies the packs and starts a lockout ----
+    # The engine (2026-10-20): the packs follow the intent, but only when no lockout runs.
+    # Every change that really happens starts a lockout of `cooldown` seconds, and while it
+    # runs no other change may touch the packs. The daemon reports the lockout as the
+    # "cooldown" state plus the time that is left.
+    $applies = @(Get-ChangeTimes 'apply').Count
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p1 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'cooldown' 8
+    Check 'a tracked app start applies the packs' (@(Get-ChangeTimes 'apply').Count -ge $applies + 1) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+    Check 'the apply starts a lockout' ($s.state -eq 'cooldown') "state=$($s.state)"
+    Check 'the lockout counts down' ($s.cooldown_remaining_ms -gt 0 -and $s.cooldown_remaining_ms -le 5000) "remaining=$($s.cooldown_remaining_ms)"
+    Check 'the applied state names the app' ($s.trigger_source -eq 'timeout.exe') "source=$($s.trigger_source)"
+    Check 'the daemon plans no switch any more' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
+
+    # ---- 5. the lockout ends while the app runs: nothing changes ----
+    # A lockout that expires while the intent still holds changes nothing and starts no new one.
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $s = Wait-State 'triggered' 15
+    Check 'the packs stay applied when the lockout expires' ($s.state -eq 'triggered') "state=$($s.state)"
+    Check 'no lockout is left behind' ($null -eq $s.cooldown_remaining_ms) "remaining=$($s.cooldown_remaining_ms)"
+    Check 'nothing was reverted' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
+
+    # ---- 6. a close with no lockout running reverts at once ----
+    # Nothing defers the change any more, so the packs go back right away.
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $closeAt = Get-Date
+    $p1 | Stop-Process -Force
+    $times = @(Wait-Change 'revert' $reverts 15)
+    Check 'a close with no lockout running reverts at once' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $revertAt = $times[$times.Count - 1]
+    $revertSeenAt = Get-Date
+    Check 'the revert is not delayed by a countdown' ((Get-Gap $closeAt $revertAt) -ge -1 -and (Get-Gap $closeAt $revertAt) -le 4) "close=$closeAt revert=$revertAt"
+    $s = Wait-State 'cooldown' 8
+    Check 'the revert starts a lockout of its own' ($s.state -eq 'cooldown') "state=$($s.state)"
+
+    # ---- 7. that lockout runs before the daemon goes idle ----
+    # The change that just happened starts a lockout too: the daemon stays "cooldown" for one
+    # more period and only then goes "idle".
+    $s = Wait-State 'idle' 20
+    $idleSeenAt = Get-Date
+    Check 'the daemon goes idle after the lockout' ($s.state -eq 'idle') "state=$($s.state)"
+    Check 'the revert is followed by a lockout of its own' ((Get-Gap $revertSeenAt $idleSeenAt) -ge 3.5 -and (Get-Gap $revertSeenAt $idleSeenAt) -le 12) "gap=$(Get-Gap $revertSeenAt $idleSeenAt)s"
+
+    # ---- 8. a close inside a lockout is deferred, not dropped ----
+    # The app starts again (that start starts a lockout) and is closed while the lockout still
+    # runs. The close may not touch the packs: it is remembered and applied when the lockout
+    # ends.
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $p2 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'cooldown' 8
+    $applyTimes = @(Wait-Change 'apply' $applies 15)
+    $applyAt = $applyTimes[$applyTimes.Count - 1]
+    Check 'the new start applies the packs again' ($applyTimes.Count -ge $applies + 1) "applies=$applies now=$($applyTimes.Count)"
+    $s = Status
+    $left = $s.cooldown_remaining_ms
+    # the close has to go out while the lockout still runs, with room for the watcher
+    Check 'the close goes out inside the lockout' ($left -gt 2000) "remaining=$left"
+    $p2 | Stop-Process -Force
+    Start-Sleep -Milliseconds 1000
+    $s = Status
+    Check 'the close inside the lockout is deferred' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
+    Check 'the state is still the lockout' ($s.state -eq 'cooldown') "state=$($s.state)"
+    Check 'the lockout keeps running, it was not restarted' ($s.cooldown_remaining_ms -lt $left) "before=$left now=$($s.cooldown_remaining_ms)"
+    $times = @(Wait-Change 'revert' $reverts 20)
+    Check 'the deferred revert happens when the lockout expires' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $revertAt = $times[$times.Count - 1]
+    Check 'the deferred revert waits for the lockout' ((Get-Gap $applyAt $revertAt) -ge 3 -and (Get-Gap $applyAt $revertAt) -le 12) "apply=$applyAt revert=$revertAt"
+    $s = Wait-State 'idle' 20
+    Check 'the deferred revert leaves the daemon idle' ($s.state -eq 'idle') "state=$($s.state)"
+
+    # ---- 9. a fast restart inside the lockout never reverts ----
+    # The app is closed and opened again while the lockout of the start still runs: the intent
+    # holds again, so nothing is changed and nothing is reverted when the lockout ends.
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $p3 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'cooldown' 8
+    $null = Wait-Change 'apply' $applies 15
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $p3 | Stop-Process -Force
+    Start-Sleep -Milliseconds 700
+    $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Status
+    $left = $s.cooldown_remaining_ms
+    Check 'the restart goes out inside the lockout' ($left -gt 1500) "remaining=$left"
+    $s = Wait-State 'triggered' 15
+    Check 'a fast restart leaves the packs applied' ($s.state -eq 'triggered') "state=$($s.state)"
+    Check 'a fast restart never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
+    Check 'a fast restart does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+
+    # ---- 10. a second tracked app changes nothing and starts no lockout ----
+    # The packs are already applied, so the intent does not change: no apply and no lockout.
+    Send-Pipe '{"type":"add_tracked_app","name":"Ping","exe":"C:\\Windows\\System32\\ping.exe"}' | Out-Null
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $p5 = Start-Tracked 'C:\Windows\System32\ping.exe' '-n 20 127.0.0.1'
+    Start-Sleep -Seconds 2
+    $s = Status
+    Check 'a second tracked app starts no lockout' (($s.state -eq 'triggered') -and ($null -eq $s.cooldown_remaining_ms)) "state=$($s.state) remaining=$($s.cooldown_remaining_ms)"
+    Check 'a second tracked app does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+    $p5 | Stop-Process -Force -ErrorAction SilentlyContinue
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\ping.exe"}' | Out-Null
+
+    # ---- 11. pause stops automatic switching ----
+    Send-Pipe '{"type":"set_paused","paused":true}' | Out-Null
+    $p4 | Stop-Process -Force
+    Start-Sleep -Seconds 1
+    $s = Status
+    Check 'paused: closing does not start a lockout' ($s.state -eq 'triggered') "state=$($s.state)"
+    $p6 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    Start-Sleep -Seconds 1
+    $s = Status
+    Check 'paused: still applied while it runs' ($s.state -eq 'triggered') "state=$($s.state)"
+
+    # ---- 12. removing the last tracked app reverts at once ----
+    # A manual action bypasses the lockout: the packs go back right away and no lockout is
+    # left behind.
+    Send-Pipe '{"type":"set_paused","paused":false}' | Out-Null
+    Start-Sleep -Milliseconds 300
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $times = @(Wait-Change 'revert' $reverts 15)
+    Check 'removing the last tracked app reverts at once' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $s = Status
+    Check 'the manual revert leaves no lockout behind' (($s.state -eq 'idle') -and ($null -eq $s.cooldown_remaining_ms)) "state=$($s.state) remaining=$($s.cooldown_remaining_ms)"
+    $p6 | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # ---- 13. config lives in the throw-away folder, not in %APPDATA% ----
+    $tempConfig = Join-Path $configDir 'config.json'
+    Check 'the test instance used its own config folder' (Test-Path $tempConfig) "expected $tempConfig"
+
+    # ---- 14. settings persist to that config file ----
+    # The dashboard always opens in the corner, so its position is not kept: the request is
+    # accepted and dropped. The cooldown is set after it, so the config on disk is written
+    # again and the check below sees what the daemon would persist.
+    Send-Pipe '{"type":"set_ui_position","x":123.5,"y":-45.0}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":25}' | Out-Null
+    Start-Sleep -Milliseconds 400
+    $saved = Get-Content $tempConfig -Raw | ConvertFrom-Json
+    Check 'cooldown persisted' ($saved.cooldown_seconds -eq 25) "got $($saved.cooldown_seconds)"
+    Check 'the dashboard position is not persisted' ($null -eq $saved.ui_position) "got $($saved.ui_position)"
+
+    # ---- 15. install / remove a pack, strictly inside the build folder ----
+    # packs_root = the first search dir that has a "packs" folder. Creating it beside the test exe
+    # guarantees install/remove can never touch the repository (that mistake deleted a repo pack
+    # once; the check below guards it).
+    $script:buildPacksExisted = Test-Path -LiteralPath $buildPacks
+    New-Item -ItemType Directory -Force -Path $buildPacks | Out-Null
+    $packSource = (Resolve-Path (Join-Path $PSScriptRoot '..\packs\rainmeter\pack.json')).Path
+    $installedDir = Join-Path $buildPacks 'rainmeter'
+    # remove_pack deletes the whole pack folder, so a pack that was already in the build folder
+    # before this run would be gone for good. Park it and put it back in the finally block.
+    if (Test-Path -LiteralPath $installedDir) {
+        $script:parkedPack = Join-Path $configDir 'parked-rainmeter'
+        Move-Item -LiteralPath $installedDir -Destination $script:parkedPack -Force
+    }
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($packSource.Replace('\','\\'))`"}" 'pack_op'
+    Check 'install reports success' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'install copied the pack into the build folder' (Test-Path (Join-Path $installedDir 'pack.json')) "expected $installedDir"
+    Check 'install did not touch the repo' (Test-Path $packSource) "missing: $packSource"
+    $op = Send-And-Wait '{"type":"remove_pack","id":"rainmeter"}' 'pack_op'
+    Check 'remove reports success' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'remove deleted the build copy' (-not (Test-Path $installedDir)) "still there: $installedDir"
+    Check 'the repo copy still exists after remove' (Test-Path $packSource) "missing: $packSource"
+
+    # ---- 16. pause is remembered across a restart (and the engine starts frozen) ----
+    Send-Pipe '{"type":"set_paused","paused":true}' | Out-Null
+    Start-Sleep -Milliseconds 300
+    $daemon | Stop-Process -Force
+    Start-Sleep -Seconds 1
+    $daemon = Start-Process $Exe -PassThru -WindowStyle Hidden
+    $s = $null
+    for ($i = 0; $i -lt 40 -and -not $s; $i++) { Start-Sleep -Milliseconds 250; $s = Status }
+    Check 'restarted instance answers' ($null -ne $s)
+    Check 'paused survives a restart' ($s.paused) "paused=$($s.paused)"
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p5 = Start-Tracked 'C:\Windows\System32\timeout.exe' '20'
+    Start-Sleep -Seconds 2
+    $s = Status
+    Check 'a paused restart does not apply on start' ($s.state -eq 'idle') "state=$($s.state)"
+    $p5 | Stop-Process -Force
+    Send-Pipe '{"type":"set_paused","paused":false}' | Out-Null
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+
+    # ---- 17. a duplicate start leaves the first instance alone ----
+    $second = Start-Process $Exe -ArgumentList '--autostart' -PassThru -WindowStyle Hidden
+    $exited = $second.WaitForExit(5000)
+    Check 'a duplicate start exits by itself' $exited "still running after 5 s"
+    Check 'the first instance is still up' (-not $daemon.HasExited)
+    $realConfigAfter = Get-FileSha $realConfig
+    Check 'the real config was not touched at all' ($realConfigAfter -eq $script:realConfigBefore) "before=$($script:realConfigBefore) after=$realConfigAfter"
+
+    # ---- 18. rapid open/close churn must not leave a phantom state ----
+    Send-Pipe '{"type":"set_paused","paused":false}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    for ($i = 0; $i -lt 5; $i++) {
+        $q = Start-Tracked 'C:\Windows\System32\timeout.exe' '20'
+        Start-Sleep -Milliseconds 700
+        $q | Stop-Process -Force
+        Start-Sleep -Milliseconds 400
+    }
+    # after the last close the intent is gone: the packs revert as soon as a change is allowed
+    # and the daemon ends up idle, once
+    $s = Wait-State 'idle' 25
+    Check 'churn settles back to idle' ($s.state -eq 'idle') "state=$($s.state)"
+    Check 'churn leaves no lockout behind' ($null -eq $s.cooldown_remaining_ms) "remaining=$($s.cooldown_remaining_ms)"
+    # ---- 19. a spec-2 pack: the daemon compiles and runs its script ----
+    $srcDir = Join-Path $env:TEMP "armoury-scriptpack-$ns"
+    New-Item -ItemType Directory -Force -Path $srcDir | Out-Null
+    $scriptPack = @'
+{
+  "spec": 2,
+  "id": "scripttest",
+  "name": "Script test",
+  "version": "1.0.0",
+  "order": 5,
+  "targets": { "process": ["timeout.exe"] },
+  "capture": [ { "key": "was_running", "mechanism": "process_running" } ],
+  "script": {
+    "apply":  "ctx.log(\"script apply ran for \" + ctx.target_name()); ctx.capture(\"note\", \"from the script\");",
+    "revert": "ctx.log(\"script revert ran\");"
+  },
+  "apply": { "steps": [] },
+  "revert": { "guard": { "targetRunning": false, "capturedRunning": true }, "steps": [] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $srcDir 'pack.json'), $scriptPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($srcDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a spec-2 pack installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"set_pack_enabled","id":"scripttest","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p7 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    # the apply starts a lockout, so the state is "cooldown" first and "triggered" after it
+    $s = Wait-State 'triggered' 20
+    Start-Sleep -Milliseconds 800
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the apply script ran' ($logText -match 'script apply ran for timeout.exe') "no script log line"
+    Check 'the apply script finished' ($logText -match 'scripttest: script apply finished')
+    $p7 | Stop-Process -Force
+    $s = Wait-State 'idle' 25
+    Start-Sleep -Milliseconds 500
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the revert script ran' ($logText -match 'script revert ran')
+    Send-Pipe '{"type":"set_pack_enabled","id":"scripttest","enabled":false}' | Out-Null
+    $op = Send-And-Wait '{"type":"remove_pack","id":"scripttest"}' 'pack_op'
+    Check 'the scripted pack removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Remove-Item -Recurse -Force $srcDir -ErrorAction SilentlyContinue
+}
+finally {
+    if ($daemon -and -not $daemon.HasExited) {
+        $daemon | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    # only the processes this harness started - never every timeout.exe on the machine
+    foreach ($child in $script:children) {
+        if (-not $child) { continue }
+        try {
+            if (-not $child.HasExited) { Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue }
+        } catch {
+        }
+    }
+    # put a pack that was already in the build folder back where it was
+    if ($script:parkedPack) {
+        Remove-Item -LiteralPath (Join-Path $buildPacks 'rainmeter') -Recurse -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $script:parkedPack -Destination (Join-Path $buildPacks 'rainmeter') -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
+    # only remove the build-folder packs dir if this run created it
+    if (-not $script:buildPacksExisted) {
+        Remove-Item -Recurse -Force $buildPacks -ErrorAction SilentlyContinue
+    }
+    Remove-Item Env:\ARMOURY_TEST_NS -ErrorAction SilentlyContinue
+}
+
+""
+if ($script:failures -eq 0) {
+    "ALL CHECKS PASSED"
+    exit 0
+}
+"$($script:failures) CHECK(S) FAILED"
+exit 1

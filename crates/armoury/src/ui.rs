@@ -32,6 +32,8 @@ const UI_MARGIN: f32 = 0.0;
 /// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
 /// packs lists as a built-in row with one dropdown.
 const CONSOLE_FEATURE: &str = "Console launcher";
+/// What the SteamGridDB field shows instead of the key: a row of dots.
+const SGDB_MASK: &str = "••••••••••••";
 /// Auto-open modes in dropdown order: (value stored in config.json, label).
 const CONSOLE_OPEN_MODES: [(&str, &str); 3] = [
     (CONSOLE_OPEN_ALWAYS, "Always open"),
@@ -48,7 +50,8 @@ fn console_open_label(mode: &str) -> &'static str {
 }
 
 enum UiEvent {
-    Response(Response),
+    /// Boxed: a response carries a whole status snapshot, which dwarfs the other variant.
+    Response(Box<Response>),
     Eof,
 }
 
@@ -78,6 +81,8 @@ struct Shared {
     /// The size we last asked each child window to take, so content that appears later
     /// (a new pack row, a longer message) can never be clipped.
     settings_size: Option<egui::Vec2>,
+    /// The settings window's viewport, so another window can ask for its repaints.
+    settings_viewport: Option<egui::ViewportId>,
     pack_sizes: HashMap<String, egui::Vec2>,
     /// When each pack window was asked for, so a viewport that never reports its size
     /// still gets placed and shown instead of hanging invisibly.
@@ -107,6 +112,12 @@ struct Shared {
     open_packs: Vec<String>,
     /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
     pack_windows: HashMap<String, (u8, Option<egui::Pos2>)>,
+    /// The child windows in chain order, right to left: the settings window and the pack
+    /// windows, in the order they joined the chain.
+    chain: Vec<ChainItem>,
+    /// Where each chain window is expected and how far it got there: the same state machine
+    /// the dashboard uses, so a window we moved ourselves is not read as dragged.
+    chain_place: HashMap<ChainItem, Placement>,
 }
 
 pub fn run() {
@@ -114,6 +125,10 @@ pub fn run() {
         eprintln!("logging init failed: {e}");
     }
     log::info!("ui starting (v{})", armoury_core::VERSION);
+    if let Some(code) = crate::dpi_error() {
+        // The DPI switch failed before the logger existed; now it can be said.
+        log::info!("DPI awareness was not set (error {code}): the process may already be aware");
+    }
 
     // ---- connect to the daemon (retry briefly: the daemon just spawned us) ----
     let pipe_name = armoury_core::pipe_name();
@@ -159,7 +174,7 @@ pub fn run() {
         loop {
             match read_msg::<_, Response>(&mut reader, &mut line) {
                 Ok(Some(resp)) => {
-                    if tx.send(UiEvent::Response(resp)).is_err() {
+                    if tx.send(UiEvent::Response(Box::new(resp))).is_err() {
                         break;
                     }
                 }
@@ -180,6 +195,7 @@ pub fn run() {
         monitors: monitor_count(),
         outbox: Some(req_tx),
         pick_tx: Some(pick_tx.clone()),
+        settings_viewport: Some(settings_viewport_id()),
         ..Default::default()
     }));
 
@@ -216,6 +232,8 @@ pub fn run() {
                 pick_tx,
                 pick_rx,
                 req_rx,
+                // Nothing is restored: the dashboard always opens in the corner.
+                start_anchor(),
             ));
             Ok(app)
         }),
@@ -242,12 +260,10 @@ struct App {
     /// Where the dashboard's top-left is anchored. `None` = the automatic bottom corner; `Some`
     /// once the user dragged it away, so it grows downwards from there for the rest of the run.
     anchor: Option<egui::Pos2>,
-    /// The position this window last asked for. A window that sits somewhere else was moved by
-    /// the user - not by our own resize, which also changes the position.
-    auto_pos: Option<egui::Pos2>,
-    /// Whether the window has reached the position we asked for at least once. Only then can a
-    /// deviation be read as the user dragging it.
-    settled: bool,
+    /// The position this window asked for and how far it got there. A window that sits
+    /// somewhere else was moved by the user - not by our own resize, which also changes the
+    /// position.
+    placement: Placement,
     /// Last position the daemon was told about (avoid a request every frame).
     last_sent_pos: Option<egui::Pos2>,
     /// When the window last moved, so the position is only saved after it settles.
@@ -262,6 +278,7 @@ impl App {
         pick_tx: crossbeam_channel::Sender<Picked>,
         pick_rx: Receiver<Picked>,
         req_rx: Receiver<Request>,
+        anchor: Option<egui::Pos2>,
     ) -> Self {
         Self {
             rx,
@@ -275,9 +292,9 @@ impl App {
             pick_query: String::new(),
             styled: false,
             last_desired: None,
-            anchor: None,
-            auto_pos: None,
-            settled: false,
+            // `None` = the automatic bottom corner; `Some` once the user dragged it away.
+            anchor,
+            placement: Placement::default(),
             last_sent_pos: None,
             still_since: Instant::now(),
         }
@@ -324,35 +341,37 @@ impl eframe::App for App {
 
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
-                UiEvent::Response(Response::HelloAck {
-                    daemon_version,
-                    status,
-                }) => {
-                    let mut s = self.shared.lock().unwrap();
-                    s.daemon_version = daemon_version;
-                    s.status = Some(status);
-                    s.connected = true;
-                }
-                UiEvent::Response(Response::Status { status }) => {
-                    let mut s = self.shared.lock().unwrap();
-                    s.status = Some(status);
-                    s.connected = true;
-                }
-                UiEvent::Response(Response::Focus) => {
-                    log::info!("focus requested by daemon");
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                UiEvent::Response(Response::PackOp { ok, message }) => {
-                    log::info!("pack op result: {message}");
-                    let mut s = self.shared.lock().unwrap();
-                    s.last_pack_op = Some((ok, message));
-                    s.catalog_installing = None;
-                }
-                UiEvent::Response(Response::ConsoleOp { ok, message }) => {
-                    log::info!("console op result: {message}");
-                    let mut s = self.shared.lock().unwrap();
-                    s.last_console_op = Some((ok, message));
-                }
+                UiEvent::Response(resp) => match *resp {
+                    Response::HelloAck {
+                        daemon_version,
+                        status,
+                    } => {
+                        let mut s = self.shared.lock().unwrap();
+                        s.daemon_version = daemon_version;
+                        s.status = Some(status);
+                        s.connected = true;
+                    }
+                    Response::Status { status } => {
+                        let mut s = self.shared.lock().unwrap();
+                        s.status = Some(status);
+                        s.connected = true;
+                    }
+                    Response::Focus => {
+                        log::info!("focus requested by daemon");
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    Response::PackOp { ok, message } => {
+                        log::info!("pack op result: {message}");
+                        let mut s = self.shared.lock().unwrap();
+                        s.last_pack_op = Some((ok, message));
+                        s.catalog_installing = None;
+                    }
+                    Response::ConsoleOp { ok, message } => {
+                        log::info!("console op result: {message}");
+                        let mut s = self.shared.lock().unwrap();
+                        s.last_console_op = Some((ok, message));
+                    }
+                },
                 UiEvent::Eof => {
                     log::info!("daemon went away — exiting");
                     std::process::exit(0);
@@ -423,18 +442,21 @@ impl eframe::App for App {
             self.apps = list_running_apps();
         }
 
-        // Keep the window live: pipe updates arrive at ~1 Hz. While a child window is open the
-        // cadence is faster so typing in the settings boxes never feels laggy (feedback
-        // 2026-10-17: a digit took ~2 s to vanish because the child only repainted on the 1 s tick).
-        let child_open = {
+        // Keep the window live: pipe updates arrive at ~1 Hz, so the dashboard repaints once
+        // a second. The settings window needs a faster beat while it is open, so typing in
+        // its boxes never feels laggy (feedback 2026-10-17: a digit took ~2 s to vanish
+        // because the child only repainted on the 1 s tick). A repaint request only ever
+        // covers the viewport it is made for, so the fast beat is asked for the settings
+        // window by id - asking for it here would only redraw the dashboard 6.7 times a
+        // second.
+        ctx.request_repaint_after(Duration::from_secs(1));
+        let (settings_open, settings_viewport) = {
             let s = self.shared.lock().unwrap();
-            s.settings_open || !s.open_packs.is_empty()
+            (s.settings_open, s.settings_viewport)
         };
-        ctx.request_repaint_after(if child_open {
-            Duration::from_millis(150)
-        } else {
-            Duration::from_secs(1)
-        });
+        if settings_open && let Some(id) = settings_viewport {
+            ctx.request_repaint_after_for(Duration::from_millis(150), id);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -475,15 +497,11 @@ impl eframe::App for App {
                         Color32::from_rgb(251, 191, 36),
                     ),
                     RunState::Cooldown => (
-                        match (st.cooldown_action.as_deref(), st.cooldown_remaining_ms) {
-                            (Some("apply"), Some(ms)) => {
-                                format!("Cooldown — applying in {}s", ms / 1000)
-                            }
-                            (Some("revert"), Some(ms)) => {
-                                format!("Cooldown — reverting in {}s", ms / 1000)
-                            }
-                            (_, Some(ms)) => format!("Cooldown — {}s left", ms / 1000),
-                            _ => "Cooldown".to_string(),
+                        // The cooldown is the settling window after a change, not a pending
+                        // revert: the number is what is left to settle.
+                        match st.cooldown_remaining_ms {
+                            Some(ms) => format!("Cooling down — {}s", ms / 1000),
+                            None => "Cooling down".to_string(),
                         },
                         Color32::from_rgb(96, 165, 250),
                     ),
@@ -581,7 +599,7 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if icon_button(ui, 22.0, draw_close).clicked() {
                         // Core X: close every window and unload the GUI.
-                        self.shared.lock().unwrap().settings_open = false;
+                        close_settings(&mut self.shared.lock().unwrap());
                         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                     }
                     ui.add_space(6.0);
@@ -596,7 +614,11 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     if icon_button(ui, 22.0, draw_gear).clicked() {
                         let mut s = self.shared.lock().unwrap();
-                        s.settings_open = !settings_open;
+                        if settings_open {
+                            close_settings(&mut s);
+                        } else {
+                            s.settings_open = true;
+                        }
                         if s.settings_open {
                             // a fresh window: forget the previous install/remove message and
                             // seed the number boxes from what the daemon reports right now
@@ -610,11 +632,9 @@ impl eframe::App for App {
                             };
                             s.cooldown_text = cooldown_text;
                             s.failsafe_text = failsafe_text;
-                            s.sgdb_text = s
-                                .status
-                                .as_ref()
-                                .map(|st| st.sgdb_api_key.clone())
-                                .unwrap_or_default();
+                            // The daemon never sends the key: the field starts empty and only
+                            // shows a mask while a key is set.
+                            s.sgdb_text.clear();
                             s.settings_stage = 0;
                             s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
                         }
@@ -652,6 +672,23 @@ impl eframe::App for App {
                     ui.label(RichText::new(&status_text).strong().size(17.0));
                 }
             });
+            if paused {
+                // The packs are off on purpose. Say so in a band of its own: a pause must
+                // never be mistaken for a pack that does not work.
+                ui.add_space(6.0);
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(58, 32, 24))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(251, 191, 36)))
+                    .corner_radius(4.0)
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .show(ui, |ui| {
+                        ui.label(
+                            RichText::new("Paused — the packs will not switch. Press Start.")
+                                .strong()
+                                .color(Color32::from_rgb(253, 224, 71)),
+                        );
+                    });
+            }
             ui.add_space(8.0);
             for (key, value) in &rows {
                 row(ui, key, value);
@@ -854,12 +891,19 @@ impl eframe::App for App {
                         }
                     }
                     if pack.applied {
-                        ui.small("· applied");
+                        ui.small(APPLIED_MARKER);
+                    }
+                    // The row shows one setting; the pack window has them all.
+                    if let Some(extra) = extra_settings(pack.settings.len()) {
+                        ui.small(RichText::new(extra).weak())
+                            .on_hover_text("More settings - open the pack's own window");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if let Some(setting) = pack.settings.first() {
                             let current = setting.value.clone().unwrap_or_default();
-                            egui::ComboBox::from_id_salt(format!("pack-{}", setting.key))
+                            // The pack id belongs in the salt: two packs can have a setting
+                            // with the same key, and one id would make them share a widget.
+                            egui::ComboBox::from_id_salt(format!("pack-{}-{}", pack.id, setting.key))
                                 .selected_text(current.clone())
                                 .width(130.0)
                                 .show_ui(ui, |ui| {
@@ -891,14 +935,20 @@ impl eframe::App for App {
         let title_font = FontId::new(17.0, FontFamily::Proportional);
         let status_font = FontId::new(17.0, FontFamily::Proportional);
         let body_font = TextStyle::Body.resolve(ui.style());
+        let small_font = TextStyle::Small.resolve(ui.style());
+        let probe = width_probe(&status_text, &rows, &packs);
         let desired = {
             let p = ui.painter();
-            let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
-            let mut w = tw(&title_font, "ArmouryDaemon") + 72.0; // room for gear + close
-            w = w.max(tw(&status_font, &status_text) + 26.0);
-            for (k, v) in &rows {
-                w = w.max(tw(&body_font, k) + 32.0 + tw(&body_font, v));
-            }
+            let measure = |kind: FontKind, text: &str| {
+                let font = match kind {
+                    FontKind::Title => title_font.clone(),
+                    FontKind::Status => status_font.clone(),
+                    FontKind::Body => body_font.clone(),
+                    FontKind::Small => small_font.clone(),
+                };
+                p.layout_no_wrap(text.to_owned(), font, Color32::WHITE).rect.width()
+            };
+            let w = probe_width(&measure, &probe);
             egui::vec2(
                 (w + 2.0 * PAD_F + 8.0).max(MIN_WINDOW_WIDTH),
                 (ui.min_rect().height() + 4.0).max(150.0),
@@ -913,30 +963,39 @@ impl eframe::App for App {
             // because it is positioned from this window's rect (see `settings_ui`).
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
             // A window the user placed grows downwards from its top-left; the automatic one stays
-            // pinned to the bottom corner.
+            // pinned to the bottom corner: the position is computed from the new size, so the
+            // corner stays glued to the corner of the work area.
             let pos = self.anchor.unwrap_or_else(|| bottom_corner(ctx, desired));
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             self.last_desired = Some(desired);
-            self.auto_pos = Some(pos);
+            // The position we just asked for: the window is somewhere else until the OS
+            // applies it, and that gap is not the user moving the window.
+            self.placement.request(pos);
         }
 
         if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
-            self.shared.lock().unwrap().core_rect = Some(outer);
+            {
+                let mut s = self.shared.lock().unwrap();
+                if s.core_rect != Some(outer) {
+                    s.core_rect = Some(outer);
+                    // The dashboard moved or resized: the chain of child windows follows it.
+                    reanchor(ctx, &mut s, outer);
+                }
+            }
             let pos = outer.min;
             match self.anchor {
                 None => {
                     // Only a move away from the position we asked for counts as the user
-                    // dragging it. Our own resize moves the window too, so the window has to
-                    // have reached that position first.
-                    let ours = self
-                        .auto_pos
-                        .unwrap_or_else(|| bottom_corner(ctx, self.last_desired.unwrap_or(desired)));
-                    if (pos - ours).length() <= 4.0 {
-                        self.settled = true;
-                    } else if self.settled {
-                        // The user dragged it away from the automatic corner: anchor it there.
-                        self.anchor = Some(pos);
-                        self.still_since = Instant::now();
+                    // dragging it. Our own resize moves the window too, and the OS applies it
+                    // a moment later, so the window has to stay away before it counts.
+                    let pinned = (outer.max - work_area(ctx).max).length() <= DRAG_SLACK;
+                    match classify(&mut self.placement, pos, pinned, Instant::now()) {
+                        Spot::Home | Spot::Away => {}
+                        Spot::Dragged(at) => {
+                            // The user dragged it away from the automatic corner: anchor it there.
+                            self.anchor = Some(at);
+                            self.still_since = Instant::now();
+                        }
                     }
                 }
                 Some(prev) => {
@@ -958,7 +1017,7 @@ impl eframe::App for App {
         if settings_open {
             let shared = self.shared.clone();
             ctx.show_viewport_deferred(
-                egui::ViewportId::from_hash_of(SETTINGS_VIEWPORT),
+                settings_viewport_id(),
                 egui::ViewportBuilder::default()
                     .with_title("Settings")
                     .with_decorations(false)
@@ -974,7 +1033,7 @@ impl eframe::App for App {
             let shared = self.shared.clone();
             let id = pack_id.clone();
             ctx.show_viewport_deferred(
-                egui::ViewportId::from_hash_of(format!("armoury-pack-{pack_id}")),
+                pack_viewport_id(pack_id),
                 egui::ViewportBuilder::default()
                     .with_title(format!("Pack: {pack_id}"))
                     .with_decorations(false)
@@ -989,26 +1048,47 @@ impl eframe::App for App {
 
 /// Raise a request from a child viewport (drained by the root App's logic()).
 fn send_request(shared: &Arc<Mutex<Shared>>, req: &Request) {
-    if let Ok(s) = shared.lock() {
-        if let Some(tx) = &s.outbox {
-            let _ = tx.send(req.clone());
-        }
+    if let Ok(s) = shared.lock()
+        && let Some(tx) = &s.outbox
+    {
+        let _ = tx.send(req.clone());
     }
 }
 
 /// Bottom-aligned to the left of an anchor edge; `anchor_left` is the left edge of the leftmost
 /// window we already have on screen (the dashboard when nothing else is open).
 fn place_left(ctx: &egui::Context, anchor_left: f32, core: Rect, size: egui::Vec2) -> egui::Pos2 {
-    let gap = 8.0;
-    let x = anchor_left - gap - size.x;
-    let mut y = core.bottom() - size.y;
-    if let Some((left, top, _right, bottom)) = work_area_pts(ctx) {
-        let margin = 6.0;
-        let x = x.max(left + margin);
-        y = y.max(top + margin).min(bottom - size.y - margin);
-        return egui::pos2(x, y);
+    match work_area_pts(ctx) {
+        Some((left, top, right, bottom)) => place_left_in(
+            Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom)),
+            anchor_left,
+            core,
+            size,
+        ),
+        None => egui::pos2(anchor_left - 8.0 - size.x, core.bottom() - size.y),
     }
+}
+
+/// The chain: the new window goes immediately to the left of `anchor_left`, bottom-aligned to
+/// the dashboard, and is clamped to the work area so it never lands off-screen.
+fn place_left_in(work: Rect, anchor_left: f32, core: Rect, size: egui::Vec2) -> egui::Pos2 {
+    let gap = 8.0;
+    let margin = 6.0;
+    let x = (anchor_left - gap - size.x).max(work.left() + margin);
+    let y = (core.bottom() - size.y)
+        .max(work.top() + margin)
+        .min(work.bottom() - size.y - margin);
     egui::pos2(x, y)
+}
+
+/// Clamp a window's top-left corner, so the window stays inside the work area.
+fn clamp_to_work_area(pos: egui::Pos2, work: Rect, size: egui::Vec2) -> egui::Pos2 {
+    let max_x = (work.right() - size.x).max(work.left());
+    let max_y = (work.bottom() - size.y).max(work.top());
+    egui::pos2(
+        pos.x.clamp(work.left(), max_x),
+        pos.y.clamp(work.top(), max_y),
+    )
 }
 
 /// Actual rect (logical points) of one of our own child windows, straight from the OS.
@@ -1028,26 +1108,171 @@ fn window_rect_pts(ctx: &egui::Context, title: &str) -> Option<Rect> {
     ))
 }
 
+/// Left edge of the leftmost pack window already on screen (stage >= 2), other than `skip`.
+fn leftmost_pack_edge(ctx: &egui::Context, s: &Shared, skip: Option<&str>) -> Option<f32> {
+    let mut left: Option<f32> = None;
+    for (id, (stage, _)) in s.pack_windows.iter() {
+        if Some(id.as_str()) == skip || *stage < 2 {
+            continue;
+        }
+        if let Some(rect) = window_rect_pts(ctx, &format!("Pack: {id}")) {
+            left = Some(left.map_or(rect.left(), |l| l.min(rect.left())));
+        }
+    }
+    left
+}
+
+/// The chain: the dashboard sits in the bottom-right corner and every other window is placed to
+/// its left. The anchor is the left edge of the leftmost window already on screen, so a new
+/// window always lands immediately to the left of its neighbour.
+fn chain_anchor(core: Rect, others: &[f32]) -> f32 {
+    others.iter().fold(core.left(), |a, l| a.min(*l))
+}
+
+/// One window in the chain: the settings window or a pack's own window.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ChainItem {
+    Settings,
+    Pack(String),
+}
+
+/// The viewport a chain window lives in.
+fn chain_viewport(item: &ChainItem) -> egui::ViewportId {
+    match item {
+        ChainItem::Settings => settings_viewport_id(),
+        ChainItem::Pack(id) => pack_viewport_id(id),
+    }
+}
+
+/// The viewport a pack window lives in.
+fn pack_viewport_id(id: &str) -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(format!("armoury-pack-{id}"))
+}
+
+/// One window in the chain, as the re-anchor sees it.
+#[derive(Clone)]
+struct ChainWindow {
+    item: ChainItem,
+    /// The window's size.
+    size: egui::Vec2,
+    /// Where the window is now.
+    current: egui::Pos2,
+    /// The user dragged the window: it keeps its place.
+    dragged: bool,
+}
+
+/// The chain rule: every window goes immediately left of the one to its right, bottom-aligned
+/// to the dashboard and clamped to the work area. A window the user dragged keeps its place
+/// and still anchors the window to its left. The order of `windows` (right to left) is kept.
+fn reanchor_chain(work: Rect, core: Rect, windows: &[ChainWindow]) -> Vec<(ChainItem, egui::Pos2)> {
+    let mut out = Vec::with_capacity(windows.len());
+    let mut edges: Vec<f32> = Vec::with_capacity(windows.len());
+    for w in windows {
+        let pos = if w.dragged {
+            w.current
+        } else {
+            place_left_in(work, chain_anchor(core, &edges), core, w.size)
+        };
+        edges.push(pos.x);
+        out.push((w.item.clone(), pos));
+    }
+    out
+}
+
+/// The dashboard's rect changed: re-anchor the chain. Every window that still sits in its slot
+/// is placed again, immediately left of the one to its right; a window the user dragged keeps
+/// its place. Called with the `Shared` lock already held by the caller.
+fn reanchor(ctx: &egui::Context, s: &mut Shared, core: Rect) {
+    let Some((left, top, right, bottom)) = work_area_pts(ctx) else {
+        return;
+    };
+    let work = Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom));
+    let now = Instant::now();
+    let mut windows: Vec<ChainWindow> = Vec::new();
+    for item in s.chain.clone() {
+        let (size, title) = match &item {
+            ChainItem::Settings => (s.settings_size, "Settings".to_string()),
+            ChainItem::Pack(id) => (s.pack_sizes.get(id).copied(), format!("Pack: {id}")),
+        };
+        let Some(size) = size else {
+            continue;
+        };
+        let Some(slot) = s.chain_place.get(&item).and_then(|p| p.requested) else {
+            continue;
+        };
+        // Where the window is now, straight from the OS.
+        let real = window_rect_pts(ctx, &title).map(|r| r.min);
+        // Our own move is not a drag: `classify` tells the two apart.
+        let place = s.chain_place.entry(item.clone()).or_default();
+        let (dragged, current) = match real {
+            Some(p) => (
+                matches!(classify(place, p, false, now), Spot::Dragged(_)),
+                p,
+            ),
+            None => (false, slot),
+        };
+        windows.push(ChainWindow {
+            item,
+            size,
+            current,
+            dragged,
+        });
+    }
+    for (w, (item, pos)) in windows.iter().zip(reanchor_chain(work, core, &windows)) {
+        if w.dragged {
+            // The user owns this window: it keeps its place and its slot stays where it is.
+            continue;
+        }
+        // The window is already where the chain wants it: leave it alone, so the state that
+        // tells our own move from the user's drag is not reset over and over.
+        let placed = s.chain_place.get(&item).and_then(|p| p.requested);
+        if placed.is_some_and(|slot| (slot - pos).length() <= 0.5) {
+            continue;
+        }
+        // The slot follows the window, so the next re-anchor knows where it is.
+        s.chain_place.entry(item.clone()).or_default().request(pos);
+        match &item {
+            ChainItem::Settings => s.settings_target = Some(pos),
+            ChainItem::Pack(id) => {
+                if let Some((stage, _)) = s.pack_windows.get(id).copied() {
+                    s.pack_windows.insert(id.clone(), (stage, Some(pos)));
+                }
+            }
+        }
+        ctx.send_viewport_cmd_to(chain_viewport(&item), egui::ViewportCommand::OuterPosition(pos));
+    }
+}
+
+/// The settings window closed: it leaves the chain.
+fn close_settings(s: &mut Shared) {
+    s.settings_open = false;
+    s.chain.retain(|c| *c != ChainItem::Settings);
+    s.chain_place.remove(&ChainItem::Settings);
+}
+
 /// Left edge of the leftmost window already on screen among the settings window and the pack
 /// windows that have been placed (stage >= 2). A new pack window is placed against this edge, so
 /// it always lands next to its neighbour — even when the user has dragged one somewhere else.
 /// Called with the `Shared` lock already held by the caller.
 fn leftmost_edge(ctx: &egui::Context, s: &Shared, skip: &str, core: Rect) -> f32 {
-    let mut anchor = core.left();
-    if s.settings_open && s.settings_stage >= 2 {
-        if let Some(rect) = window_rect_pts(ctx, "Settings") {
-            anchor = anchor.min(rect.left());
-        }
+    let mut edges: Vec<f32> = Vec::new();
+    if s.settings_open && s.settings_stage >= 2
+        && let Some(rect) = window_rect_pts(ctx, "Settings")
+    {
+        edges.push(rect.left());
     }
-    for (other, (stage, _)) in s.pack_windows.iter() {
-        if other == skip || *stage < 2 {
-            continue;
-        }
-        if let Some(rect) = window_rect_pts(ctx, &format!("Pack: {other}")) {
-            anchor = anchor.min(rect.left());
-        }
+    if let Some(left) = leftmost_pack_edge(ctx, s, Some(skip)) {
+        edges.push(left);
     }
-    anchor
+    chain_anchor(core, &edges)
+}
+
+/// Left edge of the leftmost window the settings has to clear: the dashboard and the open pack
+/// windows. The settings window itself is left out — it is the one being placed.
+/// Called with the `Shared` lock already held by the caller.
+fn leftmost_edge_to_clear(ctx: &egui::Context, s: &Shared, core: Rect) -> f32 {
+    let edges: Vec<f32> = leftmost_pack_edge(ctx, s, None).into_iter().collect();
+    chain_anchor(core, &edges)
 }
 
 /// One pack's own window: enable toggle + its single dropdown.
@@ -1074,6 +1299,8 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         let mut s = shared.lock().unwrap();
         s.open_packs.retain(|p| p != id);
         s.pack_windows.remove(id);
+        s.chain.retain(|c| *c != ChainItem::Pack(id.to_string()));
+        s.chain_place.remove(&ChainItem::Pack(id.to_string()));
         return;
     };
 
@@ -1153,6 +1380,8 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         let mut s = shared.lock().unwrap();
         s.open_packs.retain(|p| p != id);
         s.pack_windows.remove(id);
+        s.chain.retain(|c| *c != ChainItem::Pack(id.to_string()));
+        s.chain_place.remove(&ChainItem::Pack(id.to_string()));
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         return;
     }
@@ -1184,11 +1413,11 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
     let size_changed = s
         .pack_sizes
         .get(id)
-        .map_or(true, |last| (*last - desired).length() > 0.5);
+        .is_none_or(|last| (*last - desired).length() > 0.5);
     match stored {
         0 => {
             let current = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
-            let settled = current.map_or(false, |c| (c - desired).length() <= 0.5);
+            let settled = current.is_some_and(|c| (c - desired).length() <= 0.5);
             // A viewport that never reports a size must not hang the window forever.
             let waited = s
                 .pack_first_seen
@@ -1215,42 +1444,64 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
                 let pos = place_left(ctx, anchor, core, desired);
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 s.pack_windows.insert(id.to_string(), (2, Some(pos)));
+                // The pack joins the chain at its left end: it is the leftmost window.
+                let item = ChainItem::Pack(id.to_string());
+                s.chain.retain(|c| *c != item);
+                s.chain.insert(0, item.clone());
+                s.chain_place.entry(item).or_default().request(pos);
                 log::info!("pack window {id}: placed at {:.0},{:.0}", pos.x, pos.y);
             }
         }
         2 => {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            s.pack_windows.insert(id.to_string(), (3, None));
+            // The position stays in the entry: it is the window's slot in the chain.
+            let pos = s.pack_windows.get(id).and_then(|(_, p)| *p);
+            s.pack_windows.insert(id.to_string(), (3, pos));
             log::info!("pack window {id}: shown");
         }
         _ => {
-            // Up and running: follow the content if it grows, and re-pin when that pushes the
-            // window off the work area (the same rule the settings window uses).
+            // Up and running: follow the content if it grows, and keep the window in its slot
+            // when that pushes it off the work area (the same rule the settings window uses).
+            let target = s.pack_windows.get(id).and_then(|(_, p)| *p);
+            // The user may have dragged the window: the real position wins over the stored one.
+            let pos = window_rect_pts(ctx, &format!("Pack: {id}"))
+                .map(|r| r.min)
+                .or(target);
+            if pos != target {
+                s.pack_windows.insert(id.to_string(), (3, pos));
+            }
             if size_changed {
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
                 s.pack_sizes.insert(id.to_string(), desired);
                 log::info!("pack window {id}: resized to {:.0}x{:.0}", desired.x, desired.y);
-                let target = s.pack_windows.get(id).and_then(|(_, p)| *p);
-                let off_screen = match (target, work_area_pts(ctx)) {
-                    (Some(p), Some((left, top, right, bottom))) => {
-                        p.x < left
-                            || p.y < top
-                            || p.x + desired.x > right
-                            || p.y + desired.y > bottom
+                // The pack window keeps its slot in the chain: re-anchoring it against the
+                // current leftmost window would swap it with a window opened after it. The
+                // position is only clamped into the work area, so the window stays on screen.
+                let work = work_area_pts(ctx).map(|(left, top, right, bottom)| {
+                    Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
+                });
+                let clamped = match (pos, work) {
+                    (Some(p), Some(w))
+                        if p.x < w.left()
+                            || p.y < w.top()
+                            || p.x + desired.x > w.right()
+                            || p.y + desired.y > w.bottom() =>
+                    {
+                        Some(clamp_to_work_area(p, w, desired))
                     }
-                    _ => true,
+                    _ => None,
                 };
-                if off_screen {
-                    if let Some(core) = s.core_rect {
-                        let anchor = leftmost_edge(ctx, &s, id, core);
-                        let pos = place_left(ctx, anchor, core, desired);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                        s.pack_windows.insert(id.to_string(), (3, Some(pos)));
-                    }
+                if let Some(pos) = clamped {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    s.pack_windows.insert(id.to_string(), (3, Some(pos)));
                 }
             }
         }
     }
+    // Keep the window live: the daemon changes the pack state on its own schedule, so the
+    // "· applied" marker, the "Applied right now." line and the version bubble have to be
+    // refreshed. Without this the window only redraws when the OS sends it an input event.
+    ctx.request_repaint_after(Duration::from_secs(1));
 }
 
 fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
@@ -1279,15 +1530,10 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     "Triggered ({})",
                     st.trigger_source.as_deref().unwrap_or("?")
                 ),
-                RunState::Cooldown => format!(
-                    "Cooldown ({})",
-                    match (st.cooldown_action.as_deref(), st.cooldown_remaining_ms) {
-                        (Some("apply"), Some(ms)) => format!("applying in {}s", ms / 1000),
-                        (Some("revert"), Some(ms)) => format!("reverting in {}s", ms / 1000),
-                        (_, Some(ms)) => format!("{}s left", ms / 1000),
-                        _ => "pending".to_string(),
-                    }
-                ),
+                RunState::Cooldown => match st.cooldown_remaining_ms {
+                    Some(ms) => format!("Cooling down ({}s left)", ms / 1000),
+                    None => "Cooling down".to_string(),
+                },
             }
         });
         (
@@ -1330,7 +1576,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             ui.label(RichText::new("Settings").strong().size(16.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, 20.0, draw_close).clicked() {
-                    shared.lock().unwrap().settings_open = false;
+                    close_settings(&mut shared.lock().unwrap());
                     // The root viewport owns the decision to keep this window alive.
                     ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                 }
@@ -1642,17 +1888,10 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.add_space(6.0);
         ui.label(RichText::new("Console mode").strong());
         ui.add_space(4.0);
-        ui.small(
-            RichText::new("Auto-open is set on the console row under Packs.")
-                .weak(),
-        );
-        ui.add_space(4.0);
         let mut remove_console: Option<String> = None;
         if console_apps.is_empty() {
-            ui.small(
-                RichText::new("No console apps yet — add one from the launcher's \"Add app…\" tile.")
-                    .weak(),
-            );
+            // Short on purpose: a long hint here would set the window's width.
+            ui.small(RichText::new("No console apps yet.").weak());
         } else {
             egui::Grid::new("settings-console-apps")
                 .num_columns(2)
@@ -1702,31 +1941,27 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.add_space(6.0);
         ui.label(RichText::new("SteamGridDB").strong());
         ui.add_space(4.0);
-        ui.small(
-            RichText::new(
-                "Cover and hero art for games Steam doesn't know (steamgriddb.com API key).",
+        let (sgdb_set, sgdb_hint) = {
+            let s = shared.lock().unwrap();
+            (
+                s.status.as_ref().is_some_and(|st| st.sgdb_api_key_set),
+                sgdb_field_hint(s.status.as_ref()),
             )
-            .weak(),
-        );
-        ui.add_space(4.0);
-        let sgdb_set = shared
-            .lock()
-            .unwrap()
-            .status
-            .as_ref()
-            .map_or(false, |st| st.sgdb_api_key_set);
+        };
         let mut sgdb_text = shared.lock().unwrap().sgdb_text.clone();
         let mut save_sgdb = false;
+        let mut clear_sgdb = false;
         ui.horizontal(|ui| {
             let spacing = ui.spacing().item_spacing.x;
             let save_w = 52.0;
             // The key is masked, so the field stays narrow and does not stretch the window.
             let field_w = 190.0_f32.min((ui.available_width() - save_w - spacing).max(120.0));
-            // Masked: the key is never shown in the clear.
+            // Masked: the key is never shown in the clear. The daemon does not send it
+            // either, so the field only ever holds a key the user is typing right now.
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut sgdb_text)
                     .password(true)
-                    .hint_text("paste your API key…")
+                    .hint_text(sgdb_hint)
                     .desired_width(field_w),
             );
             save_sgdb = ui
@@ -1734,19 +1969,32 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     [save_w, ui.spacing().interact_size.y],
                     egui::Button::new("Save"),
                 )
-                .on_hover_text("Save this key (empty clears it)")
+                .on_hover_text("Save this key")
                 .clicked();
             save_sgdb |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if sgdb_set {
+                clear_sgdb = ui
+                    .add_sized(
+                        [save_w, ui.spacing().interact_size.y],
+                        egui::Button::new("Clear"),
+                    )
+                    .on_hover_text("Remove the saved key")
+                    .clicked();
+            }
         });
         // Keep the in-progress text so a repaint (or another window taking focus) keeps it.
         shared.lock().unwrap().sgdb_text = sgdb_text.clone();
-        if save_sgdb {
-            send_request(shared, &Request::SetSgdbKey { key: sgdb_text });
+        if save_sgdb && !sgdb_text.is_empty() {
+            send_request(shared, &Request::SetSgdbKey { key: sgdb_text.clone() });
+            // The key is never shown again: the field goes back to the mask.
+            shared.lock().unwrap().sgdb_text.clear();
+            ui.ctx().request_repaint();
+        } else if clear_sgdb {
+            send_request(shared, &Request::SetSgdbKey { key: String::new() });
+            shared.lock().unwrap().sgdb_text.clear();
             ui.ctx().request_repaint();
         }
-        if !sgdb_set {
-            ui.small(RichText::new("No key set.").weak());
-        }
+        ui.small(RichText::new(if sgdb_set { "Key set." } else { "No key set." }).weak());
 
         // ---- logs + config ----
         ui.add_space(8.0);
@@ -1772,6 +2020,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let body_font = TextStyle::Body.resolve(ui.style());
     let small_font = TextStyle::Small.resolve(ui.style());
     let button_font = TextStyle::Button.resolve(ui.style());
+    // The core (dashboard) window publishes its rect; the settings window takes its width
+    // from it, so the two are exactly as wide as each other.
+    let core_width = shared.lock().unwrap().core_rect.map(|r| r.width());
     let desired = {
         let p = ui.painter();
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
@@ -1787,13 +2038,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut w = tw(&title_font, "Settings") + 24.0 + 20.0;
         // Helper lines are drawn with `ui.small(...)`: measuring them at the body font (as this
         // used to) inflated the window by ~30%. Measure each string at the font it is drawn in.
-        for text in [
-            "Auto-open is set on the console row under Packs.",
-            "Cover and hero art for games Steam doesn't know (steamgriddb.com API key).",
-            "No console apps yet — add one from the launcher's \"Add app…\" tile.",
-            "Applies when a tracked app starts.",
-            "No key set.",
-        ] {
+        for text in ["No console apps yet.", "No key set."] {
             w = w.max(tw(&small_font, text));
         }
         for text in ["Leave idle after", "Revert after", "Idle failsafe"] {
@@ -1806,6 +2051,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ] {
             w = w.max(tw(&button_font, a) + 24.0 + tw(&button_font, b) + 24.0 + 8.0);
         }
+        // The SteamGridDB row: the masked field, Save and Clear.
+        w = w.max(190.0 + 52.0 + 52.0 + 24.0);
         // The built-in console row: name + "(built-in)" + its 120 pt dropdown.
         w = w.max(
             tw(&body_font, CONSOLE_FEATURE) + 10.0 + tw(&small_font, "(built-in)") + 10.0 + 120.0,
@@ -1819,22 +2066,25 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         for (key, value) in &rows {
             w = w.max(tw(&body_font, key)).max(tw(&body_font, value));
         }
+        // The content width is only a fallback (the first frame, before the core has
+        // published its width): it never makes the window wider than the core.
+        let content = snug_width(w, work_area_pts(ui.ctx()).map(|(left, _, right, _)| right - left));
         egui::vec2(
-            snug_width(w, work_area_pts(ui.ctx()).map(|(left, _, right, _)| right - left)),
+            core_width.map_or(content, |cw| cw.max(MIN_SETTINGS_WIDTH)),
             (ui.min_rect().height() + 4.0).max(170.0),
         )
     };
 
     let ctx = ui.ctx();
     let mut s = shared.lock().unwrap();
-    let expired = s.settings_deadline.map_or(true, |d| Instant::now() > d);
+    let expired = s.settings_deadline.is_none_or(|d| Instant::now() > d);
     let size_changed = s
         .settings_size
-        .map_or(true, |last| (last - desired).length() > 0.5);
+        .is_none_or(|last| (last - desired).length() > 0.5);
     match s.settings_stage {
         0 => {
             let cur = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
-            let settled = cur.map_or(false, |c| (c - desired).length() <= 0.5);
+            let settled = cur.is_some_and(|c| (c - desired).length() <= 0.5);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
             s.settings_size = Some(desired);
             if settled || expired {
@@ -1842,9 +2092,27 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             }
         }
         1 => {
-            let pos = bottom_right(work_area(ctx), desired, UI_MARGIN);
+            // The settings window is too big and can't sit on top of the main window, so it
+            // joins the same leftward chain as the pack windows: immediately left of the
+            // current leftmost window, bottom-aligned to the dashboard. Never above it.
+            let pos = match s.core_rect {
+                Some(core) => {
+                    let anchor = leftmost_edge_to_clear(ctx, &s, core);
+                    place_left(ctx, anchor, core, desired)
+                }
+                // No dashboard yet (the settings is opened from the dashboard, so this is a
+                // corner case): the work area's bottom-right corner.
+                None => bottom_right(work_area(ctx), desired, UI_MARGIN),
+            };
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
             s.settings_target = Some(pos);
+            // The settings joins the chain at its left end: it clears the pack windows.
+            s.chain.retain(|c| *c != ChainItem::Settings);
+            s.chain.insert(0, ChainItem::Settings);
+            s.chain_place
+                .entry(ChainItem::Settings)
+                .or_default()
+                .request(pos);
             s.settings_stage = 2;
         }
         2 => {
@@ -1868,21 +2136,34 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         _ => {
             // The window is up. It stays where the user put it, EXCEPT when the content has
             // grown: then it has to grow too, or the new rows are clipped out of sight.
+            let target = s.settings_target;
+            // The user may have dragged the window: the real position wins over the stored one.
+            let pos = window_rect_pts(ctx, "Settings").map(|r| r.min).or(target);
+            if pos != target {
+                s.settings_target = pos;
+            }
             if size_changed {
                 log::info!("settings window resized ({:.0}x{:.0})", desired.x, desired.y);
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
                 s.settings_size = Some(desired);
-                let off_screen = match (s.settings_target, work_area_pts(ctx)) {
-                    (Some(p), Some((left, top, right, bottom))) => {
-                        p.x < left
-                            || p.y < top
-                            || p.x + desired.x > right
-                            || p.y + desired.y > bottom
+                let work = work_area_pts(ctx).map(|(left, top, right, bottom)| {
+                    Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
+                });
+                // The settings window keeps its slot in the chain: re-anchoring it against the
+                // current leftmost window would swap it with a pack window opened after it.
+                // The stored position is only clamped, so the window stays on screen.
+                let clamped = match (pos, work) {
+                    (Some(p), Some(w))
+                        if p.x < w.left()
+                            || p.y < w.top()
+                            || p.x + desired.x > w.right()
+                            || p.y + desired.y > w.bottom() =>
+                    {
+                        Some(clamp_to_work_area(p, w, desired))
                     }
-                    _ => true,
+                    _ => None,
                 };
-                if off_screen {
-                    let pos = bottom_right(work_area(ctx), desired, UI_MARGIN);
+                if let Some(pos) = clamped {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                     s.settings_target = Some(pos);
                 }
@@ -1976,10 +2257,10 @@ fn packs_dir() -> PathBuf {
         if beside.is_dir() {
             return beside;
         }
-        if let Some(repo) = dir.parent().and_then(|d| d.parent()).map(|d| d.join("packs")) {
-            if repo.is_dir() {
-                return repo;
-            }
+        if let Some(repo) = dir.parent().and_then(|d| d.parent()).map(|d| d.join("packs"))
+            && repo.is_dir()
+        {
+            return repo;
         }
         return beside;
     }
@@ -2034,6 +2315,35 @@ fn initial_geometry() -> (egui::Vec2, egui::Pos2) {
     const EST_HEIGHT: f32 = 218.0; // measured height with padding and the four status rows
     let size = egui::vec2(MIN_WINDOW_WIDTH, EST_HEIGHT);
     (size, bottom_right(work_area_rect(), size, UI_MARGIN))
+}
+
+/// The anchor the dashboard starts with: `None` = the automatic bottom corner above the
+/// tray. Nothing is restored from the config, so the window can never come up off-screen.
+fn start_anchor() -> Option<egui::Pos2> {
+    None
+}
+
+/// The settings window's viewport id - the same value `show_viewport_deferred` registers
+/// it under, so another window can ask for its repaints.
+fn settings_viewport_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of(SETTINGS_VIEWPORT)
+}
+
+/// The badge on a dashboard pack row that says how many settings the pack has that the row
+/// does not show: one setting → no badge, two settings → "+1".
+fn extra_settings(count: usize) -> Option<String> {
+    (count > 1).then(|| format!("+{}", count - 1))
+}
+
+/// What the SteamGridDB field shows: the key never leaves the daemon, so a key that is set
+/// shows as a row of dots and no key shows a prompt for one. The key in the snapshot is
+/// never read: the field must not be able to show the key back.
+fn sgdb_field_hint(status: Option<&StatusSnapshot>) -> &'static str {
+    if status.is_some_and(|st| st.sgdb_api_key_set) {
+        SGDB_MASK
+    } else {
+        "paste your API key…"
+    }
 }
 
 /// Use the machine's own fonts instead of egui's embedded ones: Segoe UI Variable Text
@@ -2186,12 +2496,11 @@ fn list_running_apps() -> Vec<(String, String)> {
             buf.truncate(n as usize);
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid != 0 {
-                if let Ok(mut titles) = TITLES.lock() {
-                    if !titles.iter().any(|(p, _)| *p == pid) {
-                        titles.push((pid, String::from_utf16_lossy(&buf)));
-                    }
-                }
+            if pid != 0
+                && let Ok(mut titles) = TITLES.lock()
+                && !titles.iter().any(|(p, _)| *p == pid)
+            {
+                titles.push((pid, String::from_utf16_lossy(&buf)));
             }
         }
         1
@@ -2219,20 +2528,20 @@ fn list_running_apps() -> Vec<(String, String)> {
     let mut ok = unsafe { Process32FirstW(snap, &mut entry) } != 0;
     while ok {
         let pid = entry.th32ProcessID;
-        if pid != 0 && pid != 4 {
-            if let Some(path) = crate::watch::process_path(pid) {
-                if !own.is_empty() && path.eq_ignore_ascii_case(&own) {
-                    ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
-                    continue;
-                }
-                if !out.iter().any(|(_, p)| p.eq_ignore_ascii_case(&path)) {
-                    let title = titles
-                        .iter()
-                        .find(|(p, _)| *p == pid)
-                        .map(|(_, t)| t.clone())
-                        .unwrap_or_default();
-                    out.push((title, path));
-                }
+        if pid != 0 && pid != 4
+            && let Some(path) = crate::watch::process_path(pid)
+        {
+            if !own.is_empty() && path.eq_ignore_ascii_case(&own) {
+                ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
+                continue;
+            }
+            if !out.iter().any(|(_, p)| p.eq_ignore_ascii_case(&path)) {
+                let title = titles
+                    .iter()
+                    .find(|(p, _)| *p == pid)
+                    .map(|(_, t)| t.clone())
+                    .unwrap_or_default();
+                out.push((title, path));
             }
         }
         ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
@@ -2270,7 +2579,7 @@ fn work_area_pts(ctx: &egui::Context) -> Option<(f32, f32, f32, f32)> {
         log::warn!("SPI_GETWORKAREA failed");
         return None;
     }
-    let ppp = ctx.pixels_per_point().max(0.5) as f32;
+    let ppp = ctx.pixels_per_point().max(0.5);
     Some((
         work.left as f32 / ppp,
         work.top as f32 / ppp,
@@ -2326,9 +2635,433 @@ fn snug_width(longest_line: f32, work_width: Option<f32>) -> f32 {
     wanted.clamp(MIN_SETTINGS_WIDTH, cap)
 }
 
+/// The marker on a pack row that says the pack is applied. It comes and goes as the packs
+/// switch, so its space is always reserved: the width of the window drives its size, and
+/// the size moves the window.
+const APPLIED_MARKER: &str = "· applied";
+/// The badge on a pack row that says how many settings the row does not show. Reserved
+/// like the applied marker, for the same reason.
+const BADGE_RESERVE: &str = "+9";
+/// The status lines the dashboard can show, with the countdown at its widest and the
+/// numbers at their largest. The window is measured from these, so a ticking countdown, a
+/// pause or a killswitch never resizes it.
+const STATUS_RESERVE: [&str; 6] = [
+    "Idle",
+    "Idle mode",
+    "Waiting for daemon…",
+    "Triggered",
+    "Cooling down — 0000s",
+    "Killswitch — 99 app(s) hidden + muted",
+];
+/// The status lines the "Paused — " prefix goes in front of. The killswitch and the idle
+/// line are not among them: they are only shown while the daemon is not paused.
+const PAUSED_RESERVE: [&str; 4] = [
+    "Idle",
+    "Waiting for daemon…",
+    "Triggered",
+    "Cooling down — 0000s",
+];
+/// The rows whose value ticks: the uptime and the cooldown.
+const TICKING_ROWS: [&str; 2] = ["uptime", "cooldown"];
+
+/// The fonts the dashboard's width is measured in.
+#[derive(Clone, Copy)]
+enum FontKind {
+    Title,
+    Status,
+    Body,
+    Small,
+}
+
+/// The content the dashboard's width is measured from.
+struct WidthProbe {
+    /// The status line as shown, plus the reserved variants.
+    status: Vec<String>,
+    /// The rows: (key, value), with the ticking numbers normalized.
+    rows: Vec<(String, String)>,
+    /// The pack rows: (name, has a dropdown).
+    packs: Vec<(String, bool)>,
+}
+
+/// The content the width is measured from. The ticking numbers are normalized and the
+/// status line is joined by the variants it can take, so the width only changes when the
+/// content really changed.
+fn width_probe(status: &str, rows: &[(String, String)], packs: &[PackStatus]) -> WidthProbe {
+    let mut lines = vec![status.to_string()];
+    lines.extend(STATUS_RESERVE.iter().map(|s| s.to_string()));
+    lines.extend(PAUSED_RESERVE.iter().map(|s| format!("Paused — {s}")));
+    WidthProbe {
+        status: lines,
+        rows: rows
+            .iter()
+            .map(|(k, v)| {
+                let v = if TICKING_ROWS.contains(&k.as_str()) {
+                    pad_numbers(v)
+                } else {
+                    v.clone()
+                };
+                (k.clone(), v)
+            })
+            .collect(),
+        packs: packs
+            .iter()
+            .map(|p| (p.name.clone(), !p.settings.is_empty()))
+            .collect(),
+    }
+}
+
+/// Replace every number with a two-digit placeholder, so a ticking counter does not change
+/// the width of the window: "7s left" is measured as "07s left", the same as "48s left".
+fn pad_numbers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut digits = 0;
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            digits += 1;
+        } else {
+            if digits > 0 {
+                out.push_str("00");
+                digits = 0;
+            }
+            out.push(c);
+        }
+    }
+    if digits > 0 {
+        out.push_str("00");
+    }
+    out
+}
+
+/// The width the dashboard needs, measured from the probe. The "· applied" marker and the
+/// "+N" badge are always measured, even when they are not shown: a pack switching would
+/// otherwise change the width, and the width drives the window's size - which moves the
+/// window.
+fn probe_width(measure: &dyn Fn(FontKind, &str) -> f32, probe: &WidthProbe) -> f32 {
+    let mut w = measure(FontKind::Title, "ArmouryDaemon") + 72.0; // room for gear + close
+    for line in &probe.status {
+        w = w.max(measure(FontKind::Status, line) + 26.0);
+    }
+    for (key, value) in &probe.rows {
+        w = w.max(measure(FontKind::Body, key) + 32.0 + measure(FontKind::Body, value));
+    }
+    for (name, dropdown) in &probe.packs {
+        let mut row = measure(FontKind::Body, name) + 56.0; // ‹ button + checkbox
+        row += measure(FontKind::Small, APPLIED_MARKER) + 10.0; // always reserved
+        row += measure(FontKind::Small, BADGE_RESERVE) + 10.0; // always reserved
+        if *dropdown {
+            row += 130.0; // the dropdown
+        }
+        w = w.max(row);
+    }
+    w
+}
+
+/// How far the window may sit from the position we asked for before it counts as moved.
+const DRAG_SLACK: f32 = 4.0;
+/// How long the window has to sit away from the position we asked for before it is read
+/// as the user moving it. Our own resize moves the window too, and the OS applies it a
+/// moment later: that gap must never be read as a drag.
+const DRAG_SETTLE: Duration = Duration::from_millis(300);
+
+/// Where the dashboard is expected to be, and how far it got there.
+#[derive(Default, Clone, Copy)]
+struct Placement {
+    /// The position we last asked for.
+    requested: Option<egui::Pos2>,
+    /// The window was seen at the requested position since the last request. Only then can
+    /// a deviation be read as the user moving it.
+    settled: bool,
+    /// When the window was first seen away from the requested position.
+    off_since: Option<Instant>,
+}
+
+impl Placement {
+    /// Remember the position we just asked for. The window is somewhere else until the OS
+    /// applies it, so a mismatch right after this is not a drag.
+    fn request(&mut self, pos: egui::Pos2) {
+        self.requested = Some(pos);
+        self.settled = false;
+        self.off_since = None;
+    }
+}
+
+/// What the window's actual position says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Spot {
+    /// The window is where it belongs.
+    Home,
+    /// The window is somewhere else, but it may be our own resize still landing.
+    Away,
+    /// The user moved the window: it stays where they put it.
+    Dragged(egui::Pos2),
+}
+
+/// Read the window's actual position. A position that differs from the one we asked for is
+/// not a drag on its own: our own resize moves the window too, and the OS applies it a
+/// moment later. The window has to sit away from the requested position for `DRAG_SETTLE`,
+/// and only after it has been where we asked for it, before it counts as the user moving
+/// it.
+fn classify(place: &mut Placement, pos: egui::Pos2, pinned: bool, now: Instant) -> Spot {
+    let Some(req) = place.requested else {
+        return Spot::Home;
+    };
+    if (pos - req).length() <= DRAG_SLACK {
+        place.settled = true;
+        place.off_since = None;
+        return Spot::Home;
+    }
+    if pinned {
+        // The window sits in the corner of the work area: that is where it belongs, whatever
+        // the position we asked for was.
+        place.off_since = None;
+        return Spot::Home;
+    }
+    if !place.settled {
+        // The window has not been where we asked for it since the last request: this is our
+        // own resize still being applied, not a drag.
+        place.off_since = None;
+        return Spot::Away;
+    }
+    let since = *place.off_since.get_or_insert(now);
+    if now.saturating_duration_since(since) >= DRAG_SETTLE {
+        place.off_since = None;
+        return Spot::Dragged(pos);
+    }
+    Spot::Away
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pack as the dashboard sees it.
+    fn pack(name: &str, applied: bool, settings: usize) -> PackStatus {
+        PackStatus {
+            id: name.to_lowercase().replace(' ', "-"),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            enabled: true,
+            settings: (0..settings)
+                .map(|i| armoury_core::status::PackSettingStatus {
+                    key: format!("k{i}"),
+                    label: format!("K{i}"),
+                    values: vec!["a".to_string(), "b".to_string()],
+                    value: Some("a".to_string()),
+                })
+                .collect(),
+            applied,
+        }
+    }
+
+    /// The rows the dashboard shows.
+    fn rows(cooldown: &str) -> Vec<(String, String)> {
+        vec![
+            ("daemon".to_string(), "v1.0.0".to_string()),
+            ("uptime".to_string(), "1:02:03".to_string()),
+            ("cooldown".to_string(), cooldown.to_string()),
+            (
+                "packs".to_string(),
+                "3 installed · 2 enabled".to_string(),
+            ),
+        ]
+    }
+
+    /// A measurer that stands in for the real fonts: every character is 7 points wide.
+    fn fake_measure() -> impl Fn(FontKind, &str) -> f32 {
+        |_kind: FontKind, text: &str| text.chars().count() as f32 * 7.0
+    }
+
+    /// A status snapshot with the SteamGridDB key fields set.
+    fn status_with_key(set: bool, key: &str) -> StatusSnapshot {
+        StatusSnapshot {
+            daemon_version: "1.0.0".to_string(),
+            uptime_secs: 0,
+            state: RunState::Idle,
+            trigger_source: None,
+            cooldown_remaining_ms: None,
+            cooldown_action: None,
+            cooldown_seconds: 0,
+            paused: false,
+            killswitch_active: false,
+            killswitch_count: 0,
+            idle_active: false,
+            idle_monitors: 0,
+            idle_devices: 0,
+            idle_failsafe_enabled: false,
+            idle_failsafe_minutes: 0,
+            tracked_apps: Vec::new(),
+            tracked_apps_running: Vec::new(),
+            packs: Vec::new(),
+            console_open: "never".to_string(),
+            console_apps: Vec::new(),
+            console_hidden: Vec::new(),
+            last_played: Default::default(),
+            sgdb_api_key_set: set,
+            sgdb_api_key: key.to_string(),
+            last_error: None,
+        }
+    }
+
+    /// A window in the chain, sitting in the slot the chain gave it.
+    fn chain_window(item: ChainItem, size: egui::Vec2, slot: egui::Pos2) -> ChainWindow {
+        ChainWindow {
+            item,
+            size,
+            current: slot,
+            dragged: false,
+        }
+    }
+
+    #[test]
+    fn a_pack_row_keeps_its_width_when_the_applied_marker_comes_and_goes() {
+        // The "· applied" marker and the "+N" badge are always measured, so a pack
+        // switching does not change the width: the width drives the window's size, and the
+        // size moves the window.
+        let measure = fake_measure();
+        let applied = vec![
+            pack("Wallpaper Engine", true, 2),
+            pack("G-Helper", false, 1),
+            pack("Rainmeter", false, 1),
+        ];
+        let plain = applied
+            .iter()
+            .map(|p| pack(&p.name, false, p.settings.len()))
+            .collect::<Vec<_>>();
+        let with = probe_width(&measure, &width_probe("Idle", &rows("60s"), &applied));
+        let without = probe_width(&measure, &width_probe("Idle", &rows("60s"), &plain));
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    fn the_countdown_does_not_change_the_width() {
+        // The status line ticks every second and the cooldown row counts down: neither
+        // may resize the window.
+        let measure = fake_measure();
+        let packs = vec![pack("Wallpaper Engine", true, 2)];
+        let wide = probe_width(&measure, &width_probe("Cooling down — 48s", &rows("48s left"), &packs));
+        let narrow = probe_width(&measure, &width_probe("Cooling down — 7s", &rows("7s left"), &packs));
+        assert_eq!(wide, narrow);
+        // The numbers themselves are measured with a fixed width.
+        assert_eq!(pad_numbers("48s left"), pad_numbers("7s left"));
+        assert_eq!(pad_numbers("1:02:03"), pad_numbers("1:02:09"));
+        assert_eq!(pad_numbers("9:59"), pad_numbers("9:01"));
+    }
+
+    #[test]
+    fn our_own_resize_is_not_read_as_a_drag() {
+        // The window is in the corner and we ask for a new position: the OS applies it a
+        // moment later, so the window is somewhere else for a frame. That is our own
+        // resize, not the user dragging the window.
+        let corner = egui::pos2(1668.0, 886.0);
+        let mut place = Placement::default();
+        let now = Instant::now();
+        place.request(corner);
+        assert_eq!(classify(&mut place, corner, false, now), Spot::Home);
+        // The resize: we ask for a new position, the window has not moved yet.
+        let moved = egui::pos2(1700.0, 900.0);
+        place.request(moved);
+        assert_eq!(
+            classify(&mut place, corner, false, now + Duration::from_millis(16)),
+            Spot::Away
+        );
+        // Even a long time later it is still our own resize, as long as the window was
+        // never where we asked for it.
+        assert_eq!(
+            classify(&mut place, corner, false, now + Duration::from_secs(5)),
+            Spot::Away
+        );
+        // The window arrives.
+        assert_eq!(
+            classify(&mut place, moved, false, now + Duration::from_millis(32)),
+            Spot::Home
+        );
+    }
+
+    #[test]
+    fn a_mismatch_that_stays_is_a_drag() {
+        // The user drags the window away from the corner: the first frame is only a
+        // difference, but it stays there.
+        let corner = egui::pos2(1668.0, 886.0);
+        let dragged = egui::pos2(1000.0, 400.0);
+        let mut place = Placement::default();
+        let now = Instant::now();
+        place.request(corner);
+        assert_eq!(classify(&mut place, corner, false, now), Spot::Home);
+        assert_eq!(
+            classify(&mut place, dragged, false, now + Duration::from_millis(16)),
+            Spot::Away
+        );
+        assert_eq!(
+            classify(
+                &mut place,
+                dragged,
+                false,
+                now + Duration::from_millis(16) + DRAG_SETTLE
+            ),
+            Spot::Dragged(dragged)
+        );
+    }
+
+    #[test]
+    fn a_window_in_the_corner_stays_in_the_corner() {
+        // The work area's bottom-right corner is where the window belongs, whatever the
+        // position we asked for was: the OS may put it a point or two elsewhere.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let size = egui::vec2(416.0, 520.0);
+        let pos = bottom_right(work, size, UI_MARGIN);
+        assert!((pos.x + size.x - work.right()).abs() < 1e-3);
+        assert!((pos.y + size.y - work.bottom()).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_real_font_measures_one_width_for_the_whole_dashboard() {
+        // The same check with the real system font: the width of the window must not
+        // depend on the countdown or on a pack being applied.
+        let ctx = egui::Context::default();
+        // The fonts are only built once the context has run a pass.
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        install_fonts(&ctx);
+        let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
+        out.textures_delta.clear();
+        let p = ctx.debug_painter();
+        let measure = |kind: FontKind, text: &str| {
+            let font = match kind {
+                FontKind::Title | FontKind::Status => FontId::new(17.0, FontFamily::Proportional),
+                FontKind::Body => FontId::new(15.5, FontFamily::Proportional),
+                FontKind::Small => FontId::new(13.0, FontFamily::Proportional),
+            };
+            p.layout_no_wrap(text.to_owned(), font, Color32::WHITE)
+                .rect
+                .width()
+        };
+        let packs = vec![
+            pack("Wallpaper Engine", true, 2),
+            pack("G-Helper", false, 1),
+            pack("Rainmeter", false, 1),
+        ];
+        let cooling = probe_width(&measure, &width_probe("Cooling down — 48s", &rows("48s left"), &packs));
+        let nearly = probe_width(&measure, &width_probe("Cooling down — 7s", &rows("7s left"), &packs));
+        assert_eq!(cooling, nearly);
+        // The packs switch: the applied marker comes and goes.
+        let plain = packs
+            .iter()
+            .map(|p| pack(&p.name, false, p.settings.len()))
+            .collect::<Vec<_>>();
+        let switched = probe_width(&measure, &width_probe("Cooling down — 48s", &rows("48s left"), &plain));
+        assert_eq!(cooling, switched);
+
+        // The paused band has to fit on one line, or it wraps and the window grows.
+        let band = p
+            .layout_no_wrap(
+                "Paused — the packs will not switch. Press Start.".to_owned(),
+                FontId::new(15.5, FontFamily::Proportional),
+                Color32::WHITE,
+            )
+            .rect
+            .width();
+        assert!(band <= cooling - 20.0, "the paused band does not fit on one line");
+    }
 
     #[test]
     fn snug_width_follows_the_content_and_the_screen() {
@@ -2368,5 +3101,256 @@ mod tests {
         assert!((large.y + 749.0 - work.bottom()).abs() < 1e-3);
         // the top edge moved up by exactly the growth
         assert!((small.y - large.y - 349.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_dashboard_always_opens_in_the_corner() {
+        // Nothing is restored from the config: the window always comes up in the corner.
+        assert!(start_anchor().is_none());
+        // The corner is the bottom-right of the work area, flush above the tray.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let size = egui::vec2(MIN_WINDOW_WIDTH, 218.0);
+        let pos = bottom_right(work, size, UI_MARGIN);
+        // Both edges sit exactly on the work area's right and bottom edges.
+        assert!((pos.x + size.x - work.right()).abs() < 1e-3);
+        assert!((pos.y + size.y - work.bottom()).abs() < 1e-3);
+        assert!((pos.x - 1668.0).abs() < 1e-3);
+        assert!((pos.y - 886.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_settings_joins_the_chain_left_of_the_dashboard() {
+        // 2560x1380 px work area at 125% -> 2048 x 1104 pt on the primary monitor.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        // The dashboard sits in the bottom-right corner, flush with the work area.
+        let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
+        let size = egui::vec2(420.0, 500.0);
+
+        // Nothing else open: the settings goes immediately left of the dashboard.
+        let pos = place_left_in(work, chain_anchor(core, &[]), core, size);
+        // x = core.left() - 8 - width = 1668 - 8 - 420, y = core.bottom() - height, less the
+        // 6 pt the work-area clamp keeps below every window in the chain.
+        assert!((pos.x - 1240.0).abs() < 1e-3);
+        assert!((pos.y - 598.0).abs() < 1e-3);
+        // 8 pt clear of the dashboard.
+        assert!((pos.x + size.x - (core.left() - 8.0)).abs() < 1e-3);
+        // Bottom-aligned with the dashboard: both bottoms 6 pt above the work area's bottom.
+        assert!((pos.y + size.y - (core.bottom() - 6.0)).abs() < 1e-3);
+        // Beside the dashboard, never above it: the vertical spans overlap, the horizontal ones
+        // do not.
+        assert!(pos.y < core.bottom() && pos.y + size.y > core.top());
+        assert!(pos.x + size.x <= core.left());
+        // On screen.
+        assert!(pos.x >= work.left() && pos.x + size.x <= work.right());
+        assert!(pos.y >= work.top() && pos.y + size.y <= work.bottom());
+
+        // A pack window is already open, to the left of the dashboard: the settings has to
+        // clear that one too and goes to its left.
+        let pack = Rect::from_min_max(egui::pos2(1200.0, 700.0), egui::pos2(1580.0, 1104.0));
+        let pos = place_left_in(work, chain_anchor(core, &[pack.left()]), core, size);
+        // x = pack.left() - 8 - width = 1200 - 8 - 420, still bottom-aligned.
+        assert!((pos.x - 772.0).abs() < 1e-3);
+        assert!((pos.y - 598.0).abs() < 1e-3);
+        assert!((pos.x + size.x - (pack.left() - 8.0)).abs() < 1e-3);
+        // The order from the right is: dashboard, pack, settings.
+        assert!(core.left() > pack.left() && pack.left() > pos.x);
+
+        // The settings was open first, a pack window opens after it: the pack goes to the left
+        // of the settings, so the order from the right is: dashboard, settings, pack.
+        let settings = place_left_in(work, chain_anchor(core, &[]), core, size);
+        let new_pack = place_left_in(work, chain_anchor(core, &[settings.x]), core, egui::vec2(380.0, 300.0));
+        assert!((new_pack.x - (settings.x - 8.0 - 380.0)).abs() < 1e-3);
+        assert!((new_pack.x + 380.0 - (settings.x - 8.0)).abs() < 1e-3);
+        assert!(core.left() > settings.x && settings.x > new_pack.x);
+
+        // A dashboard filling the whole work area leaves no room on the left: the settings stays
+        // on the screen anyway.
+        let full = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let pos = place_left_in(work, chain_anchor(full, &[]), full, size);
+        assert!((pos.x - 6.0).abs() < 1e-3);
+        assert!(pos.x >= work.left() && pos.x + size.x <= work.right());
+        assert!(pos.y >= work.top() && pos.y + size.y <= work.bottom());
+    }
+
+    #[test]
+    fn the_settings_keeps_its_slot_when_the_content_grows() {
+        // 2560x1380 px work area at 125% -> 2048 x 1104 pt on the primary monitor.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
+        let pos = place_left_in(work, chain_anchor(core, &[]), core, egui::vec2(420.0, 500.0));
+
+        // The content grows but the window still fits: the stored position is kept as it is.
+        let kept = clamp_to_work_area(pos, work, egui::vec2(420.0, 500.0));
+        assert!((kept.x - pos.x).abs() < 1e-3);
+        assert!((kept.y - pos.y).abs() < 1e-3);
+        // A pack window opened after the settings sits to its left; a resize does not change
+        // that order, because the settings never re-anchors against another window.
+        let pack = place_left_in(work, chain_anchor(core, &[pos.x]), core, egui::vec2(380.0, 300.0));
+        assert!(pack.x + 380.0 <= pos.x);
+        let grown = clamp_to_work_area(pos, work, egui::vec2(420.0, 560.0));
+        assert!((grown.x - pos.x).abs() < 1e-3);
+        assert!(grown.x > pack.x);
+
+        // Grown past the bottom of the work area: the position is clamped into it, the slot (the
+        // x) is untouched.
+        assert!((grown.y - (work.bottom() - 560.0)).abs() < 1e-3);
+        assert!(grown.y >= work.top() && grown.y + 560.0 <= work.bottom());
+        // Still to the left of the dashboard.
+        assert!(grown.x + 420.0 <= core.left());
+    }
+
+    #[test]
+    fn the_badge_counts_the_settings_the_row_does_not_show() {
+        // A pack with one setting: nothing to point at.
+        assert_eq!(extra_settings(0), None);
+        assert_eq!(extra_settings(1), None);
+        // Wallpaper Engine: the row shows the first setting, the pack window has both.
+        assert_eq!(extra_settings(2), Some("+1".to_string()));
+        assert_eq!(extra_settings(4), Some("+3".to_string()));
+    }
+
+    #[test]
+    fn the_pack_window_keeps_its_slot_when_the_content_grows() {
+        // 2560x1380 px work area at 125% -> 2048 x 1104 pt on the primary monitor.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
+        // The pack opened first, the settings after it: the settings sits to the left of the pack.
+        let pack = place_left_in(work, chain_anchor(core, &[]), core, egui::vec2(380.0, 300.0));
+        let settings = place_left_in(work, chain_anchor(core, &[pack.x]), core, egui::vec2(420.0, 500.0));
+        assert!(core.left() > pack.x && pack.x > settings.x);
+
+        // The pack grows: the position is kept as it is, only clamped into the work area.
+        let grown = clamp_to_work_area(pack, work, egui::vec2(380.0, 560.0));
+        assert!((grown.x - pack.x).abs() < 1e-3);
+        // The order from the right is unchanged: the pack did not jump over the settings.
+        assert!(grown.x > settings.x);
+        // Grown past the bottom of the work area: the y is clamped, the slot (the x) is not.
+        assert!((grown.y - (work.bottom() - 560.0)).abs() < 1e-3);
+        assert!(grown.y >= work.top() && grown.y + 560.0 <= work.bottom());
+    }
+
+    #[test]
+    fn the_key_field_shows_dots_and_never_the_key() {
+        // A key is set: the field shows a row of dots.
+        let set = status_with_key(true, "");
+        assert_eq!(sgdb_field_hint(Some(&set)), SGDB_MASK);
+        // The key is never read back, not even when the daemon still sends one.
+        let leaky = status_with_key(true, "s3cret-key");
+        let hint = sgdb_field_hint(Some(&leaky));
+        assert_eq!(hint, SGDB_MASK);
+        assert!(!hint.contains("s3cret-key"));
+        // No key: the field asks for one.
+        assert_eq!(
+            sgdb_field_hint(Some(&status_with_key(false, ""))),
+            "paste your API key…"
+        );
+        // No status yet: the field asks for one.
+        assert_eq!(sgdb_field_hint(None), "paste your API key…");
+    }
+
+    #[test]
+    fn the_chain_is_reanchored_when_the_dashboard_changes() {
+        // 2560x1380 px work area at 125% -> 2048 x 1104 pt on the primary monitor.
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        // The dashboard sits in the bottom-right corner, flush with the work area.
+        let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
+        let size = egui::vec2(420.0, 500.0);
+        // The settings is immediately left of the dashboard, the pack window to its left.
+        let settings = chain_window(ChainItem::Settings, size, egui::pos2(1240.0, 598.0));
+        let pack = chain_window(
+            ChainItem::Pack("g-helper".to_string()),
+            egui::vec2(380.0, 300.0),
+            egui::pos2(852.0, 798.0),
+        );
+        // The chain as it stands: every window touches the one to its right.
+        let out = reanchor_chain(work, core, &[settings.clone(), pack.clone()]);
+        assert!((out[0].1.x - 1240.0).abs() < 1e-3);
+        assert!((out[1].1.x - 852.0).abs() < 1e-3);
+        assert!((out[0].1.x + 420.0 - (core.left() - 8.0)).abs() < 1e-3);
+        assert!((out[1].1.x + 380.0 - (out[0].1.x - 8.0)).abs() < 1e-3);
+
+        // The dashboard changed: the chain is re-anchored against its new rect.
+        let wider = Rect::from_min_max(egui::pos2(1500.0, 700.0), egui::pos2(2048.0, 1104.0));
+        let out = reanchor_chain(work, wider, &[settings, pack]);
+        let (settings_pos, pack_pos) = (out[0].1, out[1].1);
+        // The order from the right is kept: the settings, then the pack window.
+        assert!(wider.left() > settings_pos.x && settings_pos.x > pack_pos.x);
+        // Every window sits immediately left of the one to its right, with the 8 pt gap.
+        assert!((settings_pos.x + 420.0 - (wider.left() - 8.0)).abs() < 1e-3);
+        assert!((pack_pos.x + 380.0 - (settings_pos.x - 8.0)).abs() < 1e-3);
+        // Bottom-aligned with the dashboard.
+        assert!((settings_pos.y + 500.0 - (wider.bottom() - 6.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_window_the_user_dragged_is_not_moved() {
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let core = Rect::from_min_max(egui::pos2(1668.0, 886.0), egui::pos2(2048.0, 1104.0));
+        let size = egui::vec2(420.0, 500.0);
+        let slot = egui::pos2(1240.0, 598.0);
+        // The user drags the settings window away from its slot: `classify` sees the drag.
+        let dragged_to = egui::pos2(300.0, 400.0);
+        let now = Instant::now();
+        let mut place = Placement::default();
+        place.request(slot);
+        assert_eq!(classify(&mut place, slot, false, now), Spot::Home);
+        assert_eq!(
+            classify(&mut place, dragged_to, false, now + Duration::from_millis(16)),
+            Spot::Away
+        );
+        let dragged = matches!(
+            classify(
+                &mut place,
+                dragged_to,
+                false,
+                now + Duration::from_millis(16) + DRAG_SETTLE
+            ),
+            Spot::Dragged(_)
+        );
+        assert!(dragged);
+
+        // The chain leaves it where the user put it.
+        let mut window = chain_window(ChainItem::Settings, size, slot);
+        window.current = dragged_to;
+        window.dragged = dragged;
+        let out = reanchor_chain(work, core, &[window]);
+        assert!((out[0].1 - dragged_to).length() < 1e-3);
+    }
+
+    #[test]
+    fn the_reanchored_chain_stays_inside_the_work_area() {
+        let work = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        // A dashboard that fills the whole work area leaves no room on the left.
+        let core = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let settings = chain_window(ChainItem::Settings, egui::vec2(420.0, 500.0), egui::pos2(6.0, 598.0));
+        let pack = chain_window(
+            ChainItem::Pack("g-helper".to_string()),
+            egui::vec2(380.0, 300.0),
+            egui::pos2(6.0, 798.0),
+        );
+        let out = reanchor_chain(work, core, &[settings, pack]);
+        for ((_, pos), size) in out
+            .iter()
+            .zip([egui::vec2(420.0, 500.0), egui::vec2(380.0, 300.0)])
+        {
+            assert!(pos.x >= work.left() && pos.x + size.x <= work.right());
+            assert!(pos.y >= work.top() && pos.y + size.y <= work.bottom());
+        }
+
+        // A dashboard that is taller than the work area: the chain is clamped into it.
+        let tall = Rect::from_min_max(egui::pos2(1668.0, -400.0), egui::pos2(2048.0, 1600.0));
+        let out = reanchor_chain(
+            work,
+            tall,
+            &[chain_window(
+                ChainItem::Settings,
+                egui::vec2(420.0, 500.0),
+                egui::pos2(1240.0, 598.0),
+            )],
+        );
+        for ((_, pos), size) in out.iter().zip([egui::vec2(420.0, 500.0)]) {
+            assert!(pos.x >= work.left() && pos.x + size.x <= work.right());
+            assert!(pos.y >= work.top() && pos.y + size.y <= work.bottom());
+        }
     }
 }

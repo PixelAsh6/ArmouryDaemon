@@ -16,11 +16,12 @@ serde_json.workspace = true
 crossbeam-channel.workspace = true
 interprocess.workspace = true
 tray-icon.workspace = true
-global-hotkey.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_System_WindowsProgramming", "Win32_Security_Authorization"] }
 windows-sys.workspace = true
 eframe.workspace = true
 rhai.workspace = true
 ureq.workspace = true
 sha2.workspace = true
 image.workspace = true
+# The pipe's security descriptor is built from an SDDL string.
+widestring = "1"

@@ -57,12 +57,11 @@ checksum = "fc7eb209b1518d6bb87b283c20095f5228ecda460da70b44f0802523dea6da04"
 
 [[package]]
 name = "armoury"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "armoury-core",
  "crossbeam-channel",
  "eframe",
- "global-hotkey",
  "image",
  "interprocess",
  "log",
@@ -72,13 +71,14 @@ dependencies = [
  "sha2",
  "tray-icon",
  "ureq",
+ "widestring",
  "windows",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "armoury-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "log",
  "serde",
@@ -890,16 +890,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gethostname"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
-dependencies = [
- "rustix 1.1.5",
- "windows-link",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1025,23 +1015,6 @@ dependencies = [
  "skrifa",
  "smallvec",
  "vello_common",
-]
-
-[[package]]
-name = "global-hotkey"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adda8c76a5139df3bae0eb0413c2cd746f66594e0bb66231a4daa0be3172da70"
-dependencies = [
- "crossbeam-channel",
- "keyboard-types",
- "objc2 0.6.5",
- "objc2-app-kit 0.3.2",
- "once_cell",
- "thiserror 2.0.21",
- "windows-sys 0.59.0",
- "x11rb",
- "xkeysym",
 ]
 
 [[package]]
@@ -3263,23 +3236,6 @@ checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "x11rb"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
-dependencies = [
- "gethostname",
- "rustix 1.1.5",
- "x11rb-protocol",
-]
-
-[[package]]
-name = "x11rb-protocol"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
 
 [[package]]
 name = "xkbcommon-dl"

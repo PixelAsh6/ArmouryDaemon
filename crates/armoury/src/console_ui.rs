@@ -96,6 +96,10 @@ pub fn run() {
         eprintln!("logging init failed: {e}");
     }
     log::info!("console starting (v{})", armoury_core::VERSION);
+    if let Some(code) = crate::dpi_error() {
+        // The DPI switch failed before the logger existed; now it can be said.
+        log::info!("DPI awareness was not set (error {code}): the process may already be aware");
+    }
     if console_already_open() {
         log::info!("another console is already open — exiting");
         return;
@@ -229,12 +233,21 @@ fn row_center_y(band: egui::Rect) -> f32 {
     band.center().y - (HINT_GAP + HINT_H) / 2.0
 }
 
-/// DPI scale feeding the work-area and screen queries.
+/// DPI scale of the band: the primary monitor's. The band is primary-only and the primary
+/// runs at 125% here, so the system DPI is the right scale. Per-monitor limitation: a band
+/// on the 100% secondary would need that monitor's DPI, not the system one.
 fn dpi_scale() -> f32 {
     use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 
     let dpi = unsafe { GetDpiForSystem() };
     if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }.max(0.5)
+}
+
+/// Physical pixels to logical points at `scale`. The process is Per-Monitor-V2 aware, so
+/// Win32 hands out physical pixels; the band is drawn in points and egui multiplies them
+/// by the window's `pixels_per_point`, which is the scale of the monitor it sits on.
+fn to_points(px: f32, scale: f32) -> f32 {
+    px / scale
 }
 
 /// Primary work area in logical points, before any window exists.
@@ -257,8 +270,14 @@ fn work_area() -> egui::Rect {
         return egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0));
     }
     egui::Rect::from_min_max(
-        egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
-        egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
+        egui::pos2(
+            to_points(work.left as f32, scale),
+            to_points(work.top as f32, scale),
+        ),
+        egui::pos2(
+            to_points(work.right as f32, scale),
+            to_points(work.bottom as f32, scale),
+        ),
     )
 }
 
@@ -274,7 +293,7 @@ fn screen_size() -> egui::Vec2 {
     if w <= 0 || h <= 0 {
         return egui::vec2(1920.0, 1080.0);
     }
-    egui::vec2(w as f32 / scale, h as f32 / scale)
+    egui::vec2(to_points(w as f32, scale), to_points(h as f32, scale))
 }
 
 /// One console at a time: a tray open racing a pad connect (or a manual run) must not stack
@@ -1176,18 +1195,32 @@ mod tests {
     }
 
     #[test]
+    fn physical_pixels_become_points_at_the_primary_scale() {
+        // The process is Per-Monitor-V2 aware: Win32 reports physical pixels, egui draws in
+        // points. The primary is 2560x1440 at 125%, so 2048x1152 points.
+        let scale = 1.25;
+        assert!((to_points(2560.0, scale) - 2048.0).abs() < 1e-3);
+        assert!((to_points(1440.0, scale) - 1152.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn band_is_fixed_90_by_35_percent_and_docked() {
-        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0));
-        let screen = egui::vec2(1638.4, 1152.0);
+        // The primary at 125%: 2560x1440 physical is 2048x1152 points, and the work area is
+        // the same width with the taskbar off the bottom.
+        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
+        let screen = egui::vec2(2048.0, 1152.0);
         let band = band_rect(work, screen);
-        assert!((band.width() - 1474.56).abs() < 1e-3);
+        assert!((band.width() - 1843.2).abs() < 1e-3);
         assert!((band.height() - 403.2).abs() < 1e-3);
+        // in physical pixels: 90% of the 2560-wide primary, 35% of its 1440
+        assert!((band.width() * 1.25 - 2304.0).abs() < 1e-3);
+        assert!((band.height() * 1.25 - 504.0).abs() < 1e-3);
         // centered on the work area, docked 8 above its bottom edge
         assert!((band.center().x - work.center().x).abs() < 1e-3);
         assert!((band.bottom() - (work.bottom() - 8.0)).abs() < 1e-3);
         // a shorter work area moves the band, it does not resize it
         let shorter = band_rect(
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1000.0)),
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1000.0)),
             screen,
         );
         assert!((shorter.height() - 403.2).abs() < 1e-3);

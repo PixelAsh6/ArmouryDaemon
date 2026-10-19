@@ -1,8 +1,9 @@
-//! Daemon mode: single instance, tray icon + menu, Scroll Lock global hotkey,
+//! Daemon mode: single instance, tray icon + menu, End/Home keyboard hook,
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
 use crate::art;
 use crate::console;
+use crate::hotkey;
 use crate::ipc;
 use crate::killswitch;
 use crate::overlay;
@@ -15,10 +16,10 @@ use armoury_core::config::{
 };
 use armoury_core::engine::{Engine, EngineState, Transition};
 use armoury_core::protocol::{Request, Response};
-use armoury_core::status::{PackSettingStatus, PackStatus, RunState, StatusSnapshot};
-use global_hotkey::hotkey::{Code, HotKey};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use armoury_core::status::{LastError, PackSettingStatus, PackStatus, RunState, StatusSnapshot};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
+use interprocess::os::windows::local_socket::ListenerOptionsExt;
+use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::process::{Child, Command};
@@ -35,6 +36,10 @@ pub fn run(show_ui_when_running: bool) {
         eprintln!("logging init failed: {e}");
     }
     info!("daemon starting (v{})", armoury_core::VERSION);
+    if let Some(code) = crate::dpi_error() {
+        // The DPI switch failed before the logger existed; now it can be said.
+        info!("DPI awareness was not set (error {code}): the process may already be aware");
+    }
 
     // ---- single instance ----
     // Before anything with a side effect: overlay::recover_if_needed() unmutes every output
@@ -79,7 +84,11 @@ pub fn run(show_ui_when_running: bool) {
             return;
         }
     };
-    let listener = match ListenerOptions::new().name(name).create_sync() {
+    let mut options = ListenerOptions::new().name(name);
+    if let Some(sd) = pipe_security_descriptor() {
+        options = options.security_descriptor(sd);
+    }
+    let listener = match options.create_sync() {
         Ok(l) => l,
         Err(e) => {
             error!("failed to create pipe server: {e}");
@@ -179,32 +188,19 @@ pub fn run(show_ui_when_running: bool) {
         }
     };
 
-    // ---- Scroll Lock global hotkey ----
-    let hotkey_manager: Option<GlobalHotKeyManager> = match GlobalHotKeyManager::new() {
-        Ok(m) => Some(m),
-        Err(e) => {
-            warn!("hotkey manager unavailable: {e}");
-            None
-        }
+    // ---- keyboard hook (End = killswitch, Home = idle mode) ----
+    // A low-level hook, not RegisterHotKey: the key must keep working in the foreground
+    // application, and it has to be installed on this thread (the one that pumps the messages).
+    let (hotkey_hook, hotkey_rx) = match hotkey::install() {
+        Some((hook, rx)) => (Some(hook), Some(rx)),
+        None => (None, None),
     };
-    let hotkey = HotKey::new(None, Code::ScrollLock);
-    let mut hotkey_registered = false;
-    if let Some(m) = &hotkey_manager {
-        match m.register(hotkey) {
-            Ok(()) => {
-                hotkey_registered = true;
-                info!("Scroll Lock hotkey registered");
-            }
-            Err(e) => warn!("Scroll Lock hotkey registration failed: {e}"),
-        }
-    }
 
     // ---- main loop ----
     // A single waitable event lets every producer (watcher, pipe threads) wake the loop
-    // immediately; Win32 messages (tray, hotkey) wake it through the message queue.
+    // immediately; Win32 messages (tray, keyboard hook) wake it through the message queue.
     let tray_rx = TrayIconEvent::receiver();
     let menu_rx = MenuEvent::receiver();
-    let hotkey_rx = GlobalHotKeyEvent::receiver();
 
     let mut app = App {
         cfg,
@@ -216,7 +212,6 @@ pub fn run(show_ui_when_running: bool) {
         icon_active: make_tray_icon_active(),
         killswitch: killswitch::Ledger::default(),
         running_pids: HashMap::new(),
-        echo_until: None,
         overlay: overlay::Overlay::default(),
         idle_engage_tick: 0,
         idle_deadline: None,
@@ -241,6 +236,10 @@ pub fn run(show_ui_when_running: bool) {
         art_tx,
         art_rx,
         art_busy: false,
+        // A pass with the old (keyless) key may still be running: it leaves miss markers.
+        art_retry_after_pass: false,
+        last_error: None,
+        quit_requested: QuitRequest::default(),
         last_broadcast: Instant::now(),
         last_tooltip: String::new(),
         wake: wake_handle,
@@ -261,7 +260,6 @@ pub fn run(show_ui_when_running: bool) {
         pump_win32_messages();
 
         // drain every source without blocking
-        let mut quit = false;
         while let Ok(e) = tray_rx.try_recv() {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
@@ -294,16 +292,16 @@ pub fn run(show_ui_when_running: bool) {
                     info!("quit requested from tray menu");
                     // "Quit means close everything" (user decision 2026-10-18): put the apps back
                     // before the daemon goes away, instead of leaving them in game mode until the
-                    // next start reverts them.
-                    app.revert_before_quit();
-                    quit = true;
+                    // next start reverts them. The shutdown sequence itself runs below, so the
+                    // tray menu and a `quit` request over the pipe take the same path.
+                    app.quit_requested.ask();
                 }
                 other => info!("tray menu '{other}' — not implemented yet"),
             }
         }
-        while let Ok(e) = hotkey_rx.try_recv() {
-            if e.state == HotKeyState::Pressed {
-                app.on_hotkey();
+        if let Some(rx) = &hotkey_rx {
+            while let Ok(vk) = rx.try_recv() {
+                app.on_hotkey(vk);
             }
         }
         while let Ok(p) = pipe_rx.try_recv() {
@@ -324,7 +322,11 @@ pub fn run(show_ui_when_running: bool) {
                 Err(_) => break,
             }
         }
-        if quit {
+        if app.quit_requested.asked() {
+            // "Quit means close everything": the packs go back and the audio comes back before
+            // the daemon goes away.
+            app.revert_before_quit();
+            app.leave_idle_for_exit();
             break true;
         }
 
@@ -348,10 +350,8 @@ pub fn run(show_ui_when_running: bool) {
 
     // ---- shutdown ----
     info!("shutting down");
-    if let Some(m) = &hotkey_manager {
-        if hotkey_registered {
-            let _ = m.unregister(hotkey);
-        }
+    if let Some(hook) = hotkey_hook {
+        hook.uninstall();
     }
     if let Some(mut child) = app.ui_child.take() {
         let _ = child.kill();
@@ -367,6 +367,34 @@ fn basename_lower(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_else(|| path.to_ascii_lowercase())
+}
+
+/// Now, in unix seconds (the unit the journal and `LastError` use).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Remember a failure so the dashboard can show it. The most recent one wins.
+fn remember_error(slot: &mut Option<LastError>, source: &str, message: &str) {
+    *slot = Some(LastError {
+        at: unix_now(),
+        source: source.to_string(),
+        message: message.to_string(),
+    });
+}
+
+/// Forget a remembered failure that came from `prefix` ("" forgets any source).
+fn forget_error(slot: &mut Option<LastError>, prefix: &str) {
+    if slot
+        .as_ref()
+        .map(|e| e.source.starts_with(prefix))
+        .unwrap_or(false)
+    {
+        *slot = None;
+    }
 }
 
 /// Did any **key** get pressed since the previous call? Mouse buttons and wheels are skipped on
@@ -389,11 +417,6 @@ fn keyboard_pressed_since_last_poll() -> bool {
 
 fn tick_count() -> u32 {
     unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() }
-}
-
-/// The current Scroll Lock toggle state (GetAsyncKeyState reads the global toggle).
-fn scroll_lock_state() -> bool {    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    unsafe { GetAsyncKeyState(0x91) & 1 != 0 }
 }
 
 /// Tray icon built from the shared procedural icon generator.
@@ -489,8 +512,6 @@ struct App {
     killswitch: killswitch::Ledger,
     /// Tracked key -> live pids (needed to hide/mute mid-killswitch starts).
     running_pids: HashMap<String, Vec<u32>>,
-    /// Ignore our own Scroll Lock correction presses until this instant.
-    echo_until: Option<Instant>,
     /// Idle overlay (black screens + muted output devices).
     overlay: overlay::Overlay,
     /// Tick count when idle mode started, so any later input dismisses it.
@@ -528,11 +549,38 @@ struct App {
     art_tx: crossbeam_channel::Sender<String>,
     art_rx: crossbeam_channel::Receiver<String>,
     art_busy: bool,
+    /// A pass with the old (keyless) SteamGridDB key is still running: it leaves miss markers
+    /// behind, so they have to be cleared again when that pass ends.
+    art_retry_after_pass: bool,
+    /// The last failure the dashboard shows (`None` = nothing went wrong).
+    last_error: Option<LastError>,
+    /// Set by the tray menu's "Quit" and by a `quit` request over the pipe.
+    quit_requested: QuitRequest,
     last_broadcast: Instant,
     /// Last text set on the tray tooltip (avoid a Win32 call every second).
     last_tooltip: String,
     /// The wake event every producer signals (handed to each pack worker).
     wake: usize,
+}
+
+/// The daemon's exit request. The tray menu's "Quit" and a `quit` request over the pipe both
+/// set it; the main loop then runs the shutdown sequence (revert the packs, restore the
+/// audio, exit).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct QuitRequest {
+    asked: bool,
+}
+
+impl QuitRequest {
+    /// Ask for the shutdown.
+    fn ask(&mut self) {
+        self.asked = true;
+    }
+
+    /// Has the shutdown been asked for?
+    fn asked(&self) -> bool {
+        self.asked
+    }
 }
 
 /// The console launcher's entry list: tracked apps first, then console-only pins (deduped by
@@ -557,7 +605,7 @@ fn launcher_entries(cfg: &AppConfig) -> Vec<(String, String)> {
 impl App {
     fn status(&self) -> StatusSnapshot {
         let now = Instant::now();
-        let (state, trigger_source) = match self.engine.state() {
+        let (state, trigger_source) = match self.engine.state(now) {
             EngineState::Idle => (RunState::Idle, None),
             EngineState::Triggered => (RunState::Triggered, self.engine.source()),
             EngineState::Cooldown => (RunState::Cooldown, self.engine.source()),
@@ -571,9 +619,9 @@ impl App {
                 .engine
                 .cooldown_remaining(now)
                 .map(|d| d.as_millis() as u64),
-            cooldown_action: self.engine.pending_action().map(|apply| {
-                if apply { "apply" } else { "revert" }.to_string()
-            }),
+            // The wire format keeps the field, but the engine no longer plans a switch: it
+            // only knows the lockout, which is reported as the remaining time.
+            cooldown_action: None,
             cooldown_seconds: self.cfg.cooldown_seconds,
             paused: self.cfg.paused,
             killswitch_active: self.killswitch.is_active(),
@@ -590,7 +638,9 @@ impl App {
             console_hidden: self.cfg.console_hidden.clone(),
             last_played: self.cfg.last_played.clone(),
             sgdb_api_key_set: self.cfg.sgdb_api_key.is_some(),
-            sgdb_api_key: self.cfg.sgdb_api_key.clone().unwrap_or_default(),
+            // The key never travels over the pipe: the snapshot says whether a key is set and
+            // nothing more. The field stays in the wire format, so an older UI still loads.
+            sgdb_api_key: String::new(),
             packs: self
                 .pack_catalog
                 .iter()
@@ -621,6 +671,7 @@ impl App {
                     }
                 })
                 .collect(),
+            last_error: self.last_error.clone(),
         }
     }
 
@@ -717,7 +768,7 @@ impl App {
             if paused { "paused" } else { "resumed" },
             if paused { "suppressed" } else { "active" }
         );
-        // Freeze/thaw the engine itself, so a pause never leaves a phantom countdown behind and
+        // Freeze/thaw the engine itself, so a pause never leaves a phantom lockout behind and
         // resuming catches up with whatever is running (2026-10-18).
         if let Some(t) = self.engine.set_paused(paused, Instant::now()) {
             self.on_transition(t);
@@ -726,6 +777,15 @@ impl App {
     }
 
     fn on_pack_outcome(&mut self, o: packs::PackOutcome) {
+        // The dashboard shows the most recent failure; a clean run clears it again.
+        for (id, err) in &o.failed {
+            warn!("pack {id} failed: {err}");
+            remember_error(&mut self.last_error, &format!("pack:{id}"), err);
+        }
+        if o.failed.is_empty() {
+            forget_error(&mut self.last_error, "pack:");
+        }
+
         if let Some(tag) = o.tag.clone() {
             // A single-pack operation (removing an applied pack): merge instead of replacing.
             self.applied_packs.retain(|p| p != &tag);
@@ -734,9 +794,6 @@ impl App {
                 info!("pack {line}");
             }
             let failed = o.failed.first().map(|(_, e)| e.clone());
-            for (id, err) in &o.failed {
-                warn!("pack {id} failed: {err}");
-            }
             if self.pending_removal.as_ref().map(|(id, _)| id == &tag) == Some(true) {
                 let (_, client) = self.pending_removal.take().unwrap();
                 self.finish_removal(&tag, client, failed);
@@ -757,9 +814,6 @@ impl App {
         }
         for line in &o.succeeded {
             info!("pack {line}");
-        }
-        for (id, err) in &o.failed {
-            warn!("pack {id} failed: {err}");
         }
         self.write_journal(&o, true);
         self.broadcast_status();
@@ -962,17 +1016,14 @@ impl App {
         if self.cfg.tracked_apps.len() != before {
             info!("tracked app removed: {exe}");
             self.save_and_share_tracked();
-            // The entry is gone, so nothing holds the packs applied any more — but the machine is
-            // not switched back instantly: removing the last tracked app ends like an exit, so the
-            // packs stay applied for the cooldown and only then revert (spec 4). Only while paused
-            // does the manual action take effect at once (G12), which the engine signals by
-            // returning a transition.
+            // The entry is gone, so nothing holds the packs applied any more: removing the last
+            // tracked app reverts the packs at once. It is a manual action, so it bypasses the
+            // lockout (and the pause, G12) and leaves no lockout behind — the next tracked app
+            // may apply right away.
             let key = basename_lower(exe);
             if let Some(t) = self.engine.on_untracked(&key, Instant::now()) {
-                info!("tracked app removed while paused — reverting the packs now");
+                info!("tracked app removed — reverting the packs now");
                 self.send_transition(t, true);
-            } else if self.engine.state() == EngineState::Cooldown {
-                info!("tracked app removed — the packs stay applied until the cooldown expires");
             }
         }
     }
@@ -987,37 +1038,24 @@ impl App {
         self.broadcast_status();
     }
 
-    fn on_hotkey(&mut self) {
-        // Ignore the correction presses we send ourselves.
-        if self
-            .echo_until
-            .map_or(false, |t| Instant::now() < t)
-        {
-            info!("Scroll Lock echo ignored");
-            return;
-        }
-
-        // Windows toggles the Scroll Lock state at driver level; the press that just
-        // arrived has already flipped it. Whatever it was before, we want it back.
-        let want = !scroll_lock_state();
-        self.toggle_killswitch();
-
-        for _ in 0..3 {
-            if scroll_lock_state() == want {
-                break;
+    /// The low-level keyboard hook saw a hotkey. The hook only forwards the key — the work
+    /// happens here, on the event-loop thread.
+    fn on_hotkey(&mut self, vk: u32) {
+        match hotkey::action_for(vk) {
+            Some(hotkey::Action::Killswitch) => {
+                info!("killswitch hotkey (End)");
+                self.toggle_killswitch();
             }
-            self.echo_until = Some(Instant::now() + Duration::from_millis(500));
-            if let Err(e) = packs::send_chord("scrolllock") {
-                warn!("could not send the Scroll Lock correction: {e}");
-                break;
+            Some(hotkey::Action::Idle) => {
+                if self.overlay.is_active() {
+                    info!("idle mode off (Home hotkey)");
+                    self.exit_idle();
+                } else {
+                    info!("idle mode on (Home hotkey)");
+                    self.enter_idle();
+                }
             }
-            std::thread::sleep(Duration::from_millis(80));
-        }
-
-        if scroll_lock_state() == want {
-            info!("Scroll Lock state kept (was {}, still {})", !want as u8, want as u8);
-        } else {
-            warn!("Scroll Lock state could not be corrected (left toggled)");
+            None => {}
         }
     }
 
@@ -1070,6 +1108,21 @@ impl App {
             self.on_transition(t);
         }
         self.broadcast_status();
+    }
+
+    /// Leaving idle mode on the way out. The black windows vanish with the process, but the
+    /// mutes live on the device: they have to be undone here, or the machine stays silent
+    /// until the daemon starts again (and the marker file would send the next start down the
+    /// crash-recovery path). The packs are *not* re-applied — the daemon is going away.
+    fn leave_idle_for_exit(&mut self) {
+        if !self.overlay.is_active() {
+            return;
+        }
+        overlay::hide(&mut self.overlay);
+        let _ = std::fs::remove_file(overlay::marker_path());
+        self.idle_deadline = None;
+        self.last_idle_beat = None;
+        info!("idle mode left before the exit: the audio is back");
     }
 
     fn toggle_killswitch(&mut self) {
@@ -1209,17 +1262,18 @@ impl App {
     /// Tray tooltip: the product name plus what is happening right now (user request 2026-10-18).
     /// Called from the 1 Hz housekeeping tick; only touches the tray when the text changes.
     fn update_tooltip(&mut self) {
+        let now = Instant::now();
         let text = if self.cfg.paused {
             "ArmouryDaemon — paused".to_string()
         } else {
-            match self.engine.state() {
+            match self.engine.state(now) {
                 EngineState::Idle => "ArmouryDaemon — idle".to_string(),
                 EngineState::Triggered => match self.engine.source() {
                     Some(src) => format!("ArmouryDaemon — {src}"),
                     None => "ArmouryDaemon — triggered".to_string(),
                 },
-                EngineState::Cooldown => match self.engine.cooldown_remaining(Instant::now()) {
-                    Some(left) => format!("ArmouryDaemon — reverting in {}s", left.as_secs()),
+                EngineState::Cooldown => match self.engine.cooldown_remaining(now) {
+                    Some(left) => format!("ArmouryDaemon — locked for {}s", left.as_secs()),
                     None => "ArmouryDaemon — cooldown".to_string(),
                 },
             }
@@ -1352,6 +1406,13 @@ impl App {
     fn on_art(&mut self, key: String) {
         if key.is_empty() {
             self.art_busy = false;
+            if self.art_retry_after_pass {
+                // The pass that just ended ran with the old key and left its miss markers
+                // behind: clear them and go again with the new one.
+                self.art_retry_after_pass = false;
+                art::clear_misses();
+                self.ensure_art();
+            }
             return;
         }
         info!("cover art: {key} is ready");
@@ -1497,6 +1558,12 @@ impl App {
                     }
                 }
                 Request::ShowUi => self.on_open(),
+                Request::Quit => {
+                    // The same shutdown the tray menu's "Quit" triggers: the flag is read by
+                    // the main loop, which then reverts the packs and restores the audio.
+                    info!("quit requested over the pipe");
+                    self.quit_requested.ask();
+                }
                 Request::ConsoleHello { pid } => {
                     info!("console hello (pid {pid}) on connection {id}");
                     let status = self.status();
@@ -1545,6 +1612,14 @@ impl App {
                         }
                         // Never the value itself.
                         info!("steamgriddb api key changed");
+                        // A keyless pass left a miss marker per app, and the fetcher skips a
+                        // fresh marker for seven days: without this the new key would never be
+                        // used and no cover would ever appear.
+                        art::clear_misses();
+                        // A pass that is still running uses the old key and writes its markers
+                        // again: it has to be followed by another pass with the new key.
+                        self.art_retry_after_pass = self.art_busy;
+                        self.ensure_art();
                     }
                     self.broadcast_status();
                 }
@@ -1650,14 +1725,9 @@ impl App {
                     info!("cooldown set to {}s", self.cfg.cooldown_seconds);
                     self.broadcast_status();
                 }
-                Request::SetUiPosition { x, y } => {
-                    // The UI only sends this after the window has been still for a moment.
-                    if self.cfg.ui_position != Some([x, y]) {
-                        self.cfg.ui_position = Some([x, y]);
-                        if let Err(e) = armoury_core::config::save(&self.cfg) {
-                            warn!("failed to save the dashboard position: {e}");
-                        }
-                    }
+                Request::SetUiPosition { .. } => {
+                    // The dashboard always opens in the corner: the position is not kept, so the
+                    // request is accepted and dropped.
                 }
                 Request::SetIdleFailsafe { enabled, minutes } => {
                     self.cfg.idle_failsafe_enabled = enabled;
@@ -1689,10 +1759,12 @@ impl App {
                                 if updated { "updated" } else { "installed" }
                             );
                             info!("pack op: {message}");
+                            forget_error(&mut self.last_error, "catalog");
                             self.reply_pack_op(id, true, message);
                         }
                         Err(e) => {
                             warn!("pack install failed: {e}");
+                            remember_error(&mut self.last_error, "catalog", &e);
                             self.reply_pack_op(id, false, e);
                         }
                     }
@@ -1752,7 +1824,131 @@ impl App {
 // ---------------------------------------------------------------------------
 // Win32 plumbing
 
-/// Drain and dispatch pending window messages (tray icon, hotkey, taskbar restarts).
+/// The pipe's security descriptor. Without one the pipe inherits the DACL of the elevated
+/// token: a non-elevated process of the same user is locked out, an elevated process of
+/// *any* user is not — and once connected, nothing is authenticated at all.
+/// `None` = the descriptor could not be built; the pipe then keeps the default rights.
+fn pipe_security_descriptor() -> Option<SecurityDescriptor> {
+    let sddl = pipe_sddl();
+    let wide = match widestring::U16CString::from_str(&sddl) {
+        Ok(w) => w,
+        Err(e) => {
+            warn!("pipe security descriptor is malformed ({e}) — the pipe keeps the default rights");
+            return None;
+        }
+    };
+    match SecurityDescriptor::deserialize(wide.as_ucstr()) {
+        Ok(sd) => Some(sd),
+        Err(e) => {
+            warn!(
+                "pipe security descriptor refused by Windows ({e}) — the pipe keeps the default \
+                 rights"
+            );
+            None
+        }
+    }
+}
+
+/// The SDDL of the pipe: the interactive user, Administrators and SYSTEM — nobody else.
+fn pipe_sddl() -> String {
+    const BASE: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+    match current_user_sid() {
+        Some(sid) => {
+            let who = current_user_name().unwrap_or_else(|| sid.clone());
+            info!("pipe security: SYSTEM, Administrators and {who}");
+            format!("{BASE}(A;;GA;;;{sid})")
+        }
+        None => {
+            warn!(
+                "the current user could not be determined — the pipe is open to SYSTEM and \
+                 Administrators only"
+            );
+            BASE.to_string()
+        }
+    }
+}
+
+/// The SID of the user this daemon runs as (the interactive user), as an SDDL trustee
+/// (`S-1-5-21-...`). The SDDL of a security descriptor only knows SIDs, not account names.
+fn current_user_sid() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: the pseudo-handle of the current process is always valid.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return None;
+    }
+    let mut len: u32 = 0;
+    // The first call only asks for the size of the TOKEN_USER (it fails on purpose).
+    unsafe {
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+    }
+    if len == 0 {
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: the buffer is exactly as big as the call above asked for.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    if !ok {
+        return None;
+    }
+    // SAFETY: the buffer holds a TOKEN_USER written by GetTokenInformation.
+    let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let mut sid: PWSTR = PWSTR::null();
+    // SAFETY: the SID belongs to the token and lives as long as it.
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) }.is_err() {
+        return None;
+    }
+    // SAFETY: the string was just written by Windows and is null terminated.
+    let text = unsafe { sid.to_string() }.ok();
+    // SAFETY: the string was allocated by Windows with LocalAlloc.
+    unsafe { LocalFree(Some(HLOCAL(sid.as_ptr().cast()))) };
+    text
+}
+
+/// The name of the user this daemon runs as: the interactive user, whose process this is.
+fn current_user_name() -> Option<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::System::WindowsProgramming::GetUserNameW;
+
+    let mut buf = [0u16; 256];
+    let mut len = buf.len() as u32;
+    // SAFETY: the buffer and its length are handed over as the API expects.
+    if unsafe { GetUserNameW(Some(PWSTR(buf.as_mut_ptr())), &mut len) }.is_ok() {
+        // The length counts the terminating null.
+        let name = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = name.trim_end_matches('\0').trim().to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    // A service-style launch has no user name in the API but one in the environment.
+    std::env::var("USERNAME")
+        .ok()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+}
+
+/// Drain and dispatch pending window messages (tray icon, keyboard hook, taskbar restarts).
 /// Bounded: a window that keeps re-posting messages (a missing ValidateRect, a menu loop) must
 /// never stop the main loop from draining pipe requests — that is exactly how the "Wake up
 /// button does nothing" bug happened on 2026-10-17.
@@ -1859,5 +2055,109 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, "C:\\games\\demo.exe"); // the tracked copy wins
         assert_eq!(entries[1].1, "D:\\tools\\pin.exe");
+    }
+
+    #[test]
+    fn the_quit_request_asks_for_the_shutdown() {
+        let mut quit = QuitRequest::default();
+        assert!(!quit.asked());
+        quit.ask();
+        assert!(quit.asked());
+    }
+
+    #[test]
+    fn a_pack_failure_is_remembered_and_a_clean_run_forgets_it() {
+        let mut last_error: Option<LastError> = None;
+        remember_error(&mut last_error, "pack:g-helper", "the hotkey did not land");
+        let err = last_error.clone().expect("the failure is remembered");
+        assert_eq!(err.source, "pack:g-helper");
+        assert_eq!(err.message, "the hotkey did not land");
+        assert!(err.at > 0);
+
+        // the most recent failure wins
+        remember_error(&mut last_error, "pack:rainmeter", "the layout is gone");
+        assert_eq!(last_error.as_ref().unwrap().source, "pack:rainmeter");
+
+        // a clean run clears it again
+        forget_error(&mut last_error, "pack:");
+        assert!(last_error.is_none());
+    }
+
+    #[test]
+    fn a_failure_of_another_kind_survives_a_clean_pack_run() {
+        let mut last_error: Option<LastError> = None;
+        remember_error(&mut last_error, "catalog", "the manifest could not be read");
+        forget_error(&mut last_error, "pack:");
+        assert_eq!(last_error.as_ref().unwrap().source, "catalog");
+    }
+
+    #[test]
+    fn the_pipe_is_opened_to_the_user_the_administrators_and_system() {
+        let sddl = pipe_sddl();
+        assert!(sddl.starts_with("D:P"));
+        assert!(sddl.contains("(A;;GA;;;SY)")); // SYSTEM
+        assert!(sddl.contains("(A;;GA;;;BA)")); // Administrators
+        assert!(!sddl.contains("WD)")); // not "everyone"
+        assert!(!sddl.contains("AU)")); // not "authenticated users"
+        match current_user_sid() {
+            Some(sid) => {
+                assert!(sid.starts_with("S-1-"));
+                assert!(sddl.contains(&format!("(A;;GA;;;{sid})")));
+            }
+            None => assert_eq!(sddl, "D:P(A;;GA;;;SY)(A;;GA;;;BA)"),
+        }
+    }
+
+    #[test]
+    fn the_pipe_security_descriptor_is_accepted_by_windows() {
+        use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        };
+        let sddl = pipe_sddl();
+        let wide = widestring::U16CString::from_str(&sddl).expect("the sddl is well formed");
+        let sd = SecurityDescriptor::deserialize(wide.as_ucstr())
+            .unwrap_or_else(|e| panic!("the sddl '{sddl}' was refused: {e}"));
+        // A valid descriptor can be turned back into SDDL.
+        let text = sd
+            .serialize(
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION,
+                |s| s.to_string_lossy().to_string(),
+            )
+            .expect("the descriptor is serialized");
+        assert!(text.contains("SY"));
+        assert!(text.contains("BA"));
+    }
+
+    #[test]
+    fn a_client_of_the_same_user_still_reaches_the_pipe() {
+        // The pipe as the daemon opens it: the same descriptor, a name of its own so the
+        // running daemon is not touched.
+        let raw = format!("armoury-daemon-test-{}.pipe", std::process::id());
+        let name = raw.as_str().to_ns_name::<GenericNamespaced>().expect("the name");
+        let mut options = ListenerOptions::new().name(name);
+        let sd = pipe_security_descriptor().expect("the descriptor");
+        options = options.security_descriptor(sd);
+        let listener = options.create_sync().expect("the listener");
+
+        let server = thread::spawn(move || {
+            let mut conn = listener
+                .incoming()
+                .next()
+                .expect("a client connects")
+                .expect("no error");
+            let mut reader = std::io::BufReader::new(&mut conn);
+            let mut buf = String::new();
+            armoury_core::protocol::read_msg(&mut reader, &mut buf).expect("a request")
+        });
+
+        let name = raw.as_str().to_ns_name::<GenericNamespaced>().expect("the name");
+        let mut client = ConnectOptions::new()
+            .name(name)
+            .connect_sync()
+            .expect("the client connects");
+        armoury_core::protocol::write_msg(&mut client, &Request::GetStatus).expect("the request");
+        let request = server.join().expect("the server thread");
+        assert!(matches!(request, Some(Request::GetStatus)));
     }
 }

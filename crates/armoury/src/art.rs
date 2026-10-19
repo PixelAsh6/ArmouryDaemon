@@ -18,6 +18,11 @@ use std::time::Duration;
 /// An empty marker older than this is re-tried (covers art uploaded later).
 const MISS_RETRY: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// Marker suffix: the cover had no art.
+const MISS_SUFFIX: &str = ".miss";
+/// Marker suffix: the hero had no art.
+const HERO_MISS_SUFFIX: &str = ".heromiss";
+
 pub const SGDB_BASE: &str = "https://www.steamgriddb.com/api/v2";
 
 /// Hand-droppable image extensions, consulted before the fetched `.img`.
@@ -66,8 +71,8 @@ impl Kind {
     /// Empty "nothing matched" marker, re-tried after MISS_RETRY.
     fn miss(self, key: &str) -> String {
         match self {
-            Kind::Cover => format!("{key}.miss"),
-            Kind::Hero => format!("{key}.heromiss"),
+            Kind::Cover => format!("{key}{MISS_SUFFIX}"),
+            Kind::Hero => format!("{key}{HERO_MISS_SUFFIX}"),
         }
     }
 
@@ -108,6 +113,41 @@ pub fn cached(key: &str) -> Option<PathBuf> {
 /// The best cached hero (the band background) for `key`.
 pub fn cached_hero(key: &str) -> Option<PathBuf> {
     cached_in(&art_dir(), key, Kind::Hero)
+}
+
+/// Delete the "nothing matched" markers, so those apps are eligible for a fetch again.
+/// Returns how many marker files were removed.
+pub fn clear_misses() -> usize {
+    let cleared = clear_misses_in(&art_dir());
+    if cleared > 0 {
+        log::info!("cover art: {cleared} miss marker(s) cleared");
+    }
+    cleared
+}
+
+/// The markers directly under `dir` — subdirectories are left alone. A missing directory is
+/// simply nothing to clear.
+fn clear_misses_in(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut cleared = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        if (name.ends_with(MISS_SUFFIX) || name.ends_with(HERO_MISS_SUFFIX))
+            && fs::remove_file(&path).is_ok()
+        {
+            cleared += 1;
+        }
+    }
+    cleared
 }
 
 /// Fetch everything still missing (blocking — call from a worker thread). `on_ready` fires
@@ -458,10 +498,39 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let key = "fedcba9876543210";
         assert!(wanted(&dir, key, Kind::Hero));
-        fs::write(dir.join(format!("{key}.heromiss")), b"").unwrap();
+        fs::write(dir.join(format!("{key}{HERO_MISS_SUFFIX}")), b"").unwrap();
         assert!(!wanted(&dir, key, Kind::Hero)); // a fresh miss: not retried yet
         fs::write(dir.join(format!("{key}.hero.webp")), b"x").unwrap();
         assert!(!wanted(&dir, key, Kind::Hero)); // the user's own art: never compete
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_misses_removes_only_the_markers() {
+        let dir = std::env::temp_dir().join(format!("armoury-art-clear-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = "abcdef0123456789";
+        let cover_miss = dir.join(format!("{key}{MISS_SUFFIX}"));
+        let hero_miss = dir.join(format!("{key}{HERO_MISS_SUFFIX}"));
+        let img = dir.join(format!("{key}.img"));
+        let other = dir.join("notes.txt");
+        fs::write(&cover_miss, b"").unwrap();
+        fs::write(&hero_miss, b"").unwrap();
+        fs::write(&img, b"x").unwrap();
+        fs::write(&other, b"x").unwrap();
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let nested = sub.join(format!("{key}{MISS_SUFFIX}"));
+        fs::write(&nested, b"").unwrap();
+
+        assert_eq!(clear_misses_in(&dir), 2);
+        assert!(!cover_miss.exists());
+        assert!(!hero_miss.exists());
+        assert!(img.exists()); // the fetched art stays
+        assert!(other.exists()); // an unrelated file stays
+        assert!(nested.exists()); // subdirectories are not touched
+        assert_eq!(clear_misses_in(&dir), 0); // nothing left to clear
         let _ = fs::remove_dir_all(&dir);
     }
 

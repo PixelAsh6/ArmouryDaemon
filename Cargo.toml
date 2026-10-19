@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/armoury-core", "crates/armoury"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 
@@ -15,7 +15,6 @@ log = { version = "0.4.28", features = ["std"] }
 crossbeam-channel = "0.5.17"
 interprocess = "2.4.5"
 tray-icon = "0.26.1"
-global-hotkey = "0.9.0"
 # Spec 3: packs may carry a script that the daemon interprets (sandboxed, whitelisted host API).
 # Kept in `armoury` only, so the core and the GUI never link the interpreter.
 rhai = { version = "1.26", default-features = false, features = ["std"] }

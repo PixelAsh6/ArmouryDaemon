@@ -251,7 +251,7 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
         }
 
         let setting_key = pack.settings.first().map(|s| s.key.as_str());
-        let mut result = run_block(block, &ctx, setting_key);
+        let mut result = run_block(block, &ctx, setting_key, &pack.id);
 
         // Spec 2: the block's script runs after its steps, in the same context. A script may
         // capture values; they are journalled below together with the step captures.
@@ -337,80 +337,93 @@ fn target_name_or(pack: &Pack) -> String {
         .unwrap_or_else(|| "target".to_string())
 }
 
-fn run_block(block: &StepBlock, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result<Vec<String>, String> {
+fn run_block(
+    block: &StepBlock,
+    ctx: &TemplateCtx,
+    setting_key: Option<&str>,
+    pack_id: &str,
+) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
     for step in &block.steps {
-        if run_step(step, ctx, setting_key)? {
-            done.push(describe_step(step, ctx));
+        if let Some(line) = run_step(step, ctx, setting_key, pack_id)? {
+            done.push(line);
         }
     }
     Ok(done)
 }
 
-fn describe_step(step: &Step, ctx: &TemplateCtx) -> String {
-    match step.mechanism.as_str() {
-        "cli" => {
-            let exe = resolve_exe(step, ctx).unwrap_or_default();
-            let args: Vec<String> = step.args.iter().map(|a| substitute(a, ctx).0).collect();
-            format!("cli {exe} {}", args.join(" "))
-        }
-        "hotkey" => format!("hotkey {}", resolve_chord(step, ctx).unwrap_or_default()),
-        "rainmeter_bang" => {
-            format!("bang {}", substitute(step.bang.as_deref().unwrap_or(""), ctx).0)
-        }
-        "registry_set" => match &step.registry {
-            Some(r) => format!("registry {}\\{} = {}", r.path, r.name, r.dword),
-            None => "registry_set".to_string(),
-        },
-        other => other.to_string(),
+/// Substitute a template. A placeholder the pack got wrong (a typo) is warned about: it would
+/// otherwise end up in an argument or in a path as literal text.
+fn substitute_checked(template: &str, ctx: &TemplateCtx, pack_id: &str) -> String {
+    let (text, unknown) = substitute(template, ctx);
+    if !unknown.is_empty() {
+        warn!(
+            "{}: unknown placeholder(s) {}, left as written",
+            pack_id,
+            unknown.join(", ")
+        );
     }
+    text
 }
 
 /// Fill dropdown values the user's config does not know yet with the pack's defaults, so a pack
 /// that gains a setting keeps working on an older config (the Wallpaper Engine bug of 2026-10-18).
 fn fill_defaults(settings: &mut HashMap<String, String>, pack: &Pack) {
     for setting in &pack.settings {
-        if !settings.contains_key(&setting.key) {
-            if let Some(default) = &setting.default {
-                settings.insert(setting.key.clone(), default.clone());
-            }
+        if !settings.contains_key(&setting.key)
+            && let Some(default) = &setting.default
+        {
+            settings.insert(setting.key.clone(), default.clone());
         }
     }
 }
 
 /// The exe a step runs: either its own `exe` template, or one picked from a dropdown via
 /// `exe_from_setting` + `exe_map` (e.g. "auto / 64-bit / 32-bit" of a multi-binary app).
-fn resolve_exe(step: &Step, ctx: &TemplateCtx) -> Result<String, String> {
+fn resolve_exe(step: &Step, ctx: &TemplateCtx, pack_id: &str) -> Result<String, String> {
     if let Some(key) = &step.exe_from_setting {
         let value = ctx.settings.get(key).cloned().unwrap_or_default();
         let template = step
             .exe_map
             .get(&value)
             .ok_or_else(|| format!("no exe mapped for {key} = '{value}'"))?;
-        return Ok(substitute(template, ctx).0);
+        return Ok(substitute_checked(template, ctx, pack_id));
     }
-    Ok(substitute(step.exe.as_deref().unwrap_or(""), ctx).0)
+    Ok(substitute_checked(step.exe.as_deref().unwrap_or(""), ctx, pack_id))
 }
 
-fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result<bool, String> {
-    if let Some(cond) = &step.when {
-        if !cond.matches(ctx, setting_key) {
-            return Ok(false); // step does not apply to this configuration
-        }
+/// Run one step. `Ok(None)` means the step did not apply (its `when` guard, or the app was
+/// already running); `Ok(Some(line))` is the log line of the step that ran. The templates are
+/// substituted once: the step and its log line use the same values.
+fn run_step(
+    step: &Step,
+    ctx: &TemplateCtx,
+    setting_key: Option<&str>,
+    pack_id: &str,
+) -> Result<Option<String>, String> {
+    if let Some(cond) = &step.when
+        && !cond.matches(ctx, setting_key)
+    {
+        return Ok(None); // step does not apply to this configuration
     }
-    if let Some(ms) = step.sleep_ms {
-        if ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(ms.min(10_000)));
-        }
+    if let Some(ms) = step.sleep_ms
+        && ms > 0
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms.min(10_000)));
     }
     match step.mechanism.as_str() {
         "cli" => {
-            let exe = resolve_exe(step, ctx)?;
-            let args: Vec<String> = step.args.iter().map(|a| substitute(a, ctx).0).collect();
-            run_cli(&exe, &args, step.expect_exit)
+            let exe = resolve_exe(step, ctx, pack_id)?;
+            let args: Vec<String> = step
+                .args
+                .iter()
+                .map(|a| substitute_checked(a, ctx, pack_id))
+                .collect();
+            run_cli(&exe, &args, step.expect_exit)?;
+            Ok(Some(format!("cli {exe} {}", args.join(" "))))
         }
         "process_start" => {
-            let exe = resolve_exe(step, ctx)?;
+            let exe = resolve_exe(step, ctx, pack_id)?;
             if exe.is_empty() {
                 return Err("process_start: no exe".into());
             }
@@ -422,12 +435,13 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
                 .to_ascii_lowercase();
             if snapshot_targets().contains_key(&base) {
                 info!("process_start: {base} is already running — nothing to start");
-                return Ok(false);
+                return Ok(None);
             }
-            start_process(&exe)
+            start_process(&exe)?;
+            Ok(Some("process_start".to_string()))
         }
         "process_kill" => {
-            let exe = resolve_exe(step, ctx)?;
+            let exe = resolve_exe(step, ctx, pack_id)?;
             let name = exe
                 .rsplit(['\\', '/'])
                 .next()
@@ -436,26 +450,32 @@ fn run_step(step: &Step, ctx: &TemplateCtx, setting_key: Option<&str>) -> Result
             if name.is_empty() {
                 return Err("process_kill: no target".into());
             }
-            kill_by_name(&name)
+            kill_by_name(&name)?;
+            Ok(Some("process_kill".to_string()))
         }
         "registry_set" => {
             let reg = step.registry.as_ref().ok_or("registry_set: no registry block")?;
-            set_registry_dword(&reg.path, &reg.name, reg.dword)
+            set_registry_dword(&reg.path, &reg.name, reg.dword)?;
+            Ok(Some(format!(
+                "registry {}\\{} = {}",
+                reg.path, reg.name, reg.dword
+            )))
         }
         "hotkey" => {
-            match resolve_chord(step, ctx) {
-                Some(chord) => send_chord(&chord),
-                // No mapping for this dropdown value (e.g. the "kill" option): nothing to send.
-                None => Ok(()),
+            let chord = resolve_chord(step, ctx, pack_id);
+            // No mapping for this dropdown value (e.g. the "kill" option): nothing to send.
+            if let Some(chord) = &chord {
+                send_chord(chord)?;
             }
+            Ok(Some(format!("hotkey {}", chord.unwrap_or_default())))
         }
         "rainmeter_bang" => {
-            let bang = substitute(step.bang.as_deref().unwrap_or(""), ctx).0;
-            send_rainmeter_bang(&bang, &ctx.target_exe)
+            let bang = substitute_checked(step.bang.as_deref().unwrap_or(""), ctx, pack_id);
+            send_rainmeter_bang(&bang, &ctx.target_exe)?;
+            Ok(Some(format!("bang {bang}")))
         }
         other => Err(format!("unsupported mechanism '{other}'")),
     }
-    .map(|_| true)
 }
 
 /// Terminate every process with this exe file name (lowercase).
@@ -556,9 +576,9 @@ fn start_process(exe: &str) -> Result<(), String> {
         .map_err(|e| format!("start {path}: {e}"))
 }
 
-fn resolve_chord(step: &Step, ctx: &TemplateCtx) -> Option<String> {
+fn resolve_chord(step: &Step, ctx: &TemplateCtx, pack_id: &str) -> Option<String> {
     if let Some(expr) = &step.keys_from_mode {
-        let (key, _) = substitute(expr, ctx);
+        let key = substitute_checked(expr, ctx, pack_id);
         return step.map.get(&key).cloned().or_else(|| {
             warn!("hotkey: no mapping for setting value '{key}'");
             None
@@ -574,22 +594,125 @@ fn resolve_chord(step: &Step, ctx: &TemplateCtx) -> Option<String> {
     None
 }
 
+/// How long a pack's CLI call may run. The pack worker is serial, so a child that never exits
+/// would block every future apply and revert while the daemon still looks healthy.
+const CLI_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How much of a child's output is kept, per stream.
+const CLI_OUTPUT_CAP: usize = 64 * 1024;
+
 fn run_cli(exe: &str, args: &[String], expect_exit: Option<i32>) -> Result<(), String> {
+    run_cli_within(exe, args, expect_exit, CLI_TIMEOUT)
+}
+
+/// Run a program and wait for it, but not longer than `limit`. A child that outlives the limit
+/// is killed: the pack worker must never stay blocked on it.
+fn run_cli_within(
+    exe: &str,
+    args: &[String],
+    expect_exit: Option<i32>,
+    limit: Duration,
+) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
-    let output = Command::new(exe)
+    use std::process::Stdio;
+
+    let mut child = Command::new(exe)
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("spawn {exe}: {e}"))?;
-    let code = output.status.code().unwrap_or(-1);
+
+    // both pipes are drained on their own threads: a full pipe buffer would block the child
+    let out = child.stdout.take().map(spawn_drain);
+    let err = child.stderr.take().map(spawn_drain);
+
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("wait {exe}: {e}")),
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // the readers end when the pipes close; a child that left a grandchild behind may keep them
+    // open, so they are waited for briefly and then left to finish on their own
+    let out = out
+        .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
+        .unwrap_or_default();
+    let err = err
+        .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
+        .unwrap_or_default();
+    log_output(exe, "stdout", &out);
+    log_output(exe, "stderr", &err);
+
+    let Some(status) = status else {
+        return Err(format!(
+            "{exe} timed out after {} s and was killed",
+            limit.as_secs()
+        ));
+    };
+
+    let code = status.code().unwrap_or(-1);
     match expect_exit {
         Some(want) if want != code => Err(format!("{exe} exited {code}, expected {want}")),
-        _ if !output.status.success() && expect_exit.is_none() && code != 0 => {
+        _ if !status.success() && expect_exit.is_none() && code != 0 => {
             // Many tools exit non-zero without meaning failure; keep it as info only.
             Err(format!("{exe} exited {code}"))
         }
         _ => Ok(()),
     }
+}
+
+/// Drain a pipe on its own thread; the bytes arrive over the channel.
+fn spawn_drain<R: std::io::Read + Send + 'static>(
+    pipe: R,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(drain_pipe(pipe));
+    });
+    rx
+}
+
+/// Read a pipe to its end. At most `CLI_OUTPUT_CAP` bytes are kept, but the pipe keeps being
+/// drained: a chatty child must not block on a full buffer.
+fn drain_pipe(mut pipe: impl std::io::Read) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < CLI_OUTPUT_CAP {
+                    let take = n.min(CLI_OUTPUT_CAP - out.len());
+                    out.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One line of a child's output, for the log (never more than 200 characters).
+fn log_output(exe: &str, stream: &str, bytes: &[u8]) {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(line) = text.lines().find(|l| !l.trim().is_empty()) else {
+        return;
+    };
+    let line: String = line.trim().chars().take(200).collect();
+    info!("{exe} {stream}: {line}");
 }
 
 /// Rainmeter bangs. Preferred path is a WM_COPYDATA message to Rainmeter's hidden
@@ -715,12 +838,11 @@ pub fn layout_is_empty(name: &str) -> bool {
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if let Some(rest) = lower.strip_prefix("active") {
-            if let Some(value) = rest.trim_start().strip_prefix('=') {
-                if value.trim().parse::<i32>().map(|v| v >= 1).unwrap_or(false) {
-                    return false;
-                }
-            }
+        if let Some(rest) = lower.strip_prefix("active")
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+            && value.trim().parse::<i32>().map(|v| v >= 1).unwrap_or(false)
+        {
+            return false;
         }
     }
     true
@@ -728,10 +850,8 @@ pub fn layout_is_empty(name: &str) -> bool {
 
 fn decode_ini(bytes: &[u8]) -> String {
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        let words: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
+        let (chunks, _) = bytes[2..].as_chunks::<2>();
+        let words: Vec<u16> = chunks.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&words)
     } else if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
         String::from_utf8_lossy(&bytes[3..]).into_owned()
@@ -753,10 +873,10 @@ pub fn ensure_empty_layout() -> Option<String> {
     {
         return Some(name.clone());
     }
-    if let Some(name) = layouts.iter().find(|l| layout_is_empty(l)) {
-        if !name.eq_ignore_ascii_case("@Backup") {
-            return Some(name.clone());
-        }
+    if let Some(name) = layouts.iter().find(|l| layout_is_empty(l))
+        && !name.eq_ignore_ascii_case("@Backup")
+    {
+        return Some(name.clone());
     }
 
     // 2/3. create one, respecting an occupied name
@@ -1034,10 +1154,10 @@ fn snapshot_targets() -> HashMap<String, (String, u32)> {
                 .unwrap_or(entry.szExeFile.len());
             let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
             let key = name.to_ascii_lowercase();
-            if !map.contains_key(&key) {
-                if let Some(path) = crate::watch::process_path(pid) {
-                    map.insert(key, (path, pid));
-                }
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(key)
+                && let Some(path) = crate::watch::process_path(pid)
+            {
+                slot.insert((path, pid));
             }
         }
         ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
@@ -1150,6 +1270,66 @@ mod tests {
         assert_eq!(split_bang("!ToggleMeter \"Some Meter\"").len(), 2);
     }
 
+    /// A child that never finishes on its own, for the deadline test.
+    fn a_child_that_never_finishes() -> (String, Vec<String>) {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let ps = PathBuf::from(&system)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        if ps.is_file() {
+            return (
+                ps.display().to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "Start-Sleep -Seconds 30".to_string(),
+                ],
+            );
+        }
+        let cmd = PathBuf::from(&system).join("System32").join("cmd.exe");
+        (
+            cmd.display().to_string(),
+            vec!["/c".to_string(), "ping -n 30 127.0.0.1 > nul".to_string()],
+        )
+    }
+
+    #[test]
+    fn a_cli_call_has_a_deadline() {
+        // a child that never exits must be killed: the pack worker is serial and would
+        // otherwise stay blocked on it forever
+        let (exe, args) = a_child_that_never_finishes();
+        let started = Instant::now();
+        let err = run_cli_within(&exe, &args, None, Duration::from_secs(2))
+            .expect_err("a child that never exits must fail");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the child was not killed in time"
+        );
+    }
+
+    #[test]
+    fn a_cli_call_still_reports_its_exit_code() {
+        let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let exe = PathBuf::from(system)
+            .join("System32")
+            .join("cmd.exe")
+            .display()
+            .to_string();
+        assert!(run_cli(&exe, &["/c".to_string(), "exit 0".to_string()], None).is_ok());
+        let err = run_cli(&exe, &["/c".to_string(), "exit 3".to_string()], None).unwrap_err();
+        assert!(err.contains("exited 3"), "{err}");
+        let err = run_cli(
+            &exe,
+            &["/c".to_string(), "exit 3".to_string()],
+            Some(0),
+        )
+        .unwrap_err();
+        assert!(err.contains("expected 0"), "{err}");
+    }
+
     #[test]
     fn env_expansion() {
         let expanded = expand_env("%APPDATA%\\GHelper\\config.json");
@@ -1230,22 +1410,22 @@ mod tests {
             .insert("target_path".into(), "C:\\WE\\wallpaper64.exe".into());
         ctx.settings.insert("binary".into(), "auto".into());
         assert_eq!(
-            resolve_exe(&step, &ctx).unwrap(),
+            resolve_exe(&step, &ctx, "we").unwrap(),
             "C:\\WE\\wallpaper64.exe",
             "auto must call the running binary"
         );
         ctx.settings.insert("binary".into(), "32-bit".into());
-        assert_eq!(resolve_exe(&step, &ctx).unwrap(), "C:\\WE\\wallpaper32.exe");
+        assert_eq!(resolve_exe(&step, &ctx, "we").unwrap(), "C:\\WE\\wallpaper32.exe");
         ctx.settings.insert("binary".into(), "bogus".into());
-        assert!(resolve_exe(&step, &ctx).is_err());
+        assert!(resolve_exe(&step, &ctx, "we").is_err());
         // no value at all must be an error, never a silent empty exe
         ctx.settings.remove("binary");
-        assert!(resolve_exe(&step, &ctx).is_err());
+        assert!(resolve_exe(&step, &ctx, "we").is_err());
         // a step without exe_from_setting still uses its own template
         let plain: Step =
             serde_json::from_str(r#"{"mechanism":"cli","exe":"{{target.name}}"}"#).unwrap();
         ctx.target_name = "app.exe".into();
-        assert_eq!(resolve_exe(&plain, &ctx).unwrap(), "app.exe");
+        assert_eq!(resolve_exe(&plain, &ctx, "we").unwrap(), "app.exe");
     }
 
     #[test]
@@ -1284,26 +1464,26 @@ mod tests {
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("pack.json"), SAMPLE).unwrap();
 
-        let (id, updated) = install_from_path(&[install.clone()], &source).unwrap();
+        let (id, updated) = install_from_path(std::slice::from_ref(&install), &source).unwrap();
         assert_eq!(id, "sample");
         assert!(!updated);
         assert!(install.join("packs").join("sample").join("pack.json").is_file());
 
         // installing again is an update, not a second copy
-        let (id, updated) = install_from_path(&[install.clone()], &source).unwrap();
+        let (id, updated) = install_from_path(std::slice::from_ref(&install), &source).unwrap();
         assert_eq!(id, "sample");
         assert!(updated);
-        assert_eq!(load(&[install.clone()]).len(), 1);
+        assert_eq!(load(std::slice::from_ref(&install)).len(), 1);
 
-        let removed = remove_id(&[install.clone()], "sample").unwrap();
+        let removed = remove_id(std::slice::from_ref(&install), "sample").unwrap();
         assert_eq!(removed, "sample");
         assert!(!install.join("packs").join("sample").exists());
-        assert!(load(&[install.clone()]).is_empty());
+        assert!(load(std::slice::from_ref(&install)).is_empty());
 
         // nothing left to remove, and traversal is refused
-        assert!(remove_id(&[install.clone()], "sample").is_err());
-        assert!(remove_id(&[install.clone()], "../..").is_err());
-        assert!(remove_id(&[install.clone()], "C:evil").is_err());
+        assert!(remove_id(std::slice::from_ref(&install), "sample").is_err());
+        assert!(remove_id(std::slice::from_ref(&install), "../..").is_err());
+        assert!(remove_id(std::slice::from_ref(&install), "C:evil").is_err());
         let _ = std::fs::remove_dir_all(&install);
     }
 
@@ -1313,9 +1493,9 @@ mod tests {
         let bad = install.join("bad");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("pack.json"), r#"{"spec":1}"#).unwrap();
-        assert!(install_from_path(&[install.clone()], &bad).is_err());
+        assert!(install_from_path(std::slice::from_ref(&install), &bad).is_err());
         assert!(!install.join("packs").join("x").exists());
-        assert!(load(&[install.clone()]).is_empty());
+        assert!(load(std::slice::from_ref(&install)).is_empty());
         let _ = std::fs::remove_dir_all(&install);
     }
 
