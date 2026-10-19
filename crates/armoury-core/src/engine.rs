@@ -8,7 +8,8 @@
 //!   fresh cooldown.
 //! - After the revert the engine is simply Idle: there is **no second cooldown**.
 //! - Idle mode cancels switching entirely (entering reverts, leaving re-applies immediately).
-//! - Removing the last tracked app reverts immediately (manual action, no cooldown).
+//! - Removing the last tracked app ends like an exit: the packs are held for the cooldown and only
+//!   then reverted (while paused the manual action still switches back at once, G12).
 //!
 //! Deliberately free of Windows/clock dependencies so it can be unit-tested.
 
@@ -163,10 +164,14 @@ impl Engine {
         }
     }
 
-    /// A tracked app was removed from the user's list: forget it entirely. If nothing tracked is
-    /// running any more, the packs revert **now** instead of waiting out the cooldown — the user
-    /// just said the app no longer matters (2026-10-17 feedback).
-    pub fn on_untracked(&mut self, key: &str) -> Option<Transition> {
+    /// A tracked app was removed from the user's list: forget it entirely. The machine is **not**
+    /// switched back at once — with nothing tracked left, the removal ends like an exit: the packs
+    /// are held for the cooldown window and only then reverted (spec 4: the cooldown is the
+    /// engine-level delay-revert and always governs the revert, whatever made the app go away). A
+    /// cooldown that is already pending is kept, not restarted or cancelled. While paused the
+    /// user's own action still takes effect immediately (manual actions bypass pause, G12), which
+    /// is the only case that returns a transition to run now.
+    pub fn on_untracked(&mut self, key: &str, now: Instant) -> Option<Transition> {
         self.running.remove(&key.to_ascii_lowercase());
         self.last_source = if self.running.is_empty() {
             None
@@ -174,9 +179,14 @@ impl Engine {
             Some(self.source_label())
         };
         if self.running.is_empty() && self.applied {
-            self.applied = false;
-            self.pending_revert = None;
-            return Some(Transition::Reverted);
+            if self.paused {
+                self.applied = false;
+                self.pending_revert = None;
+                return Some(Transition::Reverted);
+            }
+            if self.pending_revert.is_none() {
+                self.pending_revert = Some(now + self.cooldown);
+            }
         }
         None
     }
@@ -420,18 +430,63 @@ mod tests {
     }
 
     #[test]
-    fn last_tracked_app_removed_reverts_immediately() {
+    fn removing_the_last_tracked_app_starts_the_cooldown() {
+        // Removing the entry is an exit like any other: the packs stay applied for the cooldown
+        // and only then go back (spec 4 — never switch the machine back instantly).
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("game.exe", "game.exe", 1, now);
         assert!(e.is_applied());
 
-        assert_eq!(e.on_untracked("game.exe"), Some(Transition::Reverted));
+        assert_eq!(e.on_untracked("game.exe", now), None);
+        assert!(e.is_applied(), "the packs are held for the cooldown window");
+        assert_eq!(e.state(), EngineState::Cooldown);
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+
+        // nothing reverts before the cooldown elapses
+        assert_eq!(e.tick(now + Duration::from_secs(C - 1)), None);
+        assert!(e.is_applied());
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Reverted));
         assert!(!e.is_applied());
         assert_eq!(e.state(), EngineState::Idle);
         assert_eq!(e.cooldown_remaining(now), None);
 
-        assert_eq!(e.on_untracked("ghost.exe"), None);
+        // removing an app that is not running changes nothing
+        assert_eq!(e.on_untracked("ghost.exe", now), None);
+        assert!(!e.is_applied());
+    }
+
+    #[test]
+    fn removing_the_last_app_while_paused_reverts_now() {
+        // A manual action still takes effect while the automatic switching is frozen (G12).
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        e.set_paused(true, now);
+
+        assert_eq!(e.on_untracked("game.exe", now), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.state(), EngineState::Idle);
+        assert_eq!(e.cooldown_remaining(now), None);
+    }
+
+    #[test]
+    fn removing_an_app_that_already_closed_keeps_its_cooldown() {
+        // Closing started the cooldown; removing the entry must not bring the revert forward.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        e.on_stopped("game.exe", 1, now);
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+
+        assert_eq!(e.on_untracked("game.exe", now), None);
+        assert!(e.is_applied());
+        assert_eq!(
+            e.cooldown_remaining(now),
+            Some(Duration::from_secs(C)),
+            "the pending cooldown is kept, not restarted or cancelled"
+        );
+        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Reverted));
         assert!(!e.is_applied());
     }
 
@@ -441,9 +496,10 @@ mod tests {
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("a.exe", "a.exe", 1, now);
         e.on_started("b.exe", "b.exe", 2, now);
-        assert_eq!(e.on_untracked("a.exe"), None);
+        assert_eq!(e.on_untracked("a.exe", now), None);
         assert!(e.is_applied());
         assert_eq!(e.state(), EngineState::Triggered);
+        assert_eq!(e.cooldown_remaining(now), None, "b.exe is still running");
         assert_eq!(e.source().as_deref(), Some("b.exe"));
     }
 

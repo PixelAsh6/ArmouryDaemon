@@ -33,8 +33,11 @@ pub enum Request {
     InstallPack { source: String },
     /// Remove an installed pack (its folder under `<install>\packs`).
     RemovePack { id: String },
-    /// Turn console mode on/off (a controller connect then opens the launcher).
-    SetConsoleEnabled { enabled: bool },
+    /// Console launcher auto-open: `always` (daemon startup), `pad` (controller connect),
+    /// `never`. The tray's manual open is never affected.
+    SetConsoleOpen { mode: String },
+    /// SteamGridDB API key for cover/hero art (empty string clears it).
+    SetSgdbKey { key: String },
     /// Pin an app to the console launcher (not tracked).
     AddConsoleApp { name: String, exe: String },
     /// Unpin an app from the console launcher.
@@ -103,8 +106,18 @@ mod tests {
         let req = Request::UiHello { pid: 42 };
         let mut out = Vec::new();
         write_msg(&mut out, &req).unwrap();
-        let back: Request = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
+        write_msg(
+            &mut out,
+            &Request::SetSgdbKey {
+                key: "abc123".into(),
+            },
+        )
+        .unwrap();
+        let mut reader = &out[..];
+        let back: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(back, Request::UiHello { pid: 42 }));
+        let back: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(back, Request::SetSgdbKey { ref key } if key == "abc123"));
     }
 
     #[test]
@@ -174,10 +187,12 @@ mod tests {
                 tracked_apps: vec![],
                 tracked_apps_running: vec![],
                 packs: vec![],
-                console_enabled: false,
+                console_open: "pad".into(),
                 console_apps: vec![],
                 console_hidden: vec![],
                 last_played: Default::default(),
+                sgdb_api_key_set: false,
+                sgdb_api_key: String::new(),
             },
         };
         let mut out = Vec::new();
@@ -206,6 +221,13 @@ mod tests {
         write_msg(&mut out, &Request::ShowConsole).unwrap();
         write_msg(
             &mut out,
+            &Request::SetConsoleOpen {
+                mode: "never".into(),
+            },
+        )
+        .unwrap();
+        write_msg(
+            &mut out,
             &Request::HideFromConsole {
                 exe: "C:\\Games\\doom.exe".into(),
             },
@@ -224,6 +246,8 @@ mod tests {
         assert!(matches!(req, Request::AddConsoleApp { .. }));
         let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(req, Request::ShowConsole));
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(req, Request::SetConsoleOpen { ref mode } if mode == "never"));
         let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(req, Request::HideFromConsole { .. }));
         let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();

@@ -1,4 +1,4 @@
-use crate::config::{ConsoleApp, TrackedApp};
+use crate::config::{ConsoleApp, TrackedApp, default_console_open};
 use serde::{Deserialize, Serialize};
 
 /// Top-level daemon state machine (Phase 1: always Idle).
@@ -45,9 +45,10 @@ pub struct StatusSnapshot {
     /// Installed packs and their state, for the dashboard.
     #[serde(default)]
     pub packs: Vec<PackStatus>,
-    /// Console mode: whether a controller connect opens the launcher.
-    #[serde(default)]
-    pub console_enabled: bool,
+    /// Console launcher auto-open: `"always"` (daemon startup), `"pad"` (controller connect),
+    /// `"never"`. The tray's manual open works regardless.
+    #[serde(default = "default_console_open")]
+    pub console_open: String,
     /// Apps pinned to the console launcher.
     #[serde(default)]
     pub console_apps: Vec<ConsoleApp>,
@@ -57,6 +58,13 @@ pub struct StatusSnapshot {
     /// Console: exe base name (lowercase) -> unix seconds of the last play (band recency order).
     #[serde(default)]
     pub last_played: std::collections::HashMap<String, u64>,
+    /// SteamGridDB: whether an API key is configured (drives the "no key set" hint).
+    #[serde(default)]
+    pub sgdb_api_key_set: bool,
+    /// SteamGridDB: the current key, for the settings field's masked prefill. The pipe is
+    /// local-only and the key already lives in a local config.json.
+    #[serde(default)]
+    pub sgdb_api_key: String,
 }
 
 /// One installed pack, as the dashboard sees it.

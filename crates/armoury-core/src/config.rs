@@ -4,6 +4,31 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+pub const CONSOLE_OPEN_ALWAYS: &str = "always";
+pub const CONSOLE_OPEN_PAD: &str = "pad";
+pub const CONSOLE_OPEN_NEVER: &str = "never";
+
+/// Unset or unrecognised value = the historical behaviour (`pad`).
+pub fn normalize_console_open(value: &str) -> &'static str {
+    match value.trim().to_ascii_lowercase().as_str() {
+        CONSOLE_OPEN_ALWAYS => CONSOLE_OPEN_ALWAYS,
+        CONSOLE_OPEN_NEVER => CONSOLE_OPEN_NEVER,
+        _ => CONSOLE_OPEN_PAD,
+    }
+}
+
+pub fn default_console_open() -> String {
+    CONSOLE_OPEN_PAD.to_string()
+}
+
+fn de_console_open<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(d)?;
+    Ok(normalize_console_open(&raw).to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -14,8 +39,10 @@ pub struct AppConfig {
     pub packs: HashMap<String, PackUserConfig>,
     /// Pause all pack switching (tray menu / dashboard button).
     pub paused: bool,
-    /// Controller "console mode": the pad's connect opens the console launcher.
-    pub console_enabled: bool,
+    /// Console launcher auto-open: `always` (daemon startup), `pad` (controller connect), `never`.
+    /// The tray's manual open is never affected.
+    #[serde(default = "default_console_open", deserialize_with = "de_console_open")]
+    pub console_open: String,
     /// Apps pinned to the console launcher without being tracked.
     pub console_apps: Vec<ConsoleApp>,
     /// Exe base names (lowercase) the console band hides: tracked apps kept out of the strip.
@@ -55,7 +82,7 @@ impl Default for AppConfig {
             tracked_apps: Vec::new(),
             packs: HashMap::new(),
             paused: false,
-            console_enabled: false,
+            console_open: default_console_open(),
             console_apps: Vec::new(),
             console_hidden: Vec::new(),
             idle_failsafe_enabled: true,
@@ -184,7 +211,6 @@ mod tests {
     #[test]
     fn console_fields_roundtrip_and_old_configs_still_load() {
         let mut cfg = AppConfig::default();
-        cfg.console_enabled = true;
         cfg.console_apps.push(ConsoleApp {
             name: "Notepad".into(),
             exe: "C:\\Windows\\notepad.exe".into(),
@@ -192,15 +218,40 @@ mod tests {
         cfg.console_hidden.push("notepad.exe".into());
         let text = serde_json::to_string(&cfg).unwrap();
         let back: AppConfig = serde_json::from_str(&text).unwrap();
-        assert!(back.console_enabled);
         assert_eq!(back.console_apps[0].exe, "C:\\Windows\\notepad.exe");
         assert_eq!(back.console_hidden, vec!["notepad.exe".to_string()]);
 
         // a config written before console mode existed must load with console defaults
         let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
         assert_eq!(old.cooldown_seconds, 30);
-        assert!(!old.console_enabled);
         assert!(old.console_apps.is_empty());
         assert!(old.console_hidden.is_empty());
+    }
+
+    #[test]
+    fn console_open_defaults_to_pad() {
+        assert_eq!(AppConfig::default().console_open, "pad");
+
+        // legacy config without the field (and with the retired `console_enabled`) still loads
+        let old: AppConfig =
+            serde_json::from_str(r#"{"console_enabled": true, "cooldown_seconds": 30}"#).unwrap();
+        assert_eq!(old.console_open, "pad");
+        assert_eq!(old.cooldown_seconds, 30);
+    }
+
+    #[test]
+    fn console_open_roundtrips_and_unknown_values_fall_back() {
+        for mode in ["always", "pad", "never"] {
+            let mut cfg = AppConfig::default();
+            cfg.console_open = mode.into();
+            let text = serde_json::to_string(&cfg).unwrap();
+            let back: AppConfig = serde_json::from_str(&text).unwrap();
+            assert_eq!(back.console_open, mode);
+        }
+
+        let odd: AppConfig = serde_json::from_str(r#"{"console_open": "sometimes"}"#).unwrap();
+        assert_eq!(odd.console_open, "pad");
+        let empty: AppConfig = serde_json::from_str(r#"{"console_open": ""}"#).unwrap();
+        assert_eq!(empty.console_open, "pad");
     }
 }

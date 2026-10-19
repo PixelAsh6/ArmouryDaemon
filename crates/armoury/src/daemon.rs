@@ -9,7 +9,10 @@ use crate::overlay;
 use crate::pad;
 use crate::packs;
 use crate::watch;
-use armoury_core::config::{AppConfig, ConsoleApp, TrackedApp};
+use armoury_core::config::{
+    AppConfig, CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, ConsoleApp, TrackedApp,
+    normalize_console_open,
+};
 use armoury_core::engine::{Engine, EngineState, Transition};
 use armoury_core::protocol::{Request, Response};
 use armoury_core::status::{PackSettingStatus, PackStatus, RunState, StatusSnapshot};
@@ -249,6 +252,10 @@ pub fn run(show_ui_when_running: bool) {
     }
     info!("daemon ready");
     app.ensure_art(); // tracked apps get their covers even before the console opens
+    if app.cfg.console_open == CONSOLE_OPEN_ALWAYS {
+        info!("console: open mode 'always' — starting the launcher");
+        app.show_console();
+    }
 
     let quit = loop {
         pump_win32_messages();
@@ -578,10 +585,12 @@ impl App {
             idle_failsafe_minutes: self.cfg.idle_failsafe_minutes,
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
-            console_enabled: self.cfg.console_enabled,
+            console_open: self.cfg.console_open.clone(),
             console_apps: self.cfg.console_apps.clone(),
             console_hidden: self.cfg.console_hidden.clone(),
             last_played: self.cfg.last_played.clone(),
+            sgdb_api_key_set: self.cfg.sgdb_api_key.is_some(),
+            sgdb_api_key: self.cfg.sgdb_api_key.clone().unwrap_or_default(),
             packs: self
                 .pack_catalog
                 .iter()
@@ -953,14 +962,17 @@ impl App {
         if self.cfg.tracked_apps.len() != before {
             info!("tracked app removed: {exe}");
             self.save_and_share_tracked();
-            // If that was the only tracked app holding the packs applied, revert now instead of
-            // waiting out the cooldown — the user just said this app no longer matters
-            // (feedback 2026-10-17: "it only made the changes after it entered another cooldown").
-            // Manual action: it happens even while paused.
+            // The entry is gone, so nothing holds the packs applied any more — but the machine is
+            // not switched back instantly: removing the last tracked app ends like an exit, so the
+            // packs stay applied for the cooldown and only then revert (spec 4). Only while paused
+            // does the manual action take effect at once (G12), which the engine signals by
+            // returning a transition.
             let key = basename_lower(exe);
-            if let Some(t) = self.engine.on_untracked(&key) {
-                info!("nothing tracked is running any more — reverting the packs immediately");
+            if let Some(t) = self.engine.on_untracked(&key, Instant::now()) {
+                info!("tracked app removed while paused — reverting the packs now");
                 self.send_transition(t, true);
+            } else if self.engine.state() == EngineState::Cooldown {
+                info!("tracked app removed — the packs stay applied until the cooldown expires");
             }
         }
     }
@@ -1238,8 +1250,8 @@ impl App {
         }
     }
 
-    /// Pad hotplug: a fresh connect opens the console launcher when the feature is on and no
-    /// tracked app is running (user decision 2026-10-19).
+    /// Pad hotplug: a fresh connect opens the console launcher when auto-open is not `never`
+    /// and no tracked app is running (user decision 2026-10-19).
     fn on_pad(&mut self, ev: console::PadEvent) {
         match ev {
             console::PadEvent::Connected { slot } => {
@@ -1252,11 +1264,11 @@ impl App {
         }
     }
 
-    /// Open the launcher unless console mode is off or a tracked app is running. Shared by a
-    /// fresh connect and by turning the feature on while a pad already sits in a slot — that
-    /// moment never produces a connect event (the watcher seeds the current slots at startup).
+    /// Open the launcher unless auto-open is `never` or a tracked app is running. Shared by a
+    /// fresh connect and by choosing a mode while a pad already sits in a slot — that moment
+    /// never produces a connect event (the watcher seeds the current slots at startup).
     fn open_console_if_allowed(&mut self) {
-        if !self.cfg.console_enabled {
+        if self.cfg.console_open == CONSOLE_OPEN_NEVER {
             return;
         }
         if !self.engine.running_names().is_empty() {
@@ -1497,19 +1509,42 @@ impl App {
                     self.ensure_art(); // the band is up: make sure its covers exist
                 }
                 Request::ShowConsole => self.show_console(),
-                Request::SetConsoleEnabled { enabled } => {
-                    self.cfg.console_enabled = enabled;
-                    if let Err(e) = armoury_core::config::save(&self.cfg) {
-                        warn!("failed to save config: {e}");
-                    }
-                    info!("console mode {}", if enabled { "on" } else { "off" });
-                    // A pad that is already connected will not send a fresh connect event, so
-                    // turning the feature on with one present counts as that connect.
-                    if enabled {
-                        if let Some(slot) = pad::first_connected() {
-                            info!("controller already connected (slot {slot})");
-                            self.open_console_if_allowed();
+                Request::SetConsoleOpen { mode } => {
+                    let mode = normalize_console_open(&mode).to_string();
+                    let changed = self.cfg.console_open != mode;
+                    self.cfg.console_open = mode.clone();
+                    if changed {
+                        if let Err(e) = armoury_core::config::save(&self.cfg) {
+                            warn!("failed to save config: {e}");
                         }
+                        info!("console: open mode '{mode}'");
+                    }
+                    // Selecting a mode is a trigger in its own right: a pad that is already
+                    // connected never sends a connect event, and "always" should show the band
+                    // now rather than at the next daemon start.
+                    let pad_present = pad::first_connected().is_some();
+                    if mode == CONSOLE_OPEN_ALWAYS
+                        || (mode != CONSOLE_OPEN_NEVER && pad_present)
+                    {
+                        self.open_console_if_allowed();
+                    }
+                    self.broadcast_status();
+                }
+                Request::SetSgdbKey { key } => {
+                    let key = key.trim();
+                    let new = if key.is_empty() {
+                        None
+                    } else {
+                        Some(key.to_string())
+                    };
+                    let changed = self.cfg.sgdb_api_key != new;
+                    self.cfg.sgdb_api_key = new;
+                    if changed {
+                        if let Err(e) = armoury_core::config::save(&self.cfg) {
+                            warn!("failed to save config: {e}");
+                        }
+                        // Never the value itself.
+                        info!("steamgriddb api key changed");
                     }
                     self.broadcast_status();
                 }

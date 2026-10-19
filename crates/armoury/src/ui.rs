@@ -4,7 +4,9 @@
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
 use crate::catalog::{self, CatalogPack};
-use armoury_core::config::TrackedApp;
+use armoury_core::config::{
+    CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, CONSOLE_OPEN_PAD, TrackedApp,
+};
 use armoury_core::protocol::{read_msg, write_msg, Request, Response};
 use armoury_core::status::{PackStatus, RunState, StatusSnapshot};
 use crossbeam_channel::Receiver;
@@ -23,6 +25,24 @@ const MIN_SETTINGS_WIDTH: f32 = 330.0;
 /// Inner padding of every window (text must never hug the border).
 const PAD: i8 = 10;
 const PAD_F: f32 = PAD as f32;
+
+/// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
+/// packs lists as a built-in row with one dropdown.
+const CONSOLE_FEATURE: &str = "Console launcher";
+/// Auto-open modes in dropdown order: (value stored in config.json, label).
+const CONSOLE_OPEN_MODES: [(&str, &str); 3] = [
+    (CONSOLE_OPEN_ALWAYS, "Always open"),
+    (CONSOLE_OPEN_PAD, "On pad connect"),
+    (CONSOLE_OPEN_NEVER, "Never"),
+];
+
+fn console_open_label(mode: &str) -> &'static str {
+    CONSOLE_OPEN_MODES
+        .iter()
+        .find(|(value, _)| *value == mode)
+        .map(|(_, label)| *label)
+        .unwrap_or("On pad connect")
+}
 
 enum UiEvent {
     Response(Response),
@@ -65,6 +85,8 @@ struct Shared {
     /// The settings window's number boxes, kept as text so they can be emptied while typing.
     cooldown_text: String,
     failsafe_text: String,
+    /// The settings window's SteamGridDB key field (kept so an in-progress edit survives repaints).
+    sgdb_text: String,
     /// Requests raised from child viewports, drained by the root App.
     outbox: Option<crossbeam_channel::Sender<Request>>,
     /// File dialogs started from a child viewport report back through this.
@@ -427,7 +449,18 @@ impl eframe::App for App {
         }
 
         // ---- snapshot of shared state for this frame ----
-        let (status_text, status_color, rows, settings_open, tracked, running, paused, packs, idle) = {
+        let (
+            status_text,
+            status_color,
+            rows,
+            settings_open,
+            tracked,
+            running,
+            paused,
+            packs,
+            idle,
+            console_open,
+        ) = {
             let s = self.shared.lock().unwrap();
             let (text, color) = match &s.status {
                 Some(st) => match st.state {
@@ -516,6 +549,11 @@ impl eframe::App for App {
                 .as_ref()
                 .map(|st| (st.idle_active, st.idle_monitors, st.idle_devices))
                 .unwrap_or((false, 0, 0));
+            let console_open = s
+                .status
+                .as_ref()
+                .map(|st| st.console_open.clone())
+                .unwrap_or_default();
             (
                 text,
                 color,
@@ -526,6 +564,7 @@ impl eframe::App for App {
                 paused,
                 packs,
                 idle,
+                console_open,
             )
         };
 
@@ -569,6 +608,11 @@ impl eframe::App for App {
                             };
                             s.cooldown_text = cooldown_text;
                             s.failsafe_text = failsafe_text;
+                            s.sgdb_text = s
+                                .status
+                                .as_ref()
+                                .map(|st| st.sgdb_api_key.clone())
+                                .unwrap_or_default();
                             s.settings_stage = 0;
                             s.settings_deadline = Some(Instant::now() + Duration::from_secs(6));
                             s.settings_anchor = None;
@@ -744,6 +788,36 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.label(RichText::new("Packs").strong());
             ui.add_space(4.0);
+            // Built-in entry: the console launcher. It sits beside the packs but the daemon owns
+            // it — no enable checkbox, no pack window, nothing to install or remove.
+            let mut set_console_open: Option<String> = None;
+            ui.horizontal(|ui| {
+                ui.add_space(22.0); // lines up with a pack row's ‹ button + checkbox
+                ui.label(CONSOLE_FEATURE);
+                ui.small(RichText::new("(built-in)").weak());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let combo = egui::ComboBox::from_id_salt("builtin-console-open")
+                        .selected_text(console_open_label(&console_open))
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for (mode, label) in CONSOLE_OPEN_MODES {
+                                if ui
+                                    .selectable_label(mode == console_open.as_str(), label)
+                                    .clicked()
+                                {
+                                    set_console_open = Some(mode.to_string());
+                                }
+                            }
+                        });
+                    combo.response.on_hover_text(
+                        "When the launcher opens by itself. The tray and \"Open console now\" \
+                         always work.",
+                    );
+                });
+            });
+            if let Some(mode) = set_console_open {
+                self.request(&Request::SetConsoleOpen { mode });
+            }
             if packs.is_empty() {
                 ui.small("No packs found (looked in <app>/packs).");
             }
@@ -1273,12 +1347,25 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 s.failsafe_text.clone(),
             )
         };
-        let (packs, last_op, last_console_op, catalog_state, catalog_checking, catalog_installing) = {
+        let (
+            packs,
+            last_op,
+            last_console_op,
+            catalog_state,
+            catalog_checking,
+            catalog_installing,
+            console_open,
+        ) = {
             let s = shared.lock().unwrap();
             let packs = s
                 .status
                 .as_ref()
                 .map(|st| st.packs.clone())
+                .unwrap_or_default();
+            let console_open = s
+                .status
+                .as_ref()
+                .map(|st| st.console_open.clone())
                 .unwrap_or_default();
             (
                 packs,
@@ -1287,6 +1374,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 s.catalog.clone(),
                 s.catalog_checking,
                 s.catalog_installing.clone(),
+                console_open,
             )
         };
         ui.add_space(8.0);
@@ -1376,10 +1464,34 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.add_space(4.0);
 
         let mut remove_pack: Option<String> = None;
+        let mut set_console_open: Option<String> = None;
         egui::Grid::new("settings-packs")
             .num_columns(2)
             .spacing(egui::vec2(10.0, 4.0))
             .show(ui, |ui| {
+                // Built-in feature row: same grid, no Remove button — there is nothing to uninstall.
+                ui.horizontal(|ui| {
+                    ui.label(CONSOLE_FEATURE);
+                    ui.small(RichText::new("(built-in)").weak());
+                });
+                let combo = egui::ComboBox::from_id_salt("settings-builtin-console-open")
+                    .selected_text(console_open_label(&console_open))
+                    .width(120.0)
+                    .show_ui(ui, |ui| {
+                        for (mode, label) in CONSOLE_OPEN_MODES {
+                            if ui
+                                .selectable_label(mode == console_open.as_str(), label)
+                                .clicked()
+                            {
+                                set_console_open = Some(mode.to_string());
+                            }
+                        }
+                    });
+                combo.response.on_hover_text(
+                    "When the launcher opens by itself. The tray and \"Open console now\" \
+                     always work.",
+                );
+                ui.end_row();
                 for pack in &packs {
                     ui.horizontal(|ui| {
                         ui.label(&pack.name);
@@ -1397,6 +1509,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     ui.end_row();
                 }
             });
+        if let Some(mode) = set_console_open {
+            send_request(shared, &Request::SetConsoleOpen { mode });
+        }
         if let Some(id) = remove_pack {
             send_request(shared, &Request::RemovePack { id });
         }
@@ -1506,31 +1621,25 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
 
         // ---- console mode: the pad-driven launcher ----
-        let (console_enabled, console_apps) = {
+        let console_apps = {
             let s = shared.lock().unwrap();
-            let st = s.status.as_ref();
-            (
-                st.map(|x| x.console_enabled).unwrap_or(false),
-                st.map(|x| x.console_apps.clone()).unwrap_or_default(),
-            )
+            s.status
+                .as_ref()
+                .map(|x| x.console_apps.clone())
+                .unwrap_or_default()
         };
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(6.0);
         ui.label(RichText::new("Console mode").strong());
         ui.add_space(4.0);
-        let mut console_on = console_enabled;
-        if ui
-            .checkbox(&mut console_on, "Open on controller connect")
-            .on_hover_text(
-                "A freshly connected controller opens the launcher — unless a tracked app is running",
+        ui.small(
+            RichText::new(
+                "Auto-open is set on the console row under Packs. A tracked app already running \
+                 keeps it closed.",
             )
-            .changed()
-        {
-            send_request(shared, &Request::SetConsoleEnabled { enabled: console_on });
-            ui.ctx().request_repaint();
-        }
-        ui.small(RichText::new("XInput pads. A tracked app already running keeps it closed.").weak());
+            .weak(),
+        );
         ui.add_space(4.0);
         let mut remove_console: Option<String> = None;
         if console_apps.is_empty() {
@@ -1581,6 +1690,57 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             );
         }
 
+        // ---- SteamGridDB: cover/hero art for games Steam doesn't know ----
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("SteamGridDB").strong());
+        ui.add_space(4.0);
+        ui.small(
+            RichText::new(
+                "Cover and hero art for games Steam doesn't know (steamgriddb.com API key).",
+            )
+            .weak(),
+        );
+        ui.add_space(4.0);
+        let sgdb_set = shared
+            .lock()
+            .unwrap()
+            .status
+            .as_ref()
+            .map_or(false, |st| st.sgdb_api_key_set);
+        let mut sgdb_text = shared.lock().unwrap().sgdb_text.clone();
+        let mut save_sgdb = false;
+        ui.horizontal(|ui| {
+            let spacing = ui.spacing().item_spacing.x;
+            let save_w = 52.0;
+            let field_w = (ui.available_width() - save_w - spacing).max(120.0);
+            // Masked: the key is never shown in the clear.
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut sgdb_text)
+                    .password(true)
+                    .hint_text("paste your API key…")
+                    .desired_width(field_w),
+            );
+            save_sgdb = ui
+                .add_sized(
+                    [save_w, ui.spacing().interact_size.y],
+                    egui::Button::new("Save"),
+                )
+                .on_hover_text("Save this key (empty clears it)")
+                .clicked();
+            save_sgdb |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        });
+        // Keep the in-progress text so a repaint (or another window taking focus) keeps it.
+        shared.lock().unwrap().sgdb_text = sgdb_text.clone();
+        if save_sgdb {
+            send_request(shared, &Request::SetSgdbKey { key: sgdb_text });
+            ui.ctx().request_repaint();
+        }
+        if !sgdb_set {
+            ui.small(RichText::new("No key set.").weak());
+        }
+
         // ---- logs + config ----
         ui.add_space(8.0);
         ui.separator();
@@ -1616,8 +1776,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             "Install pack…",
             "Check for updates",
             "Open console now",
-            "Open on controller connect",
-            "XInput pads. A tracked app already running keeps it closed.",
+            "Auto-open is set on the console row under Packs. A tracked app already running keeps it closed.",
             "No console apps yet — add them from the launcher's \"Add app…\" tile.",
             "Applies when a tracked app starts.",
         ] {
