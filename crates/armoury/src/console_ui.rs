@@ -24,20 +24,19 @@ use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
 use crate::art;
 use crate::pad;
 
-/// The launcher's window is the band itself: nearly the full work-area width, console style.
-const BAND_H: f32 = 400.0;
-/// Side margin between the band and the work-area edges: 5% each side (96 px at 1920).
-const BAND_MARGIN: f32 = 0.05;
-const TILE_W: f32 = 196.0;
-const TILE_H: f32 = 240.0;
+/// The launcher's window is the band itself: a fixed 90% x 35% of the full screen, console style.
+const BAND_W_FRAC: f32 = 0.90;
+const BAND_H_FRAC: f32 = 0.35;
+/// Tile height as a fraction of the band; the width keeps the old 196:240 cover ratio.
+const TILE_H_FRAC: f32 = 0.60;
+const TILE_ASPECT: f32 = 196.0 / 240.0;
 const GAP: f32 = 18.0;
 const SIDE: f32 = 48.0;
 const TILE_RADIUS: f32 = 16.0;
 /// Fallback icon box inside a tile (square covers and exe icons).
 const ICON: f32 = 108.0;
-/// How far above the work-area bottom the band sits. The old band sat 56 up; growing it 20 pt
-/// each way drops the bottom edge 20 and raises the top 20.
-const BOTTOM_LIFT: f32 = 36.0;
+/// How far above the work-area bottom the band sits: docked just above the taskbar.
+const BOTTOM_LIFT: f32 = 8.0;
 /// Gap under the tiles before the hint line (the names sit inside the tiles).
 const HINT_GAP: f32 = 14.0;
 /// Reserved height of the one-line hint: tiles + gap + hint center as one block.
@@ -50,9 +49,28 @@ const BG_GRADIENT: f32 = 140.0;
 const BG: egui::Color32 = egui::Color32::from_rgb(9, 10, 13);
 const TILE: egui::Color32 = egui::Color32::from_rgb(24, 26, 32);
 const TILE_SEL: egui::Color32 = egui::Color32::from_rgb(38, 42, 54);
-const ACCENT: egui::Color32 = egui::Color32::from_rgb(92, 148, 255);
+/// Focus ring gradient, left to right, and the glow's mid tone.
+const FOCUS_FROM: egui::Color32 = egui::Color32::from_rgb(167, 108, 255);
+const FOCUS_TO: egui::Color32 = egui::Color32::from_rgb(233, 84, 190);
+const FOCUS_MID: egui::Color32 = egui::Color32::from_rgb(200, 96, 222);
 const TEXT: egui::Color32 = egui::Color32::from_rgb(232, 236, 244);
 const MUTED: egui::Color32 = egui::Color32::from_rgb(128, 134, 148);
+
+const PAD_HINT: &str =
+    "A  open      B  close      X  add app      Y  remove      D-pad / left stick  scroll";
+const KEY_HINT: &str = "Arrows / WASD move · Enter open · Esc close · Delete remove";
+const EMPTY_HINT: &str = "No apps yet — press X to add one";
+
+/// The hint line plus the font size it is painted at.
+fn hint_line(n: usize, pad: bool) -> (&'static str, f32) {
+    if n == 0 {
+        (EMPTY_HINT, 18.0)
+    } else if pad {
+        (PAD_HINT, 14.0)
+    } else {
+        (KEY_HINT, 14.0)
+    }
+}
 
 enum Ev {
     Response(Response),
@@ -145,7 +163,10 @@ pub fn run() {
         }
     });
 
-    let band = band_rect(work_area());
+    let work = work_area();
+    let screen = screen_size();
+    // Size and position are fixed: everything is known before the window exists.
+    let band = band_rect(work, screen);
     let size = band.size();
     let (icon_rgba, icon_w, icon_h) = armoury_core::icon::rgba_icon(32);
     let options = eframe::NativeOptions {
@@ -167,24 +188,40 @@ pub fn run() {
     let _ = eframe::run_native(
         "ArmouryDaemon Console",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(rx, Box::new(send_half))) as Box<dyn eframe::App>)),
+        Box::new(move |_cc| {
+            Ok(Box::new(App::new(rx, Box::new(send_half), screen)) as Box<dyn eframe::App>)
+        }),
     );
 }
 
-/// The band inside a work area (logical points): 5% margins each side, `BAND_H` tall, its
-/// bottom edge `BOTTOM_LIFT` above the work-area bottom.
-fn band_rect(work: egui::Rect) -> egui::Rect {
-    let mx = work.width() * BAND_MARGIN;
+/// The band's height in logical points for a full-screen height.
+fn band_height(screen_h: f32) -> f32 {
+    screen_h * BAND_H_FRAC
+}
+
+/// Tile size in logical points: 60% of the band tall, keeping the 196:240 cover ratio.
+fn tile_size(screen_h: f32) -> egui::Vec2 {
+    let h = band_height(screen_h) * TILE_H_FRAC;
+    egui::vec2(h * TILE_ASPECT, h)
+}
+
+/// The band inside a work area (logical points): a fixed 90% of the screen wide, centred
+/// horizontally, 35% of the screen tall, its bottom edge `BOTTOM_LIFT` above the work area.
+fn band_rect(work: egui::Rect, screen: egui::Vec2) -> egui::Rect {
+    let half = screen.x * BAND_W_FRAC / 2.0;
     egui::Rect::from_min_max(
-        egui::pos2(work.left() + mx, work.bottom() - BOTTOM_LIFT - BAND_H),
-        egui::pos2(work.right() - mx, work.bottom() - BOTTOM_LIFT),
+        egui::pos2(
+            work.center().x - half,
+            work.bottom() - BOTTOM_LIFT - band_height(screen.y),
+        ),
+        egui::pos2(work.center().x + half, work.bottom() - BOTTOM_LIFT),
     )
 }
 
 /// Whole tiles that fit the strip's inner width with the inter-tile gap: at least one, and
 /// never one more than the width holds.
-fn visible_tiles(inner_w: f32) -> usize {
-    (((inner_w + GAP) / (TILE_W + GAP)).floor() as usize).max(1)
+fn visible_tiles(inner_w: f32, tile_w: f32) -> usize {
+    (((inner_w + GAP) / (tile_w + GAP)).floor() as usize).max(1)
 }
 
 /// The tile row's centre line. Tiles + hint gap + hint are one block, centred vertically.
@@ -192,14 +229,20 @@ fn row_center_y(band: egui::Rect) -> f32 {
     band.center().y - (HINT_GAP + HINT_H) / 2.0
 }
 
+/// DPI scale feeding the work-area and screen queries.
+fn dpi_scale() -> f32 {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }.max(0.5)
+}
+
 /// Primary work area in logical points, before any window exists.
 fn work_area() -> egui::Rect {
     use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
     use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
 
-    let dpi = unsafe { GetDpiForSystem() };
-    let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }.max(0.5);
+    let scale = dpi_scale();
     let mut work: RECT = unsafe { std::mem::zeroed() };
     let ok = unsafe {
         SystemParametersInfoW(
@@ -217,6 +260,21 @@ fn work_area() -> egui::Rect {
         egui::pos2(work.left as f32 / scale, work.top as f32 / scale),
         egui::pos2(work.right as f32 / scale, work.bottom as f32 / scale),
     )
+}
+
+/// Full primary screen size in logical points (the band's height comes from this, not the work
+/// area, so it stays 35% of the screen with or without a taskbar).
+fn screen_size() -> egui::Vec2 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+
+    let scale = dpi_scale();
+    let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    if w <= 0 || h <= 0 {
+        return egui::vec2(1920.0, 1080.0);
+    }
+    egui::vec2(w as f32 / scale, h as f32 / scale)
 }
 
 /// One console at a time: a tray open racing a pad connect (or a manual run) must not stack
@@ -290,10 +348,12 @@ struct App {
     /// Which status we last ran the art/icon passes for (0 = none yet).
     ensured_for: u64,
     status_serial: u64,
+    /// Full screen size in logical points, captured before the window existed (sizes the band).
+    screen: egui::Vec2,
 }
 
 impl App {
-    fn new(rx: Receiver<Ev>, out: Box<dyn Write>) -> Self {
+    fn new(rx: Receiver<Ev>, out: Box<dyn Write>, screen: egui::Vec2) -> Self {
         let (art_tx, art_rx) = crossbeam_channel::unbounded();
         let (hero_tx, hero_rx) = crossbeam_channel::unbounded();
         let (icon_tx, icon_rx) = crossbeam_channel::unbounded();
@@ -330,6 +390,7 @@ impl App {
             bg_fade: 1.0,
             ensured_for: 0,
             status_serial: 0,
+            screen,
         }
     }
 
@@ -527,11 +588,6 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         if self.first_frame {
             crate::ui::install_fonts(&ctx);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            // The visibility anchor for latency forensics.
-            log::info!("window shown");
-            self.first_frame = false;
         }
         ctx.request_repaint(); // the pad is polled per frame
 
@@ -665,14 +721,29 @@ impl eframe::App for App {
             self.leaving = true;
         }
 
-        let (key_left, key_right, key_enter, key_esc) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowLeft),
-                i.key_pressed(egui::Key::ArrowRight),
-                i.key_pressed(egui::Key::Enter),
-                i.key_pressed(egui::Key::Escape),
-            )
-        });
+        let (key_left, key_right, key_up, key_down, key_enter, key_esc, key_delete) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::A),
+                    i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::D),
+                    i.key_pressed(egui::Key::ArrowUp) || i.key_pressed(egui::Key::W),
+                    i.key_pressed(egui::Key::ArrowDown) || i.key_pressed(egui::Key::S),
+                    i.key_pressed(egui::Key::Enter),
+                    i.key_pressed(egui::Key::Escape),
+                    // One removal per physical press, like pad Y, not one per key-repeat.
+                    i.events.iter().any(|e| {
+                        matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::Delete,
+                                pressed: true,
+                                repeat: false,
+                                ..
+                            }
+                        )
+                    }),
+                )
+            });
 
         let dir = if key_left {
             -1
@@ -685,6 +756,13 @@ impl eframe::App for App {
         if step != 0 {
             self.selected = wrap(self.selected, step.into(), n);
         }
+        // One row: vertical keys still land somewhere sensible instead of doing nothing.
+        if key_up {
+            self.selected = 0;
+        }
+        if key_down {
+            self.selected = n.saturating_sub(1);
+        }
 
         let a = pad_state.map(|p| p.a).unwrap_or(false);
         let b = pad_state.map(|p| p.b).unwrap_or(false);
@@ -696,7 +774,7 @@ impl eframe::App for App {
         if x && !self.prev_x {
             self.open_add_dialog();
         }
-        if y && !self.prev_y {
+        if (y && !self.prev_y) || key_delete {
             self.remove_selected(&entries);
         }
         if (b && !self.prev_b) || key_esc {
@@ -733,6 +811,16 @@ impl eframe::App for App {
             self.bg_fade = (self.bg_fade + ctx.input(|i| i.stable_dt) / BG_FADE).min(1.0);
         }
 
+        // ---- window: sized and positioned once at startup; just reveal it on the first frame ----
+        let (hint, hint_font) = hint_line(n, self.pad_slot.is_some());
+        let tile = tile_size(self.screen.y);
+        if self.first_frame {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            log::info!("window shown");
+            self.first_frame = false;
+        }
+
         // ---- render: one horizontal strip, selection glides, the row wraps around ----
         // The band itself is solid (the OS window pops instantly); the content fades and
         // rises into place on entry and dips out again on the way to a launch or close.
@@ -749,37 +837,59 @@ impl eframe::App for App {
         ui.set_opacity(enter.max(0.01));
         let rise = if self.reduced { 0.0 } else { (1.0 - enter) * 40.0 };
 
-        let view_w = (full.width() - 2.0 * SIDE).max(TILE_W);
+        let view_w = (full.width() - 2.0 * SIDE).max(tile.x);
         let view_left = full.left() + SIDE;
-        let pitch = TILE_W + GAP;
+        let pitch = tile.x + GAP;
         let total = n as f32 * pitch - GAP;
-        let target_off = if n <= visible_tiles(view_w) {
+        let target_off = if n <= visible_tiles(view_w, tile.x) {
             -(view_w - total) / 2.0
         } else {
-            (self.selected as f32 * pitch + TILE_W / 2.0 - view_w / 2.0)
-                .clamp(0.0, total - view_w)
+            (self.selected as f32 * pitch + tile.x / 2.0 - view_w / 2.0)
+                .clamp(0.0, (total - view_w).max(0.0))
         };
         let scroll_time = if self.reduced { 0.001 } else { 0.22 };
         let off = ctx.animate_value_with_time(egui::Id::unique("console-scroll"), target_off, scroll_time);
         // Tiles + hint travel as one block, centered both ways in the band.
         let center_y = row_center_y(full) + rise;
-        let hint_y = center_y + TILE_H / 2.0 + HINT_GAP + HINT_H / 2.0;
+        let hint_y = center_y + tile.y / 2.0 + HINT_GAP + HINT_H / 2.0;
         let sel_time = if self.reduced { 0.001 } else { 0.18 };
 
+        // Hover sets the focus (only while the pointer actually moves, so the row scrolling
+        // under a resting cursor never fights the pad/keyboard). A click launches that tile.
+        let pointer_moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        let mut clicked = None;
+        let mut visible: Vec<(usize, egui::Rect, bool, f32)> = Vec::with_capacity(n);
         for i in 0..n {
-            let (name, exe) = &entries[i];
             let sel = ctx.animate_bool_with_time(egui::Id::unique(("console-sel", i)), i == self.selected, sel_time);
             let scale = 1.0 + 0.055 * sel;
-            let size = egui::vec2(TILE_W, TILE_H) * scale;
-            let x = view_left + i as f32 * pitch + TILE_W / 2.0 - off;
-            let center = egui::pos2(x, center_y - 12.0 * sel);
-            let rect = egui::Rect::from_center_size(center, size);
+            let rect = egui::Rect::from_center_size(
+                egui::pos2(
+                    view_left + i as f32 * pitch + tile.x / 2.0 - off,
+                    center_y - 12.0 * sel,
+                ),
+                tile * scale,
+            );
             if rect.right() < view_left - 60.0 || rect.left() > view_left + view_w + 60.0 {
                 continue; // off the visible strip: don't paint or catch clicks
             }
-
             let response = ui.interact(rect, egui::Id::unique(("console-tile", i)), egui::Sense::click());
-            let glow = (sel * 0.8 + if response.hovered() { 0.5 } else { 0.0 }).min(1.0);
+            if response.hovered() && pointer_moved {
+                self.selected = i;
+            }
+            if response.clicked() {
+                clicked = Some(i);
+            }
+            visible.push((i, rect, response.hovered(), sel));
+        }
+        if let Some(i) = clicked {
+            self.selected = i;
+            self.activate(&entries);
+        }
+
+        for (i, rect, hovered, sel) in visible {
+            let (name, exe) = &entries[i];
+            let scale = 1.0 + 0.055 * sel;
+            let glow = (sel * 0.8 + if hovered { 0.5 } else { 0.0 }).min(1.0);
 
             ui.painter().rect_filled(rect, TILE_RADIUS, if i == self.selected { TILE_SEL } else { TILE });
 
@@ -840,37 +950,18 @@ impl eframe::App for App {
             }
 
             if glow > 0.01 {
-                ui.painter().rect_stroke(
-                    rect,
-                    TILE_RADIUS,
-                    egui::Stroke::new(2.0, ACCENT.gamma_multiply(glow)),
-                    egui::StrokeKind::Outside,
-                );
-            }
-
-            if response.clicked() {
-                self.selected = i;
-                self.activate(&entries);
+                paint_focus_glow(ui.painter(), rect, glow);
+                paint_focus_ring(ui.painter(), rect, glow);
             }
         }
 
-        // ---- the hint bar: hugs the names, moving with the row ----
-        let hint = if self.pad_slot.is_some() {
-            "A  open      B  close      X  add app      Y  remove      D-pad / left stick  scroll"
-        } else {
-            "No controller — connect one, or open this from the tray"
-        };
+        // ---- the hint line: centred under the tile block ----
         let hint_y = if n == 0 { full.center().y } else { hint_y };
-        let hint_text = if n == 0 {
-            "No apps yet — press X to add one"
-        } else {
-            hint
-        };
         ui.painter().text(
             egui::pos2(full.center().x, hint_y),
             egui::Align2::CENTER_CENTER,
-            hint_text,
-            egui::FontId::proportional(if n == 0 { 18.0 } else { 14.0 }),
+            hint,
+            egui::FontId::proportional(hint_font),
             MUTED,
         );
     }
@@ -968,6 +1059,77 @@ fn scrim_rows(rect: egui::Rect) -> Vec<(f32, f32, f32, u8)> {
     rows
 }
 
+/// The focus ring's colour at `t` across the tile: violet on the left, magenta on the right.
+fn focus_color(t: f32, alpha: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    egui::Color32::from_rgba_unmultiplied(
+        mix(FOCUS_FROM.r(), FOCUS_TO.r()),
+        mix(FOCUS_FROM.g(), FOCUS_TO.g()),
+        mix(FOCUS_FROM.b(), FOCUS_TO.b()),
+        (255.0 * alpha.clamp(0.0, 1.0)) as u8,
+    )
+}
+
+/// A rounded-rect outline sampled into points (8 steps per 16 px corner arc), clockwise from
+/// the top edge. Used for both edges of the 2 px gradient ring.
+fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
+    const ARC: usize = 8;
+    let r = radius
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .max(0.0);
+    let (l, t, rgt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    let corners = [
+        (egui::pos2(rgt - r, t + r), -90.0),
+        (egui::pos2(rgt - r, b - r), 0.0),
+        (egui::pos2(l + r, b - r), 90.0),
+        (egui::pos2(l + r, t + r), 180.0),
+    ];
+    let mut out = Vec::with_capacity(4 * (ARC + 1));
+    for (center, start) in corners {
+        for k in 0..=ARC {
+            let a = (start + 90.0 * k as f32 / ARC as f32).to_radians();
+            out.push(egui::pos2(center.x + r * a.cos(), center.y + r * a.sin()));
+        }
+    }
+    out
+}
+
+/// The focus border: a mesh strip around the rounded tile, violet → magenta left to right.
+fn paint_focus_ring(painter: &egui::Painter, rect: egui::Rect, alpha: f32) {
+    let outer = rounded_outline(rect.expand(1.0), TILE_RADIUS + 1.0);
+    let inner = rounded_outline(rect.expand(-1.0), TILE_RADIUS - 1.0);
+    let width = rect.width().max(1.0);
+    let color = |p: egui::Pos2| focus_color((p.x - rect.left()) / width, alpha);
+    let mut m = Mesh::default();
+    for i in 0..outer.len() {
+        let j = (i + 1) % outer.len();
+        let base = m.vertices.len() as u32;
+        m.colored_vertex(outer[i], color(outer[i]));
+        m.colored_vertex(outer[j], color(outer[j]));
+        m.colored_vertex(inner[i], color(inner[i]));
+        m.colored_vertex(inner[j], color(inner[j]));
+        m.add_triangle(base, base + 1, base + 2);
+        m.add_triangle(base + 2, base + 1, base + 3);
+    }
+    painter.add(egui::Shape::mesh(m));
+}
+
+/// The soft halo outside the ring, in the gradient's mid purple.
+fn paint_focus_glow(painter: &egui::Painter, rect: egui::Rect, alpha: f32) {
+    for k in 0..3 {
+        let pad = 2.0 + k as f32 * 2.5;
+        let fade = alpha * (0.16 - k as f32 * 0.045);
+        painter.rect_stroke(
+            rect.expand(pad),
+            TILE_RADIUS + pad,
+            egui::Stroke::new(2.0, FOCUS_MID.gamma_multiply(fade)),
+            egui::StrokeKind::Outside,
+        );
+    }
+}
+
 fn basename_lower(path: &str) -> String {
     std::path::Path::new(path)
         .file_name()
@@ -1014,32 +1176,48 @@ mod tests {
     }
 
     #[test]
-    fn band_rect_takes_five_percent_margins_and_four_hundred_height() {
+    fn band_is_fixed_90_by_35_percent_and_docked() {
         let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1040.0));
-        let band = band_rect(work);
-        // 5% each side (96 px at 1920), so 90% wide and centered
-        assert_eq!((band.left(), band.right()), (96.0, 1824.0));
-        assert_eq!(band.width(), 1728.0);
-        assert_eq!(band.height(), 400.0);
-        // bottom edge stays 36 above the work-area bottom: top 604, bottom 1004
-        assert_eq!((band.top(), band.bottom()), (604.0, 1004.0));
+        let screen = egui::vec2(1638.4, 1152.0);
+        let band = band_rect(work, screen);
+        assert!((band.width() - 1474.56).abs() < 1e-3);
+        assert!((band.height() - 403.2).abs() < 1e-3);
+        // centered on the work area, docked 8 above its bottom edge
+        assert!((band.center().x - work.center().x).abs() < 1e-3);
+        assert!((band.bottom() - (work.bottom() - 8.0)).abs() < 1e-3);
+        // a shorter work area moves the band, it does not resize it
+        let shorter = band_rect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1000.0)),
+            screen,
+        );
+        assert!((shorter.height() - 403.2).abs() < 1e-3);
+        assert!((shorter.bottom() - 992.0).abs() < 1e-3);
         // centered on a non-zero work-area origin too
-        let shifted = band_rect(work.translate(egui::vec2(-1000.0, 40.0)));
+        let shifted = band_rect(work.translate(egui::vec2(-1000.0, 40.0)), screen);
         assert!((shifted.center().x - (work.center().x - 1000.0)).abs() < 1e-3);
-        assert_eq!(shifted.height(), 400.0);
+        assert!((shifted.height() - 403.2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn tiles_keep_the_196_by_240_ratio() {
+        let tile = tile_size(1152.0);
+        assert!((tile.y - 241.92).abs() < 1e-3);
+        assert!((tile.x - 197.568).abs() < 1e-3);
+        assert!((tile.x / tile.y - 196.0 / 240.0).abs() < 1e-6);
     }
 
     #[test]
     fn visible_tiles_never_exceeds_the_inner_width() {
-        let pitch = TILE_W + GAP;
-        for inner in [TILE_W, 400.0, 700.0, 1104.0, 1632.0, 2560.0] {
-            let n = visible_tiles(inner);
+        let tile_w = tile_size(1152.0).x;
+        let pitch = tile_w + GAP;
+        for inner in [tile_w, 400.0, 700.0, 1104.0, 1632.0, 2560.0] {
+            let n = visible_tiles(inner, tile_w);
             assert!(n >= 1);
             assert!(n as f32 * pitch - GAP <= inner);
             assert!((n as f32 + 1.0) * pitch - GAP > inner);
         }
         // a narrow band still shows the focused tile rather than nothing
-        assert_eq!(visible_tiles(10.0), 1);
+        assert_eq!(visible_tiles(10.0, tile_w), 1);
     }
 
     #[test]
