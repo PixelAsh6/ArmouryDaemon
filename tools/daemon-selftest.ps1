@@ -67,6 +67,14 @@ $ns = 'selftest-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
 $env:ARMOURY_TEST_NS = $ns
 $configDir = Join-Path ([IO.Path]::GetTempPath()) "ArmouryDaemon-test-$ns"
 $pipeName = "armoury-daemon.pipe-$ns"
+# The command-line probes get a namespace of their own: a daemon that a typo would start is
+# stopped at once by the single-instance mutex of the test instance, so the process count
+# would never change and the check would prove nothing. In its own namespace such a daemon
+# stays alive and is seen.
+$cliNs = 'selftest-cli-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+$cliConfigDir = Join-Path ([IO.Path]::GetTempPath()) "ArmouryDaemon-test-$cliNs"
+# where the captured output of the probes lands
+$cliDir = Join-Path $configDir 'cli'
 # The log of the throw-away instance. It is the only place where the harness can see that the
 # packs really changed: the status reports the state, the log reports the change.
 $logPath = Join-Path $configDir 'logs\daemon.log'
@@ -192,6 +200,94 @@ function Wait-Change([string]$what, [int]$count, [int]$timeoutSec = 20) {
 function Get-Gap($from, $to) {
     if ($null -eq $from -or $null -eq $to) { return 9999 }
     return ($to - $from).TotalSeconds
+}
+
+# The content of a file, or '' when it is empty or missing. Get-Content hands back $null for
+# an empty file, which would break every string operation on it.
+function Read-Text([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return '' }
+    $text = Get-Content -LiteralPath $path -Raw
+    if ($null -eq $text) { return '' }
+    return [string]$text
+}
+
+# The number of live processes of this very exe. The installed daemon runs from another path
+# and is never counted; a path that cannot be read any more belongs to a process that has
+# already exited.
+function Get-ExeProcessCount {
+    $count = 0
+    $name = [IO.Path]::GetFileNameWithoutExtension($Exe)
+    foreach ($p in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        try { if ($p.Path -eq $Exe) { $count++ } } catch { }
+    }
+    return $count
+}
+
+# The first non-empty line of a captured stream, for a short failure detail.
+function Get-FirstLine([string]$text) {
+    foreach ($line in ($text -split "`r?`n")) {
+        if ($line.Trim()) { return $line.Trim() }
+    }
+    return ''
+}
+
+# Run the binary with these arguments and capture what it says.
+#
+# The release build is a windows-subsystem binary: it attaches to the console of the parent
+# process and, when its standard output is not a console, it writes the line to stderr as
+# well. The output is therefore redirected into two files, and both are read back.
+#
+# The process is not stopped here: a run that does not end on its own is a resident daemon,
+# and the caller has to count it before it is killed.
+function Invoke-Cli([string[]]$argList, [int]$timeoutSec = 20) {
+    New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
+    $outPath = Join-Path $cliDir 'stdout.txt'
+    $errPath = Join-Path $cliDir 'stderr.txt'
+    Remove-Item -LiteralPath $outPath, $errPath -ErrorAction SilentlyContinue
+    $p = Start-Process $Exe -ArgumentList $argList -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+    # the finally block stops it, whatever it turns out to be
+    [void]$script:children.Add($p)
+    $null = $p.Handle    # cache the handle, or the exit code cannot be read any more
+    $exited = $p.WaitForExit($timeoutSec * 1000)
+    $code = $null
+    if ($exited) { $code = $p.ExitCode }
+    $out = Read-Text $outPath
+    $err = Read-Text $errPath
+    return [pscustomobject]@{
+        Process = $p
+        Exited  = $exited
+        Exit    = $code
+        Out     = $out
+        Err     = $err
+        Text    = "$out`n$err"
+    }
+}
+
+# Run the binary with these arguments and watch what it leaves behind.
+#
+# The number of live processes of this very exe before and after the run says whether a
+# daemon was started: the old command line started a resident daemon on a typo. A run that
+# does not end on its own is such a daemon - it is stopped here, and the checks say so.
+function Invoke-CliProbe([string[]]$argList, [int]$timeoutSec = 20) {
+    $before = Get-ExeProcessCount
+    $run = Invoke-Cli $argList $timeoutSec
+    Start-Sleep -Milliseconds 500
+    $after = Get-ExeProcessCount
+    $killed = $false
+    if (-not $run.Exited) {
+        $run.Process | Stop-Process -Force -ErrorAction SilentlyContinue
+        $killed = $true
+    }
+    $detail = "exit=$($run.Exit)"
+    if ($killed) { $detail += ' (a stray daemon was killed)' }
+    return [pscustomobject]@{
+        Run    = $run
+        Before = $before
+        After  = $after
+        Killed = $killed
+        Detail = $detail
+    }
 }
 
 # The real config of the installed daemon must not change during the run: the test instance
@@ -477,6 +573,47 @@ try {
     Check 'the scripted pack removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     Remove-Item -Recurse -Force $srcDir -ErrorAction SilentlyContinue
+
+    # ---- 20. the command line: the modes that print and exit ----
+    # The command line is parsed before anything else happens, so these runs never touch the
+    # desktop. They run in a namespace of their own ($cliNs), see the top of this file.
+    $env:ARMOURY_TEST_NS = $cliNs
+
+    # --version: the version, exit 0
+    $probe = Invoke-CliProbe @('--version')
+    $r = $probe.Run
+    Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
+    Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.0.0')) "output=$(Get-FirstLine $r.Text)"
+
+    # --help: the usage, exit 0, with every flag the parser accepts
+    $probe = Invoke-CliProbe @('--help')
+    $r = $probe.Run
+    Check 'help exits 0' ($r.Exit -eq 0) $probe.Detail
+    $flags = @('--autostart', '--ui', '--console', '--catalog-list', '--catalog-install', '--catalog-url', '--version', '--help')
+    $missing = @($flags | Where-Object { -not $r.Text.Contains($_) })
+    Check 'help lists every flag the binary accepts' ($missing.Count -eq 0) "missing: $($missing -join ' ')"
+
+    # an argument the binary does not know is an error, never a daemon
+    $probe = Invoke-CliProbe @('--definitely-not-a-flag')
+    $r = $probe.Run
+    Check 'an unknown argument exits 2' ($r.Exit -eq 2) $probe.Detail
+    Check 'an unknown argument names itself' ($r.Text.Contains('--definitely-not-a-flag')) "output=$(Get-FirstLine $r.Text)"
+    Check 'an unknown argument prints the usage on stderr' (($r.Out.Trim() -eq '') -and $r.Err.Contains('usage:')) "stdout=$(Get-FirstLine $r.Out) stderr=$(Get-FirstLine $r.Err)"
+    $detail = "before=$($probe.Before) after=$($probe.After)"
+    if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
+    Check 'an unknown argument leaves no daemon running' ($probe.After -le $probe.Before) $detail
+
+    # a flag without its value is an error as well
+    $probe = Invoke-CliProbe @('--catalog-install')
+    $r = $probe.Run
+    Check 'catalog-install without an id exits 2' ($r.Exit -eq 2) $probe.Detail
+    Check 'catalog-install without an id says the id is missing' ($r.Text.Contains('--catalog-install needs a pack id')) "output=$(Get-FirstLine $r.Text)"
+    Check 'catalog-install without an id prints the usage on stderr' (($r.Out.Trim() -eq '') -and $r.Err.Contains('usage:')) "stdout=$(Get-FirstLine $r.Out) stderr=$(Get-FirstLine $r.Err)"
+    $detail = "before=$($probe.Before) after=$($probe.After)"
+    if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
+    Check 'catalog-install without an id leaves no daemon running' ($probe.After -le $probe.Before) $detail
+
+    $env:ARMOURY_TEST_NS = $ns
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {
@@ -496,6 +633,8 @@ finally {
         Move-Item -LiteralPath $script:parkedPack -Destination (Join-Path $buildPacks 'rainmeter') -Force -ErrorAction SilentlyContinue
     }
     Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
+    # the config folder of the command-line namespace, if a probe ever started a daemon
+    Remove-Item -Recurse -Force $cliConfigDir -ErrorAction SilentlyContinue
     # only remove the build-folder packs dir if this run created it
     if (-not $script:buildPacksExisted) {
         Remove-Item -Recurse -Force $buildPacks -ErrorAction SilentlyContinue
