@@ -42,6 +42,9 @@ const GAME_FLAGS: u32 = CREATE_NO_WINDOW | DETACHED_PROCESS;
 /// How long a started process gets to stay up before the launch counts as failed. Long
 /// enough to catch the games that die in their first second, short enough not to be felt.
 const LAUNCH_GRACE: Duration = Duration::from_millis(600);
+/// How long a fresh console launcher gets to show its band. Until the band is up the
+/// launcher has no window on screen, and that is not yet a stale launcher.
+const CONSOLE_GRACE: Duration = Duration::from_secs(10);
 
 pub fn run(show_ui_when_running: bool) {
     if let Err(e) = armoury_core::logging::init("daemon") {
@@ -248,6 +251,7 @@ pub fn run(show_ui_when_running: bool) {
         ui_child: None,
         spawning_ui: false,
         console_child: None,
+        console_spawned: None,
         pad_rx,
         art_tx,
         art_rx,
@@ -570,6 +574,9 @@ struct App {
     spawning_ui: bool,
     /// The console-launcher process (spawned by a fresh pad connect or from the tray).
     console_child: Option<Child>,
+    /// When the console launcher was spawned: its band needs a moment to come up, so a
+    /// launcher without a window is only stale once it is this old.
+    console_spawned: Option<Instant>,
     /// Pad hotplug events from the controller watch.
     pad_rx: crossbeam_channel::Receiver<console::PadEvent>,
     /// Cover-art passes: worker -> main loop (a ready key, or "" when a pass finished).
@@ -692,6 +699,77 @@ fn launch_action(outcome: &LaunchOutcome) -> LaunchAction {
     } else {
         LaunchAction::Failed(outcome.message.clone())
     }
+}
+
+/// What the daemon does with the console launcher it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsoleAction {
+    /// The launcher is alive and its band is on screen: keep it.
+    Keep,
+    /// The launcher is gone: forget the handle.
+    Clear,
+    /// The launcher is alive but its band is gone: kill it and start a new one.
+    Replace,
+}
+
+/// What to do with the console launcher the daemon holds.
+///
+/// `pid` is the launcher's process id (0 when there is none). `exited` says the process is
+/// known to have finished; `window_gone` says its band is gone — closed, hidden or
+/// minimised (the OS parks a minimised band at (-32000, -32000)). A launcher that is
+/// alive but has no band can never be used again, so it is replaced instead of kept:
+/// keeping it would turn the tray's "Console mode" into a no-op.
+fn console_action(pid: u32, exited: bool, window_gone: bool) -> ConsoleAction {
+    if pid == 0 || exited {
+        ConsoleAction::Clear
+    } else if window_gone {
+        ConsoleAction::Replace
+    } else {
+        ConsoleAction::Keep
+    }
+}
+
+/// Does the process still show a window? False when the window is gone, hidden or
+/// minimised: a launcher in that state is alive but useless.
+fn console_window_up(pid: u32) -> bool {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    };
+
+    /// What the enumeration is looking for.
+    struct Search {
+        pid: u32,
+        found: bool,
+    }
+
+    unsafe extern "system" fn visit(hwnd: HWND, param: LPARAM) -> BOOL {
+        // SAFETY: the parameter is the search the caller set up, and it outlives the
+        // enumeration.
+        let search = unsafe { &mut *(param as *mut Search) };
+        let mut owner = 0u32;
+        // SAFETY: the window handle comes from EnumWindows and the pid is a plain u32.
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut owner);
+        }
+        if owner == search.pid {
+            // SAFETY: the window handle comes from EnumWindows.
+            if unsafe { IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 } {
+                search.found = true;
+                return 0; // the band is up: stop looking
+            }
+        }
+        1 // keep going
+    }
+
+    let mut search = Search { pid, found: false };
+    // SAFETY: the callback only writes into the search, which lives until the call
+    // returns.
+    unsafe {
+        EnumWindows(Some(visit), &mut search as *mut Search as LPARAM);
+    }
+    search.found
 }
 
 /// ---------------------------------------------------------------------------
@@ -1660,9 +1738,17 @@ impl App {
     /// Open the console launcher now (tray menu / settings preview / a fresh pad connect).
     fn show_console(&mut self) {
         self.reap_console_child();
-        if self.console_child.is_some() {
-            info!("console launcher is already running");
-            return;
+        match self.console_child_state() {
+            Some((_, ConsoleAction::Keep)) => {
+                info!("console launcher is already running");
+                return;
+            }
+            Some((_, ConsoleAction::Clear)) => self.forget_console_child(),
+            Some((pid, ConsoleAction::Replace)) => {
+                warn!("stale console launcher (pid {pid}): its band is gone — replacing it");
+                self.kill_console_child();
+            }
+            None => {}
         }
 
         let exe = match std::env::current_exe() {
@@ -1679,10 +1765,51 @@ impl App {
         {
             Ok(child) => {
                 info!("spawned console launcher (pid {})", child.id());
+                self.console_spawned = Some(Instant::now());
                 self.console_child = Some(child);
             }
             Err(e) => warn!("failed to spawn the console launcher: {e}"),
         }
+    }
+
+    /// What to do with the console launcher the daemon holds, if it holds one. A launcher
+    /// is only useful while its band is on screen: one that is alive but has no band was
+    /// closed (or minimised) without the process going with it.
+    fn console_child_state(&mut self) -> Option<(u32, ConsoleAction)> {
+        let started = self.console_spawned;
+        let child = self.console_child.as_mut()?;
+        let pid = child.id();
+        let exited = match child.try_wait() {
+            Ok(Some(exit)) => {
+                info!("console launcher exited ({exit})");
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!("console launcher wait failed: {e}");
+                false
+            }
+        };
+        // A launcher that has just started has no band yet: that is not a stale one.
+        let starting = started.map_or(false, |at| at.elapsed() < CONSOLE_GRACE);
+        let window_gone = !starting && !console_window_up(pid);
+        Some((pid, console_action(pid, exited, window_gone)))
+    }
+
+    /// Forget the console launcher: its process is gone and the handle is useless.
+    fn forget_console_child(&mut self) {
+        self.console_child = None;
+        self.console_spawned = None;
+    }
+
+    /// Kill the console launcher the daemon holds. Only ever the launcher: it is the one
+    /// process the daemon owns here, and a stale one must not keep the band away.
+    fn kill_console_child(&mut self) {
+        if let Some(mut child) = self.console_child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.console_spawned = None;
     }
 
     fn reap_console_child(&mut self) {
@@ -1690,7 +1817,10 @@ impl App {
             match child.try_wait() {
                 Ok(Some(exit)) => {
                     info!("console launcher exited ({exit})");
+                    // The launcher is gone: the handle goes with it, so the next request
+                    // spawns a new one instead of refusing.
                     self.console_child = None;
+                    self.console_spawned = None;
                 }
                 Ok(None) => {}
                 Err(e) => warn!("console launcher wait failed: {e}"),
@@ -2535,6 +2665,34 @@ mod tests {
         assert!(!quit.asked());
         quit.ask();
         assert!(quit.asked());
+    }
+
+    #[test]
+    fn a_live_console_launcher_with_a_window_is_kept() {
+        assert_eq!(console_action(4242, false, false), ConsoleAction::Keep);
+    }
+
+    #[test]
+    fn a_console_launcher_that_exited_is_cleared() {
+        assert_eq!(console_action(4242, true, false), ConsoleAction::Clear);
+        // an exited launcher is cleared even when its band is gone as well
+        assert_eq!(console_action(4242, true, true), ConsoleAction::Clear);
+        // and there is nothing to keep when there is no launcher at all
+        assert_eq!(console_action(0, false, false), ConsoleAction::Clear);
+    }
+
+    #[test]
+    fn a_console_launcher_without_a_window_is_replaced() {
+        // the band was closed, or the OS minimised it: the launcher is alive but can
+        // never be used again, so it is replaced instead of kept
+        assert_eq!(console_action(4242, false, true), ConsoleAction::Replace);
+    }
+
+    #[test]
+    fn a_process_without_a_window_has_none() {
+        // pid 0 is the idle process: it never owns a window, so the enumeration finds
+        // nothing. The one probe that reads the same on every machine.
+        assert!(!console_window_up(0));
     }
 
     #[test]

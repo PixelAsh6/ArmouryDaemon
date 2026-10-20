@@ -407,6 +407,8 @@ fn screen_size() -> egui::Vec2 {
 
 /// One console at a time: a tray open racing a pad connect (or a manual run) must not stack
 /// windows. The mutex is held for the process lifetime — the OS releases it on exit.
+/// The handle is never closed on purpose: that leak is what keeps a second launcher out,
+/// so releasing it would break this guard unless the mutex got a lifetime of its own.
 fn console_already_open() -> bool {
     use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows::Win32::System::Threading::CreateMutexW;
@@ -418,6 +420,21 @@ fn console_already_open() -> bool {
     match unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) } {
         Ok(_held) => unsafe { GetLastError() == ERROR_ALREADY_EXISTS },
         Err(_) => false,
+    }
+}
+
+/// Why the band process leaves the screen, if it does.
+///
+/// `closing` is the user's own request (B, Esc, a lost controller); `minimized` is the OS
+/// parking the window at (-32000, -32000). Either one ends the process: a band that is
+/// gone but still alive leaves the daemon holding a launcher it can never use.
+fn exit_reason(closing: bool, minimized: bool) -> Option<&'static str> {
+    if closing {
+        Some("the band was closed")
+    } else if minimized {
+        Some("the band was minimised")
+    } else {
+        None
     }
 }
 
@@ -1310,6 +1327,24 @@ fn is_tracked(tracked: &[TrackedApp], exe: &str) -> bool {
 }
 
 impl eframe::App for App {
+    /// The band is gone when the OS parks the window at (-32000, -32000): the ui stops
+    /// running, so nothing would ever close it and the process would stay alive with a
+    /// dead viewport. A minimised band is a closed band, and it goes the same way.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let minimized = ctx
+            .input(|i| {
+                i.raw
+                    .viewports
+                    .get(&egui::ViewportId::ROOT)
+                    .and_then(|v| v.minimized)
+            })
+            .unwrap_or(false);
+        if let Some(reason) = exit_reason(false, minimized) {
+            log::info!("{reason} — exiting");
+            std::process::exit(0);
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.first_frame {
@@ -1626,8 +1661,14 @@ impl eframe::App for App {
         }
         let slow = if self.reduced { 0.001 } else { 0.28 };
         let enter = ctx.animate_bool_with_time(egui::Id::unique("console-enter"), self.entering && !self.leaving, slow);
+        // The band is on its way out: the process goes with it. A viewport close only asks
+        // the event loop to wind down, and a window the OS took away never gets that far —
+        // the daemon would keep a launcher it can never use again.
         if self.leaving && enter < 0.03 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if let Some(reason) = exit_reason(true, false) {
+                log::info!("{reason} — exiting");
+                std::process::exit(0);
+            }
         }
 
         // ---- background: the selected entry's hero, crossfading on selection ----
@@ -2144,6 +2185,16 @@ mod tests {
         // a started game closes it
         assert!(apply_launch_ack(&mut launch, true, "launched game.exe (pid 42)".into()));
         assert_eq!(launch, Launch::Idle);
+    }
+
+    #[test]
+    fn a_minimised_band_is_a_closed_band() {
+        // the band is up: it stays
+        assert_eq!(exit_reason(false, false), None);
+        // the user closed it: the process goes
+        assert_eq!(exit_reason(true, false), Some("the band was closed"));
+        // the OS parked it at (-32000, -32000): that is a closed band as well
+        assert_eq!(exit_reason(false, true), Some("the band was minimised"));
     }
 
     #[test]
