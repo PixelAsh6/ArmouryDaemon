@@ -27,8 +27,10 @@ const MIN_SETTINGS_WIDTH: f32 = 330.0;
 /// handful of packs. The list scrolls when the catalog is longer.
 const INSTALL_PACKS_WIDTH: f32 = 430.0;
 const INSTALL_PACKS_HEIGHT: f32 = 470.0;
-/// The height of the pack list inside the window: the catalog scrolls inside it.
-const INSTALL_PACKS_LIST_HEIGHT: f32 = 340.0;
+/// The height of the foot of the install-packs window: the rule and the "Local pack"
+/// button. The list above it leaves this much room, so the button is inside the
+/// window whatever the catalog holds.
+const INSTALL_PACKS_FOOTER_HEIGHT: f32 = 62.0;
 /// Inner padding of every window (text must never hug the border).
 const PAD: i8 = 10;
 const PAD_F: f32 = PAD as f32;
@@ -817,7 +819,7 @@ impl eframe::App for App {
                 if matches.is_empty() {
                     ui.small(no_match_message(apps.is_some()));
                 } else {
-                    for (name, exe, title) in matches.iter().take(8) {
+                    for (name, exe, title) in matches.iter().take(APP_MATCH_ROWS) {
                         let label = if title.is_empty() {
                             name.clone()
                         } else {
@@ -826,6 +828,11 @@ impl eframe::App for App {
                         if ui.selectable_label(false, label).clicked() {
                             pick = Some((name.clone(), exe.clone()));
                         }
+                    }
+                    // The list only shows so many matches: say how many are left, so a
+                    // short list is never read as the whole truth.
+                    if let Some(note) = more_matches_note(matches.len(), APP_MATCH_ROWS) {
+                        ui.small(RichText::new(note).weak());
                     }
                     if matches.len() == 1 && enter {
                         pick = Some((matches[0].0.clone(), matches[0].1.clone()));
@@ -2287,11 +2294,13 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         });
         ui.add_space(4.0);
 
-        // The list has a fixed height: the catalog scrolls inside it, so the window keeps
-        // its place in the chain however many packs the repo holds.
+        // The list takes the room that is left above the foot of the window, so the
+        // "Local pack" button is always inside it. The list also shrinks to the
+        // height its rows need: there is no dead space above the rule, and the
+        // catalog scrolls inside the list when it holds more than that.
         egui::ScrollArea::vertical()
-            .max_height(INSTALL_PACKS_LIST_HEIGHT)
-            .auto_shrink([false, false])
+            .max_height((ui.available_height() - INSTALL_PACKS_FOOTER_HEIGHT).max(0.0))
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 if let Some((ok, message)) = last_op {
                     ui.small(
@@ -2927,6 +2936,21 @@ fn no_match_message(ready: bool) -> &'static str {
     } else {
         "Looking for running apps…"
     }
+}
+
+/// How many matches the picker's inline list shows at once.
+const APP_MATCH_ROWS: usize = 8;
+
+/// The line under a list of matches that was cut short: how many matches are not
+/// shown. A list that reads as the whole truth but is not is a lie, so the count is
+/// always said.
+fn more_matches_note(total: usize, shown: usize) -> Option<String> {
+    let more = total.checked_sub(shown)?;
+    if more == 0 {
+        return None;
+    }
+    let word = if more == 1 { "match" } else { "matches" };
+    Some(format!("… {more} more {word} — type to narrow the list"))
 }
 
 /// The worker that keeps the running-app list fresh.
@@ -4456,6 +4480,124 @@ mod tests {
             "the description is {rows} rows, not two or three"
         );
         assert!(rect.left() > 0.0, "the description is not indented");
+    }
+
+    /// The install-packs window as it is drawn, with a catalog of `count` packs.
+    /// Returns the painted text, the rules and the window's frame.
+    fn install_packs_frame(count: usize) -> (Vec<(String, Rect, usize)>, Vec<f32>) {
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.catalog = Some(Ok(
+                (0..count)
+                    .map(|i| {
+                        catalog_entry_with_description(
+                            &format!("pack-{i}"),
+                            &format!("Pack number {i}"),
+                            "1.4.0",
+                            "Stops the animated wallpaper while a tracked app runs and restores it \
+                             afterwards.",
+                        )
+                    })
+                    .collect(),
+            ));
+        }
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| install_packs_ui(ui, &shared));
+        });
+        let text = painted_text(&output);
+        let rules = painted_rules(&output);
+        output.drop_without_applying_deltas();
+        (text, rules)
+    }
+
+    #[test]
+    fn the_local_pack_button_is_inside_the_window() {
+        // The catalog list used to claim its full height even when its rows needed
+        // less, and the "Local pack" button below it fell out of the window. The
+        // button has to be on screen, whatever the catalog holds.
+        for count in [0usize, 3, 12] {
+            let (text, rules) = install_packs_frame(count);
+            let button = text
+                .iter()
+                .find(|(t, _, _)| t == "Local pack")
+                .map(|(_, rect, _)| *rect)
+                .expect("the install-packs window has no 'Local pack' button");
+            // The whole label is inside the window, padding included.
+            assert!(
+                button.top() >= PAD_F && button.bottom() <= INSTALL_PACKS_HEIGHT - PAD_F,
+                "the 'Local pack' button is not inside the window with {count} packs: {button:?}"
+            );
+            // The rule above the button sits between the last row and the button.
+            let rule = rules
+                .last()
+                .copied()
+                .expect("the install-packs window has no rule above the button");
+            assert!(
+                rule < button.top(),
+                "the rule is not above the 'Local pack' button with {count} packs: {rule} vs \
+                 {button:?}"
+            );
+            // The button hugs the rule: no dead space between the two.
+            assert!(
+                button.top() - rule < 30.0,
+                "the 'Local pack' button has drifted away from the rule with {count} packs: \
+                 {button:?} vs {rule}"
+            );
+            // Nothing is pushed above the rule either: the list ends where the rows end.
+            let last_row = text
+                .iter()
+                .filter(|(t, _, _)| t.starts_with("Pack number") || t.starts_with("Stops the"))
+                .map(|(_, rect, _)| rect.bottom())
+                .fold(0.0_f32, f32::max);
+            if count > 0 {
+                assert!(
+                    rule - last_row < 40.0,
+                    "there is dead space above the rule with {count} packs: {rule} vs {last_row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_long_catalog_scrolls_inside_the_list() {
+        // The list has a fixed room: a catalog that does not fit scrolls inside it,
+        // and the packs below the fold are not on screen.
+        let (text, _) = install_packs_frame(12);
+        let shown = text
+            .iter()
+            .filter(|(t, _, _)| t.starts_with("Pack number"))
+            .count();
+        assert!(
+            shown > 0 && shown < 12,
+            "the catalog does not scroll: {shown} of 12 packs are on screen"
+        );
+    }
+
+    #[test]
+    fn the_picker_says_how_many_matches_it_did_not_show() {
+        // A list that reads as complete but is not is a lie: the count is said.
+        assert_eq!(more_matches_note(8, APP_MATCH_ROWS), None);
+        assert_eq!(more_matches_note(3, APP_MATCH_ROWS), None);
+        assert_eq!(
+            more_matches_note(9, APP_MATCH_ROWS).as_deref(),
+            Some("… 1 more match — type to narrow the list")
+        );
+        assert_eq!(
+            more_matches_note(20, APP_MATCH_ROWS).as_deref(),
+            Some("… 12 more matches — type to narrow the list")
+        );
     }
 
     #[test]
