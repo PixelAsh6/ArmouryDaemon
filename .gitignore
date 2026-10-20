@@ -15,5 +15,15 @@
 *.pem
 *secret*
 
-# The config of the repo root only (the daemon's real one lives in %APPDATA%)
-/config.json
+# Any config.json in the tree, the root one and any nested one (the daemon's
+# real one lives in %APPDATA%, so nothing here may be committed)
+config.json
+
+# Scratch notes and research from the earlier session: they stay on disk, they
+# are not published (the research tree quotes other projects' own docs)
+/PLAN.md
+/RESEARCH.md
+/question.md
+/handover_2.md
+/docs/plans/
+/docs/research/

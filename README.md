@@ -297,7 +297,6 @@ crates/
 packs/                      wallpaper-engine, g-helper, rainmeter (one pack.json each)
 deploy/                     setup.ps1, uninstall.ps1, README.md
 tools/daemon-selftest.ps1   the 72-check headless integration harness
-docs/                       research notes and plans
 ```
 
 `crates/armoury` holds the daemon itself: the tray, the pipe server, the watcher, the hotkey
