@@ -34,6 +34,9 @@ The executable can install itself - the [README](../README.md) has that path. Th
 scripted one: `setup.ps1` registers the same scheduled task, writes the checksum sidecar and
 applies the folder ACL, and it needs the `packs` folder next to the executable.
 
+The executable is built for this machine's CPU and needs AVX2 - Intel from 2013, AMD from 2015;
+see [Building from source](../README.md#building-from-source).
+
 1. Put `ArmouryDaemon.exe` + the `packs` folder in a permanent folder, e.g. `C:\Apps\ArmouryDaemon`.
 2. In an **administrator** PowerShell, in that folder:
 
@@ -141,9 +144,10 @@ therefore fixed.
 
    The exe you are copying is the one in `target\release\`, and that is the **native** build:
    `.cargo/config.toml` adds `-C target-cpu=native`, so it is built for the machine that built
-   it (this one: an AMD Ryzen 7 4800H, Zen 2, AVX2-era). It is **CPU-specific** and will not run
-   on a pre-AVX2 x86-64 machine, so build it again on a new PC. The **published release** is the
-   other one: the generic x86-64 baseline, which runs on any x86-64 machine.
+   it (this one: an AMD Ryzen 7 4800H, Zen 2, AVX2-era). It is **CPU-specific** and needs
+   **AVX2** - Intel from 2013, AMD from 2015 - and the release publishes this same build, so
+   build it again on a new PC - see
+   [Building from source](../README.md#building-from-source).
 
 3. **Run `setup.ps1` in the install folder, from an elevated PowerShell:**
 

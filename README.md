@@ -220,6 +220,9 @@ small, undecorated windows plus a tray icon:
 
 The daemon is not on any package registry — it is installed from a folder you choose.
 
+The executable is built for this machine's CPU and needs AVX2 — Intel from 2013, AMD from 2015;
+see [Building from source](#building-from-source).
+
 ### From the executable alone
 
 1. **Download** `ArmouryDaemon.exe` from the
@@ -296,11 +299,14 @@ cargo test                   # the unit tests (269: 199 in armoury, 70 in armour
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
-**The published build is the generic x86-64 baseline**, so the executable in the release runs on
-any x86-64 machine. A build from this repository picks up `-C target-cpu=native` from
-`.cargo/config.toml`, so it is built for the machine that built it (this one is an AMD Ryzen 7
-4800H, Zen 2, AVX2-era) and will **not** run on a pre-AVX2 x86-64 machine. The release profile
-is `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, `incremental = false`.
+**The published executable is CPU-specific.** `.cargo/config.toml` sets `-C target-cpu=native`,
+so the build targets the CPU of the machine that built it — this one, an AMD Ryzen 7 4800H
+(Zen 2) — and that is the build that ships in the release. The executable therefore needs
+**AVX2**, which Intel has had since Haswell (2013) and AMD only since Excavator (2015)
+(Zen in 2017), together with the rest of this CPU's feature set. AMD's 2013-2014 parts —
+Steamroller, Jaguar, Kabini, Temash — have no AVX2, and nothing before 2011 has it at all, so
+the binary will not run on those. The release profile is `opt-level = 3`, `lto = "fat"`,
+`codegen-units = 1`, `strip = true`, `incremental = false`.
 
 It needs no Wallpaper Engine, G-Helper or Rainmeter: it starts a throw-away daemon instance (its
 own pipe, config folder and single-instance guard) and asserts the engine behaviour. It refuses to
