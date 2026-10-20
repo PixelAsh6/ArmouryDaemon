@@ -102,6 +102,8 @@ key to wake up* hint) and mutes every output device. Any **keypress** wakes it; 
 deliberately does not, so a nudged mouse cannot end an idle session. A failsafe timer force-quits
 idle mode after a configurable number of minutes (180 by default).
 
+The dashboard's idle band reports how many monitors it covered and how many outputs it muted.
+
 While idle mode is up, pack switching is cancelled: tracked apps count as ordinary apps. The
 packs are applied again when you wake it with a tracked app still running.
 
@@ -167,12 +169,13 @@ small, undecorated windows plus a tray icon:
 - **The Settings window** opens to the left of the dashboard: the **Revert after** value, the
   idle failsafe, the installed packs (each with a **Remove**), the console launcher's open mode
   and the apps pinned to it, the SteamGridDB key, and the buttons **Install packs**, **Open
-  packs folder** and **Check for updates**. The state, the daemon's version, the cooldown, the
-  monitor count, the tracked apps and the catalogue list are **not** here — they are on the
-  dashboard and in the Install packs window. The window opens in a leftward chain: a new window
-  goes immediately to the left of the current leftmost one, with a gap of exactly **5 physical
-  pixels** (a literal pixel count, so the display's scale cannot change it; the window sizes
-  still scale with the content and the scale).
+  packs folder** and **Check for updates**. The state, the daemon's version, the uptime, the
+  cooldown, the pack count, the tracked apps and the catalogue list are **not** here — they are
+  on the dashboard and in the Install packs window. The monitor count is no permanent row
+  either: the dashboard's idle band reports it while idle mode is up. The window opens in a
+  leftward chain: a new window goes immediately to the left of the current leftmost one, with
+  a gap of exactly **5 physical pixels** (a literal pixel count, so the display's scale cannot
+  change it; the window sizes still scale with the content and the scale).
 - **The Install packs window** is the catalogue list: it opens to the left of the dashboard, and
   every pack in the catalogue gets a **Download**, an **Update** or a *vX installed* label, plus
   a **Check for updates** button and the **Local pack** button.

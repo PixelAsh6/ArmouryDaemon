@@ -1695,8 +1695,10 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.separator();
         ui.add_space(8.0);
 
-        // The state, the daemon's version, the cooldown and the monitors are on the
-        // dashboard: the settings window only holds what can be changed here.
+        // The state, the daemon's version, the uptime, the cooldown and the pack count are on
+        // the dashboard: the settings window only holds what can be changed here. The monitor
+        // count is no permanent row anywhere: the dashboard's idle band reports it while idle
+        // mode is up, which is the only time it means anything.
 
         // ---- timing: revert cooldown + idle failsafe ----
         let (cooldown, fs_enabled, fs_minutes, mut cd_text, mut fs_text) = {
