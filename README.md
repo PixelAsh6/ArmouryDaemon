@@ -261,11 +261,11 @@ cargo test                   # the unit tests (220: 153 in armoury, 67 in armour
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
-**The release build is CPU-specific.** `.cargo/config.toml` adds `-C target-cpu=native` for
-`x86_64-pc-windows-msvc`, so the executable is built for the machine that built it — this one is
-an AMD Ryzen 7 4800H (Zen 2, AVX2-era). It will **not** run on a pre-AVX2 x86-64 machine, and a
-new PC needs a rebuild. The release profile is `opt-level = 3`, `lto = "fat"`,
-`codegen-units = 1`, `strip = true`, `incremental = false`.
+**The published build is the generic x86-64 baseline**, so the executable in the release runs on
+any x86-64 machine. A build from this repository picks up `-C target-cpu=native` from
+`.cargo/config.toml`, so it is built for the machine that built it (this one is an AMD Ryzen 7
+4800H, Zen 2, AVX2-era) and will **not** run on a pre-AVX2 x86-64 machine. The release profile
+is `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, `incremental = false`.
 
 The self-test harness needs no administrator rights and no Wallpaper Engine, G-Helper or
 Rainmeter: it starts a throw-away daemon instance (its own pipe, config folder and single-instance
