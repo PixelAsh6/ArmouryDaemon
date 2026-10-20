@@ -2546,6 +2546,9 @@ fn pack_button(catalog_version: &str, installed_version: Option<&str>) -> PackBu
 /// The one line the settings panel shows after a catalog check: what the repo holds and
 /// which of those packs are out of date. The check is the install-packs window's job, so
 /// the line says what the last check found and never that this window did it.
+///
+/// A pack this daemon is too old to run is not offered: it is neither out of date nor a
+/// pack this daemon could install, so it stays out of the counts below.
 fn catalog_check_summary(
     catalog: &Result<Vec<CatalogPack>, String>,
     packs: &[PackStatus],
@@ -2557,7 +2560,17 @@ fn catalog_check_summary(
     if entries.is_empty() {
         return "Last check: the packs repo has no packs.".to_string();
     }
-    let available: Vec<String> = entries
+    let installable: Vec<&CatalogPack> = entries
+        .iter()
+        .filter(|entry| entry.engine_gate() == EngineGate::Supported)
+        .collect();
+    if installable.is_empty() {
+        return format!(
+            "Last check: {} packs — none can be installed by this daemon",
+            entries.len()
+        );
+    }
+    let available: Vec<String> = installable
         .iter()
         .filter(|entry| {
             packs
@@ -2575,7 +2588,7 @@ fn catalog_check_summary(
         })
         .collect();
     match available.len() {
-        0 => format!("Last check: {} packs — all up to date", entries.len()),
+        0 => format!("Last check: {} packs — all up to date", installable.len()),
         1 => format!("Last check: {} is available", available[0]),
         _ => format!(
             "Last check: {} packs are out of date: {}",
@@ -3921,6 +3934,14 @@ mod tests {
         }
     }
 
+    /// A catalog entry that asks for a daemon newer than this one.
+    fn catalog_entry_needing(id: &str, name: &str, version: &str, min_engine: &str) -> CatalogPack {
+        CatalogPack {
+            min_engine: Some(min_engine.to_string()),
+            ..catalog_entry(id, name, version)
+        }
+    }
+
     /// A catalog entry that says what the pack does, as the manifest holds it.
     fn catalog_entry_with_description(
         id: &str,
@@ -3996,6 +4017,32 @@ mod tests {
             catalog_check_summary(&empty, &[]),
             "Last check: the packs repo has no packs."
         );
+    }
+
+    #[test]
+    fn the_check_summary_leaves_out_a_pack_this_daemon_cannot_install() {
+        // The daemon is too old for one of the two packs: it is neither out of date
+        // nor a pack this daemon could install.
+        let too_new = catalog_entry_needing("too-new", "Too New", "2.0.0", "99.0.0");
+        let catalog = Ok(vec![
+            catalog_entry("rainmeter", "Rainmeter", "1.4.0"),
+            too_new.clone(),
+        ]);
+        let summary = catalog_check_summary(&catalog, &[installed_pack("rainmeter", "1.3.0")]);
+        assert!(summary.contains("Rainmeter v1.4.0"), "the installable pack is named: {summary}");
+        assert!(!summary.contains("Too New"), "a refused pack is not named: {summary}");
+        assert!(!summary.contains("2.0.0"), "a refused pack is not named: {summary}");
+        assert!(!summary.contains("out of date"), "a refused pack is not out of date: {summary}");
+        // Nothing is out of date: the refused pack is not counted either.
+        let current = catalog_check_summary(&catalog, &[installed_pack("rainmeter", "1.4.0")]);
+        assert!(current.contains("all up to date"), "the installable pack is current: {current}");
+        assert!(!current.contains("2 packs"), "the refused pack is not counted: {current}");
+        // Nothing at all can be installed here: the summary says so instead of claiming
+        // the repo is up to date.
+        let all_refused = Ok(vec![too_new]);
+        let summary = catalog_check_summary(&all_refused, &[]);
+        assert!(!summary.contains("all up to date"), "it is not up to date: {summary}");
+        assert!(summary.contains("none can be installed"), "it says why: {summary}");
     }
 
     #[test]
