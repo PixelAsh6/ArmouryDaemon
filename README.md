@@ -70,6 +70,12 @@ your tracked apps and any apps you pinned to it, with the cover art of each. The
 left stick scrolls, **A** launches, **B** (or unplugging the pad) closes it. A mouse click
 launches too, and `Esc` closes.
 
+A **≡** button in the band's top-left corner opens a small menu for the artwork: **Choose
+artwork…** opens a picker with an **Icon** and a **Background** tab — the 2:3 grids for the icon,
+the wide heroes for the background — and **Use automatic again** hands the slot back to the
+automatic picker. The mouse and a controller both work, a picture you pick is shown in the band
+at once, and it stays until you take it away.
+
 The daemon does the launching, so a game started from the band triggers the packs exactly as if
 you had opened it by hand. A game that belongs to a Steam app is started the way Steam starts it
 (`steam.exe -applaunch <appid>`); anything else is spawned directly. The daemon then checks that
@@ -109,9 +115,17 @@ packs are applied again when you wake it with a tracked app still running.
 
 ### Cover art
 
-The console band shows the cover art of your apps. Games Steam knows get it from the Steam CDN;
-the rest comes from **SteamGridDB**. Without an API key the band falls back to the exe icon and
-then to a monogram.
+The console band shows the cover art of your apps. The automatic pick takes the **best** key art
+it can find: the real 600×900 library picture for the tile, and for the background the widest
+art that exists — five Steam assets are tried before **SteamGridDB** is asked at all, so a
+missing file no longer means a **black** band. Without an API key the band falls back to the exe
+icon and then to a monogram.
+
+You are not stuck with the automatic pick. The **≡** menu in the band's top-left corner has
+**Choose artwork…**, which opens a picker with an **Icon** and a **Background** tab — the 2:3
+grids for the icon, the wide heroes for the background, each with its size and style under it.
+The mouse and a controller both work, your choice is shown at once, and it keeps its place until
+you choose **Use automatic again**.
 
 ### The pack catalogue
 
@@ -168,17 +182,19 @@ small, undecorated windows plus a tray icon:
   down*. Its Packs section also carries the built-in **Console launcher** row.
 - **The Settings window** opens to the left of the dashboard: the **Revert after** value, the
   idle failsafe, the installed packs (each with a **Remove**), the console launcher's open mode
-  and the apps pinned to it, the SteamGridDB key, and the buttons **Install packs**, **Open
-  packs folder** and **Check for updates**. The state, the daemon's version, the uptime, the
-  cooldown, the pack count, the tracked apps and the catalogue list are **not** here — they are
-  on the dashboard and in the Install packs window. The monitor count is no permanent row
-  either: the dashboard's idle band reports it while idle mode is up. The window opens in a
+  and the apps pinned to it, the SteamGridDB key, and the two buttons **Install packs** and
+  **Open packs folder**. The catalogue is checked in the Install packs window; the line under the
+  packs row reports the **last check**, whoever ran it. The state, the daemon's version, the
+  uptime, the cooldown, the pack count, the tracked apps and the catalogue list are **not** here
+  — they are on the dashboard and in the Install packs window. The monitor count is no permanent
+  row either: the dashboard's idle band reports it while idle mode is up. The window opens in a
   leftward chain: a new window goes immediately to the left of the current leftmost one, with
   a gap of exactly **5 physical pixels** (a literal pixel count, so the display's scale cannot
   change it; the window sizes still scale with the content and the scale).
 - **The Install packs window** is the catalogue list: it opens to the left of the dashboard, and
-  every pack in the catalogue gets a **Download**, an **Update** or a *vX installed* label, plus
-  a **Check for updates** button and the **Local pack** button.
+  every pack in the catalogue gets a **Download**, an **Update** or a *vX installed* label at the
+  right edge of its row, its description wrapping in a column of its own, plus a **Check for
+  updates** button and the **Local pack** button.
 - **One window per pack**, showing all of its dropdowns and its version.
 - **The console band** is a wide, dark tile strip along the bottom of the screen.
 - **The idle overlay** is a black, topmost window on every monitor.
@@ -234,8 +250,8 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (181: 122 in armoury, 59 in armoury-core)
-powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 60-check integration harness
+cargo test                   # the unit tests (205: 142 in armoury, 63 in armoury-core)
+powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
 **The release build is CPU-specific.** `.cargo/config.toml` adds `-C target-cpu=native` for
@@ -270,7 +286,7 @@ crates/
   armoury/                  the single exe "ArmouryDaemon"
 packs/                      wallpaper-engine, g-helper, rainmeter (one pack.json each)
 deploy/                     setup.ps1, uninstall.ps1, README.md
-tools/daemon-selftest.ps1   the 60-check headless integration harness
+tools/daemon-selftest.ps1   the 72-check headless integration harness
 docs/                       research notes and plans
 ```
 
