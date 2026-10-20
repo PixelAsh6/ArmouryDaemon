@@ -89,6 +89,20 @@ Settings -> **Catalog** -> **Check for updates** fetches the catalog manifest an
 on offer. **Install** and **Update** download the pack, check it against the hash in the
 manifest and hand it to the daemon, which validates it and reloads.
 
+The catalog is `https://github.com/PixelAsh6/ArmouryDaemon_Packs` (MIT): `catalog/index.json` plus
+one `packs/<id>/pack.json` per pack. Two things to know about it:
+
+- **A fresh publish takes up to five minutes to show up.** `raw.githubusercontent.com` caches the
+  `main` branch for up to five minutes, so *Check for updates* can still show the previous version
+  for that long, and a pack file fetched from the stale copy does not match the manifest's hash -
+  the install is refused. That is on purpose: nothing is installed that cannot be verified. The
+  repository itself is never stale, only that cached view lags.
+- **The manifest's hash and size must describe the published bytes.** Hash the file as GitHub
+  serves it (`git cat-file blob HEAD:<path>` in the catalog repo), not as it sits in a Windows
+  working tree: `core.autocrlf=true` turns LF into CRLF, the two sizes differ, and the install then
+  fails on the size check. The catalog repo keeps its files LF with a `.gitattributes` rule
+  (`*.json text eol=lf`).
+
 ## Updating
 
 The running exe is locked, so it cannot be overwritten while the daemon is up - and `setup.ps1`
@@ -112,6 +126,10 @@ therefore fixed.
 
    The copy has to happen **after** the daemon is stopped - while it runs the exe is locked and
    the copy fails with a sharing violation.
+
+   The exe in `target\release\` is built with `-C target-cpu=native` for the machine it was built
+   on (this one: an AMD Ryzen 7 4800H). It is **CPU-specific**: it will not run on a pre-AVX2
+   x86-64 machine, so build it again on a new PC.
 
 3. **Run `setup.ps1` in the install folder, from an elevated PowerShell:**
 
