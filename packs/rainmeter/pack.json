@@ -2,7 +2,8 @@
   "spec": 2,
   "id": "rainmeter",
   "name": "Rainmeter",
-  "version": "1.4.0",
+  "version": "1.5.0",
+  "min_engine": "1.0.0",
   "order": 30,
   "targets": { "process": ["Rainmeter.exe"] },
   "settings": [

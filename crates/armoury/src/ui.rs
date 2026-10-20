@@ -3,7 +3,7 @@
 //! placed at the bottom-right corner of the primary monitor, above the taskbar.
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
-use crate::catalog::{self, CatalogPack};
+use crate::catalog::{self, CatalogPack, EngineGate};
 use armoury_core::config::{
     CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, CONSOLE_OPEN_PAD, TrackedApp,
 };
@@ -2471,6 +2471,12 @@ fn catalog_row(
                 ui.small(RichText::new("installing…").weak());
                 return;
             }
+            // A pack this daemon is too old to run gets no button: the reason is shown
+            // instead, so the user reads why it cannot be installed here.
+            if let EngineGate::Refused { reason, .. } = entry.engine_gate() {
+                ui.small(RichText::new(reason).weak());
+                return;
+            }
             match pack_button(&entry.version, installed_version) {
                 PackButton::Download => {
                     if ui
@@ -3911,6 +3917,7 @@ mod tests {
             file: format!("packs/{id}/pack.json"),
             sha256: "00".to_string(),
             size: None,
+            min_engine: None,
         }
     }
 
