@@ -426,8 +426,9 @@ impl eframe::App for App {
             }
         }
 
-        // Catalog: the settings window asked for a check. HTTPS runs on this thread, never
-        // on the UI's — the result lands in Shared and the settings window picks it up.
+        // Catalog: a check was asked for (the install-packs window is the one that asks).
+        // HTTPS runs on this thread, never on the UI's — the result lands in Shared and
+        // the windows pick it up.
         let check = {
             let mut s = self.shared.lock().unwrap();
             std::mem::take(&mut s.catalog_check_requested)
@@ -1693,7 +1694,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         });
         ui.add_space(4.0);
         ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
         // The state, the daemon's version, the uptime, the cooldown and the pack count are on
         // the dashboard: the settings window only holds what can be changed here. The monitor
@@ -1740,9 +1741,6 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 console_open,
             )
         };
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
 
         // Plain typable boxes (a DragValue refuses to be emptied, which made editing them
         // painful — 2026-10-17 feedback). They commit on Enter or when focus moves away.
@@ -1854,12 +1852,10 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             send_request(shared, &Request::RemovePack { id });
         }
         ui.add_space(4.0);
-        // Three buttons in one row. The layout wraps, so a button that does not fit moves
+        // Two buttons in one row. The layout wraps, so a button that does not fit moves
         // to the next line instead of being clipped.
-        let mut check = false;
         ui.horizontal_wrapped(|ui| {
-            // A tighter gap than the app's default: the three buttons have to share one
-            // row (379 pt of buttons in a 398 pt row).
+            // A tighter gap than the app's default: the two buttons have to share one row.
             ui.spacing_mut().item_spacing.x = 6.0;
             if ui
                 .button("Install packs")
@@ -1879,24 +1875,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             if ui.button("Open packs folder").clicked() {
                 open_folder(&packs_dir());
             }
-            if ui
-                .button("Check for updates")
-                .on_hover_text("Fetch the pack catalog and compare the versions")
-                .clicked()
-                && !catalog_checking
-            {
-                check = true;
-            }
         });
-        if check {
-            // The fetch runs on the root's worker thread: the result lands in the shared
-            // state and this window picks it up.
-            let mut s = shared.lock().unwrap();
-            s.catalog_check_requested = true;
-            s.catalog_checking = true;
-            drop(s);
-            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-        }
         if let Some((ok, message)) = last_op {
             ui.add_space(2.0);
             ui.small(
@@ -1907,10 +1886,11 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 }),
             );
         }
-        // One line: what the repo holds and what is out of date (or why the check failed).
+        // One line: what the last check found in the repo. The check itself is the
+        // install-packs window's job, so the line says "last check" and not "checked".
         if catalog_checking {
             ui.add_space(2.0);
-            ui.small(RichText::new("Checking…").weak());
+            ui.small(RichText::new("Checking the packs…").weak());
         } else if let Some(catalog) = &catalog_state {
             let summary = catalog_check_summary(catalog, &packs);
             ui.add_space(2.0);
@@ -2113,15 +2093,13 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         for [a, b] in [["Reveal logs", "Open config folder"]] {
             w = w.max(tw(&button_font, a) + 24.0 + tw(&button_font, b) + 24.0 + 8.0);
         }
-        // The packs row: three buttons side by side.
+        // The packs row: two buttons side by side.
         w = w.max(
             tw(&button_font, "Install packs")
                 + 24.0
                 + tw(&button_font, "Open packs folder")
                 + 24.0
-                + tw(&button_font, "Check for updates")
-                + 24.0
-                + 2.0 * 6.0,
+                + 6.0,
         );
         // The SteamGridDB row: the masked field, Save and Clear.
         w = w.max(190.0 + 52.0 + 52.0 + 24.0);
@@ -2458,6 +2436,12 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ctx.request_repaint_after(Duration::from_secs(1));
 }
 
+/// The width of the description column in the install-packs window. A one-sentence
+/// description wraps into two or three rows in it. The column is narrower than the
+/// window on purpose: a description that ran the full width of the window used to
+/// widen the whole list, and that pushed the state of the rows below it off the screen.
+const CATALOG_DESC_WIDTH: f32 = 240.0;
+
 /// One pack of the catalog: its name, its version, its description and the button that
 /// downloads it.
 fn catalog_row(
@@ -2474,6 +2458,9 @@ fn catalog_row(
     } else {
         &entry.name
     };
+    // The name and the state share the first line. The state sits against the right
+    // edge, and the description below never widens the row, so the state is in the
+    // same place on every row.
     ui.horizontal(|ui| {
         ui.label(RichText::new(name.as_str()).strong());
         if !entry.version.is_empty() {
@@ -2511,8 +2498,21 @@ fn catalog_row(
         });
     });
     if !entry.description.is_empty() {
-        // The description wraps: it is the reason the window is wide.
-        ui.small(RichText::new(entry.description.as_str()).weak());
+        // The description is a column of its own, indented under the name. It wraps
+        // into two or three rows instead of running off the edge of the window, and it
+        // never grows wider than its column, so it cannot push the state of the rows
+        // below it out of the window.
+        ui.indent(("catalog-description", entry.id.as_str()), |ui| {
+            let width = CATALOG_DESC_WIDTH.min(ui.available_width());
+            let rect = Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(width, ui.available_height().max(60.0)),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                ui.small(RichText::new(entry.description.as_str()).weak());
+            });
+        });
     }
     ui.add_space(6.0);
 }
@@ -2538,17 +2538,18 @@ fn pack_button(catalog_version: &str, installed_version: Option<&str>) -> PackBu
 }
 
 /// The one line the settings panel shows after a catalog check: what the repo holds and
-/// which of those packs are out of date.
+/// which of those packs are out of date. The check is the install-packs window's job, so
+/// the line says what the last check found and never that this window did it.
 fn catalog_check_summary(
     catalog: &Result<Vec<CatalogPack>, String>,
     packs: &[PackStatus],
 ) -> String {
     let entries = match catalog {
-        Err(message) => return message.clone(),
+        Err(message) => return format!("Last check failed: {message}"),
         Ok(entries) => entries,
     };
     if entries.is_empty() {
-        return "The packs repo has no packs.".to_string();
+        return "Last check: the packs repo has no packs.".to_string();
     }
     let available: Vec<String> = entries
         .iter()
@@ -2568,10 +2569,10 @@ fn catalog_check_summary(
         })
         .collect();
     match available.len() {
-        0 => format!("{} packs — all up to date", entries.len()),
-        1 => format!("{} is available", available[0]),
+        0 => format!("Last check: {} packs — all up to date", entries.len()),
+        1 => format!("Last check: {} is available", available[0]),
         _ => format!(
-            "{} packs are out of date: {}",
+            "Last check: {} packs are out of date: {}",
             available.len(),
             available.join(", ")
         ),
@@ -3913,6 +3914,19 @@ mod tests {
         }
     }
 
+    /// A catalog entry that says what the pack does, as the manifest holds it.
+    fn catalog_entry_with_description(
+        id: &str,
+        name: &str,
+        version: &str,
+        description: &str,
+    ) -> CatalogPack {
+        CatalogPack {
+            description: description.to_string(),
+            ..catalog_entry(id, name, version)
+        }
+    }
+
     /// An installed pack as the daemon reports it.
     fn installed_pack(id: &str, version: &str) -> PackStatus {
         PackStatus {
@@ -3934,7 +3948,7 @@ mod tests {
         ]);
         assert_eq!(
             catalog_check_summary(&catalog, &[installed_pack("g-helper", "1.3.1")]),
-            "2 packs — all up to date"
+            "Last check: 2 packs — all up to date"
         );
         // One pack is behind the repo.
         assert_eq!(
@@ -3945,7 +3959,7 @@ mod tests {
                     installed_pack("rainmeter", "1.3.0"),
                 ]
             ),
-            "Rainmeter v1.4.0 is available"
+            "Last check: Rainmeter v1.4.0 is available"
         );
         // Two of them are.
         assert_eq!(
@@ -3956,45 +3970,34 @@ mod tests {
                     installed_pack("rainmeter", "1.3.0"),
                 ]
             ),
-            "2 packs are out of date: G-Helper v1.3.1, Rainmeter v1.4.0"
+            "Last check: 2 packs are out of date: G-Helper v1.3.1, Rainmeter v1.4.0"
         );
         // A pack that is not installed is not out of date either.
-        assert_eq!(catalog_check_summary(&catalog, &[]), "2 packs — all up to date");
+        assert_eq!(
+            catalog_check_summary(&catalog, &[]),
+            "Last check: 2 packs — all up to date"
+        );
         // The fetch failed: the error is the result.
         let failed: Result<Vec<CatalogPack>, String> = Err("catalog: no network".to_string());
-        assert_eq!(catalog_check_summary(&failed, &[]), "catalog: no network");
+        assert_eq!(
+            catalog_check_summary(&failed, &[]),
+            "Last check failed: catalog: no network"
+        );
         // An empty repo.
         let empty: Result<Vec<CatalogPack>, String> = Ok(Vec::new());
         assert_eq!(
             catalog_check_summary(&empty, &[]),
-            "The packs repo has no packs."
+            "Last check: the packs repo has no packs."
         );
     }
 
     #[test]
-    fn the_three_packs_buttons_fit_on_one_row() {
+    fn the_two_packs_buttons_fit_on_one_row() {
         // The settings window is as wide as the dashboard (418 pt) and the frame's padding
         // takes 20 pt of it: the row has 398 pt.
         const ROW_WIDTH: f32 = 398.0;
         let ctx = egui::Context::default();
-        let (fonts, chosen) = system_fonts();
-        ctx.set_fonts(fonts);
-        // The app's own style, so the buttons are measured as they are drawn.
-        ctx.all_styles_mut(|style| {
-            style
-                .text_styles
-                .insert(TextStyle::Heading, FontId::new(23.0, FontFamily::Proportional));
-            style
-                .text_styles
-                .insert(TextStyle::Body, FontId::new(15.5, FontFamily::Proportional));
-            style
-                .text_styles
-                .insert(TextStyle::Button, FontId::new(15.5, FontFamily::Proportional));
-            style
-                .text_styles
-                .insert(TextStyle::Small, FontId::new(13.0, FontFamily::Proportional));
-            style.spacing.item_spacing = egui::vec2(10.0, 7.0);
-        });
+        let chosen = app_style(&ctx);
         let input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
@@ -4011,7 +4014,9 @@ mod tests {
                     ui.horizontal_wrapped(|ui| {
                         // The gap the packs row uses.
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        for label in ["Install packs", "Open packs folder", "Check for updates"] {
+                        // The catalogue is checked in the install-packs window, so the
+                        // settings window has two buttons and not three.
+                        for label in ["Install packs", "Open packs folder"] {
                             let rect = ui.button(label).rect;
                             rows.push(rect.top());
                             widths.push(rect.width());
@@ -4020,14 +4025,14 @@ mod tests {
                 });
         });
         output.drop_without_applying_deltas();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 2);
         if chosen.is_some() {
-            // The system font is the one the app draws with: the three buttons have to
+            // The system font is the one the app draws with: the two buttons have to
             // share one row, otherwise the row wraps and the panel grows.
-            let total: f32 = widths.iter().sum::<f32>() + 2.0 * 6.0;
+            let total: f32 = widths.iter().sum::<f32>() + 6.0;
             assert!(
-                (rows[0] - rows[1]).abs() < 0.5 && (rows[1] - rows[2]).abs() < 0.5,
-                "the three packs buttons do not fit on one row: {widths:?} ({total:.0} pt) in \
+                (rows[0] - rows[1]).abs() < 0.5,
+                "the two packs buttons do not fit on one row: {widths:?} ({total:.0} pt) in \
                  {ROW_WIDTH} pt (rows at {rows:?})"
             );
         }
@@ -4094,5 +4099,252 @@ mod tests {
         // The settings stays in the chain, the install-packs window is gone.
         assert_eq!(s.chain, vec![ChainItem::Settings]);
         assert!(!s.chain_place.contains_key(&ChainItem::InstallPacks));
+    }
+
+    /// The app's own fonts and styles, so a test measures the text as it is drawn.
+    /// Returns the name of the system font, or None when the machine has none.
+    fn app_style(ctx: &egui::Context) -> Option<&'static str> {
+        let (fonts, chosen) = system_fonts();
+        ctx.set_fonts(fonts);
+        ctx.all_styles_mut(|style| {
+            style
+                .text_styles
+                .insert(TextStyle::Heading, FontId::new(23.0, FontFamily::Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Body, FontId::new(15.5, FontFamily::Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Button, FontId::new(15.5, FontFamily::Proportional));
+            style
+                .text_styles
+                .insert(TextStyle::Small, FontId::new(13.0, FontFamily::Proportional));
+            style.spacing.item_spacing = egui::vec2(10.0, 7.0);
+        });
+        chosen
+    }
+
+    /// Every piece of text a frame painted: what it says, where it landed and how many
+    /// rows it took.
+    fn painted_text(output: &egui::FullOutput) -> Vec<(String, Rect, usize)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) => Some((
+                    t.galley.job.text.clone(),
+                    t.galley.rect.translate(t.pos.to_vec2()),
+                    t.galley.rows.len(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The horizontal rules a frame painted, from the top down. The X of a close
+    /// button is drawn with two slanting lines, so it is not one of them.
+    fn painted_rules(output: &egui::FullOutput) -> Vec<f32> {
+        let mut ys: Vec<f32> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::LineSegment { points, .. }
+                    if (points[0].y - points[1].y).abs() < 0.5 =>
+                {
+                    Some(points[0].y)
+                }
+                _ => None,
+            })
+            .collect();
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys
+    }
+
+    #[test]
+    fn the_settings_window_opens_with_one_rule() {
+        // The four status rows are gone, and so is the rule that framed them: the
+        // window opens with the title bar's own rule and straight into the content.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| settings_ui(ui, &shared));
+        });
+        let text = painted_text(&output);
+        let revert = text
+            .iter()
+            .find(|(t, _, _)| t == "Revert after")
+            .map(|(_, rect, _)| *rect)
+            .expect("the settings window has no 'Revert after' row");
+        let rules_above = painted_rules(&output)
+            .into_iter()
+            .filter(|y| *y < revert.top())
+            .count();
+        output.drop_without_applying_deltas();
+        assert_eq!(
+            rules_above, 1,
+            "the settings window opens with {rules_above} rules above the first row, not one"
+        );
+    }
+
+    #[test]
+    fn every_catalog_row_shows_its_state_on_screen() {
+        // The state of a pack (the "vX installed" label, the update button or the
+        // download button) is at the right of the row, and the description under the
+        // name wraps into two or three rows. A description that ran the full width of
+        // the window used to widen the whole list, and that pushed the state of the
+        // rows below it off the screen.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let entries = vec![
+            // The installed version is the one in the repo: the row says so.
+            catalog_entry_with_description(
+                "wallpaper-engine",
+                "Wallpaper Engine",
+                "1.4.0",
+                "Stops the animated wallpaper while a tracked app runs and restores it afterwards.",
+            ),
+            // The repo has a newer one: the row offers the update.
+            catalog_entry_with_description(
+                "g-helper",
+                "G-Helper",
+                "1.3.1",
+                "Switches G-Helper's performance mode (Turbo / Balanced / Silent) while a tracked app runs.",
+            ),
+            // Not installed at all: the row offers the download.
+            catalog_entry_with_description(
+                "rainmeter",
+                "Rainmeter",
+                "1.4.0",
+                "Swaps Rainmeter to the dropdown's layout while a tracked app runs and back again.",
+            ),
+        ];
+        let packs = vec![
+            installed_pack("wallpaper-engine", "1.4.0"),
+            installed_pack("g-helper", "1.2.0"),
+        ];
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    for entry in &entries {
+                        catalog_row(ui, &shared, entry, &packs, None);
+                    }
+                });
+        });
+        let text = painted_text(&output);
+        let state = |want: &str| {
+            text.iter()
+                .find(|(t, _, _)| t == want)
+                .map(|(_, rect, _)| *rect)
+        };
+        // The installed version is the one in the repo: the row says so.
+        let installed = state("v1.4.0 installed");
+        // A newer version in the repo: the row offers the update.
+        let update = state("Update");
+        // Not installed: the row offers the download.
+        let download = state("Download");
+        // The description wraps: two or three rows, and it is indented under the name.
+        let description = text
+            .iter()
+            .find(|(t, _, _)| t.starts_with("Stops the animated wallpaper"))
+            .map(|(_, rect, rows)| (*rect, *rows));
+        let off_window: Vec<String> = text
+            .iter()
+            .filter(|(_, rect, _)| rect.right() > INSTALL_PACKS_WIDTH + 0.5)
+            .map(|(t, rect, _)| format!("{t:?} at {rect:?}"))
+            .collect();
+        output.drop_without_applying_deltas();
+        // Nothing runs off the window: every row is fully on screen.
+        assert!(
+            off_window.is_empty(),
+            "these run off the window: {off_window:?}"
+        );
+        let installed = installed.expect("no row says the pack is installed");
+        assert!(update.is_some(), "no row offers the update");
+        assert!(download.is_some(), "no row offers the download");
+        // The label is against the right edge of the window, where it belongs.
+        assert!(
+            (installed.right() - INSTALL_PACKS_WIDTH).abs() < 0.5,
+            "the installed label is not at the right edge: {installed:?}"
+        );
+        let (rect, rows) = description.expect("the description is not on screen");
+        assert!(
+            (2..=3).contains(&rows),
+            "the description is {rows} rows, not two or three"
+        );
+        assert!(rect.left() > 0.0, "the description is not indented");
+    }
+
+    #[test]
+    fn closing_the_settings_window_takes_it_out_of_the_chain() {
+        let mut s = Shared {
+            settings_open: true,
+            ..Default::default()
+        };
+        s.chain.push(ChainItem::Settings);
+        s.chain.push(ChainItem::InstallPacks);
+        s.chain_place.insert(ChainItem::Settings, Placement::default());
+        close_settings(&mut s);
+        assert!(!s.settings_open);
+        // The install-packs window stays in the chain, the settings window is gone.
+        assert_eq!(s.chain, vec![ChainItem::InstallPacks]);
+        assert!(!s.chain_place.contains_key(&ChainItem::Settings));
+    }
+
+    #[test]
+    fn a_window_the_root_stops_showing_is_closed() {
+        // The ✕ of the settings window does not tell the OS to close the window: it
+        // stops the root from showing it, and egui closes a child viewport that was
+        // not used in a pass. This is that rule, exercised.
+        let ctx = egui::Context::default();
+        // eframe does this on a platform that has real windows; without it egui
+        // embeds the child window in the root one.
+        ctx.set_embed_viewports(false);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let id = settings_viewport_id();
+        // The root shows the window.
+        let output = ctx.run_ui(input.clone(), |_ui| {
+            ctx.show_viewport_deferred(
+                id,
+                egui::ViewportBuilder::default().with_title("Settings"),
+                |_ui, _class| {},
+            );
+        });
+        output.drop_without_applying_deltas();
+        let title = ctx.viewport_for(id, |state| state.builder.title.clone());
+        assert_eq!(
+            title.as_deref(),
+            Some("Settings"),
+            "the settings window was never opened"
+        );
+        // The window is closed: the root stops showing it.
+        let output = ctx.run_ui(input, |_ui| {});
+        output.drop_without_applying_deltas();
+        let title = ctx.viewport_for(id, |state| state.builder.title.clone());
+        assert!(title.is_none(), "the settings window is still open");
     }
 }
