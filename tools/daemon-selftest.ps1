@@ -5,8 +5,8 @@
     and single-instance mutex, via ARMOURY_TEST_NS), drives it over the pipe and asserts the engine
     behaviour. All packs are disabled for the run, so nothing on the desktop moves.
 
-    Usage (no admin needed as long as the installed daemon runs at a different privilege - the test
-    instance uses its own pipe):
+    Usage (run this from an elevated PowerShell - the executable asks Windows for administrator
+    rights, so a shell that is not elevated skips the command-line probes and says why):
         powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1
         powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1 -Exe ..\target\debug\ArmouryDaemon.exe
 

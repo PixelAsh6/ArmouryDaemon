@@ -50,11 +50,11 @@ Three packs ship with the zip: **Wallpaper Engine**, **G-Helper** and **Rainmete
 ArmouryDaemon.exe --catalog-install <id>
 ```
 
-A pack may declare the daemon it needs (`"min_engine": "1.1.0"`). A daemon that is too old for it
+A pack may declare the daemon it needs (`"min_engine": "1.2.0"`). A daemon that is too old for it
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.1.0 or newer; this daemon is 1.1.0
+pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.0
 ```
 
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
