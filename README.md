@@ -12,14 +12,13 @@ Windows 11 · Rust · MIT
 ## What it is
 
 ArmouryDaemon is a small always-on daemon — plus an on-demand GUI, in the same binary — that
-reacts to the applications you care about. It runs **resident and elevated**: a scheduled task
-starts it at logon and whenever Windows resumes from sleep, with the highest privileges, so
-there is no UAC prompt afterwards.
+reacts to the applications you care about. It runs **resident and elevated**, so there is no UAC
+prompt once it is installed.
 
-You pick the apps you track. While one of them runs, the daemon applies **packs**. A pack is a
-piece of data that says "while this app is running, tell *that* other program to do *this*, and
-remember what it was doing so it can be put back". When the app closes, every pack reverts to
-the state that was captured before it started.
+You pick the apps you track. While one of them runs, the daemon applies **packs**: the pack says
+what the other programs should do while your app is running, and remembers what they were doing
+so it can put it back. When the app closes, every pack reverts to the state captured before it
+started.
 
 Everything is local. There is no telemetry. The only network traffic is the optional pack
 catalogue and the optional cover art.
@@ -35,29 +34,35 @@ waits on the matching process handles, so an exit is exact and a PID reuse canno
 
 ### Packs
 
-Three packs ship with the daemon, and more can be installed from the catalogue:
+A pack is **data**, not code: the daemon interprets it, and nothing a pack contains can run
+arbitrary code. A pack is a single `pack.json` file, and it may expose a few dropdowns.
 
-| Pack | What it does while a tracked app runs | When it closes |
-|---|---|---|
-| **Wallpaper Engine** | Stops, pauses or kills the animated wallpaper | Plays it again |
-| **G-Helper** | Switches the performance mode (Turbo / Balanced / Silent) through G-Helper's own hotkeys | Restores the mode that was captured |
-| **Rainmeter** | Loads another layout, or quits Rainmeter entirely | Reloads the `@Backup` snapshot |
+**Where to get them** — the catalogue repository,
+**[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**, whose
+README is the reference for the pack format, the mechanism vocabulary and the script host API.
+Three packs ship with the daemon: **Wallpaper Engine**, **G-Helper** and **Rainmeter**.
 
-A pack may expose up to **four dropdowns**; the first one is the primary action. The packs ship
-with one each, except Wallpaper Engine, which has a second one for choosing between the 64-bit
-and the 32-bit binary.
+**How to install one** — Settings → **Install packs**, or from the command line:
 
-A pack may also declare the **daemon it needs** (`"min_engine": "1.1.0"`). A daemon that is too
-old for it refuses it by name instead of installing it: `pack 'rainmeter' (Rainmeter) needs
-daemon 1.1.0 or newer; this daemon is 1.0.0`, and the pack never lands on disk. The shipped
-Rainmeter pack asks for `1.0.0` — the version that ships it.
+```console
+ArmouryDaemon.exe --catalog-install <id>
+```
+
+A pack may declare the daemon it needs (`"min_engine": "1.1.0"`). A daemon that is too old for it
+refuses it **by name** instead of installing it, and the pack never lands on disk:
+
+```console
+pack 'example-pack' (Example Pack) needs daemon 1.1.0 or newer; this daemon is 1.0.0
+```
+
+The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and `1.0.0` is the daemon
+version that ships it.
 
 ### The lockout ("Revert after")
 
-Every change that actually happens starts a **lockout** — the settling window you see in the
-Settings window as **Revert after**, 60 seconds by default. While a lockout runs, no other
-change may touch the packs. An event that arrives inside that window is **deferred, not
-dropped**: it lands when the lockout expires.
+Every change that actually happens starts a **lockout** — the settling window the Settings window
+shows, 60 seconds by default. While a lockout runs, no other change may touch the packs. An event
+that arrives inside that window is **deferred, not dropped**: it lands when the lockout expires.
 
 The lockout is a minimum spacing between two changes, not a scheduled switch. A lockout that
 expires while the intent still holds changes nothing and starts no new one. A consequence worth
@@ -70,16 +75,9 @@ lockout: they change the packs at once.
 
 ### The console band (the game launcher)
 
-Plug in a controller and a dark, always-on-top tile strip opens along the bottom of the screen:
-your tracked apps and any apps you pinned to it, with the cover art of each. The d-pad or the
-left stick scrolls, **A** launches, **B** (or unplugging the pad) closes it. A mouse click
-launches too, and `Esc` closes.
-
-A **≡** button in the band's top-left corner opens a small menu for the artwork: **Choose
-artwork.** opens a picker with an **Icon** and a **Background** tab — the 2:3 grids for the icon,
-the wide heroes for the background — and **Use automatic again** hands the slot back to the
-automatic picker. The mouse and a controller both work, a picture you pick is shown in the band
-at once, and it stays until you take it away.
+Plug in a controller and the band opens: your tracked apps and any apps you pinned to it. The
+d-pad or the left stick scrolls, **A** launches, **B** (or unplugging the pad) closes it. A
+mouse click launches too, and `Esc` closes.
 
 The daemon does the launching, so a game started from the band triggers the packs exactly as if
 you had opened it by hand. A game that belongs to a Steam app is started the way Steam starts it
@@ -95,7 +93,7 @@ The band can also be opened from the tray, and it can be told to stay out of the
 | Key | What it does |
 |---|---|
 | **End** | Killswitch: hide the running tracked apps and mute their audio. Press again to put both back. |
-| **Home** | Idle mode. Press again (or press any key) to come back. |
+| **Home** | Idle mode. Press again to come back. |
 
 Both keys are handled by a **low-level keyboard hook** (`WH_KEYBOARD_LL`), not by
 `RegisterHotKey`. That distinction matters: a registered hotkey is swallowed by Windows and
@@ -134,20 +132,18 @@ you choose **Use automatic again**.
 
 ### The pack catalogue
 
-The catalogue has a window of its own: **Install packs** (Settings → **Install packs**). It
-fetches the manifest when it opens and lists every pack in it. Every entry shows its version
-and one of *Download* / *Update* / *vX installed*. The daemon downloads the file, checks its
-**size and SHA-256** against the manifest and only then validates and installs it. Nothing
-that cannot be verified is ever installed. A pack the running daemon is too old for is not
-offered at all — its row shows the reason where the **Download** button would be. The window's
-**Local pack** button opens the native file picker and installs a `pack.json` from disk — the
-only way to install a local pack file.
+The catalogue has a window of its own. It fetches the manifest when it opens and lists every
+pack in it. Every entry shows its version and one of *Download* / *Update* / *vX installed*. The
+daemon downloads the file, checks its **size and SHA-256** against the manifest and only then
+validates and installs it. Nothing that cannot be verified is ever installed. A pack the running
+daemon is too old for is not offered at all — its row shows the reason where the **Download**
+button would be. The window's **Local pack** button opens the native file picker and installs a
+`pack.json` from disk — the only way to install a local pack file.
 
-From the command line:
+The other command-line flags:
 
 ```console
 ArmouryDaemon.exe --catalog-list
-ArmouryDaemon.exe --catalog-install <id>
 ArmouryDaemon.exe --catalog-url <url>
 ArmouryDaemon.exe --version
 ArmouryDaemon.exe --help
@@ -162,12 +158,11 @@ stdout *and* stderr.
 
 ### The pack script host (spec 2 packs)
 
-A pack may carry a small **Rhai** script in `script.apply` / `script.revert`. The pack never
-executes it: the daemon compiles the source and runs it in a sandboxed interpreter that exposes
-a whitelisted host API and nothing else — no `eval`, no imports, no ambient file or process
-access. Every call is logged, the script gets a hard budget (500 000 operations, a 10 s wall
-clock), and writes and program launches are restricted to `%APPDATA%`, `%LOCALAPPDATA%`,
-`%PROGRAMDATA%` and the target app's own folder.
+A pack may carry a small **Rhai** script in `script.apply` / `script.revert`. The daemon compiles
+the source and runs it in a sandboxed interpreter that exposes a whitelisted host API and nothing
+else — no `eval`, no imports, no ambient file or process access. Every call is logged, the script
+gets a hard budget (500 000 operations, a 10 s wall clock), and writes and program launches are
+restricted to `%APPDATA%`, `%LOCALAPPDATA%`, `%PROGRAMDATA%` and the target app's own folder.
 
 The generic host function is `ctx.window_message(class, title, payload)`: it finds a window of
 another application by class and/or title and sends it the payload as a `WM_COPYDATA` message,
@@ -180,48 +175,47 @@ There are **no screenshots in this repository**, so none are linked here. The da
 small, undecorated windows plus a tray icon:
 
 - **The tray icon** is a purple-magenta squircle with a bold white **A** (drawn procedurally, not
-  a file). It turns into a red-slash variant while the killswitch is engaged. Left-click opens
+  a file). It turns **red** while the killswitch is engaged. Left-click opens
   the dashboard, right-click opens the menu (open dashboard / pause all packs / idle mode /
   toggle killswitch / console mode / quit).
 - **The executable carries the same icon**: the same drawing is embedded in it as a PE
   resource, so Explorer, the desktop, the shortcuts and the pinned taskbar item show the
   purple squircle instead of the default Windows application icon.
 - **The dashboard** opens undecorated in the bottom-right corner, above the system tray. It shows
-  the state, the daemon's version, the uptime, the cooldown, the pack count, the tracked apps
-  (with a type-to-filter picker) and the packs, with a status band for *paused* and *cooling
-  down*. Its Packs section also carries the built-in **Console launcher** row.
+  the state, the daemon's version, the uptime, the pack count, the tracked apps and the packs,
+  with a status band for *paused* and *cooling down*. Its Packs section also carries the built-in
+  **Console launcher** row.
 - **The Settings window** opens to the left of the dashboard: the **Revert after** value, the
   idle failsafe, the installed packs (each with a **Remove**), the console launcher's open mode
   and the apps pinned to it, the SteamGridDB key, and the two buttons **Install packs** and
   **Open packs folder**. The catalogue is checked in the Install packs window; the line under the
-  packs row reports the **last check**, whoever ran it. The state, the daemon's version, the
-  uptime, the cooldown, the pack count, the tracked apps and the catalogue list are **not** here
-  — they are on the dashboard and in the Install packs window. The monitor count is no permanent
-  row either: the dashboard's idle band reports it while idle mode is up. The window opens in a
-  leftward chain: a new window goes immediately to the left of the current leftmost one, with
-  a gap of exactly **5 physical pixels** (a literal pixel count, so the display's scale cannot
-  change it; the window sizes still scale with the content and the scale).
-- **The Install packs window** is the catalogue list: it opens to the left of the dashboard, and
-  every pack in the catalogue gets a **Download**, an **Update** or a *vX installed* label at the
-  right edge of its row, its description wrapping in a column of its own, plus a **Check for
-  updates** button and the **Local pack** button.
+  packs row reports the **last check**, whoever ran it. The dashboard's figures live on the
+  dashboard and in the Install packs window, not here. Windows open in a leftward chain: a new
+  window goes immediately to the left of the current leftmost one, with a gap of exactly
+  **5 physical pixels** (a literal pixel count, so the display's scale cannot change it; the
+  window sizes still scale with the content and the scale).
+- **The Install packs window** is the catalogue list: it opens to the left of the dashboard, each
+  pack's description wrapping in a column of its own, plus a **Check for updates** button and the
+  **Local pack** button.
 - **One window per pack**, showing all of its dropdowns and its version.
-- **The console band** is a wide, dark tile strip along the bottom of the screen.
-- **The idle overlay** is a black, topmost window on every monitor.
+- **The console band** is a wide, dark, always-on-top tile strip along the bottom of the screen.
+- **The idle overlay** is the black screen that idle mode puts up.
 
 ## Install
 
 The daemon is not on any package registry — it is installed from a folder you choose.
 
-1. Copy `ArmouryDaemon.exe`, the `packs` folder and the `deploy` files (`setup.ps1`,
-   `uninstall.ps1`, `README.md`) into a permanent folder, for example `C:\Apps\ArmouryDaemon`.
+1. **Download** `ArmouryDaemon-1.0.0-windows-x64.zip` from the
+   [v1.0.0 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.0.0) and unpack it
+   into a permanent folder, for example `C:\Apps\ArmouryDaemon`. The zip holds the executable,
+   the three shipped packs, the SHA-256 sidecar, `setup.ps1`, `uninstall.ps1` and this README.
 2. In an **administrator** PowerShell, in that folder:
 
    ```powershell
    powershell -ExecutionPolicy Bypass -File .\setup.ps1
    ```
 
-   `deploy\setup.ps1` registers a scheduled task that starts the daemon at logon and when Windows
+   The installer registers a scheduled task that starts the daemon at logon and whenever Windows
    resumes from sleep, **with the highest privileges**, and starts it immediately. It writes the
    SHA-256 of the executable into an `ArmouryDaemon.exe.sha256` sidecar (and into the task's
    description), so a swapped binary is detectable, and it applies an explicit ACL to the folder:
@@ -233,19 +227,22 @@ The daemon is not on any package registry — it is installed from a folder you 
 
 3. The tray icon appears. Left-click it for the dashboard.
 
+The three packs that ship with the zip — **Wallpaper Engine**, **G-Helper** and **Rainmeter** — are
+unpacked into the `packs\` folder next to the executable, and that is where your own packs go.
+
 **[deploy/README.md](deploy/README.md)** has the details: the exact ACL, updating (the running
-executable is locked, so the order is stop → copy → run `setup.ps1`), and uninstalling.
+executable is locked, so the order is stop → copy → run `setup.ps1`) and uninstalling.
 
 ## Using it
 
 | What | Where |
 |---|---|
-| Dashboard | Left-click the tray icon, or **Open dashboard** in the tray menu |
+| Dashboard | Left-click the tray icon |
 | Settings | The gear in the dashboard's title bar |
 | Tracked apps | The dashboard — the inline type-to-filter picker over all running processes, and **Browse.** |
 | Packs | The **packs** folder in the install folder; Settings → **Open packs folder** |
 | Config | `%APPDATA%\ArmouryDaemon\config.json` |
-| Logs | `%APPDATA%\ArmouryDaemon\logs\daemon.log`, `ui.log`, `console.log` (rotated, 512 KiB per generation, three generations kept) |
+| Logs | `%APPDATA%\ArmouryDaemon\logs\daemon.log`, `ui.log`, `console.log` (rolled at 512 KiB; three files are kept — the current one, `.1` and `.2`) |
 | Cover art cache | `%APPDATA%\ArmouryDaemon\art` |
 | Pack journal | `%APPDATA%\ArmouryDaemon\journal.json` |
 
@@ -260,7 +257,7 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (220: 153 in armoury, 67 in armoury-core)
+cargo test                   # the unit tests (234: 164 in armoury, 70 in armoury-core)
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
@@ -270,26 +267,9 @@ any x86-64 machine. A build from this repository picks up `-C target-cpu=native`
 4800H, Zen 2, AVX2-era) and will **not** run on a pre-AVX2 x86-64 machine. The release profile
 is `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, `incremental = false`.
 
-The self-test harness needs no administrator rights and no Wallpaper Engine, G-Helper or
-Rainmeter: it starts a throw-away daemon instance (its own pipe, config folder and single-instance
+It needs no administrator rights and no Wallpaper Engine, G-Helper or Rainmeter: it starts a
+throw-away daemon instance (its own pipe, config folder and single-instance
 guard) and asserts the engine behaviour. It refuses to run against an installed copy.
-
-## The packs
-
-The packs live in their own repository:
-**[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**.
-
-A pack is a single `pack.json` file: which process it targets, the dropdowns it exposes, what it
-captures before acting, and the ordered steps to apply and to revert. A pack is **data**, not
-code — installing one can never run arbitrary code, and a spec 2 pack's script is interpreted by
-the daemon against a whitelisted host API, never by the pack.
-
-The catalogue is `catalog/index.json` plus one `packs/<id>/pack.json` per pack. The manifest
-carries the version, the path, the SHA-256 and the size of every file; the daemon verifies both
-before it installs anything. It also carries the **minimum daemon** a pack needs. The catalogue
-holds three packs: **Wallpaper Engine 1.4.0**, **G-Helper 1.3.1** and **Rainmeter 1.5.0**, the
-last one a spec-2 pack that declares `min_engine: 1.0.0` because its script uses
-`ctx.window_message`.
 
 ## Project layout
 
@@ -300,18 +280,19 @@ crates/
   armoury/                  the single exe "ArmouryDaemon"
 packs/                      wallpaper-engine, g-helper, rainmeter (one pack.json each)
 deploy/                     setup.ps1, uninstall.ps1, README.md
-tools/daemon-selftest.ps1   the 72-check headless integration harness
+tools/daemon-selftest.ps1   the headless self-test
 ```
 
 `crates/armoury` holds the daemon itself: the tray, the pipe server, the watcher, the hotkey
 hook, the killswitch, the idle overlay, the cover-art fetcher, the console launcher, the pack
 worker, the script host and the catalogue client. `crates/armoury-core` holds the parts with no
-Windows in them: the trigger engine, the config, the pack schema and the wire protocol.
+Windows in them.
 
 ## Documentation
 
 The published documentation is this README and **[deploy/README.md](deploy/README.md)** — the
-install, the update, the uninstall, and how to write a pack.
+install, the update and the uninstall. The **pack documentation** lives in the packs repository,
+linked from the Packs section above.
 
 Everything else — the handover notes, the test checklists, the decision log and the
 specifications — are working documents. They stay local, and they are **not published**.

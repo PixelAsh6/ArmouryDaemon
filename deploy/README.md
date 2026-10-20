@@ -10,8 +10,10 @@ A small always-on Windows daemon that reacts to the apps you care about.
   applied).
 - **Killswitch** - **End** hides + mutes the running tracked apps; press again to restore. The key
   still reaches the app you are typing in (it is a low-level keyboard hook, not a registered hotkey).
-- **Idle mode** - **Home** blacks out every screen and mutes all audio; any input brings it back
-  (with an optional 3 h failsafe). While idle is up, pack switching is cancelled: tracked apps are
+- **Idle mode** - **Home** blacks out every screen and mutes all audio; a **keypress** brings it
+  back (with an optional 3 h failsafe). The wake is **keyboard-only** by design: the mouse
+  deliberately does not end an idle session, so a nudged mouse cannot do it by accident. While
+  idle is up, pack switching is cancelled: tracked apps are
   treated as ordinary apps, and the packs are applied again when you wake it with a tracked app
   still running.
 - **Pause** - stop all pack switching without uninstalling anything.
@@ -73,8 +75,8 @@ cover art (Steam, or SteamGridDB when you set a key).
 | Cover art cache | `%APPDATA%\ArmouryDaemon\art` |
 | Pack journal | `%APPDATA%\ArmouryDaemon\journal.json` |
 
-Each log is rotated: the current file, then `daemon.log.1` and `daemon.log.2` (512 KiB per
-generation, the oldest one is dropped).
+Each log is rolled at 512 KiB. Three files are kept in total: the current one, then
+`daemon.log.1` and `daemon.log.2`; the oldest is dropped.
 
 ## Cover art
 
@@ -85,9 +87,11 @@ the exe icon and then to a monogram.
 
 ## The pack catalog
 
-Settings -> **Catalog** -> **Check for updates** fetches the catalog manifest and lists what is
-on offer. **Install** and **Update** download the pack, check it against the hash in the
-manifest and hand it to the daemon, which validates it and reloads.
+The catalogue is a window of its own: Settings -> **Install packs** opens it, and it fetches the
+manifest when it opens and lists every pack in it. Each row carries a **Download**, an **Update**
+or a *vX installed* label; **Download** and **Update** fetch the pack, check it against the hash
+and the size in the manifest and hand it to the daemon, which validates it and reloads. The
+**Local pack** button opens the file picker and installs a `pack.json` from disk.
 
 The catalog is `https://github.com/PixelAsh6/ArmouryDaemon_Packs` (MIT): `catalog/index.json` plus
 one `packs/<id>/pack.json` per pack. Two things to know about it:
@@ -127,9 +131,11 @@ therefore fixed.
    The copy has to happen **after** the daemon is stopped - while it runs the exe is locked and
    the copy fails with a sharing violation.
 
-   The exe in `target\release\` is built with `-C target-cpu=native` for the machine it was built
-   on (this one: an AMD Ryzen 7 4800H). It is **CPU-specific**: it will not run on a pre-AVX2
-   x86-64 machine, so build it again on a new PC.
+   The exe you are copying is the one in `target\release\`, and that is the **native** build:
+   `.cargo/config.toml` adds `-C target-cpu=native`, so it is built for the machine that built
+   it (this one: an AMD Ryzen 7 4800H, Zen 2, AVX2-era). It is **CPU-specific** and will not run
+   on a pre-AVX2 x86-64 machine, so build it again on a new PC. The **published release** is the
+   other one: the generic x86-64 baseline, which runs on any x86-64 machine.
 
 3. **Run `setup.ps1` in the install folder, from an elevated PowerShell:**
 
@@ -184,8 +190,10 @@ and/or title (an empty field matches any) and sends it the payload as a `WM_COPY
 a 2 s timeout so a hung app cannot block the daemon. That is how the shipped Rainmeter pack loads
 a layout - the bang and the window class are pack data, not daemon knowledge.
 
-Settings -> **Install pack...** copies a `pack.json` into this folder's `packs\<id>\` (the daemon
-validates it first and reloads), **Remove** deletes a pack again.
+The **Local pack** button in the **Install packs** window opens the file picker and copies a
+`pack.json` into this folder's `packs\<id>\` (the daemon validates it first and reloads). The
+Settings window's **Open packs folder** button opens the folder itself, and **Remove** next to an
+installed pack deletes it again.
 
 ## The self-test
 
