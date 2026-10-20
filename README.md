@@ -307,14 +307,11 @@ Windows in them: the trigger engine, the config, the pack schema and the wire pr
 
 ## Documentation
 
-| File | What is in it |
-|---|---|
-| [HANDOVER.md](HANDOVER.md) | The state of the project: what is built and verified, the known issues, the gotchas |
-| [testing.md](testing.md) | The manual test checklist — the open items only |
-| [DECISIONS-2026-10-17.md](DECISIONS-2026-10-17.md) | The decision log: every behavioural decision and why it was made |
-| [SPEC3-SCRIPTING.md](SPEC3-SCRIPTING.md) | The pack script host: the format, the API, the limits and the examples |
-| [deploy/README.md](deploy/README.md) | Install, update, uninstall, and how to write a pack |
-| [PACK-SPEC-PROPOSAL.md](PACK-SPEC-PROPOSAL.md) | The original data-only pack model (the script mechanism supersedes it) |
+The published documentation is this README and **[deploy/README.md](deploy/README.md)** — the
+install, the update, the uninstall, and how to write a pack.
+
+Everything else — the handover notes, the test checklists, the decision log and the
+specifications — are working documents. They stay local, and they are **not published**.
 
 ## Licence
 

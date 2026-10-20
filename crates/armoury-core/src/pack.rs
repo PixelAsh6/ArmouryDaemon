@@ -1,8 +1,11 @@
-//! Data-only pack format (v1) — see PACK-SPEC-PROPOSAL.md.
+//! The pack format: spec 1 (data only) and spec 2 (data plus a sandboxed script). The
+//! schema is enforced here; see the daemon's README for the format, `armoury::packs` for
+//! how a pack is loaded and installed, and the catalogue repository for examples.
 //!
-//! A pack is JSON: which process it targets, exactly one dropdown setting, what to
+//! A pack is JSON: which process it targets, up to four dropdown settings, what to
 //! capture before acting, and the ordered steps to apply and to revert. All mechanics
-//! live in the daemon; installing a pack can never execute arbitrary code.
+//! live in the daemon; a spec 2 script is interpreted by the daemon against a whitelisted
+//! host API, so installing a pack can never execute arbitrary code.
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
