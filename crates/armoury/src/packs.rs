@@ -1,4 +1,5 @@
-//! Pack execution: loads data-only packs and runs their mechanisms.
+//! Pack execution: loads spec 1 (data only) and spec 2 (data plus a script) packs and
+//! runs their mechanisms and scripts, a script interpreted here against the host API.
 //!
 //! Runs on its own worker thread — the daemon's main loop must stay responsive, and
 //! CLI calls block for tens to hundreds of milliseconds.
