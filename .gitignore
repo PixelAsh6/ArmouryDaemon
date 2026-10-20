@@ -27,3 +27,12 @@ config.json
 /handover_2.md
 /docs/plans/
 /docs/research/
+
+# The working notes of the current session: the handover, the test checklists,
+# the decision log and the two specs. They stay on disk, they are not published.
+/HANDOVER.md
+/testing.md
+/testing_final.md
+/DECISIONS-2026-10-17.md
+/SPEC3-SCRIPTING.md
+/PACK-SPEC-PROPOSAL.md
