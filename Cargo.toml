@@ -27,6 +27,8 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 
 [profile.release]
-strip = true
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+strip = true
+incremental = false
