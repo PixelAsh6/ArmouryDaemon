@@ -15,7 +15,7 @@ use armoury_core::config::{
     normalize_console_open,
 };
 use armoury_core::engine::{Engine, EngineState, Transition};
-use armoury_core::protocol::{Request, Response};
+use armoury_core::protocol::{ArtListing, ArtSlot, Request, Response};
 use armoury_core::status::{LastError, PackSettingStatus, PackStatus, RunState, StatusSnapshot};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
@@ -129,6 +129,8 @@ pub fn run(show_ui_when_running: bool) {
     let (pad_tx, pad_rx) = crossbeam_channel::unbounded::<console::PadEvent>();
     // Cover-art worker -> main loop: a key with fresh art, or "" when a pass finished.
     let (art_tx, art_rx) = crossbeam_channel::unbounded::<String>();
+    // The picker's worker threads -> main loop: the photos of a page, or a saved pick.
+    let (art_query_tx, art_query_rx) = crossbeam_channel::unbounded::<ArtAnswer>();
     // Launch worker -> main loop: a finished launch and the client that asked for it.
     let (launch_tx, launch_rx) = crossbeam_channel::unbounded::<LaunchEvent>();
     console::start(pad_tx, wake_handle);
@@ -249,11 +251,14 @@ pub fn run(show_ui_when_running: bool) {
         pad_rx,
         art_tx,
         art_rx,
+        art_query_tx,
+        art_query_rx,
         art_busy: false,
         launch_tx,
         launch_rx,
         // A pass with the old (keyless) key may still be running: it leaves miss markers.
         art_retry_after_pass: false,
+        art_pass_again: false,
         last_error: None,
         quit_requested: QuitRequest::default(),
         last_broadcast: Instant::now(),
@@ -331,6 +336,9 @@ pub fn run(show_ui_when_running: bool) {
         }
         while let Ok(key) = app.art_rx.try_recv() {
             app.on_art(key);
+        }
+        while let Ok(answer) = app.art_query_rx.try_recv() {
+            app.on_art_answer(answer);
         }
         while let Ok(ev) = app.launch_rx.try_recv() {
             app.on_launch(ev);
@@ -567,6 +575,9 @@ struct App {
     /// Cover-art passes: worker -> main loop (a ready key, or "" when a pass finished).
     art_tx: crossbeam_channel::Sender<String>,
     art_rx: crossbeam_channel::Receiver<String>,
+    /// The picker's answers: the photos of a page, or the result of a saved pick.
+    art_query_tx: crossbeam_channel::Sender<ArtAnswer>,
+    art_query_rx: crossbeam_channel::Receiver<ArtAnswer>,
     art_busy: bool,
     /// Launch results: the worker thread -> the main loop (the client gets the answer).
     launch_tx: crossbeam_channel::Sender<LaunchEvent>,
@@ -574,6 +585,8 @@ struct App {
     /// A pass with the old (keyless) SteamGridDB key is still running: it leaves miss markers
     /// behind, so they have to be cleared again when that pass ends.
     art_retry_after_pass: bool,
+    /// Another art pass is needed when the running one ends (a slot went back to automatic).
+    art_pass_again: bool,
     /// The last failure the dashboard shows (`None` = nothing went wrong).
     last_error: Option<LastError>,
     /// Set by the tray menu's "Quit" and by a `quit` request over the pipe.
@@ -602,6 +615,44 @@ impl QuitRequest {
     /// Has the shutdown been asked for?
     fn asked(&self) -> bool {
         self.asked
+    }
+}
+
+/// The slot's name for the log.
+fn slot_name(slot: ArtSlot) -> &'static str {
+    match slot {
+        ArtSlot::Icon => "icon",
+        ArtSlot::Background => "background",
+    }
+}
+
+/// What an artwork request's worker thread answered.
+enum ArtAnswer {
+    /// The photos of one page of one slot.
+    Listing { client: u64, listing: ArtListing },
+    /// The result of a pick: did the file land?
+    Saved { client: u64, ok: bool, message: String },
+}
+
+/// The launcher entry for an exe, as the art fetcher wants it: the name and the path.
+///
+/// The name comes from the launcher's list — it is what the search is built from. An app
+/// that is not in the list falls back to the file name.
+fn art_want(cfg: &AppConfig, exe: &str) -> art::Want {
+    let name = launcher_entries(cfg)
+        .into_iter()
+        .find(|(_, e)| e.eq_ignore_ascii_case(exe))
+        .map(|(n, _)| n)
+        .unwrap_or_else(|| {
+            std::path::Path::new(exe)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| exe.to_string())
+        });
+    art::Want {
+        key: art::key(exe),
+        name,
+        exe: exe.to_string(),
     }
 }
 
@@ -1685,10 +1736,49 @@ impl App {
                 art::clear_misses();
                 self.ensure_art();
             }
+            if self.art_pass_again {
+                // A slot went back to automatic while the pass was running: it has to be
+                // fetched again.
+                self.art_pass_again = false;
+                self.ensure_art();
+            }
             return;
         }
         info!("cover art: {key} is ready");
         self.broadcast_status(); // the console re-reads the art folder on status updates
+    }
+
+    /// The picker's worker answered: the client that asked gets the answer.
+    fn on_art_answer(&mut self, answer: ArtAnswer) {
+        match answer {
+            ArtAnswer::Listing { client, listing } => {
+                if listing.ok {
+                    info!(
+                        "artwork: {} photo(s) of the {} slot ({} in total)",
+                        listing.items.len(),
+                        slot_name(listing.slot),
+                        listing.total
+                    );
+                } else {
+                    warn!("artwork: {}", listing.error);
+                }
+                if let Some(push) = self.clients.get(&client) {
+                    let _ = push.send(armoury_core::protocol::art_listing(&listing));
+                }
+            }
+            ArtAnswer::Saved { client, ok, message } => {
+                if ok {
+                    info!("artwork: {message}");
+                } else {
+                    warn!("artwork: {message}");
+                    remember_error(&mut self.last_error, "artwork", &message);
+                }
+                if let Some(push) = self.clients.get(&client) {
+                    let _ = push.send(armoury_core::protocol::art_set(ok, &message));
+                }
+                self.broadcast_status();
+            }
+        }
     }
 
     /// Remember when an app was last played, for the console's recency order. `exe` may be a
@@ -1952,6 +2042,75 @@ impl App {
                     // through the Steam client, and a process that dies right away is a
                     // failed launch, not a started game. The client is told either way.
                     self.launch_app(id, exe);
+                }
+                Request::ListArt { exe, slot, page } => {
+                    // The console cannot call the API itself: the daemon holds the key and
+                    // does the work. The network call happens on a worker thread, so the
+                    // main loop keeps running.
+                    let want = art_want(&self.cfg, &exe);
+                    let api = self.cfg.sgdb_api_key.clone();
+                    let tx = self.art_query_tx.clone();
+                    let wake = self.wake;
+                    thread::spawn(move || {
+                        let listing = match art::list_photos(api.as_deref(), &want, slot, page) {
+                            Ok(listing) => listing,
+                            Err(e) => ArtListing {
+                                ok: false,
+                                slot,
+                                page,
+                                total: 0,
+                                items: Vec::new(),
+                                error: e,
+                            },
+                        };
+                        let _ = tx.send(ArtAnswer::Listing { client: id, listing });
+                        signal_wake(wake);
+                    });
+                }
+                Request::SetArt { exe, slot, url } => {
+                    let key = art::key(&exe);
+                    if url.trim().is_empty() {
+                        // Automatic again: the user's own art goes, and the next art pass
+                        // fetches the slot the way it always did.
+                        let ok = art::use_automatic(&key, slot).is_ok();
+                        if ok {
+                            info!(
+                                "artwork: the {} slot of {exe} is automatic again",
+                                slot_name(slot)
+                            );
+                            // The automatic picker has to run again for this slot. A pass that
+                            // is running right now has already passed this app, so another
+                            // one is needed when it ends.
+                            self.art_pass_again = self.art_busy;
+                            self.ensure_art();
+                        } else {
+                            warn!(
+                                "artwork: cannot clear the {} slot of {exe}",
+                                slot_name(slot)
+                            );
+                        }
+                        let message = if ok {
+                            "automatic again".to_string()
+                        } else {
+                            "cannot clear the artwork".to_string()
+                        };
+                        if let Some(push) = self.clients.get(&id) {
+                            let _ = push.send(armoury_core::protocol::art_set(ok, &message));
+                        }
+                        self.broadcast_status();
+                    } else {
+                        // A chosen photo: download it and store it as the user's own art.
+                        let tx = self.art_query_tx.clone();
+                        let wake = self.wake;
+                        thread::spawn(move || {
+                            let (ok, message) = match art::set_photo(&key, slot, &url) {
+                                Ok(()) => (true, "saved".to_string()),
+                                Err(e) => (false, e),
+                            };
+                            let _ = tx.send(ArtAnswer::Saved { client: id, ok, message });
+                            signal_wake(wake);
+                        });
+                    }
                 }
                 Request::AddTrackedApp { name, exe } => {
                     self.add_tracked_app(name, exe);

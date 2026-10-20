@@ -14,7 +14,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use armoury_core::config::TrackedApp;
-use armoury_core::protocol::{read_msg, write_msg, Request, Response};
+use armoury_core::protocol::{
+    ArtListing, ArtPhoto, ArtSlot, read_msg, write_msg, Request, Response,
+};
 use armoury_core::status::StatusSnapshot;
 use crossbeam_channel::{Receiver, Sender};
 use eframe::egui;
@@ -59,10 +61,32 @@ const MUTED: egui::Color32 = egui::Color32::from_rgb(128, 134, 148);
 const WARN: egui::Color32 = egui::Color32::from_rgb(255, 138, 122);
 
 const PAD_HINT: &str =
-    "A  open      B  close      X  add app      Y  remove      D-pad / left stick  scroll";
-const KEY_HINT: &str = "Arrows / WASD move · Enter open · Esc close · Delete remove";
+    "A  open      B  close      X  add app      Y  remove      Down  menu      Left / Right  scroll";
+const KEY_HINT: &str =
+    "Arrows / WASD move · Enter open · Esc close · Delete remove · Down opens the menu";
 const EMPTY_HINT: &str = "No apps yet — press X to add one";
 const LAUNCHING_HINT: &str = "starting…";
+/// The hint line of the ≡ menu.
+const MENU_HINT: &str = "A  choose      B  back      Up / Down  move";
+/// The hint line of the artwork picker.
+const PICKER_HINT: &str =
+    "A  take it      B  back      Left / Right  scroll      Up / Down  slot";
+
+/// The two entries of the ≡ menu.
+const MENU_ENTRIES: [&str; 2] = ["Choose artwork…", "Use automatic again"];
+
+/// The ≡ button's size.
+const MENU_BTN: f32 = 44.0;
+/// The menu panel's width and the height of one entry.
+const MENU_W: f32 = 300.0;
+const MENU_ROW: f32 = 40.0;
+/// The picker's header: the app's name and the slot tabs.
+const PICKER_HEADER: f32 = 52.0;
+/// The picker's thumbnail size per slot: the 2:3 portrait and the wide hero.
+const THUMB_ICON: (f32, f32) = (132.0, 198.0);
+const THUMB_BG: (f32, f32) = (300.0, 97.0);
+/// The room under a thumbnail for its dimensions and its style.
+const CAPTION_H: f32 = 38.0;
 
 /// How long the band waits for the daemon's answer before it gives up on a launch.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -73,6 +97,52 @@ enum Launch {
     Idle,
     Pending,
     Failed(String),
+}
+
+/// What the band is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    /// The tile strip.
+    Band,
+    /// The ≡ menu.
+    Menu,
+    /// The artwork picker.
+    Picker,
+}
+
+/// The artwork picker: the photos of the focused app, one list per slot.
+struct Picker {
+    /// The slot the user is on.
+    slot: ArtSlot,
+    /// The photos of each slot, once the daemon has answered.
+    lists: HashMap<ArtSlot, ArtListing>,
+    /// The highlighted photo of each slot.
+    sel: HashMap<ArtSlot, usize>,
+    /// A page the console asked for and has not got yet (no repeat requests).
+    asked: Option<(ArtSlot, u32)>,
+    /// The app the picker is for: its name and its exe.
+    target: (String, String),
+    /// A photo is being saved.
+    busy: bool,
+    /// The last thing that happened.
+    note: String,
+    /// The last thing that happened went wrong.
+    note_bad: bool,
+}
+
+impl Picker {
+    /// The photos of the slot the user is on.
+    fn items(&self) -> &[ArtPhoto] {
+        self.lists
+            .get(&self.slot)
+            .map(|l| l.items.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The page the slot shows.
+    fn page(&self, slot: ArtSlot) -> u32 {
+        self.lists.get(&slot).map(|l| l.page).unwrap_or(0)
+    }
 }
 
 /// Apply the daemon's answer to a launch request. True = the band closes (the game
@@ -88,21 +158,26 @@ fn apply_launch_ack(state: &mut Launch, ok: bool, message: String) -> bool {
 }
 
 /// The hint line, its font size and its colour. A launch in flight and a failed launch
-/// take the line over: the user has to see that the game did not start.
-fn hint_line(n: usize, pad: bool, launch: &Launch) -> (String, f32, egui::Color32) {
-    match launch {
-        Launch::Failed(message) => (shorten(message, 140), 16.0, WARN),
-        Launch::Pending => (LAUNCHING_HINT.to_string(), 16.0, MUTED),
-        Launch::Idle => {
-            let (text, size) = if n == 0 {
-                (EMPTY_HINT, 18.0)
-            } else if pad {
-                (PAD_HINT, 14.0)
-            } else {
-                (KEY_HINT, 14.0)
-            };
-            (text.to_string(), size, MUTED)
-        }
+/// take the line over: the user has to see that the game did not start. The menu and the
+/// picker have their own hints: they say what the keys do there.
+fn hint_line(n: usize, pad: bool, launch: &Launch, view: View) -> (String, f32, egui::Color32) {
+    match view {
+        View::Menu => (MENU_HINT.to_string(), 14.0, MUTED),
+        View::Picker => (PICKER_HINT.to_string(), 14.0, MUTED),
+        View::Band => match launch {
+            Launch::Failed(message) => (shorten(message, 140), 16.0, WARN),
+            Launch::Pending => (LAUNCHING_HINT.to_string(), 16.0, MUTED),
+            Launch::Idle => {
+                let (text, size) = if n == 0 {
+                    (EMPTY_HINT, 18.0)
+                } else if pad {
+                    (PAD_HINT, 14.0)
+                } else {
+                    (KEY_HINT, 14.0)
+                };
+                (text.to_string(), size, MUTED)
+            }
+        },
     }
 }
 
@@ -368,7 +443,17 @@ struct App {
     out: Box<dyn Write>,
     status: Option<StatusSnapshot>,
     selected: usize,
-    repeat: pad::Repeat,
+    /// What the band is showing: the tiles, the menu or the picker.
+    view: View,
+    /// The highlighted entry of the ≡ menu.
+    menu_sel: usize,
+    /// The artwork picker.
+    picker: Picker,
+    /// The horizontal repeat (the band scrolls, the picker scrolls its list).
+    repeat_x: pad::Repeat,
+    /// The pad's vertical move last frame: the edge opens the menu, the picker switches
+    /// slot.
+    prev_move_y: i8,
     prev_a: bool,
     prev_b: bool,
     prev_x: bool,
@@ -388,6 +473,8 @@ struct App {
     arts: HashMap<String, egui::TextureHandle>,
     /// Hero textures for the band background, keyed like `arts`.
     heros: HashMap<String, egui::TextureHandle>,
+    /// The picker's thumbnails, keyed by their url.
+    thumbs: HashMap<String, egui::TextureHandle>,
     icons: HashMap<String, egui::TextureHandle>,
     art_tx: Sender<ArtMsg>,
     art_rx: Receiver<ArtMsg>,
@@ -398,6 +485,10 @@ struct App {
     art_want: HashSet<String>,
     hero_want: HashSet<String>,
     icon_want: HashSet<String>,
+    /// The thumbnails the console is waiting for.
+    thumb_want: HashSet<String>,
+    thumb_tx: Sender<ArtMsg>,
+    thumb_rx: Receiver<ArtMsg>,
     /// Hero crossfade: the fading-out key, the incoming one, and its progress (0..=1).
     bg_prev: Option<String>,
     bg_key: Option<String>,
@@ -414,12 +505,26 @@ impl App {
         let (art_tx, art_rx) = crossbeam_channel::unbounded();
         let (hero_tx, hero_rx) = crossbeam_channel::unbounded();
         let (icon_tx, icon_rx) = crossbeam_channel::unbounded();
+        let (thumb_tx, thumb_rx) = crossbeam_channel::unbounded();
         Self {
             rx,
             out,
             status: None,
             selected: 0,
-            repeat: pad::Repeat::default(),
+            view: View::Band,
+            menu_sel: 0,
+            picker: Picker {
+                slot: ArtSlot::Icon,
+                lists: HashMap::new(),
+                sel: HashMap::new(),
+                asked: None,
+                target: (String::new(), String::new()),
+                busy: false,
+                note: String::new(),
+                note_bad: false,
+            },
+            repeat_x: pad::Repeat::default(),
+            prev_move_y: 0,
             prev_a: false,
             prev_b: false,
             prev_x: false,
@@ -434,6 +539,7 @@ impl App {
             reduced: !animations_enabled(),
             arts: HashMap::new(),
             heros: HashMap::new(),
+            thumbs: HashMap::new(),
             icons: HashMap::new(),
             art_tx,
             art_rx,
@@ -444,6 +550,9 @@ impl App {
             art_want: HashSet::new(),
             hero_want: HashSet::new(),
             icon_want: HashSet::new(),
+            thumb_want: HashSet::new(),
+            thumb_tx,
+            thumb_rx,
             bg_prev: None,
             bg_key: None,
             bg_fade: 1.0,
@@ -628,6 +737,560 @@ impl App {
         log::info!("removing {exe} from the band");
         self.send(remove_request(tracked, exe));
     }
+
+    /// The ≡ button: open the menu, or close it when it is already open.
+    fn toggle_menu(&mut self, entries: &[(String, String)]) {
+        match menu_button_action(self.view) {
+            View::Band => self.close_menu(),
+            _ => self.open_menu(entries),
+        }
+    }
+
+    /// Open the ≡ menu. Its target is the focused app.
+    fn open_menu(&mut self, entries: &[(String, String)]) {
+        let Some((name, exe)) = entries.get(self.selected) else {
+            return;
+        };
+        if self.picker.target.1 != *exe {
+            // Another app: the photos on screen were that one's.
+            self.picker.lists.clear();
+            self.picker.sel.clear();
+            self.picker.asked = None;
+        }
+        self.picker.target = (name.clone(), exe.clone());
+        self.view = View::Menu;
+        self.menu_sel = 0;
+        self.repeat_x = pad::Repeat::default();
+        log::info!("menu opened for {exe}");
+    }
+
+    /// Back to the band.
+    fn close_menu(&mut self) {
+        self.view = View::Band;
+        self.repeat_x = pad::Repeat::default();
+    }
+
+    /// The picker's own state starts fresh, but the slot is remembered: the menu's
+    /// "use automatic again" touches the slot the user last looked at.
+    fn open_picker(&mut self) {
+        self.view = View::Picker;
+        self.picker.busy = false;
+        self.picker.note.clear();
+        self.picker.note_bad = false;
+        self.picker.asked = None;
+        self.repeat_x = pad::Repeat::default();
+        let slot = self.picker.slot;
+        self.request_listing(slot);
+    }
+
+    /// A: the highlighted entry of the menu.
+    fn menu_activate(&mut self) {
+        match self.menu_sel {
+            0 => self.open_picker(),
+            _ => self.reset_art(),
+        }
+    }
+
+    /// "Use automatic again": the slot goes back to what the automatic picker chooses.
+    fn reset_art(&mut self) {
+        let (_, exe) = self.picker.target.clone();
+        if exe.is_empty() {
+            return;
+        }
+        self.picker.busy = true;
+        self.picker.note.clear();
+        self.picker.note_bad = false;
+        self.send(Request::SetArt {
+            exe,
+            slot: self.picker.slot,
+            url: String::new(),
+        });
+    }
+
+    /// Show the other slot's list.
+    fn switch_slot(&mut self, slot: ArtSlot) {
+        if self.picker.slot == slot {
+            return;
+        }
+        self.picker.slot = slot;
+        self.repeat_x = pad::Repeat::default();
+        self.request_listing(slot);
+    }
+
+    /// Ask the daemon for one page of photos. The console has no API key: the daemon does
+    /// the work and answers with the listing.
+    fn request_page(&mut self, slot: ArtSlot, page: u32) {
+        if self.picker.asked == Some((slot, page)) {
+            return; // already asked: the answer is on its way
+        }
+        let (_, exe) = self.picker.target.clone();
+        if exe.is_empty() {
+            return;
+        }
+        self.picker.asked = Some((slot, page));
+        self.send(Request::ListArt { exe, slot, page });
+    }
+
+    /// Ask for a slot's first page, unless it is already here.
+    fn request_listing(&mut self, slot: ArtSlot) {
+        if self.picker.lists.contains_key(&slot) {
+            return;
+        }
+        self.request_page(slot, 0);
+    }
+
+    /// The daemon answered with the photos of a page.
+    fn on_listing(&mut self, listing: ArtListing) {
+        // The slot is answered: a new page may be asked for.
+        if self.picker.asked.map(|(s, _)| s == listing.slot).unwrap_or(false) {
+            self.picker.asked = None;
+        }
+        let slot = listing.slot;
+        let page = listing.page;
+        let n = listing.items.len();
+        // A new page starts at its first photo.
+        let sel = if self.picker.page(slot) == page {
+            *self.picker.sel.get(&slot).unwrap_or(&0)
+        } else {
+            0
+        };
+        self.picker
+            .sel
+            .insert(slot, sel.min(n.saturating_sub(1)));
+        self.picker.lists.insert(slot, listing);
+    }
+
+    /// The daemon answered a pick: the file on disk changed, so the band has to read it
+    /// again.
+    fn on_set(&mut self, ok: bool, message: String) {
+        self.picker.busy = false;
+        self.picker.note = message;
+        self.picker.note_bad = !ok;
+        if !ok {
+            return;
+        }
+        let (_, exe) = self.picker.target.clone();
+        if exe.is_empty() {
+            return;
+        }
+        // The texture the band holds is the old file: forget it and read the new one.
+        let key = art::key(&exe);
+        invalidate_art(
+            &mut self.arts,
+            &mut self.heros,
+            &mut self.art_want,
+            &mut self.hero_want,
+            &key,
+        );
+        let entries = self.entries();
+        self.ensure_art(&entries);
+        self.ensure_heros(&entries);
+    }
+
+    /// A: take the highlighted photo for the slot the user is on.
+    fn take_photo(&mut self, index: usize) {
+        let Some(photo) = self.picker.items().get(index) else {
+            return;
+        };
+        let url = photo.url.clone();
+        let slot = self.picker.slot;
+        let (_, exe) = self.picker.target.clone();
+        if exe.is_empty() {
+            return;
+        }
+        self.picker.busy = true;
+        self.picker.note.clear();
+        self.picker.note_bad = false;
+        self.send(Request::SetArt { exe, slot, url });
+    }
+
+    /// Move the highlight along the list. At the end of a page the next page is asked for.
+    fn picker_scroll(&mut self, step: i32) {
+        let n = self.picker.items().len();
+        if n == 0 {
+            return;
+        }
+        let slot = self.picker.slot;
+        let sel = *self.picker.sel.get(&slot).unwrap_or(&0) as i32;
+        let next = sel + step;
+        if next < 0 {
+            // Before the first photo: the page before it.
+            let page = self.picker.page(slot);
+            if page > 0 {
+                self.request_page(slot, page - 1);
+            }
+            return;
+        }
+        if next as usize >= n {
+            // After the last photo: the page after it.
+            if let Some(listing) = self.picker.lists.get(&slot) {
+                let next_page = listing.page + 1;
+                if (next_page as usize) * art::PAGE_LIMIT < listing.total as usize {
+                    self.request_page(slot, next_page);
+                }
+            }
+            return;
+        }
+        self.picker.sel.insert(slot, next as usize);
+    }
+
+    /// Queue the thumbnails of the photos on screen. The thumbnails live on a public CDN,
+    /// so the console fetches them itself: it has no API key, and does not need one.
+    fn ensure_thumbs(&mut self, urls: &[String]) {
+        let mut missing: Vec<String> = Vec::new();
+        for url in urls {
+            if url.is_empty() || self.thumbs.contains_key(url) || self.thumb_want.contains(url) {
+                continue;
+            }
+            self.thumb_want.insert(url.clone());
+            missing.push(url.clone());
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let tx = self.thumb_tx.clone();
+        thread::spawn(move || {
+            for url in missing {
+                let image = fetch_thumb(&url);
+                if tx.send(ArtMsg { key: url, image }).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// The ≡ menu: two entries under the button. The mouse picks one, the pad moves
+    /// between them and A takes the highlighted one.
+    fn paint_menu(&mut self, ui: &mut egui::Ui, full: egui::Rect) {
+        let panel = menu_rect(full);
+        let painter = ui.painter().clone();
+        painter.rect_filled(panel, 10.0, egui::Color32::from_rgb(20, 22, 28));
+        painter.rect_stroke(
+            panel,
+            10.0,
+            egui::Stroke::new(1.0, FOCUS_MID.gamma_multiply(0.5)),
+            egui::StrokeKind::Inside,
+        );
+        let pointer_moved = ui.ctx().input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        for (i, label) in MENU_ENTRIES.iter().enumerate() {
+            let row = egui::Rect::from_min_size(
+                egui::pos2(panel.left() + 8.0, panel.top() + 8.0 + i as f32 * MENU_ROW),
+                egui::vec2(panel.width() - 16.0, MENU_ROW),
+            );
+            let response = ui.interact(
+                row,
+                egui::Id::unique(("console-menu", i)),
+                egui::Sense::click(),
+            );
+            if response.hovered() && pointer_moved {
+                self.menu_sel = i;
+            }
+            if response.clicked() {
+                self.menu_sel = i;
+                self.menu_activate();
+            }
+            let on = i == self.menu_sel;
+            if on {
+                painter.rect_filled(row, 8.0, TILE_SEL);
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(row.left() + 4.0, row.center().y - 8.0),
+                        egui::vec2(3.0, 16.0),
+                    ),
+                    1.5,
+                    FOCUS_MID,
+                );
+            }
+            painter.text(
+                egui::pos2(row.left() + 16.0, row.center().y),
+                egui::Align2::LEFT_CENTER,
+                *label,
+                egui::FontId::proportional(16.0),
+                if on { TEXT } else { MUTED },
+            );
+            if i == 1 {
+                // Which slot the reset touches.
+                painter.text(
+                    egui::pos2(row.right() - 16.0, row.center().y),
+                    egui::Align2::RIGHT_CENTER,
+                    slot_label(self.picker.slot),
+                    egui::FontId::proportional(13.0),
+                    MUTED,
+                );
+            }
+        }
+    }
+
+    /// The artwork picker: the photos of the focused app, one list per slot.
+    ///
+    /// The list of the slot the user is on is a horizontal strip like the band's: the
+    /// highlighted photo sits in the middle, the mouse picks one, and the pad scrolls.
+    fn paint_picker(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, full: egui::Rect) {
+        let painter = ui.painter().clone();
+        painter.rect_filled(full, 0.0, BG);
+        let slot = self.picker.slot;
+        let (name, _) = self.picker.target.clone();
+
+        // ---- the header: the app's name and the two slots ----
+        painter.text(
+            egui::pos2(full.left() + SIDE, full.top() + PICKER_HEADER / 2.0),
+            egui::Align2::LEFT_CENTER,
+            short_name(&name, 40),
+            egui::FontId::proportional(24.0),
+            TEXT,
+        );
+        let tab_w = 120.0;
+        for (i, tab) in [ArtSlot::Icon, ArtSlot::Background].iter().enumerate() {
+            let r = egui::Rect::from_center_size(
+                egui::pos2(
+                    full.right() - SIDE - tab_w / 2.0 - i as f32 * (tab_w + 8.0),
+                    full.top() + PICKER_HEADER / 2.0,
+                ),
+                egui::vec2(tab_w, 30.0),
+            );
+            let on = *tab == slot;
+            // The mouse can pick the other list too.
+            if ui.interact(
+                r,
+                egui::Id::unique(("console-pick-tab", i)),
+                egui::Sense::click(),
+            )
+            .clicked()
+            {
+                self.switch_slot(*tab);
+            }
+            painter.rect_filled(
+                r,
+                8.0,
+                if on {
+                    TILE_SEL
+                } else {
+                    egui::Color32::from_rgb(18, 20, 26)
+                },
+            );
+            painter.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                slot_label(*tab),
+                egui::FontId::proportional(14.0),
+                if on { TEXT } else { MUTED },
+            );
+            if on {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(r.left() + 12.0, r.bottom() - 3.0),
+                        egui::vec2(r.width() - 24.0, 2.0),
+                    ),
+                    1.0,
+                    FOCUS_MID,
+                );
+            }
+        }
+
+        // ---- the list of photos ----
+        let hint_y = full.bottom() - 24.0;
+        // The listing is only borrowed for what the paint needs: the loop below changes
+        // the picker's own state.
+        let (n, listing_ok, listing_error) = match self.picker.lists.get(&slot) {
+            Some(l) => (l.items.len(), l.ok, l.error.clone()),
+            None => (0, false, String::new()),
+        };
+        let sel = *self.picker.sel.get(&slot).unwrap_or(&0);
+        let thumb = thumb_size(slot);
+        let pitch = thumb.x + GAP;
+        let view_w = full.width() - 2.0 * SIDE;
+        let view_left = full.left() + SIDE;
+        let total = n as f32 * pitch - GAP;
+        let target_off = if n == 0 {
+            0.0
+        } else if n <= visible_tiles(view_w, thumb.x) {
+            -(view_w - total) / 2.0
+        } else {
+            (sel as f32 * pitch + thumb.x / 2.0 - view_w / 2.0)
+                .clamp(0.0, (total - view_w).max(0.0))
+        };
+        let scroll_time = if self.reduced { 0.001 } else { 0.22 };
+        let off = ctx.animate_value_with_time(
+            egui::Id::unique("console-pick-scroll"),
+            target_off,
+            scroll_time,
+        );
+        let strip_top = full.top() + PICKER_HEADER + 16.0;
+        let strip_bottom = hint_y - 44.0;
+        let block_h = thumb.y + CAPTION_H;
+        let thumb_top = strip_top + ((strip_bottom - strip_top - block_h) / 2.0).max(0.0);
+
+        // Only the photos on screen are loaded and painted.
+        let first = (((off - 60.0) / pitch).floor().max(0.0) as usize).min(n);
+        let last = (((off + view_w + 60.0) / pitch).ceil().max(0.0) as usize).min(n);
+        let shown: Vec<(usize, ArtPhoto)> = match self.picker.lists.get(&slot) {
+            Some(l) => l.items[first..last]
+                .iter()
+                .enumerate()
+                .map(|(k, p)| (first + k, p.clone()))
+                .collect(),
+            None => Vec::new(),
+        };
+        let urls: Vec<String> = shown.iter().map(|(_, p)| p.thumb.clone()).collect();
+        self.ensure_thumbs(&urls);
+
+        let pointer_moved = ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
+        for (i, photo) in shown {
+            let rect = egui::Rect::from_min_size(
+                egui::pos2(view_left + i as f32 * pitch - off, thumb_top),
+                thumb,
+            );
+            let response = ui.interact(
+                rect,
+                egui::Id::unique(("console-pick", i)),
+                egui::Sense::click(),
+            );
+            if response.hovered() && pointer_moved {
+                self.picker.sel.insert(slot, i);
+            }
+            if response.clicked() {
+                self.picker.sel.insert(slot, i);
+                self.take_photo(i);
+            }
+            let on = *self.picker.sel.get(&slot).unwrap_or(&0) == i;
+            match self.thumbs.get(&photo.thumb) {
+                Some(tex) => {
+                    let (uv_min, uv_max) = cover_uv(tex.size_vec2(), rect);
+                    painter.add(
+                        RectShape::filled(rect, CornerRadius::from(8.0), egui::Color32::WHITE)
+                            .with_texture(tex.id(), egui::Rect::from_min_max(uv_min, uv_max)),
+                    );
+                }
+                None => {
+                    // The thumbnail is not here yet: the box says what the photo is.
+                    painter.rect_filled(rect, 8.0, TILE);
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}x{}", photo.width, photo.height),
+                        egui::FontId::proportional(14.0),
+                        MUTED,
+                    );
+                }
+            }
+            if on {
+                paint_focus_glow(&painter, rect, 0.9);
+                paint_focus_ring(&painter, rect, 0.9);
+            }
+            // The caption: the dimensions and the style, under every photo.
+            let cap_y = rect.bottom() + 13.0;
+            let color = if on { TEXT } else { MUTED };
+            painter.text(
+                egui::pos2(rect.center().x, cap_y),
+                egui::Align2::CENTER_CENTER,
+                format!("{}x{}", photo.width, photo.height),
+                egui::FontId::proportional(13.0),
+                color,
+            );
+            let style = if photo.style.is_empty() {
+                "—".to_string()
+            } else {
+                photo.style.clone()
+            };
+            painter.text(
+                egui::pos2(rect.center().x, cap_y + 16.0),
+                egui::Align2::CENTER_CENTER,
+                style,
+                egui::FontId::proportional(13.0),
+                color.gamma_multiply(0.85),
+            );
+        }
+
+        // ---- the state of the list ----
+        let center = egui::pos2(full.center().x, thumb_top + thumb.y / 2.0);
+        if n == 0 {
+            if listing_ok {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "no photos for this game",
+                    egui::FontId::proportional(18.0),
+                    MUTED,
+                );
+            } else if listing_error.is_empty() {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "loading…",
+                    egui::FontId::proportional(18.0),
+                    MUTED,
+                );
+            } else {
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    shorten(&listing_error, 80),
+                    egui::FontId::proportional(16.0),
+                    WARN,
+                );
+            }
+        }
+
+        // ---- the note and the hint line ----
+        let note = if self.picker.busy {
+            Some("saving…".to_string())
+        } else if self.picker.note.is_empty() {
+            None
+        } else {
+            Some(self.picker.note.clone())
+        };
+        if let Some(note) = note {
+            painter.text(
+                egui::pos2(full.center().x, hint_y - 26.0),
+                egui::Align2::CENTER_CENTER,
+                shorten(&note, 120),
+                egui::FontId::proportional(15.0),
+                if self.picker.note_bad { WARN } else { TEXT },
+            );
+        }
+        painter.text(
+            egui::pos2(full.center().x, hint_y),
+            egui::Align2::CENTER_CENTER,
+            PICKER_HINT,
+            egui::FontId::proportional(14.0),
+            MUTED,
+        );
+    }
+}
+
+/// Forget a key's textures and wishes, so the next read picks up the file on disk.
+///
+/// The band keeps the art it has loaded: without this a new file is invisible until the
+/// band restarts.
+fn invalidate_art<T>(
+    arts: &mut HashMap<String, T>,
+    heros: &mut HashMap<String, T>,
+    art_want: &mut HashSet<String>,
+    hero_want: &mut HashSet<String>,
+    key: &str,
+) {
+    arts.remove(key);
+    heros.remove(key);
+    art_want.remove(key);
+    hero_want.remove(key);
+}
+
+/// Download one thumbnail and decode it.
+fn fetch_thumb(url: &str) -> Option<(Vec<u8>, u32, u32)> {
+    let bytes = ureq::get(url)
+        .config()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_vec()
+        .ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
+    // A thumbnail is small; twice the biggest box keeps it crisp.
+    let img = img.resize(360, 360, image::imageops::FilterType::Triangle);
+    let rgba = img.to_rgba8();
+    Some((rgba.as_raw().clone(), rgba.width(), rgba.height()))
 }
 
 /// Which request "remove" sends for an entry: a tracked app is only hidden from the band (the
@@ -658,9 +1321,13 @@ impl eframe::App for App {
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
                 Ev::Response(resp) => {
-                    // The answer to a launch request rides the console-op variant; the
-                    // marker tells it apart from the add/remove answers.
+                    // The answers to the launch and to the artwork requests ride the
+                    // console-op variant; the markers tell them apart from the add/remove
+                    // answers.
                     let ack = armoury_core::protocol::as_launch_ack(&resp)
+                        .map(|(ok, text)| (ok, text.to_string()));
+                    let listing = armoury_core::protocol::as_art_listing(&resp);
+                    let set = armoury_core::protocol::as_art_set(&resp)
                         .map(|(ok, text)| (ok, text.to_string()));
                     match ack {
                         Some((ok, message)) => {
@@ -669,21 +1336,29 @@ impl eframe::App for App {
                                 self.leaving = true; // the game started: slide away
                             }
                         }
-                        None => match resp {
-                            Response::HelloAck { status, .. } => {
-                                self.status = Some(status);
-                                self.status_serial += 1;
-                                log::info!("got the app list");
+                        None => {
+                            if let Some(listing) = listing {
+                                self.on_listing(listing);
+                            } else if let Some((ok, message)) = set {
+                                self.on_set(ok, message);
+                            } else {
+                                match resp {
+                                    Response::HelloAck { status, .. } => {
+                                        self.status = Some(status);
+                                        self.status_serial += 1;
+                                        log::info!("got the app list");
+                                    }
+                                    Response::Status { status } => {
+                                        self.status = Some(status);
+                                        self.status_serial += 1;
+                                    }
+                                    Response::Focus => {
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                    }
+                                    Response::PackOp { .. } | Response::ConsoleOp { .. } => {}
+                                }
                             }
-                            Response::Status { status } => {
-                                self.status = Some(status);
-                                self.status_serial += 1;
-                            }
-                            Response::Focus => {
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                            }
-                            Response::PackOp { .. } | Response::ConsoleOp { .. } => {}
-                        },
+                        }
                     }
                 }
                 Ev::Eof => {
@@ -759,6 +1434,25 @@ impl eframe::App for App {
             self.icons.insert(m.key, handle);
         }
 
+        // ---- the picker's thumbnails from the worker ----
+        while let Ok(m) = self.thumb_rx.try_recv() {
+            match m.image {
+                Some((rgba, w, h)) => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    let handle = ctx.load_texture(
+                        format!("console-thumb:{}", m.key),
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.thumbs.insert(m.key, handle);
+                }
+                None => {
+                    // The thumbnail is not there: forget the wish so it can be tried again.
+                    self.thumb_want.remove(&m.key);
+                }
+            }
+        }
+
         // ---- file dialog result: pin the app ----
         if let Some(rx) = &self.add_dialog {
             match rx.try_recv() {
@@ -806,9 +1500,15 @@ impl eframe::App for App {
             });
         }
         if pad_state.is_none() && had_pad {
-            log::info!("controller disconnected — closing");
             self.pad_slot = None;
-            self.leaving = true;
+            if self.view == View::Band {
+                log::info!("controller disconnected — closing");
+                self.leaving = true;
+            } else {
+                // The menu and the picker stay open: the mouse still works, and a pad that
+                // comes back takes over.
+                log::info!("controller disconnected — the menu stays open");
+            }
         }
 
         let (key_left, key_right, key_up, key_down, key_enter, key_esc, key_delete) =
@@ -842,38 +1542,84 @@ impl eframe::App for App {
         } else {
             pad_state.map(|p| p.move_x).unwrap_or(0)
         };
-        let step = self.repeat.tick(dir, Instant::now());
-        if step != 0 {
-            self.selected = wrap(self.selected, step.into(), n);
-        }
-        // One row: vertical keys still land somewhere sensible instead of doing nothing.
-        if key_up {
-            self.selected = 0;
-        }
-        if key_down {
-            self.selected = n.saturating_sub(1);
-        }
+        let step = self.repeat_x.tick(dir, Instant::now());
+        // The pad's vertical move: up jumps to the first app, down opens the ≡ menu.
+        let move_y = pad_state.map(|p| p.move_y).unwrap_or(0);
+        let down_edge = move_y > 0 && self.prev_move_y <= 0;
+        let up_edge = move_y < 0 && self.prev_move_y >= 0;
 
         let a = pad_state.map(|p| p.a).unwrap_or(false);
         let b = pad_state.map(|p| p.b).unwrap_or(false);
         let x = pad_state.map(|p| p.x).unwrap_or(false);
         let y = pad_state.map(|p| p.y).unwrap_or(false);
-        if (a && !self.prev_a) || key_enter {
-            self.activate(&entries);
-        }
-        if x && !self.prev_x {
-            self.open_add_dialog();
-        }
-        if (y && !self.prev_y) || key_delete {
-            self.remove_selected(&entries);
-        }
-        if (b && !self.prev_b) || key_esc {
-            self.leaving = true;
+
+        // Each view has its own keys: while the menu or the picker is open the band must
+        // not launch a game or take the app away.
+        match self.view {
+            View::Band => {
+                if step != 0 {
+                    self.selected = wrap(self.selected, step.into(), n);
+                }
+                // One row: up jumps to the first app, down opens the menu.
+                if key_up || up_edge {
+                    self.selected = 0;
+                }
+                if key_down || down_edge {
+                    self.open_menu(&entries);
+                }
+                if (a && !self.prev_a) || key_enter {
+                    self.activate(&entries);
+                }
+                if x && !self.prev_x {
+                    self.open_add_dialog();
+                }
+                if (y && !self.prev_y) || key_delete {
+                    self.remove_selected(&entries);
+                }
+                if (b && !self.prev_b) || key_esc {
+                    self.leaving = true;
+                }
+            }
+            View::Menu => {
+                // Two entries: the move is an edge, not a held direction.
+                if up_edge || key_up {
+                    self.menu_sel = wrap(self.menu_sel, -1, MENU_ENTRIES.len());
+                }
+                if down_edge || key_down {
+                    self.menu_sel = wrap(self.menu_sel, 1, MENU_ENTRIES.len());
+                }
+                if (a && !self.prev_a) || key_enter {
+                    self.menu_activate();
+                }
+                if (b && !self.prev_b) || key_esc {
+                    self.close_menu();
+                }
+            }
+            View::Picker => {
+                if step != 0 {
+                    self.picker_scroll(step.into());
+                }
+                // Up and down walk through the two lists: the icon and the background.
+                if up_edge || key_up {
+                    self.switch_slot(ArtSlot::Icon);
+                }
+                if down_edge || key_down {
+                    self.switch_slot(ArtSlot::Background);
+                }
+                if (a && !self.prev_a) || key_enter {
+                    let sel = *self.picker.sel.get(&self.picker.slot).unwrap_or(&0);
+                    self.take_photo(sel);
+                }
+                if (b && !self.prev_b) || key_esc {
+                    self.view = View::Menu;
+                }
+            }
         }
         self.prev_a = a;
         self.prev_b = b;
         self.prev_x = x;
         self.prev_y = y;
+        self.prev_move_y = move_y;
 
         if !self.entering && !self.leaving {
             self.entering = true;
@@ -902,7 +1648,8 @@ impl eframe::App for App {
         }
 
         // ---- window: sized and positioned once at startup; just reveal it on the first frame ----
-        let (hint, hint_font, hint_color) = hint_line(n, self.pad_slot.is_some(), &self.launch);
+        let (hint, hint_font, hint_color) =
+            hint_line(n, self.pad_slot.is_some(), &self.launch, self.view);
         let tile = tile_size(self.screen.y);
         if self.first_frame {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -962,14 +1709,21 @@ impl eframe::App for App {
             if rect.right() < view_left - 60.0 || rect.left() > view_left + view_w + 60.0 {
                 continue; // off the visible strip: don't paint or catch clicks
             }
-            let response = ui.interact(rect, egui::Id::unique(("console-tile", i)), egui::Sense::click());
-            if response.hovered() && pointer_moved {
+            // The tiles only take clicks on the band: the menu and the picker float above
+            // them, and a click there must not launch a game.
+            let response = if self.view == View::Band {
+                Some(ui.interact(rect, egui::Id::unique(("console-tile", i)), egui::Sense::click()))
+            } else {
+                None
+            };
+            let hovered = response.as_ref().is_some_and(|r| r.hovered());
+            if hovered && pointer_moved {
                 self.selected = i;
             }
-            if response.clicked() {
+            if response.as_ref().is_some_and(|r| r.clicked()) {
                 clicked = Some(i);
             }
-            visible.push((i, rect, response.hovered(), sel));
+            visible.push((i, rect, hovered, sel));
         }
         if let Some(i) = clicked {
             self.selected = i;
@@ -1047,13 +1801,118 @@ impl eframe::App for App {
 
         // ---- the hint line: centred under the tile block ----
         let hint_y = if n == 0 { full.center().y } else { hint_y };
-        ui.painter().text(
-            egui::pos2(full.center().x, hint_y),
-            egui::Align2::CENTER_CENTER,
-            hint,
-            egui::FontId::proportional(hint_font),
-            hint_color,
+        if self.view != View::Picker {
+            ui.painter().text(
+                egui::pos2(full.center().x, hint_y),
+                egui::Align2::CENTER_CENTER,
+                hint,
+                egui::FontId::proportional(hint_font),
+                hint_color,
+            );
+        }
+
+        // ---- the ≡ button, the menu and the picker ----
+        if self.view != View::Picker {
+            let btn = menu_button_rect(full);
+            let response = ui.interact(
+                btn,
+                egui::Id::unique("console-menu-btn"),
+                egui::Sense::click(),
+            );
+            if response.clicked() {
+                self.toggle_menu(&entries);
+            }
+            paint_menu_button(
+                ui.painter(),
+                btn,
+                response.hovered(),
+                response.is_pointer_button_down_on(),
+            );
+        }
+        if self.view == View::Menu {
+            self.paint_menu(ui, full);
+        }
+        if self.view == View::Picker {
+            self.paint_picker(ui, &ctx, full);
+        }
+    }
+}
+
+/// What the ≡ button does: it opens the menu, or closes it when it is already open.
+fn menu_button_action(view: View) -> View {
+    match view {
+        View::Menu => View::Band,
+        _ => View::Menu,
+    }
+}
+
+/// The ≡ button's place on the band: the top-left corner, above the tiles.
+fn menu_button_rect(full: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(full.left() + SIDE, full.top() + 8.0),
+        egui::vec2(MENU_BTN, MENU_BTN),
+    )
+}
+
+/// The menu panel's place: right under the ≡ button.
+fn menu_rect(full: egui::Rect) -> egui::Rect {
+    let btn = menu_button_rect(full);
+    egui::Rect::from_min_size(
+        egui::pos2(btn.left(), btn.bottom() + 8.0),
+        egui::vec2(MENU_W, MENU_ROW * MENU_ENTRIES.len() as f32 + 16.0),
+    )
+}
+
+/// The ≡ button: three bars in a rounded box, lit when the pointer is on it.
+fn paint_menu_button(painter: &egui::Painter, rect: egui::Rect, hovered: bool, pressed: bool) {
+    let fill = if pressed {
+        TILE_SEL
+    } else if hovered {
+        egui::Color32::from_rgb(32, 35, 44)
+    } else {
+        egui::Color32::from_rgb(20, 22, 28)
+    };
+    painter.rect_filled(rect, 12.0, fill);
+    painter.rect_stroke(
+        rect,
+        12.0,
+        egui::Stroke::new(
+            1.0,
+            if hovered {
+                FOCUS_MID.gamma_multiply(0.8)
+            } else {
+                MUTED.gamma_multiply(0.45)
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let bar = rect.width() * 0.48;
+    for i in 0..3 {
+        let y = rect.center().y + (i as f32 - 1.0) * 7.0;
+        painter.rect_filled(
+            egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, y),
+                egui::vec2(bar, 2.0),
+            ),
+            1.0,
+            TEXT.gamma_multiply(if hovered { 0.95 } else { 0.7 }),
         );
+    }
+}
+
+/// The slot's name on screen.
+fn slot_label(slot: ArtSlot) -> &'static str {
+    match slot {
+        ArtSlot::Icon => "Icon",
+        ArtSlot::Background => "Background",
+    }
+}
+
+/// The picker's thumbnail size for a slot: the 2:3 portrait and the wide hero.
+fn thumb_size(slot: ArtSlot) -> egui::Vec2 {
+    match slot {
+        ArtSlot::Icon => egui::vec2(THUMB_ICON.0, THUMB_ICON.1),
+        ArtSlot::Background => egui::vec2(THUMB_BG.0, THUMB_BG.1),
     }
 }
 
@@ -1290,16 +2149,107 @@ mod tests {
     #[test]
     fn the_hint_line_shows_the_launch_state() {
         // the usual hints
-        let (text, _, color) = hint_line(2, false, &Launch::Idle);
+        let (text, _, color) = hint_line(2, false, &Launch::Idle, View::Band);
         assert_eq!(text, KEY_HINT);
         assert_eq!(color, MUTED);
         // a launch in flight
-        let (text, _, _) = hint_line(2, false, &Launch::Pending);
+        let (text, _, _) = hint_line(2, false, &Launch::Pending, View::Band);
         assert_eq!(text, LAUNCHING_HINT);
         // a failure: the reason, in the warning colour
-        let (text, _, color) = hint_line(2, false, &Launch::Failed("it did not start".into()));
+        let (text, _, color) =
+            hint_line(2, false, &Launch::Failed("it did not start".into()), View::Band);
         assert_eq!(text, "it did not start");
         assert_eq!(color, WARN);
+    }
+
+    #[test]
+    fn the_menu_and_the_picker_have_their_own_hints() {
+        // the band is not behind them: they say what the keys do there
+        let (text, _, color) = hint_line(2, true, &Launch::Idle, View::Menu);
+        assert_eq!(text, MENU_HINT);
+        assert_eq!(color, MUTED);
+        let (text, _, _) = hint_line(2, true, &Launch::Idle, View::Picker);
+        assert_eq!(text, PICKER_HINT);
+    }
+
+    #[test]
+    fn the_menu_button_opens_and_closes_the_menu() {
+        // the button toggles: it opens the menu, and closes it again
+        assert_eq!(menu_button_action(View::Band), View::Menu);
+        assert_eq!(menu_button_action(View::Menu), View::Band);
+    }
+
+    #[test]
+    fn the_menu_button_sits_above_the_tiles() {
+        let band = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1843.0, 403.0));
+        let btn = menu_button_rect(band);
+        assert!(btn.top() >= band.top());
+        assert!(btn.right() < band.right());
+        // the panel hangs under the button
+        let panel = menu_rect(band);
+        assert!(panel.top() >= btn.bottom());
+        assert!(panel.left() == btn.left());
+        // one row per entry
+        assert_eq!(panel.height(), MENU_ROW * 2.0 + 16.0);
+    }
+
+    #[test]
+    fn a_forgotten_key_is_read_again() {
+        let mut arts = HashMap::new();
+        let mut heros = HashMap::new();
+        let mut art_want = HashSet::new();
+        let mut hero_want = HashSet::new();
+        arts.insert("aa".to_string(), 1u32);
+        heros.insert("aa".to_string(), 1u32);
+        art_want.insert("aa".to_string());
+        hero_want.insert("aa".to_string());
+
+        invalidate_art(&mut arts, &mut heros, &mut art_want, &mut hero_want, "aa");
+        assert!(arts.is_empty() && heros.is_empty());
+        assert!(art_want.is_empty() && hero_want.is_empty());
+
+        // another key is left alone
+        arts.insert("bb".to_string(), 1u32);
+        invalidate_art(&mut arts, &mut heros, &mut art_want, &mut hero_want, "aa");
+        assert_eq!(arts.len(), 1);
+    }
+
+    #[test]
+    fn the_picker_scrolls_within_a_page_and_asks_for_the_next_one() {
+        // a page of three photos, and a second page behind it
+        let photos: Vec<ArtPhoto> = (0..3)
+            .map(|i| ArtPhoto {
+                id: i,
+                url: format!("https://cdn.example/{i}.png"),
+                thumb: String::new(),
+                width: 600,
+                height: 900,
+                style: "Alternate".into(),
+            })
+            .collect();
+        let listing = ArtListing {
+            ok: true,
+            slot: ArtSlot::Icon,
+            page: 0,
+            total: 3 * art::PAGE_LIMIT as u32,
+            items: photos,
+            error: String::new(),
+        };
+        let mut picker = Picker {
+            slot: ArtSlot::Icon,
+            lists: HashMap::from([(ArtSlot::Icon, listing)]),
+            sel: HashMap::from([(ArtSlot::Icon, 0usize)]),
+            asked: None,
+            target: (String::new(), String::new()),
+            busy: false,
+            note: String::new(),
+            note_bad: false,
+        };
+        // the highlight walks the page
+        picker.sel.insert(ArtSlot::Icon, 1);
+        let list = picker.lists.get(&ArtSlot::Icon).expect("the listing");
+        let sel = *picker.sel.get(&ArtSlot::Icon).unwrap_or(&0);
+        assert_eq!(list.items[sel].id, 1);
     }
 
     #[test]

@@ -46,10 +46,59 @@ pub enum Request {
     HideFromConsole { exe: String },
     /// Launch an app from the console; the daemon does the spawning and logging.
     LaunchApp { exe: String },
+    /// List the artwork SteamGridDB offers for one app and one slot (page 0 is the first).
+    ListArt { exe: String, slot: ArtSlot, page: u32 },
+    /// Choose the artwork for one slot of an app: a photo url, or an empty url for
+    /// "use automatic again".
+    SetArt { exe: String, slot: ArtSlot, url: String },
     /// Open the console launcher now (tray menu / settings preview), pad or not.
     ShowConsole,
     /// Quit the daemon: revert the packs, then exit. Same as the tray menu's "Quit".
     Quit,
+}
+
+/// The two artwork slots the band shows and the picker chooses between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtSlot {
+    /// The 2:3 portrait tile.
+    Icon,
+    /// The wide band background.
+    Background,
+}
+
+/// One artwork photo SteamGridDB offers for a game.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtPhoto {
+    /// The photo's id in the SteamGridDB catalogue.
+    pub id: u32,
+    /// The full-size image.
+    pub url: String,
+    /// The small preview image.
+    pub thumb: String,
+    pub width: u32,
+    pub height: u32,
+    /// The photo's style: "Alternate", "White Logo", "No Logo", "Material"…
+    #[serde(default)]
+    pub style: String,
+}
+
+/// A page of artwork photos for one slot of one game.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtListing {
+    /// Did the daemon get a listing at all?
+    pub ok: bool,
+    /// The slot the listing is for.
+    pub slot: ArtSlot,
+    /// The page (0 is the first).
+    pub page: u32,
+    /// How many photos the game has in this slot.
+    pub total: u32,
+    /// The photos of the page.
+    pub items: Vec<ArtPhoto>,
+    /// Why there is no listing (empty when `ok`).
+    #[serde(default)]
+    pub error: String,
 }
 
 /// Messages sent from the daemon to a client.
@@ -92,6 +141,53 @@ pub fn as_launch_ack(resp: &Response) -> Option<(bool, &str)> {
         Response::ConsoleOp { ok, message } => message
             .strip_prefix(LAUNCH_ACK)
             .map(|text| (*ok, text)),
+        _ => None,
+    }
+}
+
+/// The marker that turns a `ConsoleOp` into the answer to an artwork-list request. The
+/// photos travel as JSON in the message.
+pub const ART_LIST: &str = "art: ";
+
+/// The marker that turns a `ConsoleOp` into the answer to an artwork-set request.
+pub const ART_SET: &str = "artset: ";
+
+/// The photos of one page, as the answer to an artwork-list request.
+///
+/// It rides the `ConsoleOp` variant for the same reason the launch answer does: the
+/// `Response` enum is matched exhaustively by the dashboard, so a new variant would need
+/// a second change in a file the launcher does not own. The marker keeps the two apart.
+pub fn art_listing(listing: &ArtListing) -> Response {
+    let json = serde_json::to_string(listing).unwrap_or_default();
+    Response::ConsoleOp {
+        ok: listing.ok,
+        message: format!("{ART_LIST}{json}"),
+    }
+}
+
+/// The listing inside a response, if this response is one.
+pub fn as_art_listing(resp: &Response) -> Option<ArtListing> {
+    match resp {
+        Response::ConsoleOp { message, .. } => {
+            let json = message.strip_prefix(ART_LIST)?;
+            serde_json::from_str(json).ok()
+        }
+        _ => None,
+    }
+}
+
+/// The answer to an artwork-set request: did the pick land?
+pub fn art_set(ok: bool, message: &str) -> Response {
+    Response::ConsoleOp {
+        ok,
+        message: format!("{ART_SET}{message}"),
+    }
+}
+
+/// The set answer inside a response, if this response is one.
+pub fn as_art_set(resp: &Response) -> Option<(bool, &str)> {
+    match resp {
+        Response::ConsoleOp { ok, message } => message.strip_prefix(ART_SET).map(|text| (*ok, text)),
         _ => None,
     }
 }
@@ -305,6 +401,129 @@ mod tests {
         let (ok, message) = as_launch_ack(&back).expect("the launch answer");
         assert!(ok);
         assert_eq!(message, "started (pid 42)");
+    }
+
+    /// A listing to send over the wire.
+    fn a_listing() -> ArtListing {
+        ArtListing {
+            ok: true,
+            slot: ArtSlot::Icon,
+            page: 0,
+            total: 2,
+            items: vec![ArtPhoto {
+                id: 7,
+                url: "https://cdn.example/grid.png".into(),
+                thumb: "https://cdn.example/thumb.png".into(),
+                width: 600,
+                height: 900,
+                style: "Alternate".into(),
+            }],
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_artwork_listing_travels_as_a_console_op_with_a_marker() {
+        let resp = art_listing(&a_listing());
+        assert!(matches!(resp, Response::ConsoleOp { ok: true, .. }));
+        let back = as_art_listing(&resp).expect("the listing");
+        assert_eq!(back.slot, ArtSlot::Icon);
+        assert_eq!(back.total, 2);
+        assert_eq!(back.items.len(), 1);
+        assert_eq!(back.items[0].width, 600);
+        assert_eq!(back.items[0].style, "Alternate");
+
+        // a plain console op is not a listing
+        let op = Response::ConsoleOp {
+            ok: true,
+            message: "added".into(),
+        };
+        assert!(as_art_listing(&op).is_none());
+
+        // and it survives the wire
+        let mut out = Vec::new();
+        write_msg(&mut out, &resp).unwrap();
+        let back: Response = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
+        let back = as_art_listing(&back).expect("the listing");
+        assert_eq!(back.page, 0);
+        assert_eq!(back.items[0].id, 7);
+        assert_eq!(back.items[0].thumb, "https://cdn.example/thumb.png");
+    }
+
+    #[test]
+    fn the_artwork_set_answer_travels_as_a_console_op_with_a_marker() {
+        let resp = art_set(true, "saved");
+        let (ok, message) = as_art_set(&resp).expect("the set answer");
+        assert!(ok);
+        assert_eq!(message, "saved");
+
+        // a plain console op is not a set answer
+        let op = Response::ConsoleOp {
+            ok: true,
+            message: "removed".into(),
+        };
+        assert!(as_art_set(&op).is_none());
+
+        // and it survives the wire
+        let mut out = Vec::new();
+        write_msg(&mut out, &resp).unwrap();
+        let back: Response = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
+        let (ok, message) = as_art_set(&back).expect("the set answer");
+        assert!(ok);
+        assert_eq!(message, "saved");
+    }
+
+    #[test]
+    fn the_markers_do_not_collide() {
+        // the launch answer is not an artwork answer, and the other way round
+        let launch = launch_ack(true, "started");
+        assert!(as_art_listing(&launch).is_none());
+        assert!(as_art_set(&launch).is_none());
+        assert!(as_launch_ack(&art_listing(&a_listing())).is_none());
+        assert!(as_launch_ack(&art_set(true, "saved")).is_none());
+        // "art: " and "artset: " are not prefixes of one another
+        assert!(as_art_listing(&art_set(true, "saved")).is_none());
+        assert!(as_art_set(&art_listing(&a_listing())).is_none());
+    }
+
+    #[test]
+    fn the_artwork_requests_round_trip() {
+        let mut out = Vec::new();
+        write_msg(
+            &mut out,
+            &Request::ListArt {
+                exe: "C:\\Games\\doom.exe".into(),
+                slot: ArtSlot::Background,
+                page: 2,
+            },
+        )
+        .unwrap();
+        write_msg(
+            &mut out,
+            &Request::SetArt {
+                exe: "C:\\Games\\doom.exe".into(),
+                slot: ArtSlot::Icon,
+                url: String::new(),
+            },
+        )
+        .unwrap();
+        let mut reader = &out[..];
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        match req {
+            Request::ListArt { slot, page, .. } => {
+                assert_eq!(slot, ArtSlot::Background);
+                assert_eq!(page, 2);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        match req {
+            Request::SetArt { slot, url, .. } => {
+                assert_eq!(slot, ArtSlot::Icon);
+                assert!(url.is_empty()); // an empty url means "automatic again"
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
