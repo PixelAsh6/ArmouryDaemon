@@ -5,6 +5,7 @@
 //! live in the daemon; installing a pack can never execute arbitrary code.
 
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -26,6 +27,11 @@ pub struct Pack {
     pub name: String,
     #[serde(default)]
     pub version: String,
+    /// The smallest daemon that can run this pack, e.g. "1.1.0". No minimum means every
+    /// daemon may run it (a pack that needs a host function the daemon does not have says
+    /// so here, so an older daemon refuses it instead of failing at apply).
+    #[serde(default)]
+    pub min_engine: Option<String>,
     /// Apply ascending, revert descending.
     #[serde(default = "default_order")]
     pub order: i32,
@@ -277,6 +283,49 @@ const ALLOWED_MECHANISMS: [&str; 5] = [
 ];
 const ALLOWED_CAPTURES: [&str; 3] = ["process_running", "json_file", "target_path"];
 
+/// A version split into its numbers ("1.2.3" -> [1, 2, 3]). Only digits and dots are
+/// allowed, the shape of a `Cargo.toml` version: "1", "1.0" and "1.0.0" are versions,
+/// "1.0.0-beta", "v1.0", "1..0" and "" are not. A malformed version is an error, never a
+/// panic.
+fn version_parts(version: &str) -> Result<Vec<u64>, String> {
+    let text = version.trim();
+    if text.is_empty() {
+        return Err("the version is empty".to_string());
+    }
+    let mut parts = Vec::new();
+    for part in text.split('.') {
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("'{version}' is not a dotted numeric version"));
+        }
+        let number = part
+            .parse::<u64>()
+            .map_err(|_| format!("'{version}' has a part that is too large to be a number"))?;
+        parts.push(number);
+    }
+    Ok(parts)
+}
+
+/// Compare two dotted numeric versions. A missing part counts as zero, so "1.0" and
+/// "1.0.0" are the same version.
+pub fn compare_versions(a: &str, b: &str) -> Result<Ordering, String> {
+    let left = version_parts(a)?;
+    let right = version_parts(b)?;
+    for index in 0..left.len().max(right.len()) {
+        let l = left.get(index).copied().unwrap_or(0);
+        let r = right.get(index).copied().unwrap_or(0);
+        if l != r {
+            return Ok(l.cmp(&r));
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
+/// Is `daemon` at least `required`? A malformed version is an error, not a guess: the
+/// caller turns it into a refusal with the reason.
+pub fn version_at_least(daemon: &str, required: &str) -> Result<bool, String> {
+    Ok(compare_versions(daemon, required)? != Ordering::Less)
+}
+
 impl Pack {
     /// Human-readable problems; an empty list means the pack is valid.
     pub fn validate(&self) -> Vec<String> {
@@ -298,6 +347,13 @@ impl Pack {
         }
         if self.name.trim().is_empty() {
             errs.push("name must not be empty".into());
+        }
+        if let Some(min) = &self.min_engine
+            && version_parts(min).is_err()
+        {
+            errs.push(format!(
+                "min_engine '{min}' is not a version like \"1.0.0\" (digits and dots only)"
+            ));
         }
         if self.targets.process.is_empty() {
             errs.push("targets.process must list at least one exe file name".into());
@@ -581,5 +637,104 @@ mod tests {
     fn bad_json_is_rejected() {
         assert!(Pack::parse("{ not json").is_err());
         assert!(Pack::parse(r#"{"spec":1}"#).is_err());
+    }
+
+    /// A minimal valid pack, with the `min_engine` line the tests vary.
+    const MIN_ENGINE_PACK: &str = r#"{
+        "spec": 1, "id": "min-engine", "name": "Min engine", "version": "1.0.0",
+        "targets": { "process": ["min.exe"] },
+        "settings": [
+            { "key": "action", "label": "Action", "type": "enum", "values": ["on"], "default": "on" }
+        ],
+        "min_engine": "1.1.0",
+        "apply": { "steps": [ { "mechanism": "cli", "exe": "min.exe", "args": [] } ] },
+        "revert": { "steps": [ { "mechanism": "cli", "exe": "min.exe", "args": [] } ] }
+    }"#;
+
+    #[test]
+    fn a_version_comparison_knows_equal_newer_older_and_missing_parts() {
+        assert_eq!(compare_versions("1.0.0", "1.0.0").unwrap(), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.1", "1.0.0").unwrap(), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "1.0.1").unwrap(), Ordering::Less);
+        assert_eq!(compare_versions("2.0", "1.9.9").unwrap(), Ordering::Greater);
+        assert_eq!(compare_versions("1.9.9", "2.0").unwrap(), Ordering::Less);
+        // a missing part counts as zero, so "1.0" and "1.0.0" are the same version
+        assert_eq!(compare_versions("1.0", "1.0.0").unwrap(), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0").unwrap(), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0.0.0").unwrap(), Ordering::Equal);
+        // the numbers are numbers, not text: 1.10 is newer than 1.9
+        assert_eq!(compare_versions("1.10.0", "1.9.9").unwrap(), Ordering::Greater);
+
+        assert!(version_at_least("1.0.0", "1.0.0").unwrap());
+        assert!(version_at_least("1.0.1", "1.0.0").unwrap());
+        assert!(!version_at_least("1.0.0", "1.0.1").unwrap());
+        assert!(version_at_least("1.0", "1.0.0").unwrap());
+        assert!(version_at_least("2.0", "1.9.9").unwrap());
+        assert!(!version_at_least("1.9.9", "2.0").unwrap());
+    }
+
+    #[test]
+    fn a_malformed_version_is_an_error_and_never_a_panic() {
+        for bad in ["", " ", "1.0.0-beta", "v1.0", "1..0", "1.0.x", "one", ".1", "1."] {
+            let err = version_at_least("1.0.0", bad).expect_err("a malformed minimum is refused");
+            assert!(!err.is_empty(), "'{bad}' must say why");
+            let err = version_at_least(bad, "1.0.0").expect_err("a malformed daemon is refused");
+            assert!(!err.is_empty(), "'{bad}' must say why");
+        }
+        // a part too large to be a number is an error too, not a panic
+        assert!(version_at_least("1.0.0", "99999999999999999999.0").is_err());
+    }
+
+    #[test]
+    fn a_pack_may_state_the_minimum_daemon_it_needs() {
+        let pack = Pack::parse(MIN_ENGINE_PACK).expect("a pack with a min_engine is valid");
+        assert_eq!(pack.min_engine.as_deref(), Some("1.1.0"));
+        assert!(pack.validate().is_empty());
+
+        // a pack without one needs no minimum
+        let plain = MIN_ENGINE_PACK.replace("\"min_engine\": \"1.1.0\",", "");
+        let pack = Pack::parse(&plain).expect("a pack without a min_engine is valid");
+        assert!(pack.min_engine.is_none());
+        assert!(pack.validate().is_empty());
+
+        // a malformed minimum is refused, and the message says which field is wrong
+        for bad in ["1.0.0-beta", "v1.0", "1..0", "1.0.x", ""] {
+            let mut pack = Pack::parse(MIN_ENGINE_PACK).unwrap();
+            pack.min_engine = Some(bad.to_string());
+            let errs = pack.validate();
+            assert!(
+                errs.iter().any(|e| e.contains("min_engine")),
+                "'{bad}' must be refused: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_minimum_engine_survives_a_json_round_trip() {
+        let pack = Pack::parse(MIN_ENGINE_PACK).unwrap();
+        let json = serde_json::to_string(&pack).expect("a pack serialises");
+        assert!(json.contains("\"min_engine\":\"1.1.0\""), "the name stays: {json}");
+        let again: Pack = serde_json::from_str(&json).expect("the pack parses again");
+        assert_eq!(again.min_engine, pack.min_engine);
+        assert_eq!(again.min_engine.as_deref(), Some("1.1.0"));
+
+        // a pack without the field stays without it (an absent minimum is written as null,
+        // the way the other optional fields of a pack are)
+        let plain = MIN_ENGINE_PACK.replace("\"min_engine\": \"1.1.0\",", "");
+        let pack = Pack::parse(&plain).unwrap();
+        let json = serde_json::to_string(&pack).unwrap();
+        let again: Pack = serde_json::from_str(&json).unwrap();
+        assert!(again.min_engine.is_none(), "no minimum means none: {json}");
+
+        // unknown fields are not part of the schema: the struct drops them (the installed
+        // file keeps the original text, so nothing is lost on disk)
+        let with_extra = MIN_ENGINE_PACK.replace(
+            "\"min_engine\": \"1.1.0\",",
+            "\"min_engine\": \"1.1.0\", \"something_new\": 7,",
+        );
+        let pack = Pack::parse(&with_extra).expect("an unknown field does not make a pack invalid");
+        let json = serde_json::to_string(&pack).unwrap();
+        assert!(!json.contains("something_new"), "{json}");
+        assert_eq!(pack.min_engine.as_deref(), Some("1.1.0"));
     }
 }

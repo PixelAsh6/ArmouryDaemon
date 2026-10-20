@@ -4,7 +4,7 @@
 //! CLI calls block for tens to hundreds of milliseconds.
 //! Nothing here ever goes through a shell, and packs can only use whitelisted mechanisms.
 
-use armoury_core::pack::{Pack, Step, StepBlock, TemplateCtx, substitute};
+use armoury_core::pack::{Pack, Step, StepBlock, TemplateCtx, substitute, version_at_least};
 use crossbeam_channel::Receiver;
 use log::{info, warn};
 use std::collections::HashMap;
@@ -20,6 +20,10 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// This daemon's own version. A pack may ask for a newer one (`min_engine`), and this is
+/// what it is measured against.
+pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How soon after a revert an apply may reuse that revert's captured values instead of reading
 /// them again from disk. The controlled apps write their config with a delay (G-Helper: ~2 s), so a
@@ -88,6 +92,10 @@ pub fn load(search_dirs: &[PathBuf]) -> Vec<Installed> {
             match Pack::parse(strip_bom(&text)) {
                 Ok(pack) => {
                     if let Err(e) = check_scripts(&pack) {
+                        warn!("pack {} rejected: {e}", manifest.display());
+                        continue;
+                    }
+                    if let Err(e) = require_engine(&pack) {
                         warn!("pack {} rejected: {e}", manifest.display());
                         continue;
                     }
@@ -868,6 +876,7 @@ pub fn install_text(search_dirs: &[PathBuf], text: &str) -> Result<(String, bool
     let text = strip_bom(text).to_string();
     let pack = Pack::parse(&text)?; // validates spec/settings/steps
     check_scripts(&pack)?;          // a scripted pack must compile before it lands on disk
+    require_engine(&pack)?;         // a pack this daemon is too old to run never lands on disk
 
     let root = packs_root(search_dirs);
     let target = root.join(&pack.id);
@@ -886,6 +895,24 @@ pub fn install_text(search_dirs: &[PathBuf], text: &str) -> Result<(String, bool
         target.display()
     );
     Ok((pack.id, existed))
+}
+
+/// Refuse a pack this daemon is too old to run. A pack may need a host function the daemon
+/// does not have (`min_engine`); installing it anyway only moves the failure to apply time.
+/// The message names the pack, the version it needs and the version of the daemon that was
+/// asked to install it.
+fn require_engine(pack: &Pack) -> Result<(), String> {
+    let Some(required) = pack.min_engine.as_deref() else {
+        return Ok(()); // no minimum: every daemon may run it
+    };
+    match version_at_least(DAEMON_VERSION, required) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!(
+            "pack '{}' ({}) needs daemon {required} or newer; this daemon is {DAEMON_VERSION}",
+            pack.id, pack.name
+        )),
+        Err(e) => Err(format!("pack '{}' has an unreadable min_engine: {e}", pack.id)),
+    }
 }
 
 /// Remove an installed pack folder (only when it really holds that pack).
@@ -1414,6 +1441,54 @@ mod tests {
         assert!(install_from_path(std::slice::from_ref(&install), &bad).is_err());
         assert!(!install.join("packs").join("x").exists());
         assert!(load(std::slice::from_ref(&install)).is_empty());
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    /// The sample pack with a `min_engine` line.
+    fn sample_with_min_engine(min: &str) -> String {
+        SAMPLE.replace(
+            "\"version\": \"1.0.0\",",
+            &format!("\"version\": \"1.0.0\",\n        \"min_engine\": \"{min}\","),
+        )
+    }
+
+    #[test]
+    fn install_refuses_a_pack_this_daemon_is_too_old_for() {
+        let install = scratch_install("too-old");
+        let source = install.join("incoming");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("pack.json"), sample_with_min_engine("99.0.0")).unwrap();
+
+        let err = install_from_path(std::slice::from_ref(&install), &source)
+            .expect_err("a pack that needs a newer daemon must be refused");
+        assert!(err.contains("sample"), "the message names the pack: {err}");
+        assert!(err.contains("99.0.0"), "the message names the version it needs: {err}");
+        assert!(err.contains(DAEMON_VERSION), "the message names this daemon: {err}");
+        assert!(
+            !install.join("packs").join("sample").exists(),
+            "a refused pack must not land on disk"
+        );
+        assert!(load(std::slice::from_ref(&install)).is_empty());
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    #[test]
+    fn install_accepts_a_pack_with_no_minimum_and_with_an_older_one() {
+        let install = scratch_install("older");
+        let source = install.join("incoming");
+        std::fs::create_dir_all(&source).unwrap();
+
+        // no minimum at all
+        std::fs::write(source.join("pack.json"), SAMPLE).unwrap();
+        assert!(install_from_path(std::slice::from_ref(&install), &source).is_ok());
+
+        // older than this daemon
+        std::fs::write(source.join("pack.json"), sample_with_min_engine("0.0.1")).unwrap();
+        assert!(install_from_path(std::slice::from_ref(&install), &source).is_ok());
+
+        // exactly this daemon
+        std::fs::write(source.join("pack.json"), sample_with_min_engine(DAEMON_VERSION)).unwrap();
+        assert!(install_from_path(std::slice::from_ref(&install), &source).is_ok());
         let _ = std::fs::remove_dir_all(&install);
     }
 

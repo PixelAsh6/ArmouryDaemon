@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use armoury_core::pack::version_at_least;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -44,6 +45,70 @@ pub struct CatalogPack {
     pub sha256: String,
     #[serde(default)]
     pub size: Option<u64>,
+    /// The smallest daemon that may install this pack, e.g. "1.1.0". No minimum means every
+    /// daemon may run it.
+    #[serde(default)]
+    pub min_engine: Option<String>,
+}
+
+/// What this daemon can do with a catalogue entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineGate {
+    /// The pack may be installed here: it states no minimum, or this daemon reaches it.
+    Supported,
+    /// The pack may not be installed here. `reason` says why, in one line, ready to show.
+    Refused {
+        /// The version the pack asks for, as the manifest states it.
+        required: String,
+        /// Why it was refused.
+        reason: String,
+    },
+}
+
+impl CatalogPack {
+    /// Whether this daemon may install this pack, and why not when it may not. A malformed
+    /// minimum is refused too: an unreadable version is not a version this daemon reaches.
+    pub fn engine_gate(&self) -> EngineGate {
+        let Some(required) = self.min_engine.as_deref() else {
+            return EngineGate::Supported; // no minimum: every daemon may run it
+        };
+        match version_at_least(packs::DAEMON_VERSION, required) {
+            Ok(true) => EngineGate::Supported,
+            Ok(false) => EngineGate::Refused {
+                required: required.to_string(),
+                reason: format!(
+                    "needs daemon {required} or newer; this daemon is {}",
+                    packs::DAEMON_VERSION
+                ),
+            },
+            Err(e) => EngineGate::Refused {
+                required: required.to_string(),
+                reason: format!("the catalogue states an unreadable minimum engine version ({e})"),
+            },
+        }
+    }
+}
+
+impl Catalog {
+    /// The packs this daemon may install. The ones it may not are not hidden: they are in
+    /// `refused`, with the reason, so the UI can say why.
+    pub fn offered(&self) -> Vec<&CatalogPack> {
+        self.packs
+            .iter()
+            .filter(|pack| pack.engine_gate() == EngineGate::Supported)
+            .collect()
+    }
+
+    /// The packs this daemon may not install, with the reason the UI can show.
+    pub fn refused(&self) -> Vec<(&CatalogPack, String)> {
+        self.packs
+            .iter()
+            .filter_map(|pack| match pack.engine_gate() {
+                EngineGate::Supported => None,
+                EngineGate::Refused { reason, .. } => Some((pack, reason)),
+            })
+            .collect()
+    }
 }
 
 /// Parse and sanity-check a catalog manifest.
@@ -73,9 +138,14 @@ pub fn fetch(url: &str) -> Result<Catalog, String> {
 /// Download and install one catalog pack. Returns (pack id, updated?) as the local installer does.
 pub fn install(install_dirs: &[PathBuf], catalog_url: &str, id: &str) -> Result<(String, bool), String> {
     let catalog = fetch(catalog_url)?;
+    // A pack this daemon is too old to run is not offered: say so before the download.
+    let refused = catalog.refused();
+    if let Some((_, reason)) = refused.iter().find(|(pack, _)| pack.id == id) {
+        return Err(format!("catalog: {id} — {reason}"));
+    }
     let entry = catalog
-        .packs
-        .iter()
+        .offered()
+        .into_iter()
         .find(|pack| pack.id == id)
         .ok_or_else(|| format!("catalog: no pack called {id:?}"))?;
     let bytes = fetch_bytes(&join_url(catalog_url, &entry.file))?;
@@ -311,5 +381,90 @@ mod tests {
         assert!(packs::install_from_bytes(&[dir.clone()], bad).is_err());
         assert!(!dir.join("packs").exists(), "nothing may be written for an invalid pack");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest with three entries: one this daemon is too old for, one without a
+    /// minimum and one with a minimum it reaches.
+    const MANIFEST_WITH_ENGINES: &str = r#"{
+        "schema": 1,
+        "updated": "2026-10-20",
+        "packs": [
+            {
+                "id": "too-new",
+                "name": "Too new",
+                "version": "2.0.0",
+                "file": "packs/too-new/pack.json",
+                "sha256": "00",
+                "min_engine": "99.0.0"
+            },
+            {
+                "id": "any",
+                "name": "Any",
+                "version": "1.0.0",
+                "file": "packs/any/pack.json",
+                "sha256": "00"
+            },
+            {
+                "id": "old-enough",
+                "name": "Old enough",
+                "version": "1.0.0",
+                "file": "packs/old-enough/pack.json",
+                "sha256": "00",
+                "min_engine": "0.0.1"
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn the_manifest_reads_the_minimum_engine_of_a_pack() {
+        let catalog = parse(MANIFEST_WITH_ENGINES).expect("the manifest must parse");
+        assert_eq!(catalog.packs[0].min_engine.as_deref(), Some("99.0.0"));
+        assert!(catalog.packs[1].min_engine.is_none(), "no minimum means none");
+        assert_eq!(catalog.packs[2].min_engine.as_deref(), Some("0.0.1"));
+    }
+
+    #[test]
+    fn the_client_does_not_offer_a_pack_this_daemon_is_too_old_for() {
+        let catalog = parse(MANIFEST_WITH_ENGINES).expect("the manifest must parse");
+        let offered: Vec<&str> = catalog.offered().iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(offered, vec!["any", "old-enough"], "the rest is still offered");
+
+        let refused = catalog.refused();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].0.id, "too-new");
+        let reason = &refused[0].1;
+        assert!(reason.contains("99.0.0"), "the reason names the version: {reason}");
+        assert!(
+            reason.contains(packs::DAEMON_VERSION),
+            "the reason names this daemon: {reason}"
+        );
+
+        // the entry itself carries the same answer
+        assert_eq!(
+            catalog.packs[0].engine_gate(),
+            EngineGate::Refused {
+                required: "99.0.0".to_string(),
+                reason: reason.clone(),
+            }
+        );
+        assert_eq!(catalog.packs[1].engine_gate(), EngineGate::Supported);
+    }
+
+    #[test]
+    fn a_manifest_with_an_unreadable_minimum_is_refused_with_a_reason() {
+        let json = r#"{
+            "schema": 1,
+            "packs": [ { "id": "broken", "file": "packs/broken/pack.json", "sha256": "00",
+                         "min_engine": "not-a-version" } ]
+        }"#;
+        let catalog = parse(json).expect("one bad entry does not kill the manifest");
+        assert!(catalog.offered().is_empty(), "an unreadable minimum is never offered");
+        let refused = catalog.refused();
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].1.contains("not-a-version"),
+            "the reason names what is wrong: {}",
+            refused[0].1
+        );
     }
 }
