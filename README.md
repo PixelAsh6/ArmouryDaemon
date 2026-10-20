@@ -1,7 +1,7 @@
 # ArmouryDaemon
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](Cargo.toml)
 
 A resident Windows daemon that watches the applications you track and switches the rest of your
 machine around them. While a tracked app runs, Rainmeter, G-Helper and Wallpaper Engine get out
@@ -12,8 +12,10 @@ Windows 11 · Rust · MIT
 ## What it is
 
 ArmouryDaemon is a small always-on daemon — plus an on-demand GUI, in the same binary — that
-reacts to the applications you care about. It runs **resident and elevated**, so there is no UAC
-prompt once it is installed.
+reacts to the applications you care about. Once it is installed it runs **resident and
+elevated** — the scheduled task starts it with the highest privileges, so it comes up with no
+UAC prompt. The first manual launch of the executable does ask for administrator: it carries
+a manifest that says so.
 
 You pick the apps you track. While one of them runs, the daemon applies **packs**: the pack says
 what the other programs should do while your app is running, and remembers what they were doing
@@ -40,7 +42,7 @@ arbitrary code. A pack is a single `pack.json` file, and it may expose a few dro
 **Where to get them** — the catalogue repository,
 **[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**, whose
 README is the reference for the pack format, the mechanism vocabulary and the script host API.
-Three packs ship with the daemon: **Wallpaper Engine**, **G-Helper** and **Rainmeter**.
+Three packs ship with the zip: **Wallpaper Engine**, **G-Helper** and **Rainmeter**.
 
 **How to install one** — Settings → **Install packs**, or from the command line:
 
@@ -52,11 +54,11 @@ A pack may declare the daemon it needs (`"min_engine": "1.1.0"`). A daemon that 
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.1.0 or newer; this daemon is 1.0.0
+pack 'example-pack' (Example Pack) needs daemon 1.1.0 or newer; this daemon is 1.1.0
 ```
 
-The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and `1.0.0` is the daemon
-version that ships it.
+The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
+is `1.1.0`.
 
 ### The lockout ("Revert after")
 
@@ -140,7 +142,11 @@ daemon is too old for is not offered at all — its row shows the reason where t
 button would be. The window's **Local pack** button opens the native file picker and installs a
 `pack.json` from disk — the only way to install a local pack file.
 
-The other command-line flags:
+The catalogue needs **no API key**: the manifest and the pack files are plain public files,
+fetched from the packs repository's raw URL. The SteamGridDB key in Settings is for the **cover
+art** only.
+
+### The command line
 
 ```console
 ArmouryDaemon.exe --catalog-list
@@ -150,11 +156,20 @@ ArmouryDaemon.exe --help
 ```
 
 `--catalog-url <url>` lists that catalogue instead of the configured one. `--version` prints
-`ArmouryDaemon 1.0.0`, `--help` prints the flags the binary accepts. An argument the binary
+`ArmouryDaemon 1.1.0`, `--help` prints the flags the binary accepts. An argument the binary
 does not know is an error — the usage on stderr, exit code 2 — so the daemon never starts on
-a typo. The release build is a windows-subsystem binary: from a terminal the line only shows
-up when the output is redirected (`... --version 2>&1 | Out-String`), and it then goes to
-stdout *and* stderr.
+a typo.
+
+The release build is a **GUI-subsystem binary** (PE subsystem 2), so it prints to the console it
+attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.0` on stdout, once, and
+exits 0. Redirected, the line goes to **both** stdout and stderr, so `2>&1 | Out-String` shows
+it **twice**. `cmd.exe`'s own `>` can misbehave, because the process attaches to the parent
+console (`AttachConsole`) and re-points the standard handles, so the file can come out empty
+while the text lands on the console; and PowerShell 7 does not wait for a GUI-subsystem child,
+so `$LASTEXITCODE` stays empty after `& exe --version`.
+
+The executable carries a manifest that asks for administrator, so `--version` and `--help` from
+a **non-elevated** shell raise a UAC prompt. From an already-elevated shell they do not.
 
 ### The pack script host (spec 2 packs)
 
@@ -205,8 +220,28 @@ small, undecorated windows plus a tray icon:
 
 The daemon is not on any package registry — it is installed from a folder you choose.
 
-1. **Download** `ArmouryDaemon-1.0.0-windows-x64.zip` from the
-   [v1.0.0 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.0.0) and unpack it
+### From the executable alone
+
+1. **Download** `ArmouryDaemon.exe` from the
+   [v1.1.0 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.0) and put it
+   in a folder you can write to, for example `C:\Apps\ArmouryDaemon`.
+2. **Run it.** The executable carries a manifest that asks for administrator, so Windows shows
+   one consent prompt — accept it. The daemon then:
+   - creates the `packs\` folder next to itself if it is not there (a fresh install has no packs
+     until you install some);
+   - registers its own scheduled task — at logon and whenever Windows resumes from sleep, with
+     the highest privileges — so it comes back by itself;
+   - **opens the dashboard** on the first run, so you land on it instead of having to know to
+     click the tray icon. It does not reopen on later starts.
+3. **Settings → Install packs** opens the catalogue: every pack in it, with its version, and a
+   **Download**, **Update** or *vX installed* button per row. It needs **no API key** — the
+   SteamGridDB key in Settings is for the **cover art** only. The
+   [catalogue section](#the-pack-catalogue) has the details of the download and the check.
+
+### Or the whole thing at once
+
+1. **Download** `ArmouryDaemon-1.1.0-windows-x64.zip` from the
+   [v1.1.0 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.0) and unpack it
    into a permanent folder, for example `C:\Apps\ArmouryDaemon`. The zip holds the executable,
    the three shipped packs, the SHA-256 sidecar, `setup.ps1`, `uninstall.ps1` and this README.
 2. In an **administrator** PowerShell, in that folder:
@@ -215,10 +250,10 @@ The daemon is not on any package registry — it is installed from a folder you 
    powershell -ExecutionPolicy Bypass -File .\setup.ps1
    ```
 
-   The installer registers a scheduled task that starts the daemon at logon and whenever Windows
-   resumes from sleep, **with the highest privileges**, and starts it immediately. It writes the
-   SHA-256 of the executable into an `ArmouryDaemon.exe.sha256` sidecar (and into the task's
-   description), so a swapped binary is detectable, and it applies an explicit ACL to the folder:
+   The installer registers the same scheduled task — at logon and whenever Windows resumes from
+   sleep, **with the highest privileges** — and starts it immediately. It writes the SHA-256 of
+   the executable into an `ArmouryDaemon.exe.sha256` sidecar (and into the task's description),
+   so a swapped binary is detectable, and it applies an explicit ACL to the folder:
    Administrators and SYSTEM keep full control, your account keeps *modify* (the daemon writes
    the `packs` folder there), everybody else gets read and execute only.
 
@@ -257,7 +292,7 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (234: 164 in armoury, 70 in armoury-core)
+cargo test                   # the unit tests (260: 190 in armoury, 70 in armoury-core)
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
@@ -267,9 +302,13 @@ any x86-64 machine. A build from this repository picks up `-C target-cpu=native`
 4800H, Zen 2, AVX2-era) and will **not** run on a pre-AVX2 x86-64 machine. The release profile
 is `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = true`, `incremental = false`.
 
-It needs no administrator rights and no Wallpaper Engine, G-Helper or Rainmeter: it starts a
-throw-away daemon instance (its own pipe, config folder and single-instance
-guard) and asserts the engine behaviour. It refuses to run against an installed copy.
+It needs no Wallpaper Engine, G-Helper or Rainmeter: it starts a throw-away daemon instance (its
+own pipe, config folder and single-instance guard) and asserts the engine behaviour. It refuses to
+run against an installed copy.
+
+Run the harness from an **elevated** PowerShell: the executable carries a manifest that asks for
+administrator, so the runs it starts would raise a UAC prompt. A harness that is not elevated
+**skips** the command-line probes and prints why — a skipped check is not a failed one.
 
 ## Project layout
 
@@ -291,8 +330,8 @@ Windows in them.
 ## Documentation
 
 The published documentation is this README and **[deploy/README.md](deploy/README.md)** — the
-install, the update and the uninstall. The **pack documentation** lives in the packs repository,
-linked from the Packs section above.
+scripted install, the exact ACL, the update and the uninstall. The **pack documentation** lives in
+the packs repository, linked from the Packs section above.
 
 Everything else — the handover notes, the test checklists, the decision log and the
 specifications — are working documents. They stay local, and they are **not published**.

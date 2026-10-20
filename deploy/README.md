@@ -2,6 +2,10 @@
 
 A small always-on Windows daemon that reacts to the apps you care about.
 
+This document describes **ArmouryDaemon 1.1.0** and is the reference for the scripted install,
+the exact ACL, updating and uninstalling. The overview and the lone-exe install are in the
+[README](../README.md).
+
 - **Tracked apps** - pick them from your running windows or browse for an exe (matched by exe name).
 - **Packs** - Wallpaper Engine, G-Helper and Rainmeter. A pack may expose up to four dropdowns
   (what it should do while a tracked app runs, and how); Wallpaper Engine ships with two
@@ -25,6 +29,10 @@ Everything is local. No telemetry. The only network traffic is the optional pack
 cover art (Steam, or SteamGridDB when you set a key).
 
 ## Install
+
+The executable can install itself - the [README](../README.md) has that path. This is the
+scripted one: `setup.ps1` registers the same scheduled task, writes the checksum sidecar and
+applies the folder ACL, and it needs the `packs` folder next to the executable.
 
 1. Put `ArmouryDaemon.exe` + the `packs` folder in a permanent folder, e.g. `C:\Apps\ArmouryDaemon`.
 2. In an **administrator** PowerShell, in that folder:
@@ -198,8 +206,10 @@ installed pack deletes it again.
 ## The self-test
 
 `tools/daemon-selftest.ps1` drives a throw-away daemon instance (its own pipe, config folder and
-single-instance guard) through the whole engine and prints one line per check. It needs no admin
-rights and no Wallpaper Engine, G-Helper or Rainmeter:
+single-instance guard) through the whole engine and prints one line per check - 72 of them. It
+needs no Wallpaper Engine, G-Helper or Rainmeter, but it does need an **elevated** shell: the
+executable carries a manifest that asks for administrator, so the runs it starts would raise a
+UAC prompt. A harness that is not elevated **skips** the command-line probes and prints why.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1
