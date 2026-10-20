@@ -15,7 +15,7 @@ log = { version = "0.4.28", features = ["std"] }
 crossbeam-channel = "0.5.17"
 interprocess = "2.4.5"
 tray-icon = "0.26.1"
-# Spec 3: packs may carry a script that the daemon interprets (sandboxed, whitelisted host API).
+# Spec 2: packs may carry a script that the daemon interprets (sandboxed, whitelisted host API).
 # Kept in `armoury` only, so the core and the GUI never link the interpreter.
 rhai = { version = "1.26", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

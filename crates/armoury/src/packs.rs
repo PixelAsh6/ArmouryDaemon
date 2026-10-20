@@ -1044,7 +1044,7 @@ fn json_pointer(path: &str, pointer: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Host API for scripts (spec 3) and the load-time script check
+// Host API for scripts (spec 2) and the load-time script check
 
 /// `ctx.run_cli(exe, args)` — same rules as a `cli` step: direct spawn, no shell.
 pub(crate) fn script_cli(exe: &str, args: &[String]) -> Result<(), String> {

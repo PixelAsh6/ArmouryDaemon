@@ -1,4 +1,4 @@
-//! Spec 3 — scripted packs (Rhai).
+//! Spec 2 — scripted packs (Rhai).
 //!
 //! A pack may carry a script in `script.apply` / `script.revert`. The **pack never executes it**:
 //! the daemon compiles the source, runs it in a fresh Rhai engine with hard limits, and exposes only
