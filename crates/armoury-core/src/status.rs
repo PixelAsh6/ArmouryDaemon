@@ -46,7 +46,8 @@ pub struct StatusSnapshot {
     pub paused: bool,
     #[serde(default)]
     pub killswitch_active: bool,
-    /// How many tracked apps the killswitch is currently hiding/muting.
+    /// How many tracked apps the killswitch is currently hiding/muting — the distinct
+    /// processes it has hidden a window for or muted a session for. 0 when it is off.
     #[serde(default)]
     pub killswitch_count: u32,
     /// Idle overlay state.

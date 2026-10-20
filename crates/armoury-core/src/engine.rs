@@ -19,6 +19,9 @@
 //!   lockout: they change the packs at once, drop a running lockout and start none. Unpausing is
 //!   the one exception: with nothing running it schedules the revert, so a lockout is started to
 //!   time that revert.
+//! - The engine only believes a change when the daemon really performed it: a transition the
+//!   daemon drops (the packs are paused) is handed back to the engine, which goes back to the
+//!   state the machine is in. The intent is kept, so the change happens later, not never.
 //!
 //! Deliberately free of Windows/clock dependencies so it can be unit-tested.
 
@@ -181,6 +184,19 @@ impl Engine {
         } else {
             None
         }
+    }
+
+    /// The daemon could not perform the transition it asked for (the packs are paused and the
+    /// transition was not one of the user's own actions). The machine is still in the state it
+    /// was in, so the engine goes back to it: `applied` may only change when the daemon really
+    /// did the change. The intent is kept — the change is deferred, not dropped — and the
+    /// lockout the change started is dropped with it, because nothing happened.
+    pub fn transition_not_performed(&mut self, t: Transition) {
+        match t {
+            Transition::Applied => self.applied = false,
+            Transition::Reverted => self.applied = true,
+        }
+        self.lock_until = None;
     }
 
     /// A tracked app was removed from the user's list: forget it entirely. This is a manual
@@ -494,6 +510,30 @@ mod tests {
         assert!(!e.is_applied());
         assert_eq!(e.state(now), EngineState::Idle);
         assert_eq!(e.cooldown_remaining(now), None);
+    }
+
+    #[test]
+    fn a_transition_the_daemon_could_not_perform_is_undone() {
+        // The daemon asks for the change, then drops it (the packs are paused): the machine
+        // did not change, so the engine must not believe it did.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert!(e.is_applied());
+
+        // the revert the daemon could not perform
+        e.transition_not_performed(Transition::Reverted);
+        assert!(e.is_applied(), "the packs are still applied");
+        assert_eq!(e.cooldown_remaining(now), None, "no change, no lockout");
+
+        // the apply the daemon could not perform
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert_eq!(e.set_idle(true), Some(Transition::Reverted));
+        assert_eq!(e.set_idle(false), Some(Transition::Applied));
+        assert!(e.is_applied());
+        e.transition_not_performed(Transition::Applied);
+        assert!(!e.is_applied(), "the packs were never applied");
     }
 
     #[test]

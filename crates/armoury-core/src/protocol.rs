@@ -27,8 +27,6 @@ pub enum Request {
     SetIdleFailsafe { enabled: bool, minutes: u64 },
     /// Change the revert cooldown.
     SetCooldown { seconds: u64 },
-    /// The user moved the dashboard: remember its top-left (logical points).
-    SetUiPosition { x: f32, y: f32 },
     /// Install a pack from a local `pack.json` (or a folder holding one).
     InstallPack { source: String },
     /// Remove an installed pack (its folder under `<install>\packs`).
@@ -267,26 +265,6 @@ mod tests {
         assert!(matches!(req, Request::InstallPack { .. }));
         let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(resp, Response::PackOp { ok: false, .. }));
-    }
-
-    #[test]
-    fn roundtrip_ui_position() {
-        let mut out = Vec::new();
-        write_msg(
-            &mut out,
-            &Request::SetUiPosition {
-                x: 10.5,
-                y: -20.0,
-            },
-        )
-        .unwrap();
-        let back: Request = read_msg(&mut &out[..], &mut String::new()).unwrap().unwrap();
-        match back {
-            Request::SetUiPosition { x, y } => {
-                assert!((x - 10.5).abs() < 0.001 && (y + 20.0).abs() < 0.001);
-            }
-            other => panic!("wrong variant: {other:?}"),
-        }
     }
 
     #[test]

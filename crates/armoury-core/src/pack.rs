@@ -10,7 +10,6 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::time::Duration;
 
 fn default_spec() -> u32 {
     1
@@ -446,20 +445,60 @@ impl Pack {
                         ));
                     }
                 }
+                // A `when` that names something the pack does not have would never match, and
+                // the step would vanish silently while the pack reports success.
+                if let Some(when) = &step.when {
+                    match when.source.as_str() {
+                        "setting" => {
+                            if let Some(key) = &when.key {
+                                if !self.settings.iter().any(|s| &s.key == key) {
+                                    errs.push(format!(
+                                        "{block} step {i}: when.key '{key}' is not one of the pack's settings"
+                                    ));
+                                }
+                            } else if self.settings.is_empty() {
+                                errs.push(format!(
+                                    "{block} step {i}: when.source 'setting' needs a key — the pack has no settings"
+                                ));
+                            }
+                        }
+                        "captured" => match &when.key {
+                            Some(key) if self.capture.iter().any(|c| &c.key == key) => {}
+                            Some(key) => errs.push(format!(
+                                "{block} step {i}: when.key '{key}' is not one of the pack's captures"
+                            )),
+                            None => errs.push(format!(
+                                "{block} step {i}: when.source 'captured' needs the key of a capture"
+                            )),
+                        },
+                        other => errs.push(format!(
+                            "{block} step {i}: when.source '{other}' is not 'setting' or 'captured'"
+                        )),
+                    }
+                }
+                // The same for a hotkey step: the map key comes from one of the pack's own
+                // settings or captures, so a typo there would send nothing at all.
+                if step.mechanism == "hotkey" {
+                    if let Some(expr) = &step.keys_from_mode {
+                        for key in settings_in(expr) {
+                            if !self.settings.iter().any(|s| s.key == key) {
+                                errs.push(format!(
+                                    "{block} step {i}: keys_from_mode names the setting '{key}', which the pack does not have"
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(key) = &step.keys_from_captured
+                        && !self.capture.iter().any(|c| &c.key == key)
+                    {
+                        errs.push(format!(
+                            "{block} step {i}: keys_from_captured '{key}' is not one of the pack's captures"
+                        ));
+                    }
+                }
             }
         }
         errs
-    }
-
-    /// The value of the pack's single dropdown for a given user config.
-    pub fn setting_value(&self, values: &HashMap<String, String>) -> Option<(String, String)> {
-        let setting = self.settings.first()?;
-        let value = values
-            .get(&setting.key)
-            .cloned()
-            .or_else(|| setting.default.clone())
-            .unwrap_or_default();
-        Some((setting.key.clone(), value))
     }
 
     /// Parse a pack and reject it if invalid.
@@ -474,9 +513,21 @@ impl Pack {
     }
 }
 
-/// Parse a duration in seconds, at least 1 s.
-pub fn cooldown_from_secs(secs: u64) -> Duration {
-    Duration::from_secs(secs.max(1))
+/// The setting keys a template refers to: `{{settings.mode}}` -> ["mode"].
+fn settings_in(template: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            break;
+        };
+        if let Some(key) = after[..end].trim().strip_prefix("settings.") {
+            keys.push(key.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    keys
 }
 
 #[cfg(test)]
@@ -605,6 +656,93 @@ mod tests {
             .validate()
             .iter()
             .any(|e| e.contains("needs an exe_map")));
+    }
+
+    #[test]
+    fn a_when_clause_must_name_something_the_pack_has() {
+        // A `when` that names a setting or a capture the pack does not have would never
+        // match: the step would vanish silently while the pack reports success.
+        let mut pack = Pack::parse(WE).unwrap();
+        pack.apply.steps[0].when = Some(When {
+            source: "setting".into(),
+            key: Some("nope".into()),
+            equals: Some("stop".into()),
+            not_equals: None,
+        });
+        let errs = pack.validate();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("when.key 'nope'") && e.contains("settings")),
+            "{errs:?}"
+        );
+
+        // an unknown source never matches either
+        let mut pack = Pack::parse(WE).unwrap();
+        pack.apply.steps[0].when = Some(When {
+            source: "weather".into(),
+            key: None,
+            equals: Some("sunny".into()),
+            not_equals: None,
+        });
+        assert!(pack
+            .validate()
+            .iter()
+            .any(|e| e.contains("when.source 'weather'")));
+
+        // a captured value the pack never captures
+        let mut pack = Pack::parse(GH).unwrap();
+        pack.revert.steps[0].when = Some(When {
+            source: "captured".into(),
+            key: Some("prev_moide".into()),
+            equals: Some("1".into()),
+            not_equals: None,
+        });
+        assert!(pack
+            .validate()
+            .iter()
+            .any(|e| e.contains("when.key 'prev_moide'") && e.contains("captures")));
+
+        // a captured `when` without a key can never match
+        let mut pack = Pack::parse(GH).unwrap();
+        pack.revert.steps[0].when = Some(When {
+            source: "captured".into(),
+            key: None,
+            equals: Some("1".into()),
+            not_equals: None,
+        });
+        assert!(pack
+            .validate()
+            .iter()
+            .any(|e| e.contains("when.source 'captured' needs the key")));
+    }
+
+    #[test]
+    fn a_hotkey_step_must_take_its_key_from_the_packs_own_settings_or_captures() {
+        // keys_from_mode names a setting: a typo there sends nothing at all
+        let mut pack = Pack::parse(GH).unwrap();
+        pack.apply.steps[0].keys_from_mode = Some("{{settings.mod}}".into());
+        let errs = pack.validate();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("keys_from_mode") && e.contains("'mod'")),
+            "{errs:?}"
+        );
+
+        // keys_from_captured names a capture
+        let mut pack = Pack::parse(GH).unwrap();
+        pack.revert.steps[0].keys_from_captured = Some("prev_moide".into());
+        let errs = pack.validate();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("keys_from_captured 'prev_moide'")),
+            "{errs:?}"
+        );
+
+        // the shipped packs still pass
+        for text in [WE, GH, RM] {
+            let pack = Pack::parse(text).unwrap();
+            assert!(pack.validate().is_empty(), "{}", pack.id);
+        }
     }
 
     #[test]

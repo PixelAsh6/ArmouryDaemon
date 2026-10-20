@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{
-    DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eMultimedia, eRender,
+    DEVICE_STATE_ACTIVE, IMMDevice, IMMDeviceEnumerator, MMDeviceEnumerator, eRender,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -671,17 +671,6 @@ pub fn recover_if_needed() {
              listed)",
             ledger.devices.len()
         );
-    }
-}
-
-/// Mute state of the default output device (used by the drill).
-#[allow(dead_code)]
-pub fn default_device_muted() -> Option<bool> {    unsafe {
-        let enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let device = enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok()?;
-        let volume = device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None).ok()?;
-        volume.GetMute().ok().map(|b| b.as_bool())
     }
 }
 

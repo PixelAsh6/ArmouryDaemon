@@ -221,6 +221,12 @@ pub fn run() {
 
     let (icon_rgba, icon_w, icon_h) = armoury_core::icon::rgba_icon(32);
 
+    // The running-app list is expensive (a process-table walk plus a query per process),
+    // so a worker thread keeps it fresh and the egui thread only reads the latest
+    // snapshot. The worker stops when the UI closes.
+    let apps: AppSlot = Arc::new(Mutex::new(None));
+    let apps_worker = AppListWorker::start(&apps);
+
     // Geometry is computed before the window exists: the very first frame is already in
     // the final spot, because eframe reveals the window right after its first frame.
     // The dashboard always opens at the work area's bottom-right corner, above the tray.
@@ -254,6 +260,8 @@ pub fn run() {
                 req_rx,
                 // Nothing is restored: the dashboard always opens in the corner.
                 start_anchor(),
+                apps,
+                apps_worker,
             ));
             Ok(app)
         }),
@@ -269,9 +277,11 @@ struct App {
     pick_rx: Receiver<Picked>,
     /// Requests raised by child viewports (settings / pack windows).
     req_rx: Receiver<Request>,
-    /// Running apps offered in the picker (title, exe path).
-    apps: Vec<(String, String)>,
-    apps_refreshed: Instant,
+    /// The running apps offered in the picker (title, exe path). The worker publishes
+    /// the latest snapshot here; the egui thread only ever reads it.
+    apps: AppSlot,
+    /// The worker that keeps that list fresh. It stops when the UI closes.
+    apps_worker: AppListWorker,
     /// Search text for the running-app picker.
     pick_query: String,
     pick_tx: crossbeam_channel::Sender<Picked>,
@@ -284,10 +294,6 @@ struct App {
     /// somewhere else was moved by the user - not by our own resize, which also changes the
     /// position.
     placement: Placement,
-    /// Last position the daemon was told about (avoid a request every frame).
-    last_sent_pos: Option<egui::Pos2>,
-    /// When the window last moved, so the position is only saved after it settles.
-    still_since: Instant,
 }
 
 impl App {
@@ -299,6 +305,8 @@ impl App {
         pick_rx: Receiver<Picked>,
         req_rx: Receiver<Request>,
         anchor: Option<egui::Pos2>,
+        apps: AppSlot,
+        apps_worker: AppListWorker,
     ) -> Self {
         Self {
             rx,
@@ -307,16 +315,14 @@ impl App {
             pick_tx,
             pick_rx,
             req_rx,
-            apps: Vec::new(),
-            apps_refreshed: Instant::now() - Duration::from_secs(60),
+            apps,
+            apps_worker,
             pick_query: String::new(),
             styled: false,
             last_desired: None,
             // `None` = the automatic bottom corner; `Some` once the user dragged it away.
             anchor,
             placement: Placement::default(),
-            last_sent_pos: None,
-            still_since: Instant::now(),
         }
     }
 
@@ -457,11 +463,8 @@ impl eframe::App for App {
             });
         }
 
-        // Keep the running-app list fresh for the picker (~2 s is plenty).
-        if self.apps_refreshed.elapsed() >= Duration::from_secs(2) {
-            self.apps_refreshed = Instant::now();
-            self.apps = list_running_apps();
-        }
+        // The running-app list is refreshed by the worker, not here: the walk costs
+        // ~13 ms and would stall the thread that draws this window.
 
         // Keep the window live: pipe updates arrive at ~1 Hz, so the dashboard repaints once
         // a second. The settings window needs a faster beat while it is open, so typing in
@@ -487,6 +490,11 @@ impl eframe::App for App {
         if install_packs_open {
             ctx.request_repaint_after_for(Duration::from_millis(150), install_packs_viewport_id());
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // The UI is closing: the running-app worker must not outlive it.
+        self.apps_worker.stop();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -784,10 +792,15 @@ impl eframe::App for App {
             });
 
             // Live results for what was typed. Enter (or a click) takes the single match.
+            // The list is the worker's latest snapshot: reading it never blocks.
             let query = self.pick_query.trim().to_ascii_lowercase();
             if !query.is_empty() {
-                let matches: Vec<(String, String, String)> = self
-                    .apps
+                let apps = read_apps(&self.apps);
+                let list: &[(String, String)] = match &apps {
+                    Some(list) => list.as_slice(),
+                    None => &[],
+                };
+                let matches: Vec<(String, String, String)> = list
                     .iter()
                     .filter(|(_, exe)| !tracked.iter().any(|a| a.exe.eq_ignore_ascii_case(exe)))
                     .map(|(title, exe)| (file_name(exe), exe.clone(), title.clone()))
@@ -798,7 +811,7 @@ impl eframe::App for App {
                     .collect();
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if matches.is_empty() {
-                    ui.small("No running app matches — it has to be open, or use Browse…");
+                    ui.small(no_match_message(apps.is_some()));
                 } else {
                     for (name, exe, title) in matches.iter().take(8) {
                         let label = if title.is_empty() {
@@ -1025,20 +1038,13 @@ impl eframe::App for App {
                         Spot::Dragged(at) => {
                             // The user dragged it away from the automatic corner: anchor it there.
                             self.anchor = Some(at);
-                            self.still_since = Instant::now();
                         }
                     }
                 }
                 Some(prev) => {
                     if (pos - prev).length() > 2.0 {
+                        // The user moved it: anchor it there.
                         self.anchor = Some(pos);
-                        self.still_since = Instant::now();
-                    } else if self.still_since.elapsed() >= Duration::from_secs(1)
-                        && self.last_sent_pos != Some(pos)
-                    {
-                        // Remember it once it has stopped moving (the daemon owns config.json).
-                        self.last_sent_pos = Some(pos);
-                        self.request(&Request::SetUiPosition { x: pos.x, y: pos.y });
                     }
                 }
             }
@@ -2891,6 +2897,107 @@ fn pick_dialog(kind: Picker) -> Option<PathBuf> {
     }
 }
 
+/// The running apps the picker offers: (window title, exe path).
+type AppList = Arc<Vec<(String, String)>>;
+/// Where the worker publishes the latest list. `None` until the first refresh lands.
+type AppSlot = Arc<Mutex<Option<AppList>>>;
+
+/// How often the worker refreshes the running-app list (~2 s is plenty).
+const APPS_REFRESH_EVERY: Duration = Duration::from_secs(2);
+
+/// Publish the latest list into the slot. The slot holds one snapshot, never a queue.
+fn publish_apps(slot: &AppSlot, list: Vec<(String, String)>) {
+    *slot.lock().unwrap() = Some(Arc::new(list));
+}
+
+/// The latest published list, or `None` while the first refresh has not landed yet.
+fn read_apps(slot: &AppSlot) -> Option<AppList> {
+    slot.lock().unwrap().clone()
+}
+
+/// What the picker says when nothing matches. While the list is still being built
+/// "no match" would be a lie: the app may well be running.
+fn no_match_message(ready: bool) -> &'static str {
+    if ready {
+        "No running app matches — it has to be open, or use Browse…"
+    } else {
+        "Looking for running apps…"
+    }
+}
+
+/// The worker that keeps the running-app list fresh.
+///
+/// Building the list costs a process-table walk plus a query per process (~13 ms), and it
+/// is only needed by the add-app picker. So it is built here, on a worker thread, and the
+/// egui thread only reads the latest snapshot - it never waits for the walk.
+///
+/// The worker stops when the UI closes: it is woken up at once and ends its loop.
+struct AppListWorker {
+    /// Asks the worker to stop.
+    stop: Option<crossbeam_channel::Sender<()>>,
+    /// Says the worker has ended.
+    done: Option<crossbeam_channel::Receiver<()>>,
+    /// The worker's thread.
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl AppListWorker {
+    /// Start the worker: it publishes a fresh list every `APPS_REFRESH_EVERY`, starting
+    /// right away so the picker is not empty for the first seconds.
+    fn start(slot: &AppSlot) -> Self {
+        let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let slot = Arc::clone(slot);
+        let join = thread::spawn(move || {
+            loop {
+                let list = list_running_apps();
+                publish_apps(&slot, list);
+                match stop_rx.recv_timeout(APPS_REFRESH_EVERY) {
+                    // Asked to stop, or nobody is listening any more.
+                    Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                    // The time is up: refresh again.
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                }
+            }
+            log::info!("the running-app worker stopped");
+            let _ = done_tx.send(());
+        });
+        Self {
+            stop: Some(stop_tx),
+            done: Some(done_rx),
+            join: Some(join),
+        }
+    }
+
+    /// Ask the worker to stop. It is woken up at once.
+    fn stop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.try_send(());
+        }
+    }
+
+    /// Wait for the worker to end. `true` when it is gone.
+    fn wait_stopped(&mut self, limit: Duration) -> bool {
+        let Some(rx) = &self.done else {
+            return true;
+        };
+        if rx.recv_timeout(limit).is_err() {
+            return false;
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        true
+    }
+}
+
+impl Drop for AppListWorker {
+    fn drop(&mut self) {
+        // The UI is gone: the worker must not outlive it.
+        self.stop();
+    }
+}
+
 /// Every running process: (window title or empty, exe path), deduplicated by path.
 /// The picker lists all of them (user decision 2026-10-18) — background apps like G-Helper have no
 /// window at all, and they are exactly the kind of thing people want to track.
@@ -4400,5 +4507,60 @@ mod tests {
         output.drop_without_applying_deltas();
         let title = ctx.viewport_for(id, |state| state.builder.title.clone());
         assert!(title.is_none(), "the settings window is still open");
+    }
+
+    /// Wait until the worker has published a list (or the time is up).
+    fn wait_for_apps(slot: &AppSlot, limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if read_apps(slot).is_some() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        false
+    }
+
+    #[test]
+    fn the_running_app_list_hands_over_the_latest_value() {
+        // The slot holds one snapshot, never a queue: a new list replaces the old one,
+        // so a slow egui thread cannot make the picker fall behind.
+        let slot: AppSlot = Arc::new(Mutex::new(None));
+        // Nothing has landed yet: the picker says the list is still being built.
+        assert!(read_apps(&slot).is_none());
+        assert_eq!(no_match_message(false), "Looking for running apps…");
+        publish_apps(
+            &slot,
+            vec![("first".to_string(), "C:\\first.exe".to_string())],
+        );
+        publish_apps(
+            &slot,
+            vec![("second".to_string(), "C:\\second.exe".to_string())],
+        );
+        let latest = read_apps(&slot).expect("the list has landed");
+        assert_eq!(latest.len(), 1, "the slot holds one snapshot, not a queue");
+        assert_eq!(latest[0].1, "C:\\second.exe", "the latest value wins");
+        assert_eq!(
+            no_match_message(true),
+            "No running app matches — it has to be open, or use Browse…"
+        );
+    }
+
+    #[test]
+    fn the_running_app_worker_publishes_the_list_and_stops() {
+        // The list is built off the egui thread: the worker publishes it by itself, and
+        // the UI only reads it.
+        let slot: AppSlot = Arc::new(Mutex::new(None));
+        let mut worker = AppListWorker::start(&slot);
+        assert!(
+            wait_for_apps(&slot, Duration::from_secs(10)),
+            "the worker published no list"
+        );
+        // The UI closes: the worker must end instead of lingering.
+        worker.stop();
+        assert!(
+            worker.wait_stopped(Duration::from_secs(5)),
+            "the worker did not stop"
+        );
     }
 }

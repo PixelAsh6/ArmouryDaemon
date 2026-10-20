@@ -16,7 +16,9 @@ serde_json.workspace = true
 crossbeam-channel.workspace = true
 interprocess.workspace = true
 tray-icon.workspace = true
-windows = { workspace = true, features = ["Win32_System_WindowsProgramming", "Win32_Security_Authorization"] }
+# Win32_System_TaskScheduler: the scheduled task the daemon registers for itself.
+# Win32_System_Ole: the VARIANT the task scheduler's API takes.
+windows = { workspace = true, features = ["Win32_System_WindowsProgramming", "Win32_Security_Authorization", "Win32_System_TaskScheduler", "Win32_System_Ole"] }
 windows-sys.workspace = true
 eframe.workspace = true
 rhai.workspace = true

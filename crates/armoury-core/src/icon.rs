@@ -99,6 +99,29 @@ fn seg(px: f32, py: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> f32 {    let dx 
     ((px - qx).powi(2) + (py - qy).powi(2)).sqrt()
 }
 
+/// An HICON and who owns it. The two ways the shell hands one out are not the same: the
+/// image list gives out a *copy* (ours to destroy), while `SHGFI_ICON` gives out the
+/// shell's own icon (shared with the whole system, never to be destroyed).
+enum ShellIcon {
+    /// A copy from the system image list: the caller owns it and must destroy it.
+    Owned(windows::Win32::UI::WindowsAndMessaging::HICON),
+    /// The shell's own icon: shared, the caller must leave it alone.
+    Shared(windows::Win32::UI::WindowsAndMessaging::HICON),
+}
+
+impl ShellIcon {
+    fn handle(&self) -> windows::Win32::UI::WindowsAndMessaging::HICON {
+        match self {
+            ShellIcon::Owned(h) | ShellIcon::Shared(h) => *h,
+        }
+    }
+
+    /// May the caller destroy this handle?
+    fn owned(&self) -> bool {
+        matches!(self, ShellIcon::Owned(_))
+    }
+}
+
 /// The executable's shell icon as straight-alpha RGBA, ready for
 /// `egui::ColorImage::from_rgba_unmultiplied`. Prefers the 256 px "jumbo" icon from the
 /// system image list and falls back to the classic 32 px large icon; `None` when the file
@@ -121,7 +144,7 @@ pub fn exe_icon_rgba(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
 
 /// The best HICON the shell offers for `path`: the jumbo (256 px) entry of the system image
 /// list when available, else the plain large icon.
-fn extract_hicon(path: &Path) -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
+fn extract_hicon(path: &Path) -> Option<ShellIcon> {
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
     use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
@@ -151,12 +174,13 @@ fn extract_hicon(path: &Path) -> Option<windows::Win32::UI::WindowsAndMessaging:
         if ok != 0 {
             if let Ok(list) = SHGetImageList::<IImageList>(SHIL_JUMBO as i32) {
                 if let Ok(hicon) = list.GetIcon(info.iIcon, ILD_TRANSPARENT.0) {
-                    return Some(hicon);
+                    return Some(ShellIcon::Owned(hicon));
                 }
             }
         }
 
-        // 2. fallback: the classic large icon straight from the shell.
+        // 2. fallback: the classic large icon straight from the shell. This handle belongs to
+        // the shell — destroying it would pull the icon out of every window that shows it.
         let mut info = SHFILEINFOW::default();
         let ok = SHGetFileInfoW(
             p,
@@ -168,14 +192,14 @@ fn extract_hicon(path: &Path) -> Option<windows::Win32::UI::WindowsAndMessaging:
         if ok == 0 || info.hIcon.0.is_null() {
             return None;
         }
-        Some(info.hIcon)
+        Some(ShellIcon::Shared(info.hIcon))
     }
 }
 
 /// HICON -> straight-alpha RGBA: draw the icon through a 32-bit image list onto a top-down
 /// DIB section (the MS-sanctioned path that keeps the alpha channel), then swap BGRA -> RGBA.
-/// Always destroys `hicon`.
-fn rasterize(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<(Vec<u8>, u32, u32)> {
+/// Destroys the handle only when it is ours to destroy.
+fn rasterize(icon: ShellIcon) -> Option<(Vec<u8>, u32, u32)> {
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection,
         DIB_RGB_COLORS, DeleteDC, DeleteObject, GetObjectW, HGDIOBJ, SelectObject,
@@ -186,6 +210,7 @@ fn rasterize(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<(V
     };
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
+    let hicon = icon.handle();
     unsafe {
         let out = (|| {
             // The icon's real size, from its own colour bitmap.
@@ -248,7 +273,11 @@ fn rasterize(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<(V
             let _ = ImageList_Destroy(Some(himl));
             out
         })();
-        let _ = DestroyIcon(hicon);
+        // Only a handle we made is ours to destroy: the shell's own icon is shared with
+        // every other window that shows it.
+        if icon.owned() {
+            let _ = DestroyIcon(hicon);
+        }
         out
     }
 }
@@ -298,5 +327,15 @@ mod tests {
         assert!(w >= 32 && h >= 32, "unexpected size {w}x{h}");
         assert_eq!(rgba.len(), (w * h * 4) as usize);
         assert!(rgba.chunks_exact(4).any(|p| p[3] > 0), "no opaque pixels");
+    }
+
+    #[test]
+    fn only_a_copy_of_an_icon_is_destroyed() {
+        // The image list hands out a copy (ours to destroy); the shell's own icon is
+        // shared with the whole system and must survive us.
+        use windows::Win32::UI::WindowsAndMessaging::HICON;
+        let handle = HICON::default();
+        assert!(ShellIcon::Owned(handle).owned());
+        assert!(!ShellIcon::Shared(handle).owned());
     }
 }

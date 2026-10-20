@@ -4,6 +4,7 @@
 use crate::art;
 use crate::console;
 use crate::hotkey;
+use crate::install;
 use crate::ipc;
 use crate::killswitch;
 use crate::overlay;
@@ -45,8 +46,53 @@ const LAUNCH_GRACE: Duration = Duration::from_millis(600);
 /// How long a fresh console launcher gets to show its band. Until the band is up the
 /// launcher has no window on screen, and that is not yet a stale launcher.
 const CONSOLE_GRACE: Duration = Duration::from_secs(10);
+/// Entering and leaving idle mode are the user's own actions: they change the packs even
+/// while the daemon is paused (the pause stops *automatic* switching, not the user's own
+/// actions). Entering and leaving must behave the same, or the packs would stay reverted
+/// after the user leaves idle mode.
+const IDLE_IS_FORCED: bool = true;
 
-pub fn run(show_ui_when_running: bool) {
+/// How this daemon was started.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Start {
+    /// A user started it (a double-click, the tray, a second instance). The dashboard may
+    /// open itself on the first run.
+    Manual,
+    /// The scheduled task started it (logon, resume from sleep). It must not disturb the
+    /// user: nothing visible happens.
+    Autostart,
+}
+
+/// Why the band is being opened.
+///
+/// An automatic open (the daemon starts, the machine resumes from sleep, the open mode
+/// changes) must never interrupt a game: it is refused while a tracked app is running. An
+/// explicit open (the tray's "Console mode", the dashboard's console button) always opens
+/// the band - the user asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleOpen {
+    /// The daemon did it on its own: startup, resume from sleep, a change of the mode.
+    Automatic,
+    /// The user asked for it.
+    Explicit,
+}
+
+/// May the band open right now?
+///
+/// An automatic open is refused while a tracked app is running - the band would pop up
+/// over the game. An explicit one always opens the band: the user asked for it, and the
+/// user can close the game themselves.
+fn console_open_allowed(reason: ConsoleOpen, tracked_running: bool) -> bool {
+    match reason {
+        ConsoleOpen::Automatic => !tracked_running,
+        ConsoleOpen::Explicit => true,
+    }
+}
+
+pub fn run(start: Start) {
+    // The scheduler (logon, resume) must never disturb a daemon that is already up, and
+    // it must never open a window by itself.
+    let show_ui_when_running = start == Start::Manual;
     if let Err(e) = armoury_core::logging::init("daemon") {
         eprintln!("logging init failed: {e}");
     }
@@ -78,6 +124,17 @@ pub fn run(show_ui_when_running: bool) {
     // from a previous run that died while idle.
     killswitch::init_com();
     overlay::recover_if_needed();
+
+    // ---- the autostart task ----
+    // The daemon registers the task for itself when there is none, so the executable
+    // works on its own: a user who downloaded only ArmouryDaemon.exe still comes up at
+    // every logon and after every resume from sleep. It is quick, it does nothing when
+    // the task is already there, and it never touches a task that runs another program.
+    if install::is_test_instance() {
+        info!("autostart: skipped — this is a throw-away instance (ARMOURY_TEST_NS)");
+    } else if let Some(exe) = std::env::current_exe().ok() {
+        install::check_and_register(&exe);
+    }
 
     // ---- config ----
     let cfg = armoury_core::config::load_or_create().unwrap_or_else(|e| {
@@ -148,7 +205,19 @@ pub fn run(show_ui_when_running: bool) {
 
     // ---- packs ----
     let search = pack_search_dirs();
+    // A fresh install has no packs yet: the folder is created so the packs have
+    // somewhere to land, and the daemon starts with an empty list instead of failing.
+    if let Some(created) = packs::ensure_packs_dir(&search) {
+        info!(
+            "packs: created {} — no packs are installed yet",
+            created.display()
+        );
+    }
     let mut installed = packs::load(&search);
+    let no_packs = installed.is_empty();
+    if no_packs {
+        info!("packs: none installed — install them from the settings window");
+    }
     enrich_rainmeter(&mut installed);
 
     let pack_catalog: Vec<PackMeta> = build_catalog(&installed);
@@ -275,10 +344,27 @@ pub fn run(show_ui_when_running: bool) {
         info!("starting paused (packs will not switch until resumed)");
     }
     info!("daemon ready");
+    // ---- the first run: the dashboard opens itself ----
+    // A user who downloaded only the executable lands on the dashboard instead of having
+    // to know that there is a tray icon. It opens once: the marker remembers it, so the
+    // dashboard never comes back on its own and closing it is final.
+    let first_run_marker = install::first_run_marker();
+    if start == Start::Manual && no_packs && install::is_first_run(&first_run_marker) {
+        match install::mark_first_run_done(&first_run_marker) {
+            Ok(()) => {
+                info!("first run: opening the dashboard");
+                app.on_open();
+            }
+            Err(e) => warn!("first run: the marker could not be written ({e})"),
+        }
+    }
     app.ensure_art(); // tracked apps get their covers even before the console opens
     if app.cfg.console_open == CONSOLE_OPEN_ALWAYS {
-        info!("console: open mode 'always' — starting the launcher");
-        app.show_console();
+        // The startup open is an automatic one: the band must not pop up over a game.
+        // The engine knows nothing yet - the watcher's first samples reach the daemon
+        // through the main loop - so the running tracked apps are looked up directly.
+        info!("console: open mode 'always' — the launcher starts unless a tracked app is running");
+        app.open_console(ConsoleOpen::Automatic);
     }
 
     let quit = loop {
@@ -312,7 +398,9 @@ pub fn run(show_ui_when_running: bool) {
                     }
                 }
                 "killswitch" => app.toggle_killswitch(),
-                "console" => app.show_console(),
+                // The tray's "Console mode": the user asked for the band, so it opens even
+                // while a game is running.
+                "console" => app.open_console(ConsoleOpen::Explicit),
                 "quit" => {
                     info!("quit requested from tray menu");
                     // "Quit means close everything" (user decision 2026-10-18): put the apps back
@@ -398,6 +486,81 @@ fn basename_lower(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_else(|| path.to_ascii_lowercase())
+}
+
+/// Is one of the tracked apps running right now?
+///
+/// The watcher walks the process list once a second and tells the daemon what it finds —
+/// but its first samples only reach the daemon through the main loop, which has not started
+/// yet when the daemon opens the band at startup. So the daemon reads the process list
+/// itself, once, to answer the question that matters there: is a game running?
+fn tracked_app_running_now(cfg: &AppConfig) -> bool {
+    let wanted: Vec<String> = cfg
+        .tracked_apps
+        .iter()
+        .map(|app| basename_lower(&app.exe))
+        .collect();
+    if wanted.is_empty() {
+        return false;
+    }
+    running_process_names()
+        .iter()
+        .any(|name| wanted.iter().any(|w| w == name))
+}
+
+/// The file names of the running processes, lowercased.
+///
+/// The same walk the watcher does, only once: the daemon needs the answer before the main
+/// loop has seen the watcher's first sample.
+fn running_process_names() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut names = Vec::new();
+    let mut ok = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while ok {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        names.push(String::from_utf16_lossy(&entry.szExeFile[..len]).to_ascii_lowercase());
+        ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    names
+}
+
+/// Is the transition performed right now? A manual action (force) always is; an automatic one
+/// is suppressed while the packs are paused (the user's own switch, decision G12).
+fn transition_allowed(paused: bool, force: bool) -> bool {
+    !paused || force
+}
+
+/// Take the tracked app out of the list. Matching is by exe file name (the user's choice), so
+/// a client may send the full path it stored or only the file name. Returns the entries that
+/// were removed — empty when nothing matched.
+fn remove_tracked_apps(list: &mut Vec<TrackedApp>, wanted: &str) -> Vec<TrackedApp> {
+    let base = basename_lower(wanted);
+    let mut removed = Vec::new();
+    list.retain(|app| {
+        if basename_lower(&app.exe) == base {
+            removed.push(app.clone());
+            false
+        } else {
+            true
+        }
+    });
+    removed
 }
 
 /// Now, in unix seconds (the unit the journal and `LastError` use).
@@ -987,7 +1150,10 @@ impl App {
             cooldown_seconds: self.cfg.cooldown_seconds,
             paused: self.cfg.paused,
             killswitch_active: self.killswitch.is_active(),
-            killswitch_count: (self.running_pids.values().flatten().count()) as u32,
+            // The apps the killswitch is hiding/muting right now — from its own ledger, not
+            // from the list of running processes: an app that is merely running is not
+            // hidden, and a released killswitch hides nothing at all.
+            killswitch_count: self.killswitch.affected_apps() as u32,
             idle_active: self.overlay.is_active(),
             idle_monitors: self.overlay.monitor_count() as u32,
             idle_devices: self.overlay.muted_devices() as u32,
@@ -1118,12 +1284,15 @@ impl App {
         self.send_transition(t, false);
     }
 
-    /// `force` = a manual action (entering idle, removing the last tracked app) that must take
-    /// effect even while the daemon is paused (user decision 2026-10-18: pause stops *automatic*
-    /// switching, not the user's own actions).
+    /// `force` = a manual action (entering or leaving idle, removing the last tracked app)
+    /// that must take effect even while the daemon is paused (user decision 2026-10-18: pause
+    /// stops *automatic* switching, not the user's own actions).
     fn send_transition(&mut self, t: Transition, force: bool) {
-        if self.cfg.paused && !force {
+        if !transition_allowed(self.cfg.paused, force) {
             info!("paused — skipping the {:?} transition", t);
+            // The packs were not changed: the engine must not believe that they were, or the
+            // next trigger would find "already applied" and leave the machine wrong.
+            self.engine.transition_not_performed(t);
             self.broadcast_status();
             return;
         }
@@ -1412,22 +1581,23 @@ impl App {
     }
 
     fn remove_tracked_app(&mut self, exe: &str) {
-        let before = self.cfg.tracked_apps.len();
-        self.cfg
-            .tracked_apps
-            .retain(|a| !a.exe.eq_ignore_ascii_case(exe));
-        if self.cfg.tracked_apps.len() != before {
-            info!("tracked app removed: {exe}");
-            self.save_and_share_tracked();
-            // The entry is gone, so nothing holds the packs applied any more: removing the last
-            // tracked app reverts the packs at once. It is a manual action, so it bypasses the
-            // lockout (and the pause, G12) and leaves no lockout behind — the next tracked app
-            // may apply right away.
-            let key = basename_lower(exe);
-            if let Some(t) = self.engine.on_untracked(&key, Instant::now()) {
-                info!("tracked app removed — reverting the packs now");
-                self.send_transition(t, true);
-            }
+        // Matching is by file name, like the add path and the watcher: a client that sends
+        // back a rebuilt path removes the app just the same.
+        let base = basename_lower(exe);
+        let removed = remove_tracked_apps(&mut self.cfg.tracked_apps, exe);
+        if removed.is_empty() {
+            info!("tracked app not in the list (by name): {base}");
+            return;
+        }
+        info!("tracked app removed: {base}");
+        self.save_and_share_tracked();
+        // The entry is gone, so nothing holds the packs applied any more: removing the last
+        // tracked app reverts the packs at once. It is a manual action, so it bypasses the
+        // lockout (and the pause, G12) and leaves no lockout behind — the next tracked app
+        // may apply right away.
+        if let Some(t) = self.engine.on_untracked(&base, Instant::now()) {
+            info!("tracked app removed — reverting the packs now");
+            self.send_transition(t, true);
         }
     }
 
@@ -1490,7 +1660,7 @@ impl App {
         // action, so it happens even while paused.
         if let Some(t) = self.engine.set_idle(true) {
             info!("idle mode: tracked apps are normal apps again");
-            self.send_transition(t, true);
+            self.send_transition(t, IDLE_IS_FORCED);
         }
         self.broadcast_status();
     }
@@ -1505,10 +1675,12 @@ impl App {
         self.idle_deadline = None;
         self.last_idle_beat = None;
         self.idle_item.set_text("Idle mode");
-        // Idle over: re-apply if a tracked app is running at this moment (decision B8).
+        // Idle over: re-apply if a tracked app is running at this moment (decision B8). Like
+        // entering idle, this is a manual action: it goes through even while the daemon is
+        // paused, so the packs are not left reverted after the user leaves idle mode.
         if let Some(t) = self.engine.set_idle(false) {
             info!("idle mode over: a tracked app is running, applying the packs again");
-            self.on_transition(t);
+            self.send_transition(t, IDLE_IS_FORCED);
         }
         self.broadcast_status();
     }
@@ -1728,11 +1900,33 @@ impl App {
         if self.cfg.console_open == CONSOLE_OPEN_NEVER {
             return;
         }
-        if !self.engine.running_names().is_empty() {
-            info!("console mode: kept closed — a tracked app is running");
+        self.open_console(ConsoleOpen::Automatic);
+    }
+
+    /// Open the band, if the reason allows it.
+    ///
+    /// `reason` says who asked for it: an automatic open (the daemon started, the machine
+    /// resumed from sleep, the open mode changed) is refused while a tracked app is running
+    /// — the band would pop up over the game. An explicit open (the tray's "Console mode",
+    /// the dashboard's console button) always opens the band.
+    fn open_console(&mut self, reason: ConsoleOpen) {
+        // Only an automatic open has to look at what is running.
+        let tracked_running =
+            matches!(reason, ConsoleOpen::Automatic) && self.tracked_app_running();
+        if !console_open_allowed(reason, tracked_running) {
+            info!("console: kept closed — a tracked app is running");
             return;
         }
         self.show_console();
+    }
+
+    /// Is a tracked app running right now?
+    ///
+    /// The engine knows the apps the watcher has seen. Right after the start it knows none
+    /// of them yet — the watcher's first samples reach the daemon through the main loop,
+    /// which has not started yet — so the process list is read directly as well.
+    fn tracked_app_running(&self) -> bool {
+        !self.engine.running_names().is_empty() || tracked_app_running_now(&self.cfg)
     }
 
     /// Open the console launcher now (tray menu / settings preview / a fresh pad connect).
@@ -2064,7 +2258,9 @@ impl App {
                     }
                     self.ensure_art(); // the band is up: make sure its covers exist
                 }
-                Request::ShowConsole => self.show_console(),
+                // An explicit request over the pipe (the settings preview asks for the
+                // band): the user asked for it, so it opens even while a game is running.
+                Request::ShowConsole => self.open_console(ConsoleOpen::Explicit),
                 Request::SetConsoleOpen { mode } => {
                     let mode = normalize_console_open(&mode).to_string();
                     let changed = self.cfg.console_open != mode;
@@ -2077,7 +2273,8 @@ impl App {
                     }
                     // Selecting a mode is a trigger in its own right: a pad that is already
                     // connected never sends a connect event, and "always" should show the band
-                    // now rather than at the next daemon start.
+                    // now rather than at the next daemon start. It is an automatic open all
+                    // the same: a tracked app that is running keeps the band away.
                     let pad_present = pad::first_connected().is_some();
                     if mode == CONSOLE_OPEN_ALWAYS
                         || (mode != CONSOLE_OPEN_NEVER && pad_present)
@@ -2268,10 +2465,6 @@ impl App {
                     info!("cooldown set to {}s", self.cfg.cooldown_seconds);
                     self.broadcast_status();
                 }
-                Request::SetUiPosition { .. } => {
-                    // The dashboard always opens in the corner: the position is not kept, so the
-                    // request is accepted and dropped.
-                }
                 Request::SetIdleFailsafe { enabled, minutes } => {
                     self.cfg.idle_failsafe_enabled = enabled;
                     self.cfg.idle_failsafe_minutes = minutes.max(1);
@@ -2413,7 +2606,7 @@ fn pipe_sddl() -> String {
 
 /// The SID of the user this daemon runs as (the interactive user), as an SDDL trustee
 /// (`S-1-5-21-...`). The SDDL of a security descriptor only knows SIDs, not account names.
-fn current_user_sid() -> Option<String> {
+pub(crate) fn current_user_sid() -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -2469,7 +2662,7 @@ fn current_user_sid() -> Option<String> {
 }
 
 /// The name of the user this daemon runs as: the interactive user, whose process this is.
-fn current_user_name() -> Option<String> {
+pub(crate) fn current_user_name() -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::System::WindowsProgramming::GetUserNameW;
 
@@ -2673,6 +2866,42 @@ mod tests {
     }
 
     #[test]
+    fn an_automatic_open_is_refused_while_a_tracked_app_runs() {
+        // The band must not pop up over a game: an automatic open (the daemon starts, the
+        // machine resumes from sleep, the open mode changes) waits for the game to be gone.
+        assert!(
+            !console_open_allowed(ConsoleOpen::Automatic, true),
+            "an automatic open must not interrupt a running game"
+        );
+        assert!(console_open_allowed(ConsoleOpen::Automatic, false));
+    }
+
+    #[test]
+    fn an_explicit_open_always_opens_the_band() {
+        // The user asked for it (the tray's "Console mode", the dashboard's console
+        // button): the band opens even while a game is running.
+        assert!(
+            console_open_allowed(ConsoleOpen::Explicit, true),
+            "an explicit request must open the band"
+        );
+        assert!(console_open_allowed(ConsoleOpen::Explicit, false));
+    }
+
+    #[test]
+    fn a_daemon_without_tracked_apps_has_no_game_to_interrupt() {
+        let cfg = AppConfig::default();
+        assert!(cfg.tracked_apps.is_empty());
+        assert!(!tracked_app_running_now(&cfg));
+    }
+
+    #[test]
+    fn the_process_walk_finds_the_running_processes() {
+        // The walk is what the startup open of the band relies on: it has to see the
+        // process list at least once.
+        assert!(!running_process_names().is_empty());
+    }
+
+    #[test]
     fn a_console_launcher_that_exited_is_cleared() {
         assert_eq!(console_action(4242, true, false), ConsoleAction::Clear);
         // an exited launcher is cleared even when its band is gone as well
@@ -2789,5 +3018,124 @@ mod tests {
         armoury_core::protocol::write_msg(&mut client, &Request::GetStatus).expect("the request");
         let request = server.join().expect("the server thread");
         assert!(matches!(request, Some(Request::GetStatus)));
+    }
+
+    /// The daemon's side of the engine: what the packs really do, and the daemon's own rule
+    /// about when a transition is performed.
+    struct Machine {
+        engine: Engine,
+        /// What the packs actually do: true = applied.
+        applied: bool,
+        /// The daemon's pause switch.
+        paused: bool,
+    }
+
+    impl Machine {
+        /// The daemon's `send_transition`.
+        fn send(&mut self, t: Transition, force: bool) {
+            if !transition_allowed(self.paused, force) {
+                // The packs were not changed: the engine must not believe that they were.
+                self.engine.transition_not_performed(t);
+                return;
+            }
+            self.applied = match t {
+                Transition::Applied => true,
+                Transition::Reverted => false,
+            };
+        }
+    }
+
+    #[test]
+    fn leaving_idle_while_paused_applies_the_packs_again() {
+        // The dashboard showed "Triggered" while the packs were still reverted: leaving idle
+        // mode took the paused path, so the apply was dropped — and the engine believed it
+        // had happened, so nothing ever applied the packs again.
+        let now = Instant::now();
+        let mut m = Machine {
+            engine: Engine::new(Duration::from_secs(60)),
+            applied: false,
+            paused: false,
+        };
+
+        // a tracked app starts: the packs are applied
+        let t = m
+            .engine
+            .on_started("game.exe", "game.exe", 1, now)
+            .expect("the packs are applied");
+        m.send(t, false);
+        assert!(m.applied);
+
+        // the user pauses the switching
+        m.paused = true;
+        assert!(m.engine.set_paused(true, now).is_none());
+
+        // idle mode: the packs are reverted (a manual action, so it happens while paused)
+        let t = m.engine.set_idle(true).expect("idle reverts the packs");
+        m.send(t, IDLE_IS_FORCED);
+        assert!(!m.applied);
+        assert!(!m.engine.is_applied());
+
+        // idle mode ends: the packs are applied again — that is a manual action too
+        let t = m
+            .engine
+            .set_idle(false)
+            .expect("leaving idle applies the packs again");
+        m.send(t, IDLE_IS_FORCED);
+        assert!(m.applied, "leaving idle must apply the packs again");
+        assert_eq!(m.engine.is_applied(), m.applied, "the engine and the machine agree");
+
+        // and unpausing changes nothing
+        m.paused = false;
+        if let Some(t) = m.engine.set_paused(false, now) {
+            m.send(t, false);
+        }
+        assert!(m.applied, "the packs must be applied after the unpause");
+        assert_eq!(m.engine.is_applied(), m.applied, "the engine and the machine agree");
+    }
+
+    #[test]
+    fn a_transition_the_daemon_drops_leaves_the_engine_and_the_machine_alike() {
+        // The pause drops an automatic transition: the engine must not believe that the
+        // packs changed, or the next trigger would find "already applied" and do nothing.
+        let now = Instant::now();
+        let mut m = Machine {
+            engine: Engine::new(Duration::from_secs(60)),
+            applied: false,
+            paused: true,
+        };
+        m.engine.on_started("game.exe", "game.exe", 1, now);
+        // the transition the engine asks for, dropped by the pause
+        let t = Transition::Applied;
+        m.send(t, false);
+        assert!(!m.applied, "the machine did not change");
+        assert!(!m.engine.is_applied(), "and the engine knows it");
+    }
+
+    #[test]
+    fn a_tracked_app_is_removed_by_its_file_name() {
+        let mut list = vec![
+            TrackedApp {
+                name: "Demo".into(),
+                exe: "C:\\games\\demo.exe".into(),
+            },
+            TrackedApp {
+                name: "Other".into(),
+                exe: "C:\\games\\other.exe".into(),
+            },
+        ];
+        // a client that rebuilds the path removes the app just the same
+        let removed = remove_tracked_apps(&mut list, "D:\\copy\\DEMO.exe");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].name, "Demo");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "Other");
+
+        // the plain file name works too
+        let removed = remove_tracked_apps(&mut list, "other.exe");
+        assert_eq!(removed.len(), 1);
+        assert!(list.is_empty());
+
+        // a name that is not in the list removes nothing — and says so
+        assert!(remove_tracked_apps(&mut list, "nothing.exe").is_empty());
     }
 }

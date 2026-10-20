@@ -1,10 +1,12 @@
-//! ArmouryDaemon — single executable, five entry paths.
+//! ArmouryDaemon — single executable, six entry paths.
 //! Without arguments: the resident daemon (tray, hotkey, pipe server, UI lifecycle).
 //! With `--ui`: the on-demand GUI process (spawned by the daemon from this same file).
 //! With `--console`: the pad-driven console launcher (spawned by the daemon on a controller
 //! connect; the tray menu and the settings preview can open it too).
 //! With `--autostart`: the scheduled task's start — identical to the daemon, except that an
 //! already-running instance is left completely alone (no dashboard pops up on resume from sleep).
+//! With `--install`: register the autostart task and exit — the elevated copy of the daemon,
+//! started by the daemon itself when there is no task yet.
 //! With `--catalog-list` / `--catalog-install <id>`: pack-catalog maintenance, print and exit.
 //! With `--version` / `--help`: print and exit. Any other argument is an error, never a daemon.
 
@@ -16,6 +18,7 @@ mod console;
 mod console_ui;
 mod daemon;
 mod hotkey;
+mod install;
 mod ipc;
 mod killswitch;
 mod overlay;
@@ -41,12 +44,17 @@ fn main() {
     match parse_args(args.iter().cloned()) {
         Action::Run => {
             // The scheduler (logon, resume) must never disturb a daemon that is already up.
-            daemon::run(!is_autostart(&args));
+            daemon::run(if is_autostart(&args) {
+                daemon::Start::Autostart
+            } else {
+                daemon::Start::Manual
+            });
         }
         Action::Ui => ui::run(),
         Action::Console => console_ui::run(),
-        Action::CatalogList => catalog_list(catalog_url(&args)),
-        Action::CatalogInstall(ref id) => catalog_install(id, catalog_url(&args)),
+        Action::Install => install::install_self(),
+        Action::CatalogList(ref url) => catalog_list(url.clone()),
+        Action::CatalogInstall(ref id, ref url) => catalog_install(id, url.clone()),
         Action::CatalogUrl(ref url) => catalog_list(Some(url.clone())),
         Action::Version => print_line(&format!(
             "{} {}",
@@ -72,10 +80,13 @@ enum Action {
     Ui,
     /// The pad-driven console.
     Console,
-    /// List the packs of a catalog.
-    CatalogList,
-    /// Install one pack of a catalog.
-    CatalogInstall(String),
+    /// Register the autostart task and exit: the elevated copy of the daemon.
+    Install,
+    /// List the packs of a catalog. The URL is the one `--catalog-url` gave, if it was given.
+    CatalogList(Option<String>),
+    /// Install one pack of a catalog. The URL is the one `--catalog-url` gave, if it was
+    /// given.
+    CatalogInstall(String, Option<String>),
     /// Read the catalog from this manifest URL.
     CatalogUrl(String),
     /// Print the version.
@@ -90,10 +101,13 @@ enum Action {
 fn parse_args(args: impl Iterator<Item = String>) -> Action {
     let args: Vec<String> = args.collect();
     let mut list = false;
-    let mut install: Option<String> = None;
+    // The pack id of `--catalog-install`. It is not called `install`: that name belongs to
+    // the module above, and a local with the same name is a trap for the next reader.
+    let mut install_id: Option<String> = None;
     let mut url: Option<String> = None;
     let mut ui = false;
     let mut console = false;
+    let mut install_task = false;
     let mut help = false;
     let mut version = false;
     // A flag whose value is missing: reported after the scan, so that an argument the binary
@@ -109,12 +123,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
             "--autostart" => {}
             "--ui" => ui = true,
             "--console" => console = true,
+            "--install" => install_task = true,
             "--catalog-list" => list = true,
             "--version" | "-V" => version = true,
             "--help" | "-h" => help = true,
             "--catalog-install" => match args.get(index + 1) {
                 Some(value) if !value.starts_with('-') => {
-                    install = Some(value.clone());
+                    install_id = Some(value.clone());
                     index += 1;
                 }
                 _ => missing = missing.or_else(|| Some(format!("{arg} needs a pack id"))),
@@ -140,11 +155,11 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
     if version {
         return Action::Version;
     }
-    if let Some(id) = install {
-        return Action::CatalogInstall(id);
+    if let Some(id) = install_id {
+        return Action::CatalogInstall(id, url);
     }
     if list {
-        return Action::CatalogList;
+        return Action::CatalogList(url);
     }
     if let Some(url) = url {
         return Action::CatalogUrl(url);
@@ -155,6 +170,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
     if ui {
         return Action::Ui;
     }
+    if install_task {
+        return Action::Install;
+    }
     Action::Run
 }
 
@@ -163,20 +181,13 @@ fn is_autostart(args: &[String]) -> bool {
     args.iter().any(|arg| arg == "--autostart")
 }
 
-/// The manifest URL of `--catalog-url`, if the flag was given with one.
-fn catalog_url(args: &[String]) -> Option<String> {
-    args.iter()
-        .position(|arg| arg == "--catalog-url")
-        .and_then(|index| args.get(index + 1))
-        .cloned()
-}
-
 /// The flags this binary accepts, one line of help each. `parse_args` matches on the same
 /// names, and a test keeps the two in step.
 const FLAGS: &[(&str, &str)] = &[
     ("--autostart", "start the daemon without opening the dashboard"),
     ("--ui", "run the settings window"),
     ("--console", "run the pad-driven console"),
+    ("--install", "register the autostart task (logon + resume) and exit"),
     ("--catalog-list", "list the packs of the catalog and exit"),
     ("--catalog-install <id>", "install one pack from the catalog and exit"),
     ("--catalog-url <url>", "read the catalog from this manifest URL"),
@@ -331,18 +342,53 @@ mod tests {
     fn the_entry_paths_are_recognised() {
         assert_eq!(parse(&["--ui"]), Action::Ui);
         assert_eq!(parse(&["--console"]), Action::Console);
+        assert_eq!(parse(&["--install"]), Action::Install);
     }
 
     #[test]
     fn the_catalog_modes_are_recognised() {
-        assert_eq!(parse(&["--catalog-list"]), Action::CatalogList);
+        assert_eq!(parse(&["--catalog-list"]), Action::CatalogList(None));
         assert_eq!(
             parse(&["--catalog-install", "g-helper"]),
-            Action::CatalogInstall("g-helper".to_string())
+            Action::CatalogInstall("g-helper".to_string(), None)
         );
         assert_eq!(
             parse(&["--catalog-url", "https://host/catalog/index.json"]),
             Action::CatalogUrl("https://host/catalog/index.json".to_string())
+        );
+    }
+
+    #[test]
+    fn the_catalog_url_is_the_one_the_parser_took() {
+        // The URL travels with the action, so the reader and the parser cannot disagree.
+        let url = "https://host/catalog/index.json";
+        assert_eq!(
+            parse(&["--catalog-list", "--catalog-url", url]),
+            Action::CatalogList(Some(url.to_string()))
+        );
+        assert_eq!(
+            parse(&["--catalog-install", "g-helper", "--catalog-url", url]),
+            Action::CatalogInstall("g-helper".to_string(), Some(url.to_string()))
+        );
+        // given twice, the last one wins — in the parser and in the reader alike
+        assert_eq!(
+            parse(&[
+                "--catalog-url",
+                "https://first/index.json",
+                "--catalog-url",
+                "https://second/index.json"
+            ]),
+            Action::CatalogUrl("https://second/index.json".to_string())
+        );
+        assert_eq!(
+            parse(&[
+                "--catalog-list",
+                "--catalog-url",
+                "https://first/index.json",
+                "--catalog-url",
+                "https://second/index.json"
+            ]),
+            Action::CatalogList(Some("https://second/index.json".to_string()))
         );
     }
 
@@ -385,6 +431,7 @@ mod tests {
             "--autostart",
             "--ui",
             "--console",
+            "--install",
             "--catalog-list",
             "--catalog-install",
             "--catalog-url",
@@ -395,5 +442,37 @@ mod tests {
         ] {
             assert!(usage.contains(flag), "the usage must mention {flag}");
         }
+    }
+
+    #[test]
+    fn the_catalog_id_does_not_shadow_the_install_module() {
+        // The local of `--catalog-install` used to be called `install` - the same name as
+        // the module. It compiles (they live in different namespaces) and it is a trap for
+        // the next reader, so the rename is kept honest by this test.
+        //
+        // The lines are looked at one by one: a plain `contains` would find this test's
+        // own needles and prove nothing.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("main.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let lines: Vec<&str> = source.lines().map(|line| line.trim_start()).collect();
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.starts_with("let mut install:")),
+            "the local must not be called `install` any more: it shadows `mod install`"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("let mut install_id:")),
+            "the local must be called `install_id`"
+        );
+        assert!(
+            lines.iter().any(|line| *line == "mod install;"),
+            "the module must stay"
+        );
     }
 }

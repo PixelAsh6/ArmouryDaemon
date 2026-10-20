@@ -36,6 +36,11 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
 /// How many `config.json.bad.N` copies are kept before a timestamped name is used.
 const MAX_BACKUPS: usize = 5;
 
+/// Config keys this build does not understand any more: they are dropped when the file is
+/// read, so the next save writes the file without them. ("ui_position" was the dashboard's
+/// last position; the dashboard always opens in the corner and the field was never used.)
+const RETIRED_KEYS: &[&str] = &["ui_position"];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -58,9 +63,6 @@ pub struct AppConfig {
     /// Idle overlay safety cap: force-quit after `idle_failsafe_minutes`.
     pub idle_failsafe_enabled: bool,
     pub idle_failsafe_minutes: u64,
-    /// Where the dashboard was last left (logical points); `None` = the default bottom corner.
-    #[serde(default)]
-    pub ui_position: Option<[f32; 2]>,
     /// Pack catalog manifest URL; `None` = the official catalog.
     #[serde(default)]
     pub catalog_url: Option<String>,
@@ -98,7 +100,6 @@ impl Default for AppConfig {
             console_hidden: Vec::new(),
             idle_failsafe_enabled: true,
             idle_failsafe_minutes: 180,
-            ui_position: None,
             catalog_url: None,
             last_played: HashMap::new(),
             sgdb_api_key: None,
@@ -156,6 +157,12 @@ fn load_or_create_at(path: &Path) -> io::Result<AppConfig> {
     let text = fs::read_to_string(path)?;
     match serde_json::from_str::<AppConfig>(&text) {
         Ok(mut cfg) => {
+            // Keys this build used to keep and no longer understands are dropped, so the
+            // next save cleans them out of the file. Keys of a *newer* build are kept (see
+            // `extra`).
+            for key in RETIRED_KEYS {
+                cfg.extra.remove(*key);
+            }
             if cfg.schema_version > SUPPORTED_SCHEMA_VERSION {
                 log::warn!(
                     "config at {} has schema version {} — this build supports {SUPPORTED_SCHEMA_VERSION} and will not write the file back",
@@ -283,7 +290,6 @@ mod tests {
         let cfg: AppConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.cooldown_seconds, 60);
         assert_eq!(cfg.schema_version, SUPPORTED_SCHEMA_VERSION);
-        assert_eq!(cfg.ui_position, None);
         assert_eq!(cfg.catalog_url, None);
         assert_eq!(cfg.sgdb_api_key, None);
         assert!(cfg.console_apps.is_empty());
@@ -308,20 +314,6 @@ mod tests {
         let back: AppConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back.tracked_apps.len(), 1);
         assert_eq!(back.tracked_apps[0].exe, "demo.exe");
-    }
-
-    #[test]
-    fn ui_position_roundtrips_and_older_configs_still_load() {
-        let mut cfg = AppConfig::default();
-        cfg.ui_position = Some([120.0, 340.5]);
-        let text = serde_json::to_string(&cfg).unwrap();
-        let back: AppConfig = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.ui_position, Some([120.0, 340.5]));
-
-        // a config written before the field existed must still load (None, not an error)
-        let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
-        assert_eq!(old.cooldown_seconds, 30);
-        assert_eq!(old.ui_position, None);
     }
 
     #[test]
@@ -466,13 +458,39 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_key_is_dropped_when_the_config_is_read() {
+        // "ui_position" was the dashboard's last position. The field is gone, so the file
+        // must not keep it any more — but a key of a newer build is still kept.
+        let dir = temp_dir("retired");
+        let path = dir.join("config.json");
+        fs::write(
+            &path,
+            r#"{"cooldown_seconds": 30, "ui_position": [0.0, 0.0], "future_setting": 42}"#,
+        )
+        .unwrap();
+
+        let cfg = load_or_create_at(&path).unwrap();
+        assert_eq!(cfg.cooldown_seconds, 30);
+        assert!(
+            !cfg.extra.contains_key("ui_position"),
+            "the retired key must be gone"
+        );
+        assert_eq!(cfg.extra.get("future_setting"), Some(&serde_json::json!(42)));
+
+        // and the next save writes the file without it
+        save_at(&path, &cfg).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("ui_position"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn every_field_still_round_trips_with_the_catch_all() {
         let mut cfg = AppConfig {
             cooldown_seconds: 42,
             paused: true,
             idle_failsafe_enabled: false,
             idle_failsafe_minutes: 5,
-            ui_position: Some([1.5, 2.5]),
             catalog_url: Some("https://example.invalid/catalog.json".into()),
             sgdb_api_key: Some("key".into()),
             console_open: "never".into(),
@@ -492,7 +510,6 @@ mod tests {
         assert!(back.paused);
         assert!(!back.idle_failsafe_enabled);
         assert_eq!(back.idle_failsafe_minutes, 5);
-        assert_eq!(back.ui_position, Some([1.5, 2.5]));
         assert_eq!(back.catalog_url.as_deref(), Some("https://example.invalid/catalog.json"));
         assert_eq!(back.sgdb_api_key.as_deref(), Some("key"));
         assert_eq!(back.console_open, "never");

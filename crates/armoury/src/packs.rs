@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::script;
 
+use windows::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -260,7 +261,8 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
         }
 
         let setting_key = pack.settings.first().map(|s| s.key.as_str());
-        let mut result = run_block(block, &ctx, setting_key, &pack.id);
+        let block_name = if job.apply { "apply" } else { "revert" };
+        let mut result = run_block(block, &ctx, setting_key, &pack.id, block_name);
 
         // Spec 2: the block's script runs after its steps, in the same context. A script may
         // capture values; they are journalled below together with the step captures.
@@ -351,10 +353,12 @@ fn run_block(
     ctx: &TemplateCtx,
     setting_key: Option<&str>,
     pack_id: &str,
+    block_name: &str,
 ) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
-    for step in &block.steps {
-        if let Some(line) = run_step(step, ctx, setting_key, pack_id)? {
+    for (index, step) in block.steps.iter().enumerate() {
+        let label = format!("{block_name} step {index}");
+        if let Some(line) = run_step(step, ctx, setting_key, pack_id, &label)? {
             done.push(line);
         }
     }
@@ -403,12 +407,14 @@ fn resolve_exe(step: &Step, ctx: &TemplateCtx, pack_id: &str) -> Result<String, 
 
 /// Run one step. `Ok(None)` means the step did not apply (its `when` guard, or the app was
 /// already running); `Ok(Some(line))` is the log line of the step that ran. The templates are
-/// substituted once: the step and its log line use the same values.
+/// substituted once: the step and its log line use the same values. `label` names the step
+/// in an error message ("apply step 0").
 fn run_step(
     step: &Step,
     ctx: &TemplateCtx,
     setting_key: Option<&str>,
     pack_id: &str,
+    label: &str,
 ) -> Result<Option<String>, String> {
     if let Some(cond) = &step.when
         && !cond.matches(ctx, setting_key)
@@ -471,12 +477,11 @@ fn run_step(
             )))
         }
         "hotkey" => {
-            let chord = resolve_chord(step, ctx, pack_id);
-            // No mapping for this dropdown value (e.g. the "kill" option): nothing to send.
-            if let Some(chord) = &chord {
-                send_chord(chord)?;
-            }
-            Ok(Some(format!("hotkey {}", chord.unwrap_or_default())))
+            // A value the step's map does not know is a failure, not a no-op: the step
+            // would do nothing, and a pack that does nothing must not report success.
+            let chord = resolve_chord(step, ctx, pack_id, label)?;
+            send_chord(&chord)?;
+            Ok(Some(format!("hotkey {chord}")))
         }
         other => Err(format!("unsupported mechanism '{other}'")),
     }
@@ -580,22 +585,33 @@ fn start_process(exe: &str) -> Result<(), String> {
         .map_err(|e| format!("start {path}: {e}"))
 }
 
-fn resolve_chord(step: &Step, ctx: &TemplateCtx, pack_id: &str) -> Option<String> {
+/// The key chord a hotkey step sends. The map key comes from a dropdown value
+/// (`keys_from_mode`) or from a captured value (`keys_from_captured`).
+///
+/// A value the step's `map` does not know is a failure: the step would send nothing, and a
+/// pack that does nothing must not report success. The error names the pack, the step and
+/// the value, so the dashboard can say what went wrong.
+fn resolve_chord(
+    step: &Step,
+    ctx: &TemplateCtx,
+    pack_id: &str,
+    label: &str,
+) -> Result<String, String> {
     if let Some(expr) = &step.keys_from_mode {
         let key = substitute_checked(expr, ctx, pack_id);
-        return step.map.get(&key).cloned().or_else(|| {
-            warn!("hotkey: no mapping for setting value '{key}'");
-            None
+        return step.map.get(&key).cloned().ok_or_else(|| {
+            format!("{pack_id}: {label}: no hotkey is mapped for the setting value '{key}'")
         });
     }
     if let Some(key) = &step.keys_from_captured {
         let value = ctx.captured.get(key).cloned().unwrap_or_default();
-        return step.map.get(&value).cloned().or_else(|| {
-            warn!("hotkey: no mapping for captured {key}='{value}'");
-            None
+        return step.map.get(&value).cloned().ok_or_else(|| {
+            format!("{pack_id}: {label}: no hotkey is mapped for the captured {key}='{value}'")
         });
     }
-    None
+    Err(format!(
+        "{pack_id}: {label}: the hotkey step has neither keys_from_mode nor keys_from_captured"
+    ))
 }
 
 /// How long a pack's CLI call may run. The pack worker is serial, so a child that never exits
@@ -633,16 +649,42 @@ fn run_cli_within(
     let out = child.stdout.take().map(spawn_drain);
     let err = child.stderr.take().map(spawn_drain);
 
+    // Wait on the child's process handle instead of polling it: the pack worker is
+    // serial, so a 10 ms poll was 100 wake-ups per call for nothing, and a slow call
+    // held every later pack up for the whole limit.
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let handle = HANDLE(child.as_raw_handle() as *mut core::ffi::c_void);
     let deadline = Instant::now() + limit;
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(e) => return Err(format!("wait {exe}: {e}")),
-        }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             break None;
         }
+        // The wait is cut at the deadline, so the child can never outlive the limit.
+        let millis = (deadline - now).as_millis().min(u32::MAX as u128 - 1) as u32 + 1;
+        let wait = unsafe { WaitForSingleObject(handle, millis) };
+        if wait == WAIT_OBJECT_0 {
+            // The child has exited: take its exit code.
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                // The handle says it is done but the code is not there yet (it does not
+                // happen in practice): look again.
+                Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                Err(e) => return Err(format!("wait {exe}: {e}")),
+            }
+            continue;
+        }
+        if wait == WAIT_TIMEOUT {
+            break None;
+        }
+        // The wait itself failed (WAIT_FAILED): do not spin on it.
+        warn!(
+            "WaitForSingleObject failed for {exe} (error {})",
+            unsafe { GetLastError() }.0
+        );
         std::thread::sleep(Duration::from_millis(10));
     };
     if status.is_none() {
@@ -671,11 +713,15 @@ fn run_cli_within(
     let code = status.code().unwrap_or(-1);
     match expect_exit {
         Some(want) if want != code => Err(format!("{exe} exited {code}, expected {want}")),
-        _ if !status.success() && expect_exit.is_none() && code != 0 => {
-            // Many tools exit non-zero without meaning failure; keep it as info only.
-            Err(format!("{exe} exited {code}"))
+        Some(_) => Ok(()),
+        None => {
+            // Many tools exit non-zero without meaning failure (a warning code), so without
+            // an explicit `expect_exit` the exit code is information, not a failure.
+            if !status.success() {
+                info!("{exe} exited {code} (no expect_exit set — information only)");
+            }
+            Ok(())
         }
-        _ => Ok(()),
     }
 }
 
@@ -843,6 +889,27 @@ pub fn packs_root(search_dirs: &[PathBuf]) -> PathBuf {
         .cloned()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("packs")
+}
+
+/// The `packs` folder, created when it is missing. A fresh install has no packs until
+/// the user installs some, but the folder has to exist for them to land in, and the
+/// daemon starts with an empty list instead of failing.
+///
+/// The folder that is already there wins: a dev build keeps using the repository's own
+/// `packs` folder and never grows a second one next to the executable. Returns the
+/// folder that was created, if one was.
+pub fn ensure_packs_dir(search_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let root = packs_root(search_dirs);
+    if root.is_dir() {
+        return None;
+    }
+    match std::fs::create_dir_all(&root) {
+        Ok(()) => Some(root),
+        Err(e) => {
+            warn!("cannot create the packs folder {}: {e}", root.display());
+            None
+        }
+    }
 }
 
 /// Install (or update) a pack from a local `pack.json`, or from a folder holding one.
@@ -1115,7 +1182,20 @@ fn snapshot_targets() -> HashMap<String, (String, u32)> {
 // ---------------------------------------------------------------------------
 // Input synthesis
 
-pub fn send_chord(chord: &str) -> Result<(), String> {    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+/// How long to wait before the second attempt at an injection.
+const SEND_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// One injection attempt: how many events the OS took, and the Win32 error it left
+/// behind (meaningful only when it took fewer than it was given).
+#[derive(Clone, Copy)]
+struct Injection {
+    sent: u32,
+    total: u32,
+    error: u32,
+}
+
+pub fn send_chord(chord: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     };
 
@@ -1140,17 +1220,83 @@ pub fn send_chord(chord: &str) -> Result<(), String> {    use windows_sys::Win32
         inputs.push(make(*vk, KEYEVENTF_KEYUP));
     }
 
-    let sent = unsafe {
-        SendInput(
-            inputs.len() as u32,
-            inputs.as_ptr(),
-            std::mem::size_of::<INPUT>() as i32,
-        )
+    let total = inputs.len() as u32;
+    let mut send = || {
+        let sent =
+            unsafe { SendInput(total, inputs.as_ptr(), std::mem::size_of::<INPUT>() as i32) };
+        if sent == total {
+            return Injection {
+                sent,
+                total,
+                error: 0,
+            };
+        }
+        // The error is read here and nowhere else: any other Win32 call in between
+        // would overwrite it, and then the message would name the wrong error.
+        let error = unsafe { GetLastError() }.0;
+        Injection { sent, total, error }
     };
-    if sent as usize != inputs.len() {
-        return Err(format!("SendInput delivered {sent}/{} events", inputs.len()));
+    inject_with_retry(&mut send, SEND_RETRY_DELAY)
+}
+
+/// Send the chord's events, and try once more if the OS refused them.
+///
+/// A refused injection is not a lost step: the input desktop may not be ready yet (the
+/// daemon had just started and the hotkey hook did not exist yet). So the first failure
+/// is reported with the Win32 error it carried, and the second attempt decides the step.
+///
+/// `send` is the injection itself, so the retry can be tested without a desktop.
+fn inject_with_retry(send: &mut dyn FnMut() -> Injection, delay: Duration) -> Result<(), String> {
+    let first = send();
+    if first.sent == first.total {
+        return Ok(());
     }
-    Ok(())
+    let first_error = describe_win32_error(first.error);
+    // The input desktop may not be ready yet: give it a moment and try once more.
+    std::thread::sleep(delay);
+    let second = send();
+    if second.sent == second.total {
+        warn!(
+            "SendInput delivered {}/{} events ({}); the retry worked",
+            first.sent, first.total, first_error
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "SendInput delivered {}/{} events ({}); the retry delivered {}/{} events ({})",
+        first.sent,
+        first.total,
+        first_error,
+        second.sent,
+        second.total,
+        describe_win32_error(second.error)
+    ))
+}
+
+/// The Win32 error of a refused injection, in words: "error 5: access denied".
+fn describe_win32_error(code: u32) -> String {
+    match win32_error_text(code) {
+        Some(text) => format!("error {code}: {text}"),
+        None => format!("error {code}"),
+    }
+}
+
+/// A short name for the Win32 errors an injection can be refused with, so the log says
+/// what happened and not only a number.
+fn win32_error_text(code: u32) -> Option<&'static str> {
+    use windows::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_BUSY, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_SHARING_VIOLATION, WIN32_ERROR,
+    };
+    match WIN32_ERROR(code) {
+        c if c == ERROR_ACCESS_DENIED => Some("access denied"),
+        c if c == ERROR_BUSY => Some("the device is busy"),
+        c if c == ERROR_INVALID_HANDLE => Some("invalid handle"),
+        c if c == ERROR_INVALID_PARAMETER => Some("invalid parameter"),
+        c if c == ERROR_NOT_ENOUGH_MEMORY => Some("not enough memory"),
+        c if c == ERROR_SHARING_VIOLATION => Some("the file is in use"),
+        _ => None,
+    }
 }
 
 /// "ctrl+shift+alt+f18" -> virtual key codes in order.
@@ -1197,6 +1343,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_packs_folder_is_created_when_it_is_missing() {
+        let dir = std::env::temp_dir().join(format!("armoury-packs-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let search = vec![dir.clone()];
+        let created = ensure_packs_dir(&search).expect("the folder is created");
+        assert_eq!(created, dir.join("packs"));
+        assert!(dir.join("packs").is_dir(), "the folder is there now");
+        // the second call finds the folder and does nothing
+        assert!(ensure_packs_dir(&search).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_packs_folder_that_is_already_there_wins() {
+        // the dev build: the repository's own packs folder must not be shadowed by a
+        // second one next to the executable
+        let root = std::env::temp_dir().join(format!("armoury-packs-dir-2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let first = root.join("first");
+        let second = root.join("second");
+        std::fs::create_dir_all(second.join("packs")).unwrap();
+        let search = vec![first.clone(), second.clone()];
+        assert!(
+            ensure_packs_dir(&search).is_none(),
+            "nothing is created when a folder is already there"
+        );
+        assert!(
+            !first.join("packs").exists(),
+            "the first folder of the search order is left alone"
+        );
+        assert_eq!(packs_root(&search), second.join("packs"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn chord_parsing() {
         assert_eq!(
             parse_chord("ctrl+shift+alt+f18").unwrap(),
@@ -1205,6 +1387,107 @@ mod tests {
         assert_eq!(parse_chord("f16").unwrap(), vec![0x7F]);
         assert_eq!(parse_chord("a").unwrap(), vec![0x41]);
         assert!(parse_chord("ctrl+nope").is_err());
+    }
+
+    /// An injection that always fails the same way: (events taken, events asked for, error).
+    fn refused_injection(error: u32) -> Injection {
+        Injection {
+            sent: 0,
+            total: 8,
+            error,
+        }
+    }
+
+    #[test]
+    fn a_refused_injection_names_the_win32_error() {
+        // The message says which Win32 error happened: a bare "delivered 0/8 events"
+        // leaves the log nothing to work with (2026-10-20: the G-Helper revert).
+        let mut calls = 0;
+        let mut send = || {
+            calls += 1;
+            refused_injection(5)
+        };
+        let err = inject_with_retry(&mut send, Duration::ZERO)
+            .expect_err("a refused injection must fail the step");
+        assert!(err.contains("SendInput delivered 0/8 events"), "{err}");
+        assert!(err.contains("error 5"), "the code is in the message: {err}");
+        assert!(err.contains("access denied"), "the code is in words: {err}");
+    }
+
+    #[test]
+    fn a_refused_injection_is_tried_once_more() {
+        // The first attempt is refused, the second one gets through: the step must not
+        // be lost over a desktop that was not ready yet.
+        let mut calls = 0;
+        let mut send = || {
+            calls += 1;
+            if calls == 1 {
+                refused_injection(5)
+            } else {
+                Injection {
+                    sent: 8,
+                    total: 8,
+                    error: 0,
+                }
+            }
+        };
+        assert!(
+            inject_with_retry(&mut send, Duration::ZERO).is_ok(),
+            "the retry saves the step"
+        );
+        assert_eq!(calls, 2, "the injection is tried exactly twice");
+    }
+
+    #[test]
+    fn the_second_attempt_is_what_gets_reported() {
+        // Both attempts fail: the message carries both, so the log shows how far it got.
+        let mut calls = 0;
+        let mut send = || {
+            calls += 1;
+            if calls == 1 {
+                Injection {
+                    sent: 4,
+                    total: 8,
+                    error: 5,
+                }
+            } else {
+                Injection {
+                    sent: 2,
+                    total: 8,
+                    error: 87,
+                }
+            }
+        };
+        let err = inject_with_retry(&mut send, Duration::ZERO)
+            .expect_err("two refused injections must fail the step");
+        assert!(err.contains("4/8 events"), "the first attempt: {err}");
+        assert!(err.contains("2/8 events"), "the retry: {err}");
+        assert!(err.contains("error 5"), "the first error: {err}");
+        assert!(err.contains("error 87"), "the retry's error: {err}");
+        assert_eq!(calls, 2, "the injection is tried exactly twice");
+    }
+
+    #[test]
+    fn a_delivered_injection_is_not_tried_again() {
+        let mut calls = 0;
+        let mut send = || {
+            calls += 1;
+            Injection {
+                sent: 8,
+                total: 8,
+                error: 0,
+            }
+        };
+        assert!(inject_with_retry(&mut send, Duration::ZERO).is_ok());
+        assert_eq!(calls, 1, "a chord that got through is never sent twice");
+    }
+
+    #[test]
+    fn an_unknown_win32_error_is_still_named() {
+        // A code with no name in the table still reaches the log: the number is the point.
+        let text = describe_win32_error(1234);
+        assert!(text.contains("1234"), "{text}");
+        assert_eq!(describe_win32_error(5), "error 5: access denied");
     }
 
     /// A child that never finishes on its own, for the deadline test.
@@ -1248,7 +1531,27 @@ mod tests {
     }
 
     #[test]
-    fn a_cli_call_still_reports_its_exit_code() {
+    fn the_cli_wait_stops_at_the_deadline() {
+        // The wait is a real wait on the child's process handle, but it must not wait
+        // longer than the limit: the pack worker is serial and every later pack waits.
+        let (exe, args) = a_child_that_never_finishes();
+        let started = Instant::now();
+        let err = run_cli_within(&exe, &args, None, Duration::from_millis(700))
+            .expect_err("a child that never exits must fail");
+        let elapsed = started.elapsed();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            elapsed >= Duration::from_millis(600),
+            "the wait gave up before the deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the wait went past the deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_cli_call_reports_its_exit_code_only_when_the_step_asks_for_it() {
         let system = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
         let exe = PathBuf::from(system)
             .join("System32")
@@ -1256,8 +1559,10 @@ mod tests {
             .display()
             .to_string();
         assert!(run_cli(&exe, &["/c".to_string(), "exit 0".to_string()], None).is_ok());
-        let err = run_cli(&exe, &["/c".to_string(), "exit 3".to_string()], None).unwrap_err();
-        assert!(err.contains("exited 3"), "{err}");
+        // Many tools exit non-zero without meaning failure: without an `expect_exit` that is
+        // information, not a failure — the step must not be reported as broken.
+        assert!(run_cli(&exe, &["/c".to_string(), "exit 3".to_string()], None).is_ok());
+        // With `expect_exit` the code is the contract: a different one fails the step.
         let err = run_cli(
             &exe,
             &["/c".to_string(), "exit 3".to_string()],
@@ -1265,6 +1570,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("expected 0"), "{err}");
+        assert!(run_cli(&exe, &["/c".to_string(), "exit 0".to_string()], Some(0)).is_ok());
     }
 
     #[test]
@@ -1372,6 +1678,78 @@ mod tests {
             serde_json::from_str(r#"{"mechanism":"cli","exe":"{{target.name}}"}"#).unwrap();
         ctx.target_name = "app.exe".into();
         assert_eq!(resolve_exe(&plain, &ctx, "we").unwrap(), "app.exe");
+    }
+
+    #[test]
+    fn a_hotkey_step_without_a_mapping_is_a_failure() {
+        // A dropdown value the step's map does not know: the step would send nothing, and a
+        // pack that does nothing must not report success. This is the G-Helper revert path.
+        let step: Step = serde_json::from_str(
+            r#"{"mechanism":"hotkey","keys_from_mode":"{{settings.mode}}",
+                "map":{"Turbo":"ctrl+shift+alt+f18"}}"#,
+        )
+        .unwrap();
+        let mut ctx = TemplateCtx::default();
+        ctx.settings.insert("mode".into(), "Silent".into());
+        let err = run_step(&step, &ctx, Some("mode"), "g-helper", "revert step 0")
+            .expect_err("an unmapped value must fail the step");
+        assert!(err.contains("g-helper"), "{err}");
+        assert!(err.contains("revert step 0"), "{err}");
+        assert!(err.contains("Silent"), "{err}");
+    }
+
+    #[test]
+    fn an_unmapped_captured_value_is_a_failure() {
+        let step: Step = serde_json::from_str(
+            r#"{"mechanism":"hotkey","keys_from_captured":"prev_mode",
+                "map":{"0":"ctrl+shift+alt+f17"}}"#,
+        )
+        .unwrap();
+        let mut ctx = TemplateCtx::default();
+        ctx.captured.insert("prev_mode".into(), "3".into());
+        let err = run_step(&step, &ctx, None, "g-helper", "revert step 0")
+            .expect_err("an unmapped captured value must fail the step");
+        assert!(err.contains("g-helper"), "{err}");
+        assert!(err.contains("revert step 0"), "{err}");
+        assert!(err.contains("prev_mode"), "{err}");
+        assert!(err.contains("3"), "{err}");
+    }
+
+    #[test]
+    fn a_pack_with_an_unmapped_hotkey_reports_the_failure() {
+        // The whole job: the pack runs, the hotkey has no chord, and the outcome says so —
+        // this is what reaches the dashboard's error line.
+        let json = r#"{
+  "spec": 1, "id": "hotkey-test", "name": "Hotkey test", "version": "1.0.0", "order": 1,
+  "targets": { "process": ["hotkey-test-target.exe"] },
+  "settings": [
+    { "key": "mode", "label": "Mode", "type": "enum", "values": ["Turbo", "Silent"], "default": "Turbo" }
+  ],
+  "apply": { "guard": { "targetRunning": false },
+    "steps": [ { "mechanism": "hotkey", "keys_from_mode": "{{settings.mode}}",
+                 "map": { "Turbo": "ctrl+shift+alt+f18" } } ] },
+  "revert": { "guard": { "targetRunning": false },
+    "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] }
+}"#;
+        let pack = Pack::parse(json).expect("the test pack must be valid");
+        let job = PackJob {
+            apply: true,
+            tag: None,
+            enabled: HashMap::from([("hotkey-test".to_string(), true)]),
+            values: HashMap::from([(
+                "hotkey-test".to_string(),
+                HashMap::from([("mode".to_string(), "Silent".to_string())]),
+            )]),
+            captured: HashMap::new(),
+        };
+        let outcome = run_job(&[Installed { pack }], &job, &mut None);
+        assert!(outcome.failed.len() == 1, "the pack must report a failure");
+        let (id, message) = &outcome.failed[0];
+        assert_eq!(id, "hotkey-test");
+        assert!(message.contains("hotkey-test"), "{message}");
+        assert!(message.contains("apply step 0"), "{message}");
+        assert!(message.contains("Silent"), "{message}");
+        assert!(outcome.succeeded.is_empty(), "{:?}", outcome.succeeded);
     }
 
     #[test]

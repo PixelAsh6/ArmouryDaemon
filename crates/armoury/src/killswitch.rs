@@ -20,7 +20,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 #[derive(Default)]
 pub struct Ledger {
-    hidden: Vec<isize>,
+    /// (window, process) for every window we hid
+    hidden: Vec<(isize, u32)>,
     /// (pid, was muted before us) for every session we muted
     muted: Vec<(u32, bool)>,
     active: bool,
@@ -29,6 +30,17 @@ pub struct Ledger {
 impl Ledger {
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// How many apps the killswitch is suppressing right now: the distinct processes it has
+    /// hidden a window for or muted a session for. A released killswitch holds nothing, so
+    /// this is 0 — which is what the dashboard shows.
+    pub fn affected_apps(&self) -> usize {
+        let mut pids: Vec<u32> = self.hidden.iter().map(|(_, pid)| *pid).collect();
+        pids.extend(self.muted.iter().map(|(pid, _)| *pid));
+        pids.sort_unstable();
+        pids.dedup();
+        pids.len()
     }
 }
 
@@ -46,11 +58,11 @@ pub fn engage(pids: &[u32], ledger: &mut Ledger) -> (usize, usize) {
 
     for pid in pids {
         for hwnd in windows_of(*pid) {
-            if !ledger.hidden.contains(&hwnd) {
+            if !ledger.hidden.iter().any(|(w, _)| *w == hwnd) {
                 unsafe {
                     let _ = ShowWindow(HWND(hwnd as *mut _), SW_HIDE);
                 }
-                ledger.hidden.push(hwnd);
+                ledger.hidden.push((hwnd, *pid));
                 hidden_now += 1;
             }
         }
@@ -76,7 +88,7 @@ pub fn engage(pids: &[u32], ledger: &mut Ledger) -> (usize, usize) {
 
 /// Put back exactly what we changed.
 pub fn disengage(ledger: &mut Ledger) {
-    for hwnd in ledger.hidden.drain(..) {
+    for (hwnd, _) in ledger.hidden.drain(..) {
         unsafe {
             let _ = ShowWindow(HWND(hwnd as *mut _), SW_SHOW);
         }
@@ -193,26 +205,43 @@ fn set_mute(pid: u32, mute: bool) -> Option<bool> {
     previous
 }
 
-/// Mute state of a process's sessions (diagnostics: used by the drill scripts).
-#[allow(dead_code)]
-pub fn current_mute(pid: u32) -> Option<bool> {
-    for control in sessions() {
-        unsafe {
-            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
-                continue;
-            };
-            if control2.GetProcessId().unwrap_or(0) != pid {
-                continue;
-            }
-            let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {
-                continue;
-            };
-            return volume.GetMute().ok().map(|b| b.as_bool());
-        }
-    }
-    None
-}
-
 /// Keep the compiler honest about the interface imports we rely on.
 #[allow(dead_code)]
 fn _assert_types(_: Option<IAudioSessionControl>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ledger_counts_the_apps_it_suppresses() {
+        let mut ledger = Ledger::default();
+        assert_eq!(ledger.affected_apps(), 0, "an unused ledger suppresses nothing");
+        assert!(!ledger.is_active());
+
+        // two windows of one app and one session of another: two apps
+        ledger.hidden.push((10, 42));
+        ledger.hidden.push((11, 42));
+        ledger.muted.push((42, false));
+        ledger.muted.push((43, false));
+        assert_eq!(ledger.affected_apps(), 2);
+        assert_eq!(ledger.hidden.len(), 2, "the windows are counted on their own");
+        assert_eq!(ledger.muted.len(), 2, "and so are the muted sessions");
+    }
+
+    #[test]
+    fn a_released_killswitch_suppresses_nothing() {
+        let mut ledger = Ledger::default();
+        ledger.hidden.push((10, 42));
+        ledger.muted.push((42, false));
+        ledger.active = true;
+        assert!(ledger.is_active());
+
+        // what `disengage` does: the windows are shown and the sessions unmuted again
+        ledger.hidden.clear();
+        ledger.muted.clear();
+        ledger.active = false;
+        assert_eq!(ledger.affected_apps(), 0);
+        assert!(!ledger.is_active());
+    }
+}

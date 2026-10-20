@@ -231,6 +231,16 @@ function Get-FirstLine([string]$text) {
     return ''
 }
 
+# Is this shell elevated? The executable asks Windows for administrator rights (the manifest
+# it carries), so a program it starts from a shell that is not elevated raises a UAC prompt.
+# An admin user in a normal shell is NOT elevated: the administrator group is deny-only in
+# the filtered token, and IsInRole says so.
+function Test-Elevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 # Run the binary with these arguments and capture what it says.
 #
 # The release build is a windows-subsystem binary: it attaches to the console of the parent
@@ -455,15 +465,14 @@ try {
     Check 'the test instance used its own config folder' (Test-Path $tempConfig) "expected $tempConfig"
 
     # ---- 14. settings persist to that config file ----
-    # The dashboard always opens in the corner, so its position is not kept: the request is
-    # accepted and dropped. The cooldown is set after it, so the config on disk is written
+    # The dashboard always opens in the corner: there is no position to keep, and the request
+    # that used to carry it is gone. The cooldown is set, so the config on disk is written
     # again and the check below sees what the daemon would persist.
-    Send-Pipe '{"type":"set_ui_position","x":123.5,"y":-45.0}' | Out-Null
     Send-Pipe '{"type":"set_cooldown","seconds":25}' | Out-Null
     Start-Sleep -Milliseconds 400
     $saved = Get-Content $tempConfig -Raw | ConvertFrom-Json
     Check 'cooldown persisted' ($saved.cooldown_seconds -eq 25) "got $($saved.cooldown_seconds)"
-    Check 'the dashboard position is not persisted' ($null -eq $saved.ui_position) "got $($saved.ui_position)"
+    Check 'the retired dashboard position is gone from the config' ($null -eq $saved.ui_position) "got $($saved.ui_position)"
 
     # ---- 15. install / remove a pack, strictly inside the build folder ----
     # packs_root = the first search dir that has a "packs" folder. Creating it beside the test exe
@@ -577,43 +586,57 @@ try {
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
     # desktop. They run in a namespace of their own ($cliNs), see the top of this file.
-    $env:ARMOURY_TEST_NS = $cliNs
+    #
+    # The executable asks Windows for administrator rights (the manifest it carries), so a
+    # probe started from a shell that is not elevated raises a UAC prompt - and the harness
+    # would sit there waiting for an answer. An elevated harness hands the probes its own
+    # elevated token: no prompt, and the probes run exactly as they always did. A harness
+    # that is not elevated skips them and says why - a skipped check is not a failed one.
+    if (Test-Elevated) {
+        $env:ARMOURY_TEST_NS = $cliNs
 
-    # --version: the version, exit 0
-    $probe = Invoke-CliProbe @('--version')
-    $r = $probe.Run
-    Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
-    Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.0.0')) "output=$(Get-FirstLine $r.Text)"
+        # --version: the version, exit 0
+        $probe = Invoke-CliProbe @('--version')
+        $r = $probe.Run
+        Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
+        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.0.0')) "output=$(Get-FirstLine $r.Text)"
 
-    # --help: the usage, exit 0, with every flag the parser accepts
-    $probe = Invoke-CliProbe @('--help')
-    $r = $probe.Run
-    Check 'help exits 0' ($r.Exit -eq 0) $probe.Detail
-    $flags = @('--autostart', '--ui', '--console', '--catalog-list', '--catalog-install', '--catalog-url', '--version', '--help')
-    $missing = @($flags | Where-Object { -not $r.Text.Contains($_) })
-    Check 'help lists every flag the binary accepts' ($missing.Count -eq 0) "missing: $($missing -join ' ')"
+        # --help: the usage, exit 0, with every flag the parser accepts
+        $probe = Invoke-CliProbe @('--help')
+        $r = $probe.Run
+        Check 'help exits 0' ($r.Exit -eq 0) $probe.Detail
+        $flags = @('--autostart', '--ui', '--console', '--catalog-list', '--catalog-install', '--catalog-url', '--version', '--help')
+        $missing = @($flags | Where-Object { -not $r.Text.Contains($_) })
+        Check 'help lists every flag the binary accepts' ($missing.Count -eq 0) "missing: $($missing -join ' ')"
 
-    # an argument the binary does not know is an error, never a daemon
-    $probe = Invoke-CliProbe @('--definitely-not-a-flag')
-    $r = $probe.Run
-    Check 'an unknown argument exits 2' ($r.Exit -eq 2) $probe.Detail
-    Check 'an unknown argument names itself' ($r.Text.Contains('--definitely-not-a-flag')) "output=$(Get-FirstLine $r.Text)"
-    Check 'an unknown argument prints the usage on stderr' (($r.Out.Trim() -eq '') -and $r.Err.Contains('usage:')) "stdout=$(Get-FirstLine $r.Out) stderr=$(Get-FirstLine $r.Err)"
-    $detail = "before=$($probe.Before) after=$($probe.After)"
-    if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
-    Check 'an unknown argument leaves no daemon running' ($probe.After -le $probe.Before) $detail
+        # an argument the binary does not know is an error, never a daemon
+        $probe = Invoke-CliProbe @('--definitely-not-a-flag')
+        $r = $probe.Run
+        Check 'an unknown argument exits 2' ($r.Exit -eq 2) $probe.Detail
+        Check 'an unknown argument names itself' ($r.Text.Contains('--definitely-not-a-flag')) "output=$(Get-FirstLine $r.Text)"
+        Check 'an unknown argument prints the usage on stderr' (($r.Out.Trim() -eq '') -and $r.Err.Contains('usage:')) "stdout=$(Get-FirstLine $r.Out) stderr=$(Get-FirstLine $r.Err)"
+        $detail = "before=$($probe.Before) after=$($probe.After)"
+        if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
+        Check 'an unknown argument leaves no daemon running' ($probe.After -le $probe.Before) $detail
 
-    # a flag without its value is an error as well
-    $probe = Invoke-CliProbe @('--catalog-install')
-    $r = $probe.Run
-    Check 'catalog-install without an id exits 2' ($r.Exit -eq 2) $probe.Detail
-    Check 'catalog-install without an id says the id is missing' ($r.Text.Contains('--catalog-install needs a pack id')) "output=$(Get-FirstLine $r.Text)"
-    Check 'catalog-install without an id prints the usage on stderr' (($r.Out.Trim() -eq '') -and $r.Err.Contains('usage:')) "stdout=$(Get-FirstLine $r.Out) stderr=$(Get-FirstLine $r.Err)"
-    $detail = "before=$($probe.Before) after=$($probe.After)"
-    if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
-    Check 'catalog-install without an id leaves no daemon running' ($probe.After -le $probe.Before) $detail
+        # a flag without its value is an error as well
+        $probe = Invoke-CliProbe @('--catalog-install')
+        $r = $probe.Run
+        Check 'catalog-install without an id exits 2' ($r.Exit -eq 2) $probe.Detail
+        Check 'catalog-install without an id says the id is missing' ($r.Text.Contains('--catalog-install needs a pack id')) "output=$(Get-FirstLine $r.Text)"
+        Check 'catalog-install without an id prints the usage on stderr' (($r.Out.Trim() -eq '') -and $r.Err.Contains('usage:')) "stdout=$(Get-FirstLine $r.Out) stderr=$(Get-FirstLine $r.Err)"
+        $detail = "before=$($probe.Before) after=$($probe.After)"
+        if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
+        Check 'catalog-install without an id leaves no daemon running' ($probe.After -le $probe.Before) $detail
 
-    $env:ARMOURY_TEST_NS = $ns
+        $env:ARMOURY_TEST_NS = $ns
+    }
+    else {
+        "SKIP  the command-line probes (--version, --help, an unknown argument, a flag without"
+        "      its value): the executable asks Windows for administrator rights, and this"
+        "      harness is not elevated - every probe would raise a UAC prompt and the harness"
+        "      would wait for the answer. Run the harness from an elevated shell to run them."
+    }
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {
