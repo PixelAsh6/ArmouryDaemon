@@ -14,7 +14,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use log::{error, info, warn};
-use windows::core::{BSTR, Interface, PCWSTR};
+use windows::core::{BSTR, HRESULT, Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, VARIANT_BOOL};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Com::{
@@ -46,6 +46,11 @@ pub const RESUME_SUBSCRIPTION: &str = "<QueryList><Query Id=\"0\" Path=\"System\
 /// The file that remembers that the dashboard has been shown once. Its absence means
 /// "the daemon has not been set up yet", its presence means "leave the user alone".
 pub const FIRST_RUN_MARKER: &str = "first-run.done";
+
+/// The answer the task scheduler gives when there is no task under that name:
+/// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`. Every other error means the task is
+/// there and cannot be read - which is not the same as "there is no task".
+const TASK_NOT_FOUND: HRESULT = HRESULT::from_win32(2);
 
 /// The flag the elevated copy of the daemon is started with: it registers the task and
 /// exits, it does not become the daemon.
@@ -194,13 +199,23 @@ pub fn read_existing() -> Result<Existing, String> {
         // The task lives in the root folder, so its name is the path. The full path is
         // tried as well, for a scheduler that wants it that way.
         let full = format!("\\{TASK_NAME}");
-        let task = match folder
-            .GetTask(&BSTR::from(TASK_NAME))
-            .or_else(|_| folder.GetTask(&BSTR::from(full.as_str())))
-        {
+        let task = match folder.GetTask(&BSTR::from(TASK_NAME)) {
             Ok(task) => task,
-            // No task under that name: nothing is registered.
-            Err(_) => return Ok(Existing::None),
+            Err(first) => match folder.GetTask(&BSTR::from(full.as_str())) {
+                Ok(task) => task,
+                Err(second) => {
+                    let existing = missing_or_unreadable(first.code(), second.code());
+                    if let Existing::Foreign { .. } = existing {
+                        warn!(
+                            "the task '{TASK_NAME}' cannot be read ({}, {}) - it is treated as a task of \
+                             somebody else's and is left alone",
+                            first.code(),
+                            second.code()
+                        );
+                    }
+                    return Ok(existing);
+                }
+            },
         };
         let definition = task
             .Definition()
@@ -235,6 +250,22 @@ pub fn read_existing() -> Result<Existing, String> {
             Some(exe) if same_path(&path, &exe) => Existing::Ours { arguments },
             _ => Existing::Foreign { path },
         })
+    }
+}
+
+/// What the two failed ways of asking for the task mean.
+///
+/// Only "there is no such task" on both of them means the name is free. Any other
+/// answer (the task is there and cannot be read - access denied, a task that will not
+/// open) means there is a task under that name, and it is not ours to touch: it is
+/// somebody else's, and it is never registered over.
+fn missing_or_unreadable(first: HRESULT, second: HRESULT) -> Existing {
+    if first == TASK_NOT_FOUND && second == TASK_NOT_FOUND {
+        Existing::None
+    } else {
+        Existing::Foreign {
+            path: String::new(),
+        }
     }
 }
 
@@ -492,8 +523,10 @@ pub fn check_and_register(exe: &Path) {
             info!("autostart: the scheduled task '{TASK_NAME}' is already registered for this executable");
         }
         Plan::LeaveAlone => {
+            // A task that could not be read has no path to name: it is simply "another
+            // program's task".
             let other = match &existing {
-                Existing::Foreign { path } => path.as_str(),
+                Existing::Foreign { path } if !path.is_empty() => path.as_str(),
                 _ => "another program",
             };
             warn!(
@@ -706,6 +739,34 @@ mod tests {
         let foreign = Existing::Foreign {
             path: "C:\\other\\thing.exe".to_string(),
         };
+        assert_eq!(decide(&foreign, true), Plan::LeaveAlone);
+        assert_eq!(decide(&foreign, false), Plan::LeaveAlone);
+    }
+
+    #[test]
+    fn a_task_that_cannot_be_read_is_never_taken_for_an_absent_one() {
+        // Both ways of asking for the task say "there is no such task": the name is free.
+        assert_eq!(
+            missing_or_unreadable(TASK_NOT_FOUND, TASK_NOT_FOUND),
+            Existing::None
+        );
+        // The task is there and cannot be read (access denied, a task that will not
+        // open). It is somebody else's, and it is never registered over.
+        let denied = HRESULT::from_win32(5);
+        assert_eq!(
+            missing_or_unreadable(TASK_NOT_FOUND, denied),
+            Existing::Foreign {
+                path: String::new()
+            }
+        );
+        assert_eq!(
+            missing_or_unreadable(denied, TASK_NOT_FOUND),
+            Existing::Foreign {
+                path: String::new()
+            }
+        );
+        // And the plan for it is the same as for any other task of somebody else.
+        let foreign = missing_or_unreadable(denied, denied);
         assert_eq!(decide(&foreign, true), Plan::LeaveAlone);
         assert_eq!(decide(&foreign, false), Plan::LeaveAlone);
     }

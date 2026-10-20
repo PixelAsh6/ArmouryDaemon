@@ -495,6 +495,10 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // The UI is closing: the running-app worker must not outlive it.
         self.apps_worker.stop();
+        // And it must be gone, not merely asked to go. The walk is short, so the wait is
+        // over in milliseconds; the limit is only there so a stuck walk cannot hang the
+        // shutdown (the thread then dies with the process).
+        self.apps_worker.wait_stopped(Duration::from_secs(1));
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
