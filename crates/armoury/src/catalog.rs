@@ -99,19 +99,31 @@ pub fn download_to(catalog_url: &str, entry: &CatalogPack, dest: &Path) -> Resul
 pub fn verify(bytes: &[u8], expected_sha256: &str, expected_size: Option<u64>) -> Result<(), String> {
     if let Some(size) = expected_size {
         if bytes.len() as u64 != size {
-            return Err(format!(
+            return Err(mismatch(format!(
                 "catalog: pack size {} does not match the manifest ({size})",
                 bytes.len()
-            ));
+            )));
         }
     }
     let actual = hex_sha256(bytes);
     if !actual.eq_ignore_ascii_case(expected_sha256.trim()) {
-        return Err(format!(
+        return Err(mismatch(format!(
             "catalog: pack sha256 {actual} does not match the manifest ({expected_sha256})"
-        ));
+        )));
     }
     Ok(())
+}
+
+/// A pack that does not match the manifest. The numbers first, then what did not happen, then
+/// the two causes worth looking at: a catalog that has not reached the CDN yet, and a hash that
+/// was taken from a working-tree copy instead of the published bytes.
+fn mismatch(detail: String) -> String {
+    format!(
+        "{detail}. Nothing was installed. A catalog that was published a moment ago may not have \
+         reached the CDN yet — raw.githubusercontent.com caches `main` for about five minutes — \
+         and a hash taken from a Windows working-tree copy (CRLF) never matches the published \
+         bytes."
+    )
 }
 
 pub fn hex_sha256(bytes: &[u8]) -> String {
@@ -256,6 +268,21 @@ mod tests {
         assert!(verify(bytes, hash, Some(6)).is_err(), "size mismatch must refuse");
         assert!(verify(bytes, "00", Some(5)).is_err(), "hash mismatch must refuse");
         assert!(verify(bytes, &hash.to_ascii_uppercase(), Some(5)).is_ok());
+    }
+
+    #[test]
+    fn a_mismatch_says_what_did_not_happen_and_why() {
+        let bytes = b"hello";
+        let hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        let size = verify(bytes, hash, Some(6)).expect_err("the sizes differ");
+        assert!(size.contains('6') && size.contains("5"), "the numbers stay: {size}");
+        let sha = verify(bytes, "00", None).expect_err("the hashes differ");
+        assert!(sha.contains(hash), "the numbers stay: {sha}");
+        for message in [size, sha] {
+            assert!(message.contains("Nothing was installed"), "{message}");
+            assert!(message.contains("five minutes"), "{message}");
+            assert!(message.contains("CRLF"), "{message}");
+        }
     }
 
     #[test]
