@@ -47,6 +47,11 @@ A pack may expose up to **four dropdowns**; the first one is the primary action.
 with one each, except Wallpaper Engine, which has a second one for choosing between the 64-bit
 and the 32-bit binary.
 
+A pack may also declare the **daemon it needs** (`"min_engine": "1.1.0"`). A daemon that is too
+old for it refuses it by name instead of installing it: `pack 'rainmeter' (Rainmeter) needs
+daemon 1.1.0 or newer; this daemon is 1.0.0`, and the pack never lands on disk. The shipped
+Rainmeter pack asks for `1.0.0` — the version that ships it.
+
 ### The lockout ("Revert after")
 
 Every change that actually happens starts a **lockout** — the settling window you see in the
@@ -133,8 +138,10 @@ The catalogue has a window of its own: **Install packs** (Settings → **Install
 fetches the manifest when it opens and lists every pack in it. Every entry shows its version
 and one of *Download* / *Update* / *vX installed*. The daemon downloads the file, checks its
 **size and SHA-256** against the manifest and only then validates and installs it. Nothing
-that cannot be verified is ever installed. The window's **Local pack** button opens the native
-file picker and installs a `pack.json` from disk — the only way to install a local pack file.
+that cannot be verified is ever installed. A pack the running daemon is too old for is not
+offered at all — its row shows the reason where the **Download** button would be. The window's
+**Local pack** button opens the native file picker and installs a `pack.json` from disk — the
+only way to install a local pack file.
 
 From the command line:
 
@@ -250,7 +257,7 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (205: 142 in armoury, 63 in armoury-core)
+cargo test                   # the unit tests (220: 153 in armoury, 67 in armoury-core)
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
@@ -275,7 +282,10 @@ the daemon against a whitelisted host API, never by the pack.
 
 The catalogue is `catalog/index.json` plus one `packs/<id>/pack.json` per pack. The manifest
 carries the version, the path, the SHA-256 and the size of every file; the daemon verifies both
-before it installs anything.
+before it installs anything. It also carries the **minimum daemon** a pack needs. The catalogue
+holds three packs: **Wallpaper Engine 1.4.0**, **G-Helper 1.3.1** and **Rainmeter 1.5.0**, the
+last one a spec-2 pack that declares `min_engine: 1.0.0` because its script uses
+`ctx.window_message`.
 
 ## Project layout
 
