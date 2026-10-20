@@ -183,6 +183,9 @@ small, undecorated windows plus a tray icon:
   a file). It turns into a red-slash variant while the killswitch is engaged. Left-click opens
   the dashboard, right-click opens the menu (open dashboard / pause all packs / idle mode /
   toggle killswitch / console mode / quit).
+- **The executable carries the same icon**: the same drawing is embedded in it as a PE
+  resource, so Explorer, the desktop, the shortcuts and the pinned taskbar item show the
+  purple squircle instead of the default Windows application icon.
 - **The dashboard** opens undecorated in the bottom-right corner, above the system tray. It shows
   the state, the daemon's version, the uptime, the cooldown, the pack count, the tracked apps
   (with a type-to-filter picker) and the packs, with a status band for *paused* and *cooling
