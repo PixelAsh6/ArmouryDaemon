@@ -197,8 +197,12 @@ fn mismatch(detail: String) -> String {
 }
 
 pub fn hex_sha256(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
+    hex_digest(&Sha256::digest(bytes))
+}
+
+/// A digest as lowercase hex - the one way this crate writes a hash down.
+pub fn hex_digest(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
         out.push_str(&format!("{byte:02x}"));
     }

@@ -6,14 +6,20 @@
 //! and the same settings (highest privileges). The script stays authoritative when it
 //! runs; this module is what makes the executable usable on its own, without the script.
 //!
+//! The task the daemon registers carries the same tamper record the script writes: the
+//! SHA-256 of the executable, in a sidecar next to it and in the description of the
+//! task. A task registered by either path is therefore indistinguishable.
+//!
 //! The Windows API is used directly (the Task Scheduler COM API through the `windows`
 //! crate), so nothing is shelled out to and the task is defined in one place only.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use log::{error, info, warn};
+use sha2::{Digest, Sha256};
 use windows::core::{BSTR, HRESULT, Interface, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, VARIANT_BOOL};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
@@ -21,10 +27,10 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
 use windows::Win32::System::TaskScheduler::{
-    CLSID_CTaskScheduler, IEventTrigger, IExecAction, ILogonTrigger, IPrincipal, ITaskFolder,
-    ITaskService, ITaskSettings, TASK_ACTION_EXEC, TASK_CREATE_OR_UPDATE,
-    TASK_INSTANCES_IGNORE_NEW, TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_HIGHEST,
-    TASK_TRIGGER_EVENT, TASK_TRIGGER_LOGON,
+    IEventTrigger, IExecAction, ILogonTrigger, IPrincipal, ITaskFolder, ITaskService,
+    ITaskSettings, TASK_ACTION_EXEC, TASK_CREATE_OR_UPDATE, TASK_INSTANCES_IGNORE_NEW,
+    TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_HIGHEST, TASK_TRIGGER_EVENT, TASK_TRIGGER_LOGON,
+    TaskScheduler as CLSID_TaskScheduler,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken, WaitForSingleObject};
 use windows::Win32::System::Variant::VARIANT;
@@ -46,6 +52,10 @@ pub const RESUME_SUBSCRIPTION: &str = "<QueryList><Query Id=\"0\" Path=\"System\
 /// The file that remembers that the dashboard has been shown once. Its absence means
 /// "the daemon has not been set up yet", its presence means "leave the user alone".
 pub const FIRST_RUN_MARKER: &str = "first-run.done";
+
+/// The hash sidecar next to the executable: the installer writes the same file, with
+/// the same name, so a sidecar from either path is the same sidecar.
+pub const SIDECAR_SUFFIX: &str = ".sha256";
 
 /// The answer the task scheduler gives when there is no task under that name:
 /// `HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)`. Every other error means the task is
@@ -72,8 +82,13 @@ pub const MANIFEST: &str = "assets/ArmouryDaemon.manifest";
 pub enum Existing {
     /// Nothing is registered under the task name.
     None,
-    /// The task is ours: it runs this executable. `arguments` is what it passes to it.
-    Ours { arguments: String },
+    /// The task is ours: it runs this executable. `arguments` is what it passes to it,
+    /// `description` is what the task says about itself - it carries the hash of the
+    /// executable the task was registered for.
+    Ours {
+        arguments: String,
+        description: String,
+    },
     /// The task belongs to something else: its action runs another program.
     Foreign { path: String },
 }
@@ -105,7 +120,7 @@ pub fn decide(existing: &Existing, elevated: bool) -> Plan {
                 Plan::Elevate
             }
         }
-        Existing::Ours { arguments } => {
+        Existing::Ours { arguments, .. } => {
             if arguments.trim() == TASK_ARGUMENTS {
                 Plan::Nothing
             } else if elevated {
@@ -139,6 +154,54 @@ pub fn mark_first_run_done(marker: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(marker, b"ArmouryDaemon: the dashboard has been shown.\n")
+}
+
+// ---------------------------------------------------------------------------
+// The hash of the executable (pure where it can be)
+// ---------------------------------------------------------------------------
+
+/// The description of the task, in the wording `deploy/setup.ps1` uses. A task
+/// registered by the script and one registered by the daemon are indistinguishable.
+pub fn task_description(hash: &str) -> String {
+    format!("ArmouryDaemon autostart. exe SHA256 {hash} (see ArmouryDaemon.exe.sha256).")
+}
+
+/// The description of a task whose hash could not be recorded - the same words the
+/// installer uses when its sidecar could not be written.
+pub fn task_description_without_hash() -> String {
+    "ArmouryDaemon autostart. exe SHA256 not recorded (the hash sidecar could not be \
+     written)."
+        .to_string()
+}
+
+/// The bytes of the hash sidecar, in exactly the format `deploy/setup.ps1` writes:
+/// the lowercase hex digest, two spaces, the name of the executable, a trailing CRLF.
+/// (`Set-Content -Encoding ASCII` writes the text and one CRLF, and nothing else.)
+pub fn sidecar_bytes(hash: &str, file_name: &str) -> Vec<u8> {
+    format!("{hash}  {file_name}\r\n").into_bytes()
+}
+
+/// Where the sidecar lives: next to the executable, with `.sha256` appended to its
+/// name - the same file the installer writes.
+pub fn sidecar_path(exe: &Path) -> PathBuf {
+    let mut name = exe.as_os_str().to_os_string();
+    name.push(SIDECAR_SUFFIX);
+    PathBuf::from(name)
+}
+
+/// The hash a task description records, if it records one.
+///
+/// The description is free text, so only the exact wording of the installer and of
+/// the daemon is recognised: anything else is "no hash recorded", never a guess.
+pub fn recorded_hash(description: &str) -> Option<String> {
+    let hash = description
+        .strip_prefix("ArmouryDaemon autostart. exe SHA256 ")?
+        .strip_suffix(" (see ArmouryDaemon.exe.sha256).")?;
+    let hex = hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if hex { Some(hash.to_string()) } else { None }
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +245,24 @@ fn service() -> Result<(ITaskService, ITaskFolder), String> {
         // COM for this thread. It may already be up (the daemon initialises it for the
         // audio interfaces); the second call is a no-op then.
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // The Task Scheduler 2.0 coclass (taskschd.dll), which is the one that serves
+        // ITaskService. The crate's other constant, CLSID_CTaskScheduler, is the 1.0
+        // coclass (mstask.dll) and does not know this interface at all: asking it for
+        // ITaskService answers E_NOINTERFACE (0x80004002).
         let service: ITaskService =
-            CoCreateInstance::<_, ITaskService>(&CLSID_CTaskScheduler, None, CLSCTX_INPROC_SERVER)
+            CoCreateInstance::<_, ITaskService>(&CLSID_TaskScheduler, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("the task scheduler is not reachable ({e})"))?;
+        // The service object has to be connected to the local scheduler before it will
+        // hand out a folder: unconnected, GetFolder answers 0x800704E3 ("this operation
+        // is supported only when you are connected to the server").
+        service
+            .Connect(
+                &VARIANT::default(),
+                &VARIANT::default(),
+                &VARIANT::default(),
+                &VARIANT::default(),
+            )
+            .map_err(|e| format!("the task scheduler could not be connected ({e})"))?;
         let folder = service
             .GetFolder(&BSTR::from("\\"))
             .map_err(|e| format!("the task folder is not reachable ({e})"))?;
@@ -244,10 +322,21 @@ pub fn read_existing() -> Result<Existing, String> {
         let mut arguments = BSTR::default();
         let _ = exec.Arguments(&mut arguments).ok();
 
+        // What the task says about itself: it carries the hash of the executable it
+        // was registered for.
+        let mut description = BSTR::default();
+        if let Ok(info) = definition.RegistrationInfo() {
+            let _ = info.Description(&mut description).ok();
+        }
+
         let path = path.to_string();
         let arguments = arguments.to_string();
+        let description = description.to_string();
         Ok(match our_executable() {
-            Some(exe) if same_path(&path, &exe) => Existing::Ours { arguments },
+            Some(exe) if same_path(&path, &exe) => Existing::Ours {
+                arguments,
+                description,
+            },
             _ => Existing::Foreign { path },
         })
     }
@@ -269,8 +358,75 @@ fn missing_or_unreadable(first: HRESULT, second: HRESULT) -> Existing {
     }
 }
 
+/// The SHA-256 of a file, as lowercase hex - the same digest the installer records.
+pub fn file_sha256(path: &Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("the file {} cannot be read ({e})", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| format!("the file {} cannot be read ({e})", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(crate::catalog::hex_digest(&hasher.finalize()))
+}
+
+/// Record the hash of the executable next to it, in the format the installer uses.
+///
+/// A failure warns and carries on: the task has to be registered either way, and a
+/// missing sidecar is a security gap, not a reason to leave the daemon down. The
+/// installer uses the same policy.
+fn record_hash(exe: &Path) -> Option<String> {
+    let sidecar = sidecar_path(exe);
+    let hash = match file_sha256(exe) {
+        Ok(hash) => hash,
+        Err(e) => {
+            warn!(
+                "the hash of the executable could not be read ({e}) - the exe hash is not \
+                 recorded, so a swapped binary would not be detectable"
+            );
+            return None;
+        }
+    };
+    let name = exe
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match std::fs::write(&sidecar, sidecar_bytes(&hash, &name)) {
+        Ok(()) => {
+            info!(
+                "the exe hash is recorded: {hash} (also in {})",
+                sidecar.display()
+            );
+            Some(hash)
+        }
+        Err(e) => {
+            warn!(
+                "the hash sidecar {} was NOT written ({e}) - the exe hash is not recorded, \
+                 so a swapped binary would not be detectable",
+                sidecar.display()
+            );
+            None
+        }
+    }
+}
+
 /// Register the task for this executable: the same one `deploy/setup.ps1` registers.
 pub fn register(exe: &Path) -> Result<(), String> {
+    // The tamper record, in the two places the installer puts it: the sidecar next to
+    // the executable and the description of the task. Both are written before the task
+    // is registered, so a task that exists carries the hash of the binary it runs.
+    let hash = record_hash(exe);
+    let description = match &hash {
+        Some(hash) => task_description(hash),
+        None => task_description_without_hash(),
+    };
+
     let (service, folder) = service()?;
     let work_dir = exe.parent().unwrap_or(Path::new("."));
     let exe_text = exe.to_string_lossy().to_string();
@@ -283,12 +439,10 @@ pub fn register(exe: &Path) -> Result<(), String> {
             .NewTask(0)
             .map_err(|e| format!("the task definition cannot be created ({e})"))?;
 
-        // The description says what the task is. The installer adds the hash of the
-        // executable to it — it is the one that knows it.
+        // The description says what the task is, and carries the hash of the
+        // executable - the same wording the installer uses.
         if let Ok(info) = definition.RegistrationInfo() {
-            let _ = info.SetDescription(&BSTR::from(
-                "ArmouryDaemon autostart. The daemon registered this task for itself.",
-            ));
+            let _ = info.SetDescription(&BSTR::from(description.as_str()));
         }
 
         // The action: this executable, with --autostart, in its own folder.
@@ -521,6 +675,13 @@ pub fn check_and_register(exe: &Path) {
     match plan {
         Plan::Nothing => {
             info!("autostart: the scheduled task '{TASK_NAME}' is already registered for this executable");
+            // The task records the hash of the binary it was registered for. A
+            // different one means the executable was swapped afterwards. Nothing is
+            // written here: the installer owns the sidecar and the description of a
+            // task that is already there.
+            if let Existing::Ours { description, .. } = &existing {
+                check_recorded_hash(exe, description);
+            }
         }
         Plan::LeaveAlone => {
             // A task that could not be read has no path to name: it is simply "another
@@ -563,6 +724,29 @@ pub fn check_and_register(exe: &Path) {
                 Err(e) => warn!("autostart: the scheduled task was not registered ({e})"),
             });
         }
+    }
+}
+
+/// The task records the hash of the executable it was registered for. A hash that is
+/// not the one of the running executable means the binary was swapped afterwards.
+fn check_recorded_hash(exe: &Path, description: &str) {
+    let Some(recorded) = recorded_hash(description) else {
+        info!(
+            "autostart: the scheduled task carries no recorded exe hash - the tamper record is missing"
+        );
+        return;
+    };
+    match file_sha256(exe) {
+        Ok(actual) if actual == recorded => {}
+        Ok(actual) => warn!(
+            "autostart: the exe hash in the scheduled task ({recorded}) is not the hash of the \
+             running executable ({actual}) - the executable was swapped after the task was \
+             registered"
+        ),
+        Err(e) => warn!(
+            "autostart: the hash of the running executable could not be read ({e}), so the one \
+             in the scheduled task ({recorded}) could not be checked"
+        ),
     }
 }
 
@@ -707,6 +891,107 @@ mod tests {
     }
 
     #[test]
+    fn the_sidecar_is_the_hash_two_spaces_the_name_and_a_crlf() {
+        // The installer writes it with `Set-Content -Encoding ASCII`: the text and one
+        // CRLF, and nothing else. The daemon writes the same bytes, so a sidecar from
+        // either path is byte for byte the same file.
+        let bytes = sidecar_bytes("abc", "ArmouryDaemon.exe");
+        assert_eq!(bytes, b"abc  ArmouryDaemon.exe\r\n".to_vec());
+        // The real thing: 64 hex characters, two spaces, the name, a CRLF.
+        let hash = "a164d04318dac86be5d411bfba6a09e1603f6004490989af43497f7d54fcf29d";
+        let sidecar = sidecar_bytes(hash, "ArmouryDaemon.exe");
+        assert_eq!(sidecar.len(), 85);
+        assert_eq!(
+            sidecar,
+            format!("{hash}  ArmouryDaemon.exe\r\n").into_bytes()
+        );
+    }
+
+    #[test]
+    fn the_sidecar_sits_next_to_the_executable() {
+        let sidecar = sidecar_path(Path::new(r"C:\Apps\ArmouryDaemon\ArmouryDaemon.exe"));
+        assert_eq!(
+            sidecar,
+            PathBuf::from(r"C:\Apps\ArmouryDaemon\ArmouryDaemon.exe.sha256")
+        );
+    }
+
+    #[test]
+    fn the_description_carries_the_hash() {
+        // The wording of the installer, so a task registered by either path is
+        // indistinguishable.
+        let hash = "a164d04318dac86be5d411bfba6a09e1603f6004490989af43497f7d54fcf29d";
+        assert_eq!(
+            task_description(hash),
+            format!("ArmouryDaemon autostart. exe SHA256 {hash} (see ArmouryDaemon.exe.sha256).")
+        );
+        assert_eq!(
+            task_description_without_hash(),
+            "ArmouryDaemon autostart. exe SHA256 not recorded (the hash sidecar could not be \
+             written)."
+        );
+    }
+
+    #[test]
+    fn the_installer_writes_the_same_sidecar_and_the_same_description() {
+        // The two install paths have to stay in step: the installer writes the
+        // sidecar and the description, and the daemon writes the same bytes.
+        let script = setup_script();
+        assert!(
+            script.contains(r#"("{0}  {1}" -f $hash, (Split-Path $exe -Leaf))"#),
+            "the installer must write the hash, two spaces and the file name"
+        );
+        assert!(
+            script.contains("-Encoding ASCII"),
+            "the installer must write the sidecar as plain ASCII"
+        );
+        assert!(
+            script.contains(
+                r#"$description = "ArmouryDaemon autostart. exe SHA256 $hash (see ArmouryDaemon.exe.sha256).""#
+            ),
+            "the installer must use the same description as the daemon"
+        );
+        assert!(
+            script.contains(
+                r#"$description = "ArmouryDaemon autostart. exe SHA256 not recorded (the hash sidecar could not be written).""#
+            ),
+            "the installer must use the same wording when the hash could not be recorded"
+        );
+    }
+
+    #[test]
+    fn a_hash_is_only_read_from_a_description_of_our_own() {
+        // The description is free text, so only the exact wording is recognised.
+        let hash = "a164d04318dac86be5d411bfba6a09e1603f6004490989af43497f7d54fcf29d";
+        assert_eq!(
+            recorded_hash(&task_description(hash)),
+            Some(hash.to_string())
+        );
+        assert_eq!(recorded_hash(&task_description_without_hash()), None);
+        assert_eq!(recorded_hash("ArmouryDaemon autostart."), None);
+        assert_eq!(recorded_hash(""), None);
+        // A hash that is not 64 lowercase hex characters is not a hash.
+        assert_eq!(recorded_hash(&task_description("abc")), None);
+        assert_eq!(recorded_hash(&task_description(&hash.to_uppercase())), None);
+    }
+
+    #[test]
+    fn the_hash_of_a_file_is_the_one_the_installer_records() {
+        let dir = std::env::temp_dir().join(format!("armoury-sha256-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ArmouryDaemon.exe");
+        fs::write(&file, b"hello").unwrap();
+        // SHA-256("hello")
+        assert_eq!(
+            file_sha256(&file).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        assert!(file_sha256(&dir.join("missing.exe")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_missing_task_is_registered_when_the_rights_are_there() {
         assert_eq!(decide(&Existing::None, true), Plan::Register);
     }
@@ -720,6 +1005,7 @@ mod tests {
     fn a_task_that_is_already_ours_is_left_alone() {
         let ours = Existing::Ours {
             arguments: TASK_ARGUMENTS.to_string(),
+            description: task_description("a".repeat(64).as_str()),
         };
         assert_eq!(decide(&ours, true), Plan::Nothing);
         assert_eq!(decide(&ours, false), Plan::Nothing);
@@ -729,6 +1015,7 @@ mod tests {
     fn a_task_of_ours_with_the_wrong_argument_is_fixed() {
         let ours = Existing::Ours {
             arguments: String::new(),
+            description: String::new(),
         };
         assert_eq!(decide(&ours, true), Plan::Register);
         assert_eq!(decide(&ours, false), Plan::Elevate);
