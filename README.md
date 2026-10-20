@@ -76,7 +76,7 @@ left stick scrolls, **A** launches, **B** (or unplugging the pad) closes it. A m
 launches too, and `Esc` closes.
 
 A **≡** button in the band's top-left corner opens a small menu for the artwork: **Choose
-artwork…** opens a picker with an **Icon** and a **Background** tab — the 2:3 grids for the icon,
+artwork.** opens a picker with an **Icon** and a **Background** tab — the 2:3 grids for the icon,
 the wide heroes for the background — and **Use automatic again** hands the slot back to the
 automatic picker. The mouse and a controller both work, a picture you pick is shown in the band
 at once, and it stays until you take it away.
@@ -127,7 +127,7 @@ missing file no longer means a **black** band. Without an API key the band falls
 icon and then to a monogram.
 
 You are not stuck with the automatic pick. The **≡** menu in the band's top-left corner has
-**Choose artwork…**, which opens a picker with an **Icon** and a **Background** tab — the 2:3
+**Choose artwork.**, which opens a picker with an **Icon** and a **Background** tab — the 2:3
 grids for the icon, the wide heroes for the background, each with its size and style under it.
 The mouse and a controller both work, your choice is shown at once, and it keeps its place until
 you choose **Use automatic again**.
@@ -145,7 +145,7 @@ only way to install a local pack file.
 
 From the command line:
 
-```
+```console
 ArmouryDaemon.exe --catalog-list
 ArmouryDaemon.exe --catalog-install <id>
 ArmouryDaemon.exe --catalog-url <url>
@@ -239,7 +239,7 @@ executable is locked, so the order is stop → copy → run `setup.ps1`), and un
 |---|---|
 | Dashboard | Left-click the tray icon, or **Open dashboard** in the tray menu |
 | Settings | The gear in the dashboard's title bar |
-| Tracked apps | The dashboard — the inline type-to-filter picker over all running processes, and **Browse…** |
+| Tracked apps | The dashboard — the inline type-to-filter picker over all running processes, and **Browse.** |
 | Packs | The **packs** folder in the install folder; Settings → **Open packs folder** |
 | Config | `%APPDATA%\ArmouryDaemon\config.json` |
 | Logs | `%APPDATA%\ArmouryDaemon\logs\daemon.log`, `ui.log`, `console.log` (rotated, 512 KiB per generation, three generations kept) |
@@ -273,7 +273,8 @@ guard) and asserts the engine behaviour. It refuses to run against an installed 
 
 ## The packs
 
-The packs live in their own repository: **[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**.
+The packs live in their own repository:
+**[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**.
 
 A pack is a single `pack.json` file: which process it targets, the dropdowns it exposes, what it
 captures before acting, and the ordered steps to apply and to revert. A pack is **data**, not
@@ -289,7 +290,7 @@ last one a spec-2 pack that declares `min_engine: 1.0.0` because its script uses
 
 ## Project layout
 
-```
+```text
 Cargo.toml                  the workspace (two crates, one release profile)
 crates/
   armoury-core/             config, protocol, status, engine, pack schema, logging, icon
