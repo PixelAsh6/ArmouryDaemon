@@ -299,7 +299,7 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (269: 199 in armoury, 70 in armoury-core)
+cargo test                   # the unit tests (315: 239 in armoury, 76 in armoury-core)
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
