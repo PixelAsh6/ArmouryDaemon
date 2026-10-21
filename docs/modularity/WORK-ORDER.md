@@ -33,23 +33,27 @@ and "Next action".**
 
 ## Phase A — foundation (no user-visible change)
 
-### A1. Fix the TLS root store — **the next action**
+### A1. Fix the TLS root store — **done (2026-10-22)**
 
-A real bug, still open, and it blocks the whole module channel.
+A real bug, and it blocked the whole module channel. It is fixed: the catalogue is validated
+against the Windows certificate store now.
 
-`Cargo.toml` has `ureq = { version = "3", default-features = false, features = ["rustls"] }`.
+`Cargo.toml` had `ureq = { version = "3", default-features = false, features = ["rustls"] }`.
 In ureq 3.4.2 the `rustls` feature is
 `["rustls-no-provider","_ring","rustls-webpki-roots"]` and `RootCerts` defaults to
-`WebPki`. `Cargo.lock` contains `webpki-roots` and **no** `rustls-native-certs`. So the
-catalog fetch validates TLS against Mozilla's bundled roots, **not the Windows cert
-store** — and it fails on any machine with a corporate CA or TLS interception.
+`WebPki`. `Cargo.lock` contained `webpki-roots` and **no** `rustls-native-certs`. So the
+catalog fetch validated TLS against Mozilla's bundled roots, **not the Windows cert
+store** — and it failed on any machine with a corporate CA or TLS interception.
 
 ```toml
 ureq = { version = "3", default-features = false,
          features = ["rustls", "platform-verifier", "win-system-proxy", "gzip"] }
 ```
 ```rust
-Config::builder().tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
+// one agent, built on the first fetch: a request-level TLS change bypasses the pool
+let tls = TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build();
+let config = Config::builder().tls_config(tls).timeout_global(Some(15s)).build();
+let agent = Agent::new_with_config(config);
 ```
 
 `platform-verifier` → `rustls-platform-verifier` uses the Windows platform certificate
@@ -59,6 +63,15 @@ Windows *service*; this app is a per-user process.)
 
 **Accept:** the catalog fetch works against a machine with a corporate CA. Note it in
 the changelog.
+
+**What is left of the acceptance:** a machine behind a corporate CA. The root store is
+asserted by a unit test and the fetch of a public host is in the self-test harness, but
+the corporate case itself can only be confirmed by a user on such a machine. The reason
+is in `PROGRESS.md`.
+
+**The cost:** the release build grows by **60,416 bytes** (+0.47 %) — the platform
+verifier, the WinINet proxy reader and the gzip decoder. `DECISIONS.md` §12 says why that
+is accepted and what would pay it back.
 
 ### A2. Capability-scoped host API
 

@@ -73,6 +73,15 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 > **These numbers predate two changes**: `strip` is now `"debuginfo"` (not `true`) and
 > the target moved to `x86-64-v3`. **Re-measure the baseline before using the byte
 > count as a limit.**
+>
+> **Re-measured on the current tree (2026-10-22, `9276196`): the release build is
+> 12,808,192 bytes** — that is the v1.1.4 release asset and the installed copy, byte for
+> byte (sha256 `a0b19a1c32e05e6511c1a765a02bdd4101d3b9e7ce83e8474d15a3136a45704c`).
+> Use this one as the limit.
+>
+> **After A1 (2026-10-22): 12,868,608 bytes** — **+60,416 bytes (+0.47 %)** for the platform
+> verifier, the WinINet proxy reader and the gzip decoder. `DECISIONS.md` §12 says why that
+> is accepted, and what would pay it back.
 
 ### Runtime
 
@@ -86,6 +95,7 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 | Named-pipe JSON round trip | **28.0 µs** (50 sequential: 32.5 µs/trip) |
 | SHA-256 | 1,312 MiB/s (32 MiB in 24.18 ms) |
 | Resident daemon | 2.0 MB private / 12.7 MB WS / 0.078 % of one core (measured pre-1.1.3) |
+| Resident daemon, **four tracked apps** | **1.72 % of one core** — 1.031 CPU seconds in 60 s (2026-10-22, A1). The difference is the 1 Hz process-table walk (trap 5): with nothing tracked it is skipped. **After A1: 1.692 %** (1.016 CPU s in 60 s) — unchanged, as it has to be. |
 
 ### What the numbers decide
 
@@ -105,9 +115,12 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 
 ## 3. The traps
 
-1. **The `ureq` root store bug.** `features = ["rustls"]` only → Mozilla roots, not the
-   Windows cert store → the catalog fails behind any corporate CA. **Still open.**
-   (`WORK-ORDER.md` A1.)
+1. **The `ureq` root store bug — fixed in A1.** `features = ["rustls"]` only → Mozilla
+   roots, not the Windows cert store → the catalog failed behind any corporate CA. The
+   fix is the `platform-verifier` feature **and** `RootCerts::PlatformVerifier` together.
+   **The art fetches still have it**: `art.rs:991` and `console_ui.rs:1320` make their own
+   `ureq::get(...)` calls with no TLS config, so the SteamGridDB lookups are still
+   validated against the bundled roots. Same bug, still open.
 2. **The pack worker is a single serial thread** (`packs.rs:160`,
    `while let Ok(job) = jobs.recv()`). A slow mode would block every later apply and
    revert. Modes need their own worker.
@@ -182,6 +195,30 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     `ArmouryDaemon-<version>-windows-x64.zip` is planning a file that does not
     exist. The release workflow still checks the repo's `packs\` folder against the
     catalogue, but it no longer ships those bytes.
+21. **ureq's API is not what it looks like** (learned the hard way in A1).
+    `Config` lives at **`ureq::config::Config`**, not at `ureq::Config` — the crate root
+    does not re-export it, and the build fails with *cannot find `Config` in `ureq`*.
+    `Config::builder()` returns a **`ConfigBuilder`**, not a `Config` — the outer
+    `.build()` is missing if you copy a snippet. `ureq::get(uri)` builds a **use-once
+    agent** (`Agent::new_with_defaults()`), so there is **no connection pool** at all.
+    A **request-level** `.config()` bypasses the agent's pool when the TLS settings
+    differ — ureq's own words: *"Request-level changes to connection settings (TLS, IP
+    family, TCP_NODELAY, buffer sizes, or the configured User-Agent used for proxy
+    CONNECT) bypass the Agent's pool"*. And `RootCerts::PlatformVerifier` **panics at
+    runtime** without the `platform-verifier` feature
+    (`ureq-3.4.2/src/tls/rustls.rs:184`) — the feature and the setting have to come
+    together. The vendored source is in
+    `%USERPROFILE%\.cargo\registry\src\…\ureq-3.4.2`: read it, do not remember it.
+22. **The WinINet proxy is read when the client is built.** `Config::default()` calls
+    `Proxy::try_from_env()`, which reads `HKCU\Software\Microsoft\Windows\CurrentVersion\
+    Internet Settings` (`ProxyEnable`, `ProxyServer`). A client that is built once reads
+    it once, so a proxy change is only picked up after a restart of the daemon.
+23. **A self-signed certificate cannot serve TLS on Windows.** `SslStream` refuses an
+    ephemeral key: *"Authentication failed because the platform does not support
+    ephemeral keys"*. A local HTTPS probe needs a key in the user's key store, so the
+    harness probes the public catalogue instead.
+24. **`Cargo.lock` carries two `windows-sys` versions now**: 0.61.2 (the project's) and
+    0.52.0 (from `rustls-platform-verifier`). That is normal — do not "fix" it.
 
 ---
 

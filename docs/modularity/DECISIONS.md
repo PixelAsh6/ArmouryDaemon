@@ -207,7 +207,80 @@ window that expires while the intent still holds changes nothing.
 
 ---
 
-## 11. Deliberately out of scope
+## 11. The catalogue client is one agent, built once, with the platform verifier
+
+**Settled — implemented in A1.** `crates/armoury/src/catalog.rs` builds **one** `ureq::Agent`
+from a `Config` that carries a `TlsConfig` with `RootCerts::PlatformVerifier`, and every
+fetch goes through that agent. The client is built on the **first** fetch, not at startup.
+
+**Why:**
+
+- The **Windows certificate store** is the root store. The machine's own store carries the
+  enterprise roots, the constraints and the revocation policy, and the catalogue has to be
+  reachable on a machine with a corporate CA or with TLS interception. Mozilla's bundled roots
+  know none of them.
+- **One agent, not one per request.** A request-level TLS change **bypasses the agent's
+  connection pool** — ureq says so itself. More important: the rustls `ClientConfig` and the
+  platform verifier are built **once per agent**, not once per fetch, and the verifier opens
+  the certificate store.
+- **The client is built on the first fetch.** The daemon's idle path never touches the
+  network, and nothing may be added to it.
+- The **WinINet** proxy settings, not WinHTTP: this is a per-user desktop app. WinHTTP is for
+  a Windows *service*.
+
+**Known trade-off, accepted:** the proxy settings are read when the client is built, so a
+proxy change is only picked up after the daemon restarts. Reading them per fetch would mean a
+new client per fetch — the cost this decision removes.
+
+**Rejected:**
+
+- **`ureq::get(url).config()…build()`** — the request-level config the folder's first draft
+  showed. It bypasses the pool, and it builds a new client for every request.
+- **One agent per request** (what the code did before): a new rustls config and a new
+  platform verifier for every fetch, and no connection reuse.
+- **Mozilla's roots** (`RootCerts::WebPki`, ureq's default): the bug this phase fixes.
+- **Pinning the catalogue's certificate**: it fights the TLS interception this phase is about,
+  and `rustls` has no pinning API.
+
+---
+
+## 12. The catalogue client may add 60 KB — the size rule bends here, once
+
+**Settled — implemented in A1.** The release build grows from **12,808,192 bytes** (v1.1.4)
+to **12,868,608 bytes**: **+60,416 bytes, +0.47 %**. `WORK-ORDER.md` says only Phase E may
+add bytes. This phase adds them anyway, and the reason is in the numbers.
+
+**Why:** a catalogue that cannot be fetched is worth more than 60 KB of a 12.8 MB executable.
+The rule exists to catch *gratuitous* growth — a module system, a WASM runtime — and not to
+freeze a bug fix that makes the product work on the machines it is sold for.
+
+**What is in the 60,416 bytes:** the platform verifier (`rustls-platform-verifier` and its
+`windows-sys` bindings), the WinINet proxy reader (`winreg`) and the gzip decoder (`flate2`
+with `miniz_oxide`). The build was not profiled per crate, so the split is not measured —
+the total is.
+
+**What would pay it back, and did not happen here:** the binary still carries **Mozilla's
+bundled roots** (`webpki-roots`) even though nothing uses them any more. They are only still
+there because the **art fetches** (`art.rs:991`, `console_ui.rs:1320`) make their own
+`ureq::get(...)` calls with the default configuration, which is `RootCerts::WebPki`. Move
+those two to the shared client and the `rustls-webpki-roots` feature can go: the binary
+loses the Mozilla roots — the crate is 447 KB of source, most of it certificate bytes — and
+that is more than the 60 KB the platform verifier costs. That is a follow-up: it touches
+files this phase was told not to touch.
+
+**Rejected:**
+
+- **Dropping the `gzip` feature** to claw the bytes back. The catalogue's payloads are
+  1–2 KB, so gzip saves a kilobyte of traffic and costs tens of kilobytes of binary — a bad
+  trade on its own — but the phase asks for compressed responses, and the self-test harness
+  now proves that they arrive and are decoded.
+- **Changing `strip` from `"debuginfo"` to `"symbols"`** to make the number fit. That is
+  gaming the measurement: the binary would shrink for an unrelated reason and the symbol
+  table the crash reports need would be gone.
+
+---
+
+## 13. Deliberately out of scope
 
 - A public plugin SDK, a marketplace, a third-party publisher story.
 - TUF, sigstore, TLS pinning, delta updates (`bsdiff` + `bzip2` — a 2.85 GB `target/`

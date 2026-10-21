@@ -38,9 +38,13 @@ background.
 ## Current state
 
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`.
-- The **1.1.4** work — the lockout rewritten to hold a change in both directions, the
-  release carrying only the executable and its sidecar, the toolchain pinned — is
+- The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
+  the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
+- **Phase A1 is done** — the catalogue is validated against the **Windows certificate
+  store**, not Mozilla's bundled roots, so it works behind a corporate CA. The client is
+  one `ureq::Agent`, the user's WinINet proxy settings are read, and the responses are
+  compressed. See `PROGRESS.md`.
 - **The tree is clean and everything is committed.** There is no uncommitted work to
   protect.
 - ~60 % of the request is **already shipped**: G-Helper, Rainmeter and Wallpaper
@@ -62,25 +66,14 @@ background.
 
 ## The next action
 
-**Phase A1 — fix the TLS root store.** It is a real bug, it is still open, and it
-blocks the whole module channel.
+**Phase A2 — the capability-scoped host API.** A pack declares the capabilities it needs
+and the daemon grants only those: a call to a function that was not granted has to fail as
+an **unknown function**, not as a runtime check a call site could forget.
 
-`Cargo.toml` has `ureq = { ..., features = ["rustls"] }` only. In ureq 3.4.2 the
-`rustls` feature is `["rustls-no-provider","_ring","rustls-webpki-roots"]` and
-`RootCerts` defaults to `WebPki`, so the catalog fetch validates TLS against Mozilla's
-bundled roots **instead of the Windows cert store** — and fails on any machine with a
-corporate CA or TLS interception.
-
-```toml
-ureq = { version = "3", default-features = false,
-         features = ["rustls", "platform-verifier", "win-system-proxy", "gzip"] }
-```
-```rust
-Config::builder().tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
-```
-
-The full phase list is in `WORK-ORDER.md`. Phases run in order: **A → B → C → D**,
-and **E (WASM) is deferred** until the rest has shipped and settled.
+`DESIGN.md` §2 has the capability table and §3 the mechanism — **one engine per capability
+set**, because the sandbox keeps one engine per thread since 1.1.3, so "register less" is
+no longer free. The full phase list is in `WORK-ORDER.md`. Phases run in order:
+**A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and settled.
 
 ---
 

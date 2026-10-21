@@ -300,6 +300,83 @@ function Invoke-CliProbe([string[]]$argList, [int]$timeoutSec = 20) {
     }
 }
 
+# Run the binary with these arguments while a local server answers the request, then
+# read back what it said.
+#
+# The order matters: the server has to answer while the binary waits for it, so the
+# process is started first and the server is called from here. The server is a script
+# block that gets the loopback port it has to answer on.
+function Invoke-CatalogProbe([string[]]$argList, [scriptblock]$serve, [int]$timeoutSec = 40) {
+    New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
+    $outPath = Join-Path $cliDir 'stdout.txt'
+    $errPath = Join-Path $cliDir 'stderr.txt'
+    Remove-Item -LiteralPath $outPath, $errPath -ErrorAction SilentlyContinue
+    $p = Start-Process $Exe -ArgumentList $argList -PassThru -WindowStyle Hidden `
+            -RedirectStandardOutput $outPath -RedirectStandardError $errPath
+    [void]$script:children.Add($p)
+    $null = $p.Handle    # cache the handle, or the exit code cannot be read any more
+    # the local server answers while the binary waits for it
+    try { & $serve } catch { "the local server failed: $_" }
+    $exited = $p.WaitForExit($timeoutSec * 1000)
+    $code = $null
+    if ($exited) { $code = $p.ExitCode }
+    if (-not $exited) { $p | Stop-Process -Force -ErrorAction SilentlyContinue }
+    $out = Read-Text $outPath
+    $err = Read-Text $errPath
+    return [pscustomobject]@{
+        Process = $p
+        Exited  = $exited
+        Exit    = $code
+        Out     = $out
+        Err     = $err
+        Text    = "$out`n$err"
+    }
+}
+
+# The request of one connection, as text. The client sends headers only, so the first
+# blank line ends it.
+function Read-Request([System.Net.Sockets.TcpClient]$client) {
+    $stream = $client.GetStream()
+    $buffer = New-Object byte[] 8192
+    $text = ''
+    while (-not $text.Contains("`r`n`r`n")) {
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        if ($read -le 0) { break }
+        $text += [System.Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+        if ($text.Length -gt 65536) { break }
+    }
+    return $text
+}
+
+# The gzip-compressed bytes of a string.
+function Get-GzipBytes([string]$text) {
+    $raw = [System.Text.Encoding]::UTF8.GetBytes($text)
+    $ms = [System.IO.MemoryStream]::new()
+    $gz = [System.IO.Compression.GZipStream]::new($ms, [System.IO.Compression.CompressionMode]::Compress, $true)
+    $gz.Write($raw, 0, $raw.Length)
+    $gz.Dispose()
+    return $ms.ToArray()
+}
+
+# A loopback listener on a free port, and the task that waits for the first connection.
+function Start-LoopbackListener {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    return [pscustomobject]@{
+        Listener = $listener
+        Port     = $listener.LocalEndpoint.Port
+        Accept   = $listener.AcceptTcpClientAsync()
+    }
+}
+
+# Why a fetch failed: the TLS check refused the certificate, the network is not there, or
+# something else. The first is the build, the second is the machine, the third is a bug.
+function Get-FetchFailure([string]$text) {
+    if ($text -match '(?i)certificate|unknownissuer|untrusted|rustls') { return 'tls' }
+    if ($text -match '(?i)host not found|connection failed|timeout|dns|no such host') { return 'network' }
+    return 'other'
+}
+
 # The real config of the installed daemon must not change during the run: the test instance
 # writes into a temp folder (ARMOURY_TEST_NS), so the file has to be byte-identical afterwards.
 $realConfig = Join-Path $env:APPDATA 'ArmouryDaemon\config.json'
@@ -679,13 +756,85 @@ try {
         if ($probe.Killed) { $detail += ' (a stray daemon was killed)' }
         Check 'catalog-install without an id leaves no daemon running' ($probe.After -le $probe.Before) $detail
 
+        # -- 20b. the catalogue fetch itself --
+        #
+        # The catalogue is fetched over HTTPS with the **Windows certificate store** as the
+        # root store, and the response is compressed. Two probes show both:
+        #
+        # * a plain HTTP server on the loopback interface that answers with a
+        #   **gzip-compressed** manifest. The daemon has to list the pack, and the server has
+        #   to have seen "Accept-Encoding: gzip" - the client asks for a compressed response
+        #   and decodes it.
+        # * the **real** catalogue over HTTPS. The certificate of a public host is in the
+        #   Windows store, so a fetch that succeeds proves the platform verifier is wired up
+        #   and works. A machine behind a corporate CA cannot be shown here: that needs a
+        #   private root in the machine's certificate store. The root store itself is
+        #   asserted by the unit test in catalog.rs (the client trusts the platform
+        #   verifier).
+
+        # (a) the gzip manifest
+        $localManifest = '{"schema":1,"updated":"2026-10-22","packs":[{"id":"local-test","name":"Local test","version":"9.9.9","description":"served by the harness","file":"packs/local-test/pack.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":10}]}'
+        $gzipBody = Get-GzipBytes $localManifest
+        $server = Start-LoopbackListener
+        $script:served = ''
+        $probe = Invoke-CatalogProbe @('--catalog-list', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
+            if (-not $server.Accept.Wait(20000)) { throw 'the daemon did not connect' }
+            $client = $server.Accept.GetAwaiter().GetResult()
+            try {
+                $script:served = Read-Request $client
+                $stream = $client.GetStream()
+                $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Encoding: gzip`r`nContent-Length: $($gzipBody.Length)`r`nConnection: close`r`n`r`n"
+                $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                $stream.Write($headBytes, 0, $headBytes.Length)
+                $stream.Write($gzipBody, 0, $gzipBody.Length)
+                $stream.Flush()
+            }
+            finally { $client.Close() }
+        }
+        $server.Listener.Stop()
+        $r = $probe
+        Check 'the catalogue listing succeeds against a local server' ($r.Exited -and $r.Exit -eq 0) "exit=$($r.Exit)"
+        Check 'the catalogue listing names the pack' ($r.Text.Contains('local-test')) "output=$(Get-FirstLine $r.Text)"
+        Check 'the client asks for a compressed response' ($script:served -match '(?i)accept-encoding:\s*gzip') "request=$($script:served -replace "`r`n", ' ')"
+
+        # (b) the real catalogue, over HTTPS, with the Windows certificate store
+        $run = Invoke-Cli @('--catalog-list') 40
+        $failure = Get-FetchFailure $run.Text
+        if (($run.Exit -ne 0) -and ($failure -eq 'network')) {
+            # the machine cannot reach the catalogue right now. That is the network and not
+            # the build, so the check is skipped rather than failed.
+            "SKIP  the catalogue fetch against the real catalogue: this machine cannot reach"
+            "      it right now ($($run.Err.Trim()))"
+        }
+        else {
+            # a certificate error here is a failure of the build: the platform verifier is
+            # not doing its job, and the fetch of a public host has to work
+            Check 'the catalogue fetch validates against the Windows certificate store' (($run.Exit -eq 0) -and ($run.Text -match 'catalog: https://')) "output=$(Get-FirstLine $run.Text)"
+            Check 'the catalogue listing names the shipped packs' ($run.Text -match 'g-helper') "output=$(Get-FirstLine $run.Text)"
+        }
+
+        # (c) a pack from the real catalogue: the download, and the size and the SHA-256 of
+        # the published bytes. This is the path a user takes when they install a pack, and
+        # it is where a compressed response would show up: the bytes that are verified are
+        # the plain ones.
+        $run = Invoke-Cli @('--catalog-install', 'g-helper') 60
+        $failure = Get-FetchFailure $run.Text
+        if (($run.Exit -ne 0) -and ($failure -eq 'network')) {
+            "SKIP  the catalogue install against the real catalogue: this machine cannot reach"
+            "      it right now ($($run.Err.Trim()))"
+        }
+        else {
+            Check 'a pack from the catalogue installs and verifies' ($run.Exit -eq 0) "output=$(Get-FirstLine $run.Text)"
+        }
+
         $env:ARMOURY_TEST_NS = $ns
     }
     else {
         "SKIP  the command-line probes (--version, --help, an unknown argument, a flag without"
-        "      its value): the executable asks Windows for administrator rights, and this"
-        "      harness is not elevated - every probe would raise a UAC prompt and the harness"
-        "      would wait for the answer. Run the harness from an elevated shell to run them."
+        "      its value) and the two catalogue probes (a gzip manifest, the real catalogue):"
+        "      the executable asks Windows for administrator rights, and this harness is not"
+        "      elevated - every probe would raise a UAC prompt and the harness would wait for"
+        "      the answer. Run the harness from an elevated shell to run them."
     }
 }
 finally {

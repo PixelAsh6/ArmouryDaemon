@@ -159,6 +159,10 @@ The catalogue needs **no API key**: the manifest and the pack files are plain pu
 fetched from the packs repository's raw URL. The SteamGridDB key in Settings is for the **cover
 art** only.
 
+The fetch is validated against the **Windows certificate store**, so a machine with a
+corporate CA — or one whose TLS is intercepted by a proxy — can still reach the catalogue. It
+goes through the proxy of the desktop session, the way every other app on the machine does.
+
 ### The command line
 
 ```console
@@ -383,7 +387,8 @@ MIT — see [LICENSE](LICENSE).
   [windows-sys](https://github.com/microsoft/windows-rs) — the Win32 surface.
 - [ureq](https://github.com/algesten/ureq) with
   [rustls](https://github.com/rustls/rustls) and
-  [webpki-roots](https://github.com/rustls/webpki-roots) — the catalogue fetch.
+  [rustls-platform-verifier](https://github.com/rustls/rustls-platform-verifier) — the
+  catalogue fetch, validated against the **Windows certificate store**.
 - [serde](https://github.com/serde-rs/serde),
   [serde_json](https://github.com/serde-rs/json),
   [image](https://github.com/image-rs/image),

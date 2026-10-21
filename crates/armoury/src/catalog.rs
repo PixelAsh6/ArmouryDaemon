@@ -8,10 +8,13 @@
 //! This module is transport + verification only; the UI and the protocol wiring build on it.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use armoury_core::pack::version_at_least;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use ureq::config::Config;
+use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::packs;
 
@@ -251,11 +254,33 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("catalog: cannot download {url} ({e})"))
 }
 
+/// The HTTP client the catalogue fetch uses.
+///
+/// One agent, built once and shared by every fetch: it validates TLS against the **Windows
+/// certificate store** — so a machine with a corporate CA, or one whose TLS is intercepted by
+/// a proxy, can still reach the catalogue — it reads the user's WinINet proxy settings, and it
+/// keeps one connection pool for the whole process.
+///
+/// The agent is built on the first fetch and not at startup: the daemon's idle path never
+/// touches the network, and the platform verifier opens the certificate store when the first
+/// TLS connection is made.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        let tls = TlsConfig::builder()
+            .root_certs(RootCerts::PlatformVerifier)
+            .build();
+        let config = Config::builder()
+            .tls_config(tls)
+            .timeout_global(Some(std::time::Duration::from_secs(15)))
+            .build();
+        ureq::Agent::new_with_config(config)
+    })
+}
+
 fn get(url: &str) -> Result<ureq::http::Response<ureq::Body>, String> {
-    ureq::get(url)
-        .config()
-        .timeout_global(Some(std::time::Duration::from_secs(15)))
-        .build()
+    agent()
+        .get(url)
         .call()
         .map_err(|e| format!("catalog: cannot fetch {url} ({e})"))
 }
@@ -372,6 +397,31 @@ mod tests {
         assert_eq!(url_or_default(None), DEFAULT_URL);
         assert_eq!(url_or_default(Some("   ")), DEFAULT_URL);
         assert_eq!(url_or_default(Some("https://example.com/c.json")), "https://example.com/c.json");
+    }
+
+    #[test]
+    fn the_client_trusts_the_windows_certificate_store() {
+        // The bug this guards: the root store was Mozilla's bundled roots, so the catalogue
+        // fetch failed on any machine with a corporate CA or a TLS-intercepting proxy.
+        let roots = agent().config().tls_config().root_certs();
+        assert!(
+            matches!(roots, RootCerts::PlatformVerifier),
+            "the catalogue must be validated against the Windows certificate store, not {roots:?}"
+        );
+    }
+
+    #[test]
+    fn the_client_is_one_shared_agent() {
+        // One agent, one connection pool: a request-level TLS change would bypass the pool.
+        assert!(
+            std::ptr::eq::<ureq::Agent>(agent(), agent()),
+            "every catalogue fetch must share one client"
+        );
+        assert_eq!(
+            agent().config().timeouts().global,
+            Some(std::time::Duration::from_secs(15)),
+            "the 15 s budget of the whole call must survive"
+        );
     }
 
     #[test]

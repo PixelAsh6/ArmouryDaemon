@@ -3,6 +3,23 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- The catalogue fetch validated TLS against **Mozilla's bundled roots** instead of the **Windows
+  certificate store**, so it failed on any machine with a corporate CA or with TLS interception.
+  The root store is the platform's now: the enterprise roots, the constraints and the revocation
+  checks of the machine's own certificate store decide what is trusted.
+
+### Changed
+
+- The catalogue fetch reads the **WinINet proxy settings** of the user. This is a per-user
+  desktop app, so the proxy of the desktop session is the right one — WinHTTP would be for a
+  Windows *service*.
+- The catalogue responses are **compressed**: the client asks for `gzip` and decodes it. The
+  bytes that are verified against the manifest are the plain ones, as before.
+
 ## [1.1.4] - 2026-10-22
 
 ### Fixed
