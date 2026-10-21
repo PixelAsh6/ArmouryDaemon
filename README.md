@@ -1,7 +1,7 @@
 # ArmouryDaemon
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.1.4-blue.svg)](Cargo.toml)
 
 A resident Windows daemon that watches the applications you track and switches the rest of your
 machine around them. While a tracked app runs, Rainmeter, G-Helper and Wallpaper Engine get out
@@ -44,7 +44,7 @@ arbitrary code. A pack is a single `pack.json` file, and it may expose a few dro
 **Where to get them** — the catalogue repository,
 **[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**, whose
 README is the reference for the pack format, the mechanism vocabulary and the script host API.
-Three packs ship with the zip: **Wallpaper Engine**, **G-Helper** and **Rainmeter**.
+Three packs are published there: **Wallpaper Engine**, **G-Helper** and **Rainmeter**.
 
 **How to install one** — Settings → **Install packs**, or from the command line:
 
@@ -56,31 +56,34 @@ A pack may declare the daemon it needs (`"min_engine": "1.2.0"`). A daemon that 
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.3
+pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.4
 ```
 
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
-is `1.1.3`.
+is `1.1.4`.
 
 ### The lockout ("Cooldown")
 
-The lockout is the settling window the Settings window shows, 60 seconds by default. It has one
-job: it **holds the revert**.
+The lockout is the settling window the Settings window shows, 60 seconds by default. It holds a
+change in **both** directions: while a window runs, no change may touch the packs.
 
-- A tracked app **starts** → the packs go to the applied state **at once**. The apply is never
-  deferred — the lockout does not hold it.
-- That change starts a lockout of its own, so the **next** revert waits the full window.
-- The last tracked app **closes** → the revert is **held**: it waits for a window and lands when
-  that window is over. The machine stays in the applied state until then.
+- A tracked app **starts** and **no window is running** → the packs go to the applied state
+  **at once**. The machine is free then — the first launch of a session — and the change starts
+  a lockout of its own.
+- A tracked app **starts inside a window** → the apply is **held**. The packs stay where they
+  are until the window is over, and they go to the applied state then — if the app is still
+  running by then.
+- The last tracked app **closes** → the revert is **held** as well. The close starts a window if
+  none is running and keeps the running one otherwise, and the revert lands when that window is
+  over. The machine stays in the applied state until then.
 - The app **starts again inside that window** → the held revert is cancelled. The packs stay
   applied — the machine is already in the state the app wants, so nothing needs doing.
-- When the window is over: if the app is **not** running, the revert lands and the packs go back
-  to their own state. If it **is** running, nothing happens.
+- When the window is over: the held change lands **only if it is still wanted**, and it lands
+  **exactly once**. The change that lands starts a lockout of its own.
+- A lockout that expires while the app still runs changes nothing and starts no new one.
 
-The lockout is a minimum spacing before a **revert**, and only a change that actually happened
-starts one: a lockout that expires while the app still runs changes nothing and starts no new
-one. Because the "previous state" is always captured on a settled machine, the capture can never
-read the daemon's own value back.
+Because the "previous state" is always captured on a settled machine, the capture can never read
+the daemon's own value back.
 
 Manual actions — removing a tracked app, pausing, entering or leaving idle mode — bypass the
 lockout: they change the packs at once.
@@ -166,12 +169,12 @@ ArmouryDaemon.exe --help
 ```
 
 `--catalog-url <url>` lists that catalogue instead of the configured one. `--version` prints
-`ArmouryDaemon 1.1.3`, `--help` prints the flags the binary accepts. An argument the binary
+`ArmouryDaemon 1.1.4`, `--help` prints the flags the binary accepts. An argument the binary
 does not know is an error — the usage on stderr, exit code 2 — so the daemon never starts on
 a typo.
 
 The release build is a **GUI-subsystem binary** (PE subsystem 2), so it prints to the console it
-attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.3` on stdout, once, and
+attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.4` on stdout, once, and
 exits 0. Redirected, the line goes to **both** stdout and stderr, so `2>&1 | Out-String` shows
 it **twice**. `cmd.exe`'s own `>` can misbehave, because the process attaches to the parent
 console (`AttachConsole`) and re-points the standard handles, so the file can come out empty
@@ -236,8 +239,10 @@ AMD Excavator (2015) and later; see [Building from source](#building-from-source
 ### From the executable alone
 
 1. **Download** `ArmouryDaemon.exe` from the
-   [v1.1.3 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3) and put it
-   in a folder you can write to, for example `C:\Apps\ArmouryDaemon`.
+   [v1.1.4 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.4) and put it
+   in a folder you can write to, for example `C:\Apps\ArmouryDaemon`. The release carries this
+   executable and its `ArmouryDaemon.exe.sha256` sidecar — the SHA-256 of the file, so a swapped
+   binary is detectable — and nothing else.
 2. **Run it.** The executable carries a manifest that asks for administrator, so Windows shows
    one consent prompt — accept it. The daemon then:
    - creates the `packs\` folder next to itself if it is not there (a fresh install has no packs
@@ -251,12 +256,17 @@ AMD Excavator (2015) and later; see [Building from source](#building-from-source
    SteamGridDB key in Settings is for the **cover art** only. The
    [catalogue section](#the-pack-catalogue) has the details of the download and the check.
 
-### Or the whole thing at once
+The three packs — **Wallpaper Engine**, **G-Helper** and **Rainmeter** — are not in the release
+any more: the catalogue is where they come from, and they are installed into the `packs\` folder
+next to the executable, which is where your own packs go too.
 
-1. **Download** `ArmouryDaemon-1.1.3-windows-x64.zip` from the
-   [v1.1.3 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3) and unpack it
-   into a permanent folder, for example `C:\Apps\ArmouryDaemon`. The zip holds the executable,
-   the three shipped packs, the SHA-256 sidecar, `setup.ps1`, `uninstall.ps1` and this README.
+### Or the scripted install
+
+The release does not publish a zip any more, so there is nothing to unpack: the scripted install
+lives in the **`deploy\` folder of the repository**, next to the executable.
+
+1. Put `ArmouryDaemon.exe` and the `deploy\` folder's `setup.ps1` in a permanent folder, for
+   example `C:\Apps\ArmouryDaemon`.
 2. In an **administrator** PowerShell, in that folder:
 
    ```powershell
@@ -278,9 +288,6 @@ AMD Excavator (2015) and later; see [Building from source](#building-from-source
    script carries on, so the install can no longer leave the daemon down.
 
 3. The tray icon appears. Left-click it for the dashboard.
-
-The three packs that ship with the zip — **Wallpaper Engine**, **G-Helper** and **Rainmeter** — are
-unpacked into the `packs\` folder next to the executable, and that is where your own packs go.
 
 **[deploy/README.md](deploy/README.md)** has the details: the exact ACL, updating (the running
 executable is locked, so the order is stop → copy → run `setup.ps1`) and uninstalling.
@@ -309,8 +316,8 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (327: 251 in armoury, 76 in armoury-core)
-powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
+cargo test                   # the unit tests (339: 254 in armoury, 85 in armoury-core)
+powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 84-check integration harness
 ```
 
 **The published executable has a fixed target.** `.cargo/config.toml` sets

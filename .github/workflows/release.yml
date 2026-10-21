@@ -1,9 +1,10 @@
 # Publishes a release of ArmouryDaemon.
 #
-# The trigger is a tag push: the tag names the release (v1.1.3) and the body of the release
+# The trigger is a tag push: the tag names the release (v1.1.4) and the body of the release
 # is the file release-notes\<tag\>.md in the repository. The release is published unattended -
 # there is no approval step - and only after every check has passed: the executable, its
-# manifest, its icon, the hash sidecar, the zip and the packs against the catalogue.
+# manifest, its icon, the hash sidecar and the packs against the catalogue. The release
+# carries two assets and no more: the executable and its hash sidecar.
 #
 # The release profile (lto = "fat", codegen-units = 1) needs 13 to 21 minutes, so the build
 # step is given 60. The CI workflow runs the tests on the same tag push; this workflow builds
@@ -45,10 +46,18 @@ jobs:
           ref: ${{ github.ref }}
 
       - name: Install the Rust toolchain
-        # The workspace asks for rust-version = "1.95" (the minimum) and the project is built
-        # with the stable toolchain - there is no rust-toolchain.toml - so stable satisfies it.
-        # The host target is x86_64-pc-windows-msvc, the one the Windows runners are set up for.
-        uses: dtolnay/rust-toolchain@stable
+        # The toolchain is pinned to 1.98.0 and not to "stable": stable moves to a new
+        # release every six weeks, so two runs of the same commit can be built by
+        # different compilers. This workflow publishes the binary, and the CI workflow
+        # hands over the very same source as an artefact to test before a release exists:
+        # the binary that was tested has to be the binary that ships, and only a pinned
+        # toolchain says so.
+        # The workspace asks for rust-version = "1.95" (the minimum supported version);
+        # the pin is above it and does not change it. There is no rust-toolchain.toml.
+        # The host target is x86_64-pc-windows-msvc, the one the Windows runners are set up
+        # for; the MSVC toolchain and the Windows SDK (rc.exe) come with the runner image,
+        # so the action asks for no components.
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Find the Windows resource compiler (rc.exe)
         shell: pwsh
@@ -104,9 +113,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # The version is the one in the workspace Cargo.toml, so the zip is named after the
-          # build and not after a number typed into the workflow. The tag has to be that
-          # version: a release named v1.1.3 that carries 1.1.2 is a release nobody can trust.
+          # The version is the one in the workspace Cargo.toml, so the release is titled
+          # after the build and not after a number typed into the workflow. The tag has to be
+          # that version: a release named v1.1.4 that carries 1.1.3 is a release nobody can
+          # trust.
           $toml = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') -Raw
           $version = ''
           $section = ''
@@ -345,46 +355,6 @@ jobs:
           "HASH=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host "the exe hash is $hash"
 
-      - name: Build the release zip
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # The zip holds exactly these eight entries, in this order. The names are written
-          # with forward slashes: that is what the zip format uses.
-          $root = $env:GITHUB_WORKSPACE
-          $exe = Join-Path $root 'target\release\ArmouryDaemon.exe'
-          $entries = @(
-              @{ name = 'ArmouryDaemon.exe';                   path = $exe },
-              @{ name = 'ArmouryDaemon.exe.sha256';           path = "$exe.sha256" },
-              @{ name = 'README.md';                          path = (Join-Path $root 'README.md') },
-              @{ name = 'setup.ps1';                          path = (Join-Path $root 'deploy\setup.ps1') },
-              @{ name = 'uninstall.ps1';                      path = (Join-Path $root 'deploy\uninstall.ps1') },
-              @{ name = 'packs/g-helper/pack.json';           path = (Join-Path $root 'packs\g-helper\pack.json') },
-              @{ name = 'packs/rainmeter/pack.json';          path = (Join-Path $root 'packs\rainmeter\pack.json') },
-              @{ name = 'packs/wallpaper-engine/pack.json';   path = (Join-Path $root 'packs\wallpaper-engine\pack.json') }
-          )
-          Add-Type -AssemblyName System.IO.Compression
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $zipPath = Join-Path $env:RUNNER_TEMP "ArmouryDaemon-$env:VERSION-windows-x64.zip"
-          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
-          $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
-          try {
-              foreach ($entry in $entries) {
-                  if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) { throw "the zip entry $($entry.name) is missing: $($entry.path)" }
-                  [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $entry.path, $entry.name, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
-              }
-          } finally { $zip.Dispose() }
-          $read = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-          try {
-              $names = @($read.Entries | ForEach-Object { $_.FullName })
-          } finally { $read.Dispose() }
-          $expected = @($entries | ForEach-Object { $_.name })
-          if ($names.Count -ne $expected.Count) { throw "the zip holds $($names.Count) entries, not $($expected.Count)" }
-          for ($i = 0; $i -lt $expected.Count; $i++) {
-              if ($names[$i] -ne $expected[$i]) { throw "the zip entry $i is $($names[$i]), not $($expected[$i])" }
-          }
-          Write-Host "the zip holds $($names.Count) entries: $($names -join ', ')"
-
       - name: Check the packs against the catalogue
         shell: pwsh
         run: |
@@ -444,8 +414,7 @@ jobs:
           $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           [System.IO.File]::WriteAllText($notes, $text, (New-Object System.Text.UTF8Encoding($false)))
           $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\ArmouryDaemon.exe'
-          $zip = Join-Path $env:RUNNER_TEMP "ArmouryDaemon-$env:VERSION-windows-x64.zip"
-          gh release create $env:TAG $exe "$exe.sha256" $zip --title "ArmouryDaemon $env:VERSION" --notes-file $notes --verify-tag
+          gh release create $env:TAG $exe "$exe.sha256" --title "ArmouryDaemon $env:VERSION" --notes-file $notes --verify-tag
           if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit code $LASTEXITCODE)" }
 
       - name: Check that the published body is the file
@@ -480,9 +449,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # The three assets are downloaded again and checked against what was built: the
-          # exe's hash, the sidecar's 85 bytes and the zip's eight entries - and the exe
-          # inside the zip hashes to the same value.
+          # The two assets are downloaded again and checked against what was built: the
+          # exe's hash and the sidecar's 85 bytes. The sidecar is compared byte for byte,
+          # so the hash field in it is the one the build wrote.
           function Get-Sha256Hex([byte[]]$bytes) {
               $sha = [System.Security.Cryptography.SHA256]::Create()
               try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
@@ -493,6 +462,13 @@ jobs:
           New-Item -ItemType Directory -Path $dir | Out-Null
           gh release download $env:TAG --dir $dir
           if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit code $LASTEXITCODE)" }
+
+          $assets = @(Get-ChildItem -LiteralPath $dir -File | ForEach-Object { $_.Name } | Sort-Object)
+          $expectedAssets = @('ArmouryDaemon.exe', 'ArmouryDaemon.exe.sha256')
+          if ($assets.Count -ne $expectedAssets.Count) { throw "the release holds $($assets.Count) assets ($($assets -join ', ')), not $($expectedAssets.Count)" }
+          for ($i = 0; $i -lt $expectedAssets.Count; $i++) {
+              if ($assets[$i] -ne $expectedAssets[$i]) { throw "the asset $i is $($assets[$i]), not $($expectedAssets[$i])" }
+          }
 
           $publishedExe = Join-Path $dir 'ArmouryDaemon.exe'
           if (-not (Test-Path -LiteralPath $publishedExe -PathType Leaf)) { throw "the release has no ArmouryDaemon.exe asset" }
@@ -507,31 +483,4 @@ jobs:
           for ($i = 0; $i -lt $expected.Length; $i++) {
               if ($sidecar[$i] -ne $expected[$i]) { throw "the published sidecar differs at byte $i" }
           }
-
-          $publishedZip = Join-Path $dir "ArmouryDaemon-$env:VERSION-windows-x64.zip"
-          if (-not (Test-Path -LiteralPath $publishedZip -PathType Leaf)) { throw "the release has no zip asset" }
-          Add-Type -AssemblyName System.IO.Compression
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $expectedEntries = @('ArmouryDaemon.exe', 'ArmouryDaemon.exe.sha256', 'README.md', 'setup.ps1', 'uninstall.ps1', 'packs/g-helper/pack.json', 'packs/rainmeter/pack.json', 'packs/wallpaper-engine/pack.json')
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($publishedZip)
-          try {
-              $names = @($zip.Entries | ForEach-Object { $_.FullName })
-              if ($names.Count -ne $expectedEntries.Count) { throw "the published zip holds $($names.Count) entries, not $($expectedEntries.Count)" }
-              for ($i = 0; $i -lt $expectedEntries.Count; $i++) {
-                  if ($names[$i] -ne $expectedEntries[$i]) { throw "the published zip entry $i is $($names[$i]), not $($expectedEntries[$i])" }
-              }
-              $entry = $zip.GetEntry('ArmouryDaemon.exe')
-              if (-not $entry) { throw "the published zip has no ArmouryDaemon.exe" }
-              $stream = $entry.Open()
-              $memory = New-Object System.IO.MemoryStream
-              try {
-                  $stream.CopyTo($memory)
-                  $zipped = $memory.ToArray()
-              } finally {
-                  $stream.Dispose()
-                  $memory.Dispose()
-              }
-          } finally { $zip.Dispose() }
-          $zippedHash = Get-Sha256Hex $zipped
-          if ($zippedHash -ne $env:HASH) { throw "the exe inside the published zip hashes to $zippedHash, not $env:HASH" }
-          Write-Host "the three assets are published and they are the ones that were built (exe $publishedHash)"
+          Write-Host "the two assets are published and they are the ones that were built (exe $publishedHash)"

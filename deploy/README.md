@@ -2,7 +2,7 @@
 
 A small always-on Windows daemon that reacts to the apps you care about.
 
-This document describes **ArmouryDaemon 1.1.3** and is the reference for the scripted install,
+This document describes **ArmouryDaemon 1.1.4** and is the reference for the scripted install,
 the exact ACL, updating and uninstalling. The overview and the lone-exe install are in the
 [README](../README.md).
 
@@ -215,7 +215,7 @@ installed pack deletes it again.
 ## The self-test
 
 `tools/daemon-selftest.ps1` drives a throw-away daemon instance (its own pipe, config folder and
-single-instance guard) through the whole engine and prints one line per check - 72 of them. It
+single-instance guard) through the whole engine and prints one line per check - 84 of them. It
 needs no Wallpaper Engine, G-Helper or Rainmeter, but it does need an **elevated** shell: the
 executable carries a manifest that asks for administrator, so the runs it starts would raise a
 UAC prompt. A harness that is not elevated **skips** the command-line probes and prints why.

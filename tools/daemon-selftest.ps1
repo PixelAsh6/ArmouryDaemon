@@ -333,11 +333,12 @@ try {
     Check 'packs disabled + cooldown 5 s' ((@($s.packs | Where-Object enabled).Count -eq 0) -and ($s.cooldown_seconds -eq 5))
 
     # ---- 4. a tracked app start applies the packs and starts a lockout ----
-    # The engine (2026-10-21): the apply is never deferred — a tracked app that starts gets
-    # the packs at once. The change starts a lockout of `cooldown` seconds, and that lockout
-    # holds the *revert*: a close waits for the window, and a fast restart inside it cancels
-    # the wait. The daemon reports the lockout as the "cooldown" state plus the time that is
-    # left.
+    # The engine (2026-10-22): the lockout holds a change in *both* directions. This start
+    # finds no window running - the machine is free, the first launch of a session - so the
+    # packs come on at once, and the change starts a window of `cooldown` seconds. A start
+    # *inside* a window waits for it (section 9c). A close waits for a window too, and a fast
+    # restart inside that window cancels the wait. The daemon reports the window as the
+    # "cooldown" state plus the time that is left.
     $applies = @(Get-ChangeTimes 'apply').Count
     Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     $p1 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
@@ -357,8 +358,9 @@ try {
     Check 'nothing was reverted' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
 
     # ---- 6. a close with no lockout running holds the revert ----
-    # The lockout holds the revert: the close starts one and the revert lands when it expires,
-    # so a fast restart inside the window cancels it and the packs stay applied.
+    # The close always waits for a window: it starts one if none is running and keeps the
+    # running one otherwise, and the revert lands when that window is over - so a fast restart
+    # inside the window cancels it and the packs stay applied.
     $reverts = @(Get-ChangeTimes 'revert').Count
     $closeAt = Get-Date
     $p1 | Stop-Process -Force
@@ -429,8 +431,9 @@ try {
     Check 'a fast restart does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
 
     # ---- 9b. a fast restart after the lockout ended never reverts ----
-    # The close lands between two lockouts (2026-10-21): the lockout holds the revert, the
-    # restart inside that window cancels it, and the packs stay applied the whole time.
+    # The close lands between two lockouts (2026-10-21): the close starts a window and holds
+    # the revert, the restart inside that window cancels it, and the packs stay applied the
+    # whole time.
     $applies = @(Get-ChangeTimes 'apply').Count
     $reverts = @(Get-ChangeTimes 'revert').Count
     $p4 | Stop-Process -Force
@@ -442,25 +445,30 @@ try {
     Check 'a fast restart after the lockout ended never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
     Check 'a fast restart after the lockout ended does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
 
-    # ---- 9c. a start while the lockout runs applies at once ----
-    # The lockout holds the revert, not the apply: an app that starts while the daemon is
-    # still inside the lockout of the last change gets the packs at once. The revert below
-    # leaves the daemon in a lockout, so the start lands inside it.
+    # ---- 9c. a start while the lockout runs waits for it ----
+    # The lockout holds a change in both directions (2026-10-22): an app that starts while the
+    # daemon is still inside the window of the last change does *not* get the packs at once -
+    # the apply waits for the window and lands when it is over, if the app is still running by
+    # then. The revert below leaves the daemon in a window, so the start lands inside it.
     $applies = @(Get-ChangeTimes 'apply').Count
     $reverts = @(Get-ChangeTimes 'revert').Count
     $p4 | Stop-Process -Force
     $times = @(Wait-Change 'revert' $reverts 15)
     Check 'the close lets the revert land' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $revertAt = $times[$times.Count - 1]
     $s = Wait-State 'cooldown' 8
     Check 'the revert starts a lockout of its own' ($s.state -eq 'cooldown') "state=$($s.state)"
 
-    # the app starts again while that lockout still runs: the packs must come back at once
+    # the app starts again while that window still runs: the packs must not come back yet
+    $left = (Status).cooldown_remaining_ms
+    Check 'the start goes out inside the lockout' ($left -gt 2000) "remaining=$left"
     $startAt = Get-Date
     $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
-    $times = @(Wait-Change 'apply' $applies 15)
-    Check 'a start inside the lockout applies the packs' ($times.Count -ge $applies + 1) "applies=$applies now=$($times.Count)"
+    $times = @(Wait-Change 'apply' $applies 20)
+    Check 'the held apply lands when the lockout expires' ($times.Count -ge $applies + 1) "applies=$applies now=$($times.Count)"
     $applyAt = $times[$times.Count - 1]
-    Check 'the apply is not delayed by the lockout' ((Get-Gap $startAt $applyAt) -ge -1 -and (Get-Gap $startAt $applyAt) -le 3) "start=$startAt apply=$applyAt"
+    Check 'the apply is not delayed past the lockout' ((Get-Gap $startAt $applyAt) -ge 2 -and (Get-Gap $startAt $applyAt) -le 12) "start=$startAt apply=$applyAt"
+    Check 'the apply waited for the lockout' ((Get-Gap $revertAt $applyAt) -ge 3 -and (Get-Gap $revertAt $applyAt) -le 12) "revert=$revertAt apply=$applyAt"
 
     # the apply starts a lockout of its own, and the daemon settles again
     $s = Wait-State 'triggered' 20
@@ -641,7 +649,7 @@ try {
         $probe = Invoke-CliProbe @('--version')
         $r = $probe.Run
         Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
-        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.3')) "output=$(Get-FirstLine $r.Text)"
+        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.4')) "output=$(Get-FirstLine $r.Text)"
 
         # --help: the usage, exit 0, with every flag the parser accepts
         $probe = Invoke-CliProbe @('--help')

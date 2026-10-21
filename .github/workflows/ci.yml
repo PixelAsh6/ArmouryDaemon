@@ -2,11 +2,14 @@
 #
 # The project is Windows-only: the daemon talks to the Win32 API, the icon and the manifest
 # are embedded by Microsoft's resource compiler (rc.exe), and the self-test harness drives a
-# real daemon over a named pipe. This workflow builds and tests. It never publishes anything:
-# no release, no tag, no asset upload - a release workflow is a separate decision.
+# real daemon over a named pipe. This workflow builds and tests. It never publishes a
+# release: no release, no tag - a release workflow is a separate decision. The one thing
+# it can leave behind is the release build as an artefact on a manual run, so there is a
+# binary to test before a release is ever published.
 #
 # The release profile (lto = "fat", codegen-units = 1) needs 13 to 21 minutes, so it is only
-# built on a tag push. Every other push is covered by the debug build and the test run.
+# built on a tag push or on a manual run. Every other push is covered by the debug build and
+# the test run.
 
 name: CI
 
@@ -19,6 +22,7 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 # The workflow only reads the repository.
 permissions:
@@ -46,10 +50,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install the Rust toolchain
-        # The workspace asks for rust-version = "1.95" (the minimum) and the project is built
-        # with the stable toolchain - there is no rust-toolchain.toml - so stable satisfies it.
-        # The host target is x86_64-pc-windows-msvc, the one the Windows runners are set up for.
-        uses: dtolnay/rust-toolchain@stable
+        # The toolchain is pinned to 1.98.0 and not to "stable": stable moves to a new
+        # release every six weeks, so two runs of the same commit can be built by
+        # different compilers. This workflow hands over the release build as an artefact to
+        # test and the release workflow publishes that same source later, so the binary
+        # that was tested has to be the binary that ships: only a pinned toolchain says so.
+        # The workspace asks for rust-version = "1.95" (the minimum supported version);
+        # the pin is above it and does not change it. There is no rust-toolchain.toml.
+        # The host target is x86_64-pc-windows-msvc, the one the Windows runners are set up
+        # for; the MSVC toolchain and the Windows SDK (rc.exe) come with the runner image,
+        # so the action asks for no components.
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Find the Windows resource compiler (rc.exe)
         shell: pwsh
@@ -162,11 +173,47 @@ jobs:
           if ($code -ne 0) { throw "the self-test harness failed (exit code $code)" }
 
       - name: Build the release profile
-        # The release profile needs 13 to 21 minutes, so it is only built on a tag push.
-        # Nothing is published here: no release, no tag, no asset upload.
-        if: startsWith(github.ref, 'refs/tags/v')
+        # The release profile needs 13 to 21 minutes, so it is only built on a tag push or
+        # on a manual run. Nothing is published here: no release, no tag. The build only
+        # leaves an artefact behind, so the binary can be tested before a release exists.
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
           cargo build --workspace --release --locked
           if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit code $LASTEXITCODE)" }
+
+      - name: Write the hash sidecar
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The sidecar is the format deploy/setup.ps1 writes: the lowercase hex digest, two
+          # spaces, the file name and a trailing CRLF - 85 bytes. The bytes are written here
+          # and not through Set-Content, so the 85 bytes are exactly the 85 bytes of the
+          # format whatever the shell does with a line ending. This is the step the release
+          # workflow runs, so the artefact carries the very sidecar the release carries.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\ArmouryDaemon.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "the release executable is missing: $exe" }
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          try {
+              $stream = [System.IO.File]::OpenRead($exe)
+              try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose() }
+          } finally { $sha.Dispose() }
+          $hash = ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+          [System.IO.File]::WriteAllBytes("$exe.sha256", [System.Text.Encoding]::ASCII.GetBytes("$hash  ArmouryDaemon.exe`r`n"))
+          $written = [System.IO.File]::ReadAllBytes("$exe.sha256")
+          if ($written.Length -ne 85) { throw "the sidecar is $($written.Length) bytes, not the 85 the format asks for" }
+          Write-Host "the exe hash is $hash"
+
+      - name: Upload the executable for testing
+        # The artefact holds the two files the release holds: the executable and its
+        # sidecar. A run of this workflow is a test of the build, not a release.
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: armourydaemon-windows-x64
+          path: |
+            target/release/ArmouryDaemon.exe
+            target/release/ArmouryDaemon.exe.sha256
+          if-no-files-found: error

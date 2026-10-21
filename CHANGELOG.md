@@ -3,6 +3,31 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.4] - 2026-10-22
+
+### Fixed
+
+- The lockout held a change in one direction only. A tracked app that started while a window was
+  running got the packs at once, so the machine changed in the middle of a cooldown, and a close
+  that landed between two windows put the machine back at once — the restart that followed then
+  waited out the revert's own window, so the machine sat in the quiet mode while the game ran and
+  the logs showed the revert before the apply. The lockout now holds a change in **both**
+  directions: a **close is always held** (it starts a window if none is running and keeps the
+  running one rather than restarting it), a **start inside a window is held** and lands at the
+  expiry — if the app is still running by then — **exactly once**, a **restart inside the window
+  cancels the hold**, and a **manual action still bypasses** it. A start with no window running
+  still applies at once: that is the first launch of a session.
+
+### Changed
+
+- The release carries **only the executable and its hash sidecar** now. There is no zip and no
+  scripts in it: the executable installs itself, and the scripted install lives in the
+  repository's `deploy\` folder.
+- The CI and release workflows pin the toolchain to **1.98.0** instead of `stable`, so two runs of
+  the same commit are built by the same compiler. The CI workflow can also be run by hand, and it
+  then hands over the release build as an artefact, so a binary can be tested before a release
+  exists.
+
 ## [1.1.3] - 2026-10-21
 
 ### Fixed
@@ -137,6 +162,7 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 - The spec 2 pack script host: a pack may carry a small Rhai script, and the daemon runs it in a
   sandboxed interpreter.
 
+[1.1.4]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.4
 [1.1.3]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3
 [1.1.2]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2
 [1.1.1]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.1
