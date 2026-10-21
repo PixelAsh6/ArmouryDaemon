@@ -2,7 +2,7 @@
 
 A small always-on Windows daemon that reacts to the apps you care about.
 
-This document describes **ArmouryDaemon 1.1.2** and is the reference for the scripted install,
+This document describes **ArmouryDaemon 1.1.3** and is the reference for the scripted install,
 the exact ACL, updating and uninstalling. The overview and the lone-exe install are in the
 [README](../README.md).
 
@@ -38,8 +38,8 @@ The two registrations agree in every field that affects the daemon's behaviour. 
 itself differs in two fields that change nothing: the script writes task schema `1.3` where the
 daemon's own registration writes `1.2`, and only the script sets `UseUnifiedSchedulingEngine`.
 
-The executable is built for this machine's CPU and needs AVX2 - Intel from 2013, AMD from 2015;
-see [Building from source](../README.md#building-from-source).
+The executable targets the **x86-64 v3** level and needs AVX2 - Intel Haswell (2013) and later,
+AMD Excavator (2015) and later; see [Building from source](../README.md#building-from-source).
 
 1. Put `ArmouryDaemon.exe` + the `packs` folder in a permanent folder, e.g. `C:\Apps\ArmouryDaemon`.
 2. In an **administrator** PowerShell, in that folder:
@@ -146,11 +146,12 @@ therefore fixed.
    The copy has to happen **after** the daemon is stopped - while it runs the exe is locked and
    the copy fails with a sharing violation.
 
-   The exe you are copying is the one in `target\release\`, and that is the **native** build:
-   `.cargo/config.toml` adds `-C target-cpu=native`, so it is built for the machine that built
-   it (this one: an AMD Ryzen 7 4800H, Zen 2, AVX2-era). It is **CPU-specific** and needs
-   **AVX2** - Intel from 2013, AMD from 2015 - and the release publishes this same build, so
-   build it again on a new PC - see
+   The exe you are copying is the one in `target\release\`, and that is the **x86-64 v3** build:
+   `.cargo/config.toml` adds `-C target-cpu=x86-64-v3` - a **fixed** target (AVX2, BMI1, BMI2,
+   F16C, FMA, LZCNT, MOVBE, XSAVE), not the CPU of the machine that built it. It needs **AVX2** -
+   Intel Haswell (2013) and later, AMD Excavator (2015) and later - and the release publishes
+   this same build, so **you do not have to build it again on a new PC**: the only machine that
+   cannot run it is one older than Haswell or Excavator. See
    [Building from source](../README.md#building-from-source).
 
 3. **Run `setup.ps1` in the install folder, from an elevated PowerShell:**

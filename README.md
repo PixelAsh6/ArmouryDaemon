@@ -1,7 +1,7 @@
 # ArmouryDaemon
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.1.3-blue.svg)](Cargo.toml)
 
 A resident Windows daemon that watches the applications you track and switches the rest of your
 machine around them. While a tracked app runs, Rainmeter, G-Helper and Wallpaper Engine get out
@@ -33,6 +33,8 @@ You choose the apps to track, either from the running windows or by browsing for
 They are matched by **exe file name** (case-insensitively), so a game installed anywhere on disk
 is the same tracked app. The daemon walks the process table once a second, diffs the PID set and
 waits on the matching process handles, so an exit is exact and a PID reuse cannot confuse it.
+While **no applications are tracked** it skips the walk entirely — there is nothing it could
+match.
 
 ### Packs
 
@@ -54,11 +56,11 @@ A pack may declare the daemon it needs (`"min_engine": "1.2.0"`). A daemon that 
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.2
+pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.3
 ```
 
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
-is `1.1.2`.
+is `1.1.3`.
 
 ### The lockout ("Revert after")
 
@@ -156,12 +158,12 @@ ArmouryDaemon.exe --help
 ```
 
 `--catalog-url <url>` lists that catalogue instead of the configured one. `--version` prints
-`ArmouryDaemon 1.1.2`, `--help` prints the flags the binary accepts. An argument the binary
+`ArmouryDaemon 1.1.3`, `--help` prints the flags the binary accepts. An argument the binary
 does not know is an error — the usage on stderr, exit code 2 — so the daemon never starts on
 a typo.
 
 The release build is a **GUI-subsystem binary** (PE subsystem 2), so it prints to the console it
-attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.2` on stdout, once, and
+attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.3` on stdout, once, and
 exits 0. Redirected, the line goes to **both** stdout and stderr, so `2>&1 | Out-String` shows
 it **twice**. `cmd.exe`'s own `>` can misbehave, because the process attaches to the parent
 console (`AttachConsole`) and re-points the standard handles, so the file can come out empty
@@ -220,13 +222,13 @@ small, undecorated windows plus a tray icon:
 
 The daemon is not on any package registry — it is installed from a folder you choose.
 
-The executable is built for this machine's CPU and needs AVX2 — Intel from 2013, AMD from 2015;
-see [Building from source](#building-from-source).
+The executable targets the **x86-64 v3** level and needs AVX2 — Intel Haswell (2013) and later,
+AMD Excavator (2015) and later; see [Building from source](#building-from-source).
 
 ### From the executable alone
 
 1. **Download** `ArmouryDaemon.exe` from the
-   [v1.1.2 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2) and put it
+   [v1.1.3 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3) and put it
    in a folder you can write to, for example `C:\Apps\ArmouryDaemon`.
 2. **Run it.** The executable carries a manifest that asks for administrator, so Windows shows
    one consent prompt — accept it. The daemon then:
@@ -243,8 +245,8 @@ see [Building from source](#building-from-source).
 
 ### Or the whole thing at once
 
-1. **Download** `ArmouryDaemon-1.1.2-windows-x64.zip` from the
-   [v1.1.2 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2) and unpack it
+1. **Download** `ArmouryDaemon-1.1.3-windows-x64.zip` from the
+   [v1.1.3 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3) and unpack it
    into a permanent folder, for example `C:\Apps\ArmouryDaemon`. The zip holds the executable,
    the three shipped packs, the SHA-256 sidecar, `setup.ps1`, `uninstall.ps1` and this README.
 2. In an **administrator** PowerShell, in that folder:
@@ -299,18 +301,20 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (315: 239 in armoury, 76 in armoury-core)
+cargo test                   # the unit tests (327: 251 in armoury, 76 in armoury-core)
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 72-check integration harness
 ```
 
-**The published executable is CPU-specific.** `.cargo/config.toml` sets `-C target-cpu=native`,
-so the build targets the CPU of the machine that built it — this one, an AMD Ryzen 7 4800H
-(Zen 2) — and that is the build that ships in the release. The executable therefore needs
-**AVX2**, which Intel has had since Haswell (2013) and AMD only since Excavator (2015)
-(Zen in 2017), together with the rest of this CPU's feature set. AMD's 2013-2014 parts —
-Steamroller, Jaguar, Kabini, Temash — have no AVX2, and nothing before 2011 has it at all, so
-the binary will not run on those. The release profile is `opt-level = 3`, `lto = "fat"`,
-`codegen-units = 1`, `strip = true`, `incremental = false`.
+**The published executable has a fixed target.** `.cargo/config.toml` sets
+`-C target-cpu=x86-64-v3`, so the build targets the **x86-64 v3** microarchitecture level —
+**AVX2**, **BMI1**, **BMI2**, **F16C**, **FMA**, **LZCNT**, **MOVBE** and **XSAVE**, on top of
+v2's CX16, POPCNT and SSE4.2. That is a **fixed** target, not the CPU of the machine that built
+it, so the build is **the same on every machine** and it is the build that ships in the release.
+It needs **AVX2**, which Intel has had since Haswell (2013) and AMD only since Excavator (2015)
+(Zen in 2017). AMD's 2013-2014 parts — Steamroller, Jaguar, Kabini, Temash — have no AVX2, and
+nothing before 2011 has it at all, so the binary will not run on those. The release profile is
+`opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `strip = "debuginfo"`,
+`incremental = false`.
 
 It needs no Wallpaper Engine, G-Helper or Rainmeter: it starts a throw-away daemon instance (its
 own pipe, config folder and single-instance guard) and asserts the engine behaviour. It refuses to

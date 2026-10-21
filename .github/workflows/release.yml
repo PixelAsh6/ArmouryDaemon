@@ -1,0 +1,537 @@
+# Publishes a release of ArmouryDaemon.
+#
+# The trigger is a tag push: the tag names the release (v1.1.3) and the body of the release
+# is the file release-notes\<tag\>.md in the repository. The release is published unattended -
+# there is no approval step - and only after every check has passed: the executable, its
+# manifest, its icon, the hash sidecar, the zip and the packs against the catalogue.
+#
+# The release profile (lto = "fat", codegen-units = 1) needs 13 to 21 minutes, so the build
+# step is given 60. The CI workflow runs the tests on the same tag push; this workflow builds
+# the release and publishes it, and it never runs the tests itself.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The workflow creates the release and uploads the assets.
+permissions:
+  contents: write
+
+# Two pushes of the same tag must not race for the same release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # The release profile has incremental = false; the cache must not carry incremental
+  # artefacts of one profile into the build of another.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  release:
+    name: Build and publish (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          # The release is the tag, not the branch the tag points at.
+          ref: ${{ github.ref }}
+
+      - name: Install the Rust toolchain
+        # The workspace asks for rust-version = "1.95" (the minimum) and the project is built
+        # with the stable toolchain - there is no rust-toolchain.toml - so stable satisfies it.
+        # The host target is x86_64-pc-windows-msvc, the one the Windows runners are set up for.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Find the Windows resource compiler (rc.exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # crates/armoury/build.rs embeds the icon and the manifest as PE resources with
+          # rc.exe. It searches ProgramFiles(x86)\Windows Kits\10\bin itself and honours the
+          # RC variable, so the same search is done here and the result is handed to the
+          # build: the newest SDK that ships an x64\rc.exe wins, exactly like the build does.
+          $base = ${env:ProgramFiles(x86)}
+          $bin = if ($base) { Join-Path $base 'Windows Kits\10\bin' } else { $null }
+          $rc = $null
+          $newest = $null
+          if ($bin -and (Test-Path -LiteralPath $bin)) {
+              foreach ($dir in Get-ChildItem -LiteralPath $bin -Directory) {
+                  $candidate = Join-Path $dir.FullName 'x64\rc.exe'
+                  if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+                  try { $version = [version]$dir.Name } catch { continue }
+                  if ($null -eq $newest -or $version -gt $newest) {
+                      $newest = $version
+                      $rc = $candidate
+                  }
+              }
+          }
+          if ($rc) {
+              Write-Host "rc.exe: $rc"
+              "RC=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+              throw "no rc.exe under $bin - the build would have neither the icon nor the manifest"
+          }
+
+      - name: Cache the cargo registry and the target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Build the release profile
+        # The release profile needs 13 to 21 minutes, so it is given an hour.
+        timeout-minutes: 60
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo build --workspace --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit code $LASTEXITCODE)" }
+
+      - name: Read the version and the release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The version is the one in the workspace Cargo.toml, so the zip is named after the
+          # build and not after a number typed into the workflow. The tag has to be that
+          # version: a release named v1.1.3 that carries 1.1.2 is a release nobody can trust.
+          $toml = Get-Content -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml') -Raw
+          $version = ''
+          $section = ''
+          foreach ($line in ($toml -split "`r?`n")) {
+              $text = $line.Trim()
+              if ($text -match '^\[(.+)\]$') { $section = $Matches[1]; continue }
+              if ($section -eq 'workspace.package' -and $text -match '^version\s*=\s*"([^"]+)"') {
+                  $version = $Matches[1]
+                  break
+              }
+          }
+          if (-not $version) { throw 'the workspace version could not be read from Cargo.toml' }
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -ne "v$version") { throw "the tag is $tag but the workspace version is $version" }
+          $notes = Join-Path $env:GITHUB_WORKSPACE "release-notes\$tag.md"
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "the release notes are missing: $notes" }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "the release is $tag (workspace version $version)"
+
+      - name: Check that the executable carries its manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The manifest is what makes Windows ask for administrator rights. It is embedded
+          # from assets/ArmouryDaemon.manifest by rc.exe, so a missing one means the resource
+          # compiler was not found and the executable would not be auto-elevated.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\ArmouryDaemon.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "the release executable is missing: $exe" }
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          if (-not $text.Contains('requireAdministrator')) {
+              throw 'the executable does not carry the manifest: rc.exe was not found, so the build has neither the icon nor the auto-elevation'
+          }
+          Write-Host 'the manifest is embedded (the executable asks Windows for administrator rights)'
+
+      - name: Check that the executable carries its icon
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The icon is a PE resource, so it is read out of the file the way the shell reads
+          # it: the group directory is parsed, every image it names is fetched, and the
+          # largest one is decoded by Windows itself and read back as pixels. A file without
+          # the resource, or with a blank one, fails here.
+          Add-Type -TypeDefinition @'
+              using System;
+              using System.Collections.Generic;
+              using System.Runtime.InteropServices;
+
+              public static class PeIcon
+              {
+                  const uint LOAD_LIBRARY_AS_DATAFILE = 0x00000002;
+                  const uint LOAD_LIBRARY_AS_IMAGE_RESOURCE = 0x00000020;
+                  const uint RT_ICON = 3;
+                  const uint RT_GROUP_ICON = 14;
+
+                  [StructLayout(LayoutKind.Sequential)]
+                  struct ICONINFO { public bool fIcon; public int xHotspot; public int yHotspot; public IntPtr hbmMask; public IntPtr hbmColor; }
+
+                  [StructLayout(LayoutKind.Sequential)]
+                  struct BITMAP
+                  {
+                      public int bmType; public int bmWidth; public int bmHeight; public int bmWidthBytes;
+                      public short bmPlanes; public short bmBitCount; public IntPtr bmBits;
+                  }
+
+                  [StructLayout(LayoutKind.Sequential)]
+                  struct BITMAPINFOHEADER
+                  {
+                      public uint biSize; public int biWidth; public int biHeight; public ushort biPlanes;
+                      public ushort biBitCount; public uint biCompression; public uint biSizeImage;
+                      public int biXPelsPerMeter; public int biYPelsPerMeter; public uint biClrUsed; public uint biClrImportant;
+                  }
+
+                  [StructLayout(LayoutKind.Sequential)]
+                  struct BITMAPINFO
+                  {
+                      public BITMAPINFOHEADER bmiHeader;
+                      [MarshalAs(UnmanagedType.ByValArray, SizeConst = 256)]
+                      public uint[] bmiColors;
+                  }
+
+                  [DllImport("kernel32.dll", EntryPoint = "LoadLibraryExW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+                  static extern IntPtr LoadLibraryExW(string file, IntPtr reserved, uint flags);
+                  [DllImport("kernel32.dll", EntryPoint = "FreeLibrary", ExactSpelling = true, SetLastError = true)]
+                  static extern bool FreeLibrary(IntPtr module);
+                  [DllImport("kernel32.dll", EntryPoint = "FindResourceW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+                  static extern IntPtr FindResourceW(IntPtr module, IntPtr name, IntPtr type);
+                  [DllImport("kernel32.dll", EntryPoint = "LoadResource", ExactSpelling = true, SetLastError = true)]
+                  static extern IntPtr LoadResource(IntPtr module, IntPtr res);
+                  [DllImport("kernel32.dll", EntryPoint = "LockResource", ExactSpelling = true, SetLastError = true)]
+                  static extern IntPtr LockResource(IntPtr res);
+                  [DllImport("kernel32.dll", EntryPoint = "SizeofResource", ExactSpelling = true, SetLastError = true)]
+                  static extern uint SizeofResource(IntPtr module, IntPtr res);
+                  [DllImport("user32.dll", EntryPoint = "CreateIconFromResourceEx", ExactSpelling = true, SetLastError = true)]
+                  static extern IntPtr CreateIconFromResourceEx(IntPtr bytes, uint size, bool isIcon, uint version, int desired, int reserved);
+                  [DllImport("user32.dll", EntryPoint = "GetIconInfo", ExactSpelling = true, SetLastError = true)]
+                  static extern bool GetIconInfo(IntPtr icon, out ICONINFO info);
+                  [DllImport("user32.dll", EntryPoint = "DestroyIcon", ExactSpelling = true, SetLastError = true)]
+                  static extern bool DestroyIcon(IntPtr icon);
+                  [DllImport("user32.dll", EntryPoint = "GetDC", ExactSpelling = true, SetLastError = true)]
+                  static extern IntPtr GetDC(IntPtr hwnd);
+                  [DllImport("user32.dll", EntryPoint = "ReleaseDC", ExactSpelling = true, SetLastError = true)]
+                  static extern int ReleaseDC(IntPtr hwnd, IntPtr hdc);
+                  [DllImport("gdi32.dll", EntryPoint = "GetObjectW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+                  static extern int GetObject(IntPtr handle, int bytes, ref BITMAP bitmap);
+                  [DllImport("gdi32.dll", EntryPoint = "GetDIBits", ExactSpelling = true, SetLastError = true)]
+                  static extern int GetDIBits(IntPtr hdc, IntPtr hbm, uint start, uint lines, byte[] bits, ref BITMAPINFO info, uint usage);
+
+                  static byte[] Resource(IntPtr module, uint id, uint type)
+                  {
+                      IntPtr res = FindResourceW(module, new IntPtr((long)id), new IntPtr((long)type));
+                      if (res == IntPtr.Zero) return null;
+                      uint size = SizeofResource(module, res);
+                      IntPtr data = LockResource(LoadResource(module, res));
+                      if (data == IntPtr.Zero || size == 0) return null;
+                      byte[] bytes = new byte[size];
+                      Marshal.Copy(data, bytes, 0, (int)size);
+                      return bytes;
+                  }
+
+                  static bool IsPng(byte[] bytes)
+                  {
+                      if (bytes == null || bytes.Length < 24) return false;
+                      return bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47;
+                  }
+
+                  public static string Describe(string path)
+                  {
+                      IntPtr module = LoadLibraryExW(path, IntPtr.Zero, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+                      if (module == IntPtr.Zero) throw new InvalidOperationException("the file could not be opened as a resource file (win32 error " + Marshal.GetLastWin32Error() + ")");
+                      try
+                      {
+                          byte[] group = Resource(module, 1, RT_GROUP_ICON);
+                          if (group == null || group.Length < 6) throw new InvalidOperationException("the file carries no icon group (RT_GROUP_ICON)");
+                          int count = BitConverter.ToUInt16(group, 4);
+                          if (count < 1) throw new InvalidOperationException("the icon group is empty");
+
+                          List<string> entries = new List<string>();
+                          byte[] biggest = null;
+                          int biggestArea = 0;
+                          for (int i = 0; i < count; i++)
+                          {
+                              int o = 6 + 14 * i;
+                              if (o + 14 > group.Length) throw new InvalidOperationException("the icon group is truncated");
+                              int w = group[o] == 0 ? 256 : group[o];
+                              int h = group[o + 1] == 0 ? 256 : group[o + 1];
+                              int bits = BitConverter.ToUInt16(group, o + 6);
+                              int id = BitConverter.ToUInt16(group, o + 12);
+                              byte[] image = Resource(module, (uint)id, RT_ICON);
+                              if (image == null) throw new InvalidOperationException("the icon image with the id " + id + " is missing");
+                              if (!IsPng(image))
+                              {
+                                  if (image.Length < 40 || BitConverter.ToUInt32(image, 0) != 40)
+                                      throw new InvalidOperationException("the icon image with the id " + id + " is neither a PNG nor a bitmap");
+                                  int bw = BitConverter.ToInt32(image, 4);
+                                  int bh = BitConverter.ToInt32(image, 8);
+                                  int bb = BitConverter.ToUInt16(image, 14);
+                                  if (bw <= 0 || bh == 0 || bb < 1 || bb > 32)
+                                      throw new InvalidOperationException("the icon image with the id " + id + " has no usable bitmap header");
+                              }
+                              entries.Add(w + "x" + h + " " + bits + "-bit");
+                              if (w * h > biggestArea) { biggestArea = w * h; biggest = image; }
+                          }
+
+                          // Windows decodes the image and the pixels are read back: a real
+                          // drawing has more than one colour, a blank block has exactly one.
+                          GCHandle pinned = GCHandle.Alloc(biggest, GCHandleType.Pinned);
+                          IntPtr icon = IntPtr.Zero;
+                          try
+                          {
+                              icon = CreateIconFromResourceEx(pinned.AddrOfPinnedObject(), (uint)biggest.Length, true, 0x00030000, 0, 0);
+                              if (icon == IntPtr.Zero) throw new InvalidOperationException("the icon image could not be decoded by Windows");
+                              ICONINFO info;
+                              if (!GetIconInfo(icon, out info)) throw new InvalidOperationException("the decoded icon has no bitmap");
+                              IntPtr source = info.hbmColor != IntPtr.Zero ? info.hbmColor : info.hbmMask;
+                              BITMAP shape = new BITMAP();
+                              if (GetObject(source, Marshal.SizeOf(typeof(BITMAP)), ref shape) == 0)
+                                  throw new InvalidOperationException("the decoded icon has no bitmap header");
+                              int width = shape.bmWidth;
+                              int height = Math.Abs(shape.bmHeight);
+                              if (width <= 0 || height <= 0) throw new InvalidOperationException("the decoded icon has no pixels");
+                              BITMAPINFO bmi = new BITMAPINFO();
+                              bmi.bmiHeader.biSize = 40;
+                              bmi.bmiHeader.biWidth = width;
+                              bmi.bmiHeader.biHeight = height;
+                              bmi.bmiHeader.biPlanes = 1;
+                              bmi.bmiHeader.biBitCount = 32;
+                              bmi.bmiHeader.biCompression = 0;
+                              IntPtr hdc = GetDC(IntPtr.Zero);
+                              try
+                              {
+                                  byte[] pixels = new byte[width * height * 4];
+                                  if (GetDIBits(hdc, source, 0, (uint)height, pixels, ref bmi, 0) <= 0)
+                                      throw new InvalidOperationException("the decoded icon could not be read back");
+                                  HashSet<int> colours = new HashSet<int>();
+                                  for (int p = 0; p + 3 < pixels.Length; p += 4)
+                                      colours.Add(pixels[p] | (pixels[p + 1] << 8) | (pixels[p + 2] << 16) | (pixels[p + 3] << 24));
+                                  if (colours.Count < 8) throw new InvalidOperationException("the icon is one flat colour, not a drawing");
+                                  return "the icon group holds " + count + " images (" + string.Join(", ", entries.ToArray()) +
+                                         "); the largest one decodes to " + width + "x" + height + " pixels in " + colours.Count + " colours";
+                              }
+                              finally { ReleaseDC(IntPtr.Zero, hdc); }
+                          }
+                          finally
+                          {
+                              if (icon != IntPtr.Zero) DestroyIcon(icon);
+                              pinned.Free();
+                          }
+                      }
+                      finally { FreeLibrary(module); }
+                  }
+              }
+          '@
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\ArmouryDaemon.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "the release executable is missing: $exe" }
+          Write-Host ([PeIcon]::Describe($exe))
+
+      - name: Write the hash sidecar
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The sidecar is the format deploy/setup.ps1 writes: the lowercase hex digest, two
+          # spaces, the file name and a trailing CRLF - 85 bytes. The bytes are written here
+          # and not through Set-Content, so the 85 bytes are exactly the 85 bytes of the
+          # format whatever the shell does with a line ending.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\ArmouryDaemon.exe'
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          try {
+              $stream = [System.IO.File]::OpenRead($exe)
+              try { $bytes = $sha.ComputeHash($stream) } finally { $stream.Dispose() }
+          } finally { $sha.Dispose() }
+          $hash = ([System.BitConverter]::ToString($bytes) -replace '-', '').ToLowerInvariant()
+          [System.IO.File]::WriteAllBytes("$exe.sha256", [System.Text.Encoding]::ASCII.GetBytes("$hash  ArmouryDaemon.exe`r`n"))
+          $written = [System.IO.File]::ReadAllBytes("$exe.sha256")
+          if ($written.Length -ne 85) { throw "the sidecar is $($written.Length) bytes, not the 85 the format asks for" }
+          "HASH=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "the exe hash is $hash"
+
+      - name: Build the release zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The zip holds exactly these eight entries, in this order. The names are written
+          # with forward slashes: that is what the zip format uses.
+          $root = $env:GITHUB_WORKSPACE
+          $exe = Join-Path $root 'target\release\ArmouryDaemon.exe'
+          $entries = @(
+              @{ name = 'ArmouryDaemon.exe';                   path = $exe },
+              @{ name = 'ArmouryDaemon.exe.sha256';           path = "$exe.sha256" },
+              @{ name = 'README.md';                          path = (Join-Path $root 'README.md') },
+              @{ name = 'setup.ps1';                          path = (Join-Path $root 'deploy\setup.ps1') },
+              @{ name = 'uninstall.ps1';                      path = (Join-Path $root 'deploy\uninstall.ps1') },
+              @{ name = 'packs/g-helper/pack.json';           path = (Join-Path $root 'packs\g-helper\pack.json') },
+              @{ name = 'packs/rainmeter/pack.json';          path = (Join-Path $root 'packs\rainmeter\pack.json') },
+              @{ name = 'packs/wallpaper-engine/pack.json';   path = (Join-Path $root 'packs\wallpaper-engine\pack.json') }
+          )
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipPath = Join-Path $env:RUNNER_TEMP "ArmouryDaemon-$env:VERSION-windows-x64.zip"
+          if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
+          $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
+          try {
+              foreach ($entry in $entries) {
+                  if (-not (Test-Path -LiteralPath $entry.path -PathType Leaf)) { throw "the zip entry $($entry.name) is missing: $($entry.path)" }
+                  [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $entry.path, $entry.name, [System.IO.Compression.CompressionLevel]::Optimal) | Out-Null
+              }
+          } finally { $zip.Dispose() }
+          $read = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+              $names = @($read.Entries | ForEach-Object { $_.FullName })
+          } finally { $read.Dispose() }
+          $expected = @($entries | ForEach-Object { $_.name })
+          if ($names.Count -ne $expected.Count) { throw "the zip holds $($names.Count) entries, not $($expected.Count)" }
+          for ($i = 0; $i -lt $expected.Count; $i++) {
+              if ($names[$i] -ne $expected[$i]) { throw "the zip entry $i is $($names[$i]), not $($expected[$i])" }
+          }
+          Write-Host "the zip holds $($names.Count) entries: $($names -join ', ')"
+
+      - name: Check the packs against the catalogue
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The daemon verifies a downloaded pack's size and SHA-256 against the catalogue
+          # manifest, so the packs the release ships have to be the very bytes the catalogue
+          # publishes. A difference fails the job here, before anything is published.
+          function Get-Sha256Hex([byte[]]$bytes) {
+              $sha = [System.Security.Cryptography.SHA256]::Create()
+              try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+              return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+          }
+          $root = $env:GITHUB_WORKSPACE
+          $base = 'https://raw.githubusercontent.com/PixelAsh6/ArmouryDaemon_Packs/main'
+          $client = [System.Net.Http.HttpClient]::new()
+          try {
+              $catalogBytes = $client.GetByteArrayAsync("$base/catalog/index.json").GetAwaiter().GetResult()
+              $catalog = [Text.Encoding]::UTF8.GetString($catalogBytes) | ConvertFrom-Json
+              foreach ($pack in $catalog.packs) {
+                  $file = [string]$pack.file
+                  if (-not $file) { throw "a catalogue entry has no file: $($pack.id)" }
+                  $published = $client.GetByteArrayAsync("$base/$file").GetAwaiter().GetResult()
+                  $local = Join-Path $root ($file -replace '/', '\')
+                  if (-not (Test-Path -LiteralPath $local -PathType Leaf)) {
+                      throw "the catalogue publishes '$file' but the release does not ship it ($local is missing)"
+                  }
+                  $localBytes = [System.IO.File]::ReadAllBytes($local)
+                  $publishedHash = Get-Sha256Hex $published
+                  $localHash = Get-Sha256Hex $localBytes
+                  if ($publishedHash -ne $localHash) {
+                      throw "the pack '$file' differs from the catalogue: $publishedHash in the catalogue, $localHash in the release"
+                  }
+                  if ($pack.sha256 -and $publishedHash -ne ([string]$pack.sha256).ToLowerInvariant()) {
+                      throw "the catalogue's own hash for '$file' does not match the file it publishes"
+                  }
+                  if ($pack.size -and $published.Length -ne [int]$pack.size) {
+                      throw "the catalogue's size for '$file' does not match the file it publishes"
+                  }
+                  Write-Host "$file is the catalogue's own bytes ($localHash)"
+              }
+          } finally { $client.Dispose() }
+
+      - name: Create the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The body is a file, never a command line: a body typed on the command line goes
+          # through the console's code page, and this project has been bitten by mojibake
+          # before. The file is normalised to LF first, so the published body does not depend
+          # on the line endings the checkout happened to write.
+          $source = Join-Path $env:GITHUB_WORKSPACE "release-notes\$env:TAG.md"
+          $text = [System.IO.File]::ReadAllText($source, [System.Text.Encoding]::UTF8)
+          $text = $text -replace "`r`n", "`n"
+          $text = $text -replace "`r", "`n"
+          $notes = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          [System.IO.File]::WriteAllText($notes, $text, (New-Object System.Text.UTF8Encoding($false)))
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\release\ArmouryDaemon.exe'
+          $zip = Join-Path $env:RUNNER_TEMP "ArmouryDaemon-$env:VERSION-windows-x64.zip"
+          gh release create $env:TAG $exe "$exe.sha256" $zip --title "ArmouryDaemon $env:VERSION" --notes-file $notes --verify-tag
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed (exit code $LASTEXITCODE)" }
+
+      - name: Check that the published body is the file
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The body is compared with the file byte for byte. It is read through the API and
+          # not through the console, so the comparison is not made on text that has been
+          # through a code page - and the body itself is never printed.
+          $headers = @{
+              Authorization = "Bearer $env:GH_TOKEN"
+              Accept = 'application/vnd.github+json'
+              'X-GitHub-Api-Version' = '2022-11-28'
+              'User-Agent' = 'ArmouryDaemon-release'
+          }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:GITHUB_REPOSITORY/releases/tags/$env:TAG" -Headers $headers
+          $published = [System.Text.Encoding]::UTF8.GetBytes([string]$release.body)
+          $local = [System.IO.File]::ReadAllBytes((Join-Path $env:RUNNER_TEMP 'release-notes.md'))
+          if ($published.Length -ne $local.Length) {
+              throw "the published body is $($published.Length) bytes, the file is $($local.Length)"
+          }
+          for ($i = 0; $i -lt $local.Length; $i++) {
+              if ($published[$i] -ne $local[$i]) { throw "the published body differs from the file at byte $i" }
+          }
+          Write-Host "the published body is the file, byte for byte ($($local.Length) bytes)"
+
+      - name: Check the published assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The three assets are downloaded again and checked against what was built: the
+          # exe's hash, the sidecar's 85 bytes and the zip's eight entries - and the exe
+          # inside the zip hashes to the same value.
+          function Get-Sha256Hex([byte[]]$bytes) {
+              $sha = [System.Security.Cryptography.SHA256]::Create()
+              try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+              return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'published'
+          if (Test-Path -LiteralPath $dir) { Remove-Item -LiteralPath $dir -Recurse -Force }
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          gh release download $env:TAG --dir $dir
+          if ($LASTEXITCODE -ne 0) { throw "gh release download failed (exit code $LASTEXITCODE)" }
+
+          $publishedExe = Join-Path $dir 'ArmouryDaemon.exe'
+          if (-not (Test-Path -LiteralPath $publishedExe -PathType Leaf)) { throw "the release has no ArmouryDaemon.exe asset" }
+          $publishedHash = Get-Sha256Hex ([System.IO.File]::ReadAllBytes($publishedExe))
+          if ($publishedHash -ne $env:HASH) { throw "the published exe hashes to $publishedHash, not $env:HASH" }
+
+          $publishedSidecar = Join-Path $dir 'ArmouryDaemon.exe.sha256'
+          if (-not (Test-Path -LiteralPath $publishedSidecar -PathType Leaf)) { throw "the release has no ArmouryDaemon.exe.sha256 asset" }
+          $sidecar = [System.IO.File]::ReadAllBytes($publishedSidecar)
+          if ($sidecar.Length -ne 85) { throw "the published sidecar is $($sidecar.Length) bytes, not 85" }
+          $expected = [System.Text.Encoding]::ASCII.GetBytes("$env:HASH  ArmouryDaemon.exe`r`n")
+          for ($i = 0; $i -lt $expected.Length; $i++) {
+              if ($sidecar[$i] -ne $expected[$i]) { throw "the published sidecar differs at byte $i" }
+          }
+
+          $publishedZip = Join-Path $dir "ArmouryDaemon-$env:VERSION-windows-x64.zip"
+          if (-not (Test-Path -LiteralPath $publishedZip -PathType Leaf)) { throw "the release has no zip asset" }
+          Add-Type -AssemblyName System.IO.Compression
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $expectedEntries = @('ArmouryDaemon.exe', 'ArmouryDaemon.exe.sha256', 'README.md', 'setup.ps1', 'uninstall.ps1', 'packs/g-helper/pack.json', 'packs/rainmeter/pack.json', 'packs/wallpaper-engine/pack.json')
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($publishedZip)
+          try {
+              $names = @($zip.Entries | ForEach-Object { $_.FullName })
+              if ($names.Count -ne $expectedEntries.Count) { throw "the published zip holds $($names.Count) entries, not $($expectedEntries.Count)" }
+              for ($i = 0; $i -lt $expectedEntries.Count; $i++) {
+                  if ($names[$i] -ne $expectedEntries[$i]) { throw "the published zip entry $i is $($names[$i]), not $($expectedEntries[$i])" }
+              }
+              $entry = $zip.GetEntry('ArmouryDaemon.exe')
+              if (-not $entry) { throw "the published zip has no ArmouryDaemon.exe" }
+              $stream = $entry.Open()
+              $memory = New-Object System.IO.MemoryStream
+              try {
+                  $stream.CopyTo($memory)
+                  $zipped = $memory.ToArray()
+              } finally {
+                  $stream.Dispose()
+                  $memory.Dispose()
+              }
+          } finally { $zip.Dispose() }
+          $zippedHash = Get-Sha256Hex $zipped
+          if ($zippedHash -ne $env:HASH) { throw "the exe inside the published zip hashes to $zippedHash, not $env:HASH" }
+          Write-Host "the three assets are published and they are the ones that were built (exe $publishedHash)"

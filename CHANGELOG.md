@@ -3,6 +3,33 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.3] - 2026-10-21
+
+### Fixed
+
+- The pack script's sandbox built a new interpreter and registered its host functions on every
+  run. It keeps one engine now: the 432.7 µs the build used to cost is paid once, and a run
+  spends 4.7 µs on the engine.
+- The killswitch unmuted an audio session the user had muted themselves. Only the sessions it
+  changed are restored now.
+
+### Changed
+
+- The build is no longer specific to the machine that compiled it. The build now targets the
+  fixed **x86-64 v3** level — AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE and XSAVE — so the
+  executable is the same on every machine, and it runs on Intel Haswell (2013) and later and AMD
+  Excavator (2015) and later without being rebuilt for another PC.
+- The killswitch enumerated the machine's audio sessions once per tracked app. It enumerates
+  them once for the whole press now, and restores from its ledger on release without enumerating
+  at all: about 45 ms off the event loop on each press.
+- The daemon walked the process table every tick, even with nothing tracked. The walk is skipped
+  when no applications are tracked: it cost about 19.5 ms a second, and it now happens only when
+  there is something to find.
+- The console band is centred on the screen again and is allowed to cover the dashboard, because
+  the band is used to launch a game from a controller while the user is away from the computer.
+- The band's corner radius and bottom fade are point values, and its corner arc is sampled
+  according to the physical pixel size, so the drawing scales with the display.
+
 ## [1.1.2] - 2026-10-21
 
 ### Added
@@ -98,6 +125,7 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 - The spec 2 pack script host: a pack may carry a small Rhai script, and the daemon runs it in a
   sandboxed interpreter.
 
+[1.1.3]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3
 [1.1.2]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2
 [1.1.1]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.1
 [1.1.0]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.0

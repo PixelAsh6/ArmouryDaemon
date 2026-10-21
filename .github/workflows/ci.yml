@@ -1,0 +1,172 @@
+# Continuous integration for ArmouryDaemon.
+#
+# The project is Windows-only: the daemon talks to the Win32 API, the icon and the manifest
+# are embedded by Microsoft's resource compiler (rc.exe), and the self-test harness drives a
+# real daemon over a named pipe. This workflow builds and tests. It never publishes anything:
+# no release, no tag, no asset upload - a release workflow is a separate decision.
+#
+# The release profile (lto = "fat", codegen-units = 1) needs 13 to 21 minutes, so it is only
+# built on a tag push. Every other push is covered by the debug build and the test run.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+
+# The workflow only reads the repository.
+permissions:
+  contents: read
+
+# A new push to a branch makes the running build of that branch obsolete.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The release profile has incremental = false; the cache must not carry incremental
+  # artefacts of one profile into the build of another.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-and-test:
+    name: Build and test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        # The workspace asks for rust-version = "1.95" (the minimum) and the project is built
+        # with the stable toolchain - there is no rust-toolchain.toml - so stable satisfies it.
+        # The host target is x86_64-pc-windows-msvc, the one the Windows runners are set up for.
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Find the Windows resource compiler (rc.exe)
+        shell: pwsh
+        run: |
+          # crates/armoury/build.rs embeds the icon and the manifest as PE resources with
+          # rc.exe. It searches ProgramFiles(x86)\Windows Kits\10\bin itself and honours the
+          # RC variable, so the same search is done here and the result is handed to the
+          # build: the newest SDK that ships an x64\rc.exe wins, exactly like the build does.
+          $base = ${env:ProgramFiles(x86)}
+          $bin = if ($base) { Join-Path $base 'Windows Kits\10\bin' } else { $null }
+          $rc = $null
+          $newest = $null
+          if ($bin -and (Test-Path -LiteralPath $bin)) {
+              foreach ($dir in Get-ChildItem -LiteralPath $bin -Directory) {
+                  $candidate = Join-Path $dir.FullName 'x64\rc.exe'
+                  if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+                  try { $version = [version]$dir.Name } catch { continue }
+                  if ($null -eq $newest -or $version -gt $newest) {
+                      $newest = $version
+                      $rc = $candidate
+                  }
+              }
+          }
+          if ($rc) {
+              Write-Host "rc.exe: $rc"
+              "RC=$rc" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+              Write-Host "warning: no rc.exe under $bin - the icon and the manifest are not embedded"
+          }
+
+      - name: Cache the cargo registry and the target directory
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('.cargo/config.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+
+      - name: Build the workspace (debug)
+        shell: pwsh
+        run: |
+          # The error action preference is reset: cargo writes its progress to stderr, and a
+          # shell that stops on every error record would call that a failure. The exit code
+          # of cargo decides, not the stream it wrote to.
+          $ErrorActionPreference = 'Continue'
+          cargo build --workspace --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit code $LASTEXITCODE)" }
+
+      - name: Check that the executable carries its manifest
+        shell: pwsh
+        run: |
+          # The manifest is what makes Windows ask for administrator rights. It is embedded
+          # from assets/ArmouryDaemon.manifest by rc.exe, so a missing one means the resource
+          # compiler was not found and the executable would not be auto-elevated.
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\debug\ArmouryDaemon.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "the debug executable is missing: $exe" }
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe))
+          if (-not $text.Contains('requireAdministrator')) {
+              throw 'the executable does not carry the manifest: rc.exe was not found, so the build has neither the icon nor the auto-elevation'
+          }
+          Write-Host 'the manifest is embedded (the executable asks Windows for administrator rights)'
+
+      - name: Run the unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo test --workspace --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed (exit code $LASTEXITCODE)" }
+
+      - name: Check that the shell is elevated
+        shell: pwsh
+        run: |
+          # The harness skips the command-line probes when the shell that runs it is not
+          # elevated, because the executable asks Windows for administrator rights and every
+          # probe would raise a UAC prompt. The Windows runners run with the administrative
+          # token, so this holds - and a runner that does not satisfy it fails here instead
+          # of quietly running fewer checks.
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+              throw 'the self-test harness needs an elevated shell'
+          }
+          Write-Host "elevated as $($identity.Name)"
+
+      - name: Run the self-test harness
+        working-directory: tools
+        shell: pwsh
+        run: |
+          # The harness resolves -Exe against the current directory, so it runs from the
+          # tools folder and points at the debug build the test step has just made.
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'daemon-selftest.log'
+          & powershell -ExecutionPolicy Bypass -File .\daemon-selftest.ps1 -Exe ..\target\debug\ArmouryDaemon.exe 2>&1 |
+              Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          $summary = @('## Self-test harness', '')
+          if ($code -eq 0) {
+              $summary += 'Result: every check passed.'
+          } else {
+              $summary += "Result: failed (exit code $code)."
+          }
+          $summary += ''
+          $summary += '```'
+          $summary += @(Get-Content -LiteralPath $log | Select-Object -Last 30)
+          $summary += '```'
+          $summary -join [Environment]::NewLine | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          if ($code -ne 0) { throw "the self-test harness failed (exit code $code)" }
+
+      - name: Build the release profile
+        # The release profile needs 13 to 21 minutes, so it is only built on a tag push.
+        # Nothing is published here: no release, no tag, no asset upload.
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          cargo build --workspace --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit code $LASTEXITCODE)" }
