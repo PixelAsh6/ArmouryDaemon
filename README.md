@@ -1,7 +1,7 @@
 # ArmouryDaemon
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.1-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.1.2-blue.svg)](Cargo.toml)
 
 A resident Windows daemon that watches the applications you track and switches the rest of your
 machine around them. While a tracked app runs, Rainmeter, G-Helper and Wallpaper Engine get out
@@ -54,11 +54,11 @@ A pack may declare the daemon it needs (`"min_engine": "1.2.0"`). A daemon that 
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.1
+pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.2
 ```
 
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
-is `1.1.1`.
+is `1.1.2`.
 
 ### The lockout ("Revert after")
 
@@ -156,12 +156,12 @@ ArmouryDaemon.exe --help
 ```
 
 `--catalog-url <url>` lists that catalogue instead of the configured one. `--version` prints
-`ArmouryDaemon 1.1.1`, `--help` prints the flags the binary accepts. An argument the binary
+`ArmouryDaemon 1.1.2`, `--help` prints the flags the binary accepts. An argument the binary
 does not know is an error — the usage on stderr, exit code 2 — so the daemon never starts on
 a typo.
 
 The release build is a **GUI-subsystem binary** (PE subsystem 2), so it prints to the console it
-attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.1` on stdout, once, and
+attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.2` on stdout, once, and
 exits 0. Redirected, the line goes to **both** stdout and stderr, so `2>&1 | Out-String` shows
 it **twice**. `cmd.exe`'s own `>` can misbehave, because the process attaches to the parent
 console (`AttachConsole`) and re-points the standard handles, so the file can come out empty
@@ -226,7 +226,7 @@ see [Building from source](#building-from-source).
 ### From the executable alone
 
 1. **Download** `ArmouryDaemon.exe` from the
-   [v1.1.1 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.1) and put it
+   [v1.1.2 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2) and put it
    in a folder you can write to, for example `C:\Apps\ArmouryDaemon`.
 2. **Run it.** The executable carries a manifest that asks for administrator, so Windows shows
    one consent prompt — accept it. The daemon then:
@@ -243,8 +243,8 @@ see [Building from source](#building-from-source).
 
 ### Or the whole thing at once
 
-1. **Download** `ArmouryDaemon-1.1.1-windows-x64.zip` from the
-   [v1.1.1 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.1) and unpack it
+1. **Download** `ArmouryDaemon-1.1.2-windows-x64.zip` from the
+   [v1.1.2 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2) and unpack it
    into a permanent folder, for example `C:\Apps\ArmouryDaemon`. The zip holds the executable,
    the three shipped packs, the SHA-256 sidecar, `setup.ps1`, `uninstall.ps1` and this README.
 2. In an **administrator** PowerShell, in that folder:

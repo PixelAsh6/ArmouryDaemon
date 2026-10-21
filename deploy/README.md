@@ -2,7 +2,7 @@
 
 A small always-on Windows daemon that reacts to the apps you care about.
 
-This document describes **ArmouryDaemon 1.1.1** and is the reference for the scripted install,
+This document describes **ArmouryDaemon 1.1.2** and is the reference for the scripted install,
 the exact ACL, updating and uninstalling. The overview and the lone-exe install are in the
 [README](../README.md).
 

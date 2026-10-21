@@ -66,6 +66,51 @@ fn console_open_label(mode: &str) -> &'static str {
         .unwrap_or("On pad connect")
 }
 
+/// The name a pack row shows: the pack's own name, or its id when it has none.
+fn pack_row_name<'a>(name: &'a str, id: &'a str) -> &'a str {
+    if name.is_empty() { id } else { name }
+}
+
+/// What a pack row is sorted by: the name on the row in lower case, and the id when two
+/// names are the same, so the order never wobbles.
+///
+/// This is the order the rows are *shown* in. The order the daemon applies the packs in
+/// is the pack's own `order` field and is a different thing: nothing here touches it.
+fn pack_row_order<'a>(name: &'a str, id: &'a str) -> (String, &'a str) {
+    (pack_row_name(name, id).to_lowercase(), id)
+}
+
+/// The installed packs in the order the dashboard and the settings window show them.
+/// The list is a copy, so the daemon's order - the one it applies the packs in - stays
+/// as it is.
+fn sorted_packs(packs: &[PackStatus]) -> Vec<&PackStatus> {
+    let mut rows: Vec<&PackStatus> = packs.iter().collect();
+    rows.sort_by(|a, b| pack_row_order(&a.name, &a.id).cmp(&pack_row_order(&b.name, &b.id)));
+    rows
+}
+
+/// The catalogue entries in the order the install-packs window shows them.
+fn sorted_catalog(entries: &[CatalogPack]) -> Vec<&CatalogPack> {
+    let mut rows: Vec<&CatalogPack> = entries.iter().collect();
+    rows.sort_by(|a, b| pack_row_order(&a.name, &a.id).cmp(&pack_row_order(&b.name, &b.id)));
+    rows
+}
+
+/// True when the window already has the size we asked for.
+///
+/// The comparison is in physical pixels, because that is the only place the two sizes can
+/// be equal: the OS rounds a window's size to whole pixels, so a size in points never
+/// matches exactly. 430 pt at 125% is 538 px, which is 430.4 pt again - a difference of
+/// 0.4 pt per axis, and the length of that vector is longer than the half a point the
+/// check used to allow. The window then never settled and waited for its six-second
+/// deadline before it came up.
+fn size_settled(cur: egui::Vec2, desired: egui::Vec2, ppp: f32) -> bool {
+    let ppp = ppp.max(0.5);
+    let have = egui::vec2((cur.x * ppp).round(), (cur.y * ppp).round());
+    let want = egui::vec2((desired.x * ppp).round(), (desired.y * ppp).round());
+    (have - want).length() <= 1.0
+}
+
 enum UiEvent {
     /// Boxed: a response carries a whole status snapshot, which dwarfs the other variant.
     Response(Box<Response>),
@@ -104,6 +149,12 @@ struct Shared {
     install_packs_open: bool,
     install_packs_stage: u8,
     install_packs_deadline: Option<Instant>,
+    /// When the window was asked for, so the log can say how long it took to appear.
+    install_packs_requested_at: Option<Instant>,
+    /// The root has come back for the install-packs window it created. eframe only paints
+    /// a window it has been asked for, and the first request went out before the window
+    /// existed.
+    install_packs_asked: bool,
     install_packs_target: Option<egui::Pos2>,
     install_packs_size: Option<egui::Vec2>,
     pack_sizes: HashMap<String, egui::Vec2>,
@@ -124,13 +175,17 @@ struct Shared {
     /// Result of the last console-app add/remove, shown in the settings window.
     last_console_op: Option<(bool, String)>,
     /// Catalog (Phase 8) state for the settings window: the last check's result, whether a
-    /// check is in flight, the pack id being downloaded, and the verified temp file waiting
+    /// check is in flight, the pack ids on their way, and the verified temp files waiting
     /// for the daemon's install request.
     catalog: Option<Result<Vec<CatalogPack>, String>>,
     catalog_check_requested: bool,
     catalog_checking: bool,
-    catalog_installing: Option<String>,
-    catalog_install_path: Option<PathBuf>,
+    /// The packs that are on their way, in the order they were asked for. The row of a pack
+    /// in here says "installing…" and offers no button. There is more than one: a second
+    /// pack may be asked for while the first one is still coming down.
+    catalog_installing: Vec<String>,
+    /// The verified pack files waiting for the daemon's install request.
+    catalog_install_path: Vec<PathBuf>,
     /// Per-pack windows: ids in open order.
     open_packs: Vec<String>,
     /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
@@ -392,7 +447,12 @@ impl eframe::App for App {
                         log::info!("pack op result: {message}");
                         let mut s = self.shared.lock().unwrap();
                         s.last_pack_op = Some((ok, message));
-                        s.catalog_installing = None;
+                        // The daemon has answered for the pack that was on its way, so its
+                        // row may offer the button again. The answers come in the order the
+                        // requests went out, so the first one is the first pack.
+                        if !s.catalog_installing.is_empty() {
+                            s.catalog_installing.remove(0);
+                        }
                     }
                     Response::ConsoleOp { ok, message } => {
                         log::info!("console op result: {message}");
@@ -435,30 +495,49 @@ impl eframe::App for App {
         }
 
         // Catalog: a check was asked for (the install-packs window is the one that asks).
-        // HTTPS runs on this thread, never on the UI's — the result lands in Shared and
-        // the windows pick it up.
+        // HTTPS runs on a worker thread, never on the UI's — the result lands in Shared
+        // and the windows pick it up.
         let check = {
             let mut s = self.shared.lock().unwrap();
             std::mem::take(&mut s.catalog_check_requested)
         };
         if check {
             let shared = Arc::clone(&self.shared);
+            let ctx = ctx.clone();
+            // The catalogue is named before the round trip starts, so the worker has
+            // nothing to do but wait for the network.
+            let url = catalogue_url();
+            log::info!("catalog: checking {url}");
+            let started = Instant::now();
             thread::spawn(move || {
-                let configured = armoury_core::config::load_or_create()
-                    .ok()
-                    .and_then(|cfg| cfg.catalog_url);
-                let url = catalog::url_or_default(configured.as_deref());
-                log::info!("catalog: checking {url}");
                 let result = catalog::fetch(&url);
-                let mut s = shared.lock().unwrap();
-                s.catalog_checking = false;
-                s.catalog = Some(result.map(|catalog| catalog.packs));
+                let since_request = {
+                    let mut s = shared.lock().unwrap();
+                    s.catalog_checking = false;
+                    s.catalog = Some(result.map(|catalog| catalog.packs));
+                    s.install_packs_requested_at.map(|at| at.elapsed())
+                };
+                match since_request {
+                    Some(total) => log::info!(
+                        "catalog: fetched in {} ms ({} ms after the request)",
+                        started.elapsed().as_millis(),
+                        total.as_millis()
+                    ),
+                    None => log::info!("catalog: fetched in {} ms", started.elapsed().as_millis()),
+                }
+                // The rows are here now: the window that shows them has to redraw at
+                // once, not at its next tick.
+                request_catalog_repaint(&ctx, &shared);
             });
         }
-        // A verified catalog file waiting for the daemon: installing still goes through the
-        // daemon's normal request (it validates and owns the packs folder).
-        let ready = self.shared.lock().unwrap().catalog_install_path.take();
-        if let Some(path) = ready {
+        // Verified catalog files waiting for the daemon: installing still goes through the
+        // daemon's normal request (it validates and owns the packs folder). There is more
+        // than one: a second pack may be asked for while the first one is coming down.
+        let ready: Vec<PathBuf> = {
+            let mut s = self.shared.lock().unwrap();
+            std::mem::take(&mut s.catalog_install_path)
+        };
+        for path in ready {
             log::info!("installing catalog pack from {}", path.display());
             self.request(&Request::InstallPack {
                 source: path.display().to_string(),
@@ -476,12 +555,13 @@ impl eframe::App for App {
         // window by id - asking for it here would only redraw the dashboard 6.7 times a
         // second.
         ctx.request_repaint_after(Duration::from_secs(1));
-        let (settings_open, settings_viewport, install_packs_open) = {
+        let (settings_open, settings_viewport, install_packs_open, install_packs_asked) = {
             let s = self.shared.lock().unwrap();
             (
                 s.settings_open,
                 s.settings_viewport,
                 s.install_packs_open,
+                s.install_packs_asked,
             )
         };
         if settings_open && let Some(id) = settings_viewport {
@@ -491,6 +571,13 @@ impl eframe::App for App {
         // beat, not only when the daemon says something.
         if install_packs_open {
             ctx.request_repaint_after_for(Duration::from_millis(150), install_packs_viewport_id());
+            if !install_packs_asked {
+                // The window was created in the root's last pass, and eframe only paints a
+                // window it has been asked for: the request above went out before the
+                // window existed. Come back for it now, so it comes up at once.
+                self.shared.lock().unwrap().install_packs_asked = true;
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -916,7 +1003,9 @@ impl eframe::App for App {
             }
             let mut set_enabled: Option<(String, bool)> = None;
             let mut set_value: Option<(String, String, String)> = None;
-            for pack in &packs {
+            // The rows are shown by name. The console launcher above them is a built-in
+            // feature and not a pack, so it keeps its place and is not in this list.
+            for pack in sorted_packs(&packs) {
                 ui.horizontal(|ui| {
                     let mut open_this = ui
                         .small_button("‹")
@@ -1409,6 +1498,8 @@ fn close_settings(s: &mut Shared) {
 /// The install-packs window closed: it leaves the chain.
 fn close_install_packs(s: &mut Shared) {
     s.install_packs_open = false;
+    s.install_packs_requested_at = None;
+    s.install_packs_asked = false;
     s.chain.retain(|c| *c != ChainItem::InstallPacks);
     s.chain_place.remove(&ChainItem::InstallPacks);
 }
@@ -1604,7 +1695,8 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
     match stored {
         0 => {
             let current = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
-            let settled = current.is_some_and(|c| (c - desired).length() <= 0.5);
+            let settled =
+                current.is_some_and(|c| size_settled(c, desired, ctx.pixels_per_point()));
             // A viewport that never reports a size must not hang the window forever.
             let waited = s
                 .pack_first_seen
@@ -1848,7 +1940,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             .show(ui, |ui| {
                 // Only the installed packs: the console launcher is a built-in feature, not a
                 // pack, and it has its own row further down.
-                for pack in &packs {
+                for pack in sorted_packs(&packs) {
                     ui.horizontal(|ui| {
                         ui.label(&pack.name);
                         if !pack.version.is_empty() {
@@ -1884,6 +1976,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     s.install_packs_open = true;
                     s.install_packs_stage = 0;
                     s.install_packs_deadline = Some(Instant::now() + Duration::from_secs(6));
+                    s.install_packs_requested_at = Some(Instant::now());
+                    s.install_packs_asked = false;
+                    log::info!("install packs window requested");
                 }
                 drop(s);
                 // The root viewport owns the window: it creates it and does the fetch.
@@ -2147,7 +2242,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     match s.settings_stage {
         0 => {
             let cur = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
-            let settled = cur.is_some_and(|c| (c - desired).length() <= 0.5);
+            let settled =
+                cur.is_some_and(|c| size_settled(c, desired, ctx.pixels_per_point()));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
             s.settings_size = Some(desired);
             if settled || expired {
@@ -2327,13 +2423,15 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                         ui.small(RichText::new("The packs repo has no packs.").weak());
                     }
                     Some(Ok(entries)) => {
-                        for entry in entries {
+                        // The rows are shown by name: the catalogue's own order is the
+                        // repo's, not one to read.
+                        for entry in sorted_catalog(entries) {
                             catalog_row(
                                 ui,
                                 shared,
                                 entry,
                                 &packs,
-                                catalog_installing.as_deref(),
+                                &catalog_installing,
                             );
                         }
                     }
@@ -2377,19 +2475,24 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let ctx = ui.ctx();
     let mut s = shared.lock().unwrap();
     let expired = s.install_packs_deadline.is_none_or(|d| Instant::now() > d);
+    let stage_before = s.install_packs_stage;
     match s.install_packs_stage {
         0 => {
             let desired = egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
             s.install_packs_size = Some(desired);
             let cur = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
-            let settled = cur.is_some_and(|c| (c - desired).length() <= 0.5);
+            let settled =
+                cur.is_some_and(|c| size_settled(c, desired, ctx.pixels_per_point()));
             if settled || expired {
                 // The window fetches the catalog itself when it opens: the request goes to
                 // the root, which does the round trip on a worker thread.
                 if !s.catalog_checking {
                     s.catalog_check_requested = true;
                     s.catalog_checking = true;
+                    // The root picks the request up on its next frame, and its next frame
+                    // is a tick away: ask for it now, so the round trip starts now.
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
                 }
                 s.install_packs_stage = 1;
             }
@@ -2433,7 +2536,15 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             if placed || expired {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 s.install_packs_stage = 3;
-                log::info!("install packs window shown");
+                // How long the window took to appear, measured from the click that asked
+                // for it: this is the number the "it opens slowly" complaint is about.
+                match s.install_packs_requested_at {
+                    Some(at) => log::info!(
+                        "install packs window shown ({} ms after the request)",
+                        at.elapsed().as_millis()
+                    ),
+                    None => log::info!("install packs window shown"),
+                }
             } else if let Some(t) = s.install_packs_target {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(t));
             }
@@ -2448,7 +2559,15 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             }
         }
     }
+    let stage_after = s.install_packs_stage;
     drop(s);
+
+    // The window has to be on the screen now, not at the next tick. Every step of the
+    // way asks for the next one right away, so the whole way from the request to the
+    // window on the screen is a couple of frames instead of a couple of seconds.
+    if stage_after != stage_before {
+        ctx.request_repaint();
+    }
 
     // Keep the window live: a download in flight and the result of the last install have
     // to show up on their own.
@@ -2468,7 +2587,7 @@ fn catalog_row(
     shared: &Arc<Mutex<Shared>>,
     entry: &CatalogPack,
     packs: &[PackStatus],
-    installing: Option<&str>,
+    installing: &[String],
 ) {
     let installed = packs.iter().find(|p| p.id == entry.id);
     let installed_version = installed.map(|p| p.version.as_str());
@@ -2486,7 +2605,9 @@ fn catalog_row(
             ui.small(RichText::new(format!("v{}", entry.version)).weak());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if installing == Some(entry.id.as_str()) {
+            // A pack that is on its way has no button: the row says so instead, and the
+            // button comes back when the daemon has answered.
+            if installing.iter().any(|id| id == &entry.id) {
                 ui.small(RichText::new("installing…").weak());
                 return;
             }
@@ -2503,7 +2624,7 @@ fn catalog_row(
                         .on_hover_text("Download, verify and install this pack")
                         .clicked()
                     {
-                        start_catalog_install(shared, entry);
+                        start_catalog_install(shared, entry, ui.ctx());
                     }
                 }
                 PackButton::Update => {
@@ -2513,7 +2634,7 @@ fn catalog_row(
                         entry.version
                     );
                     if ui.small_button("Update").on_hover_text(hover).clicked() {
-                        start_catalog_install(shared, entry);
+                        start_catalog_install(shared, entry, ui.ctx());
                     }
                 }
                 PackButton::Installed(version) => {
@@ -2775,6 +2896,22 @@ fn install_packs_viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of(INSTALL_PACKS_VIEWPORT)
 }
 
+/// The windows that show what the catalogue holds: the install-packs window with its rows
+/// and the settings window with its one-line summary. They have to redraw as soon as the
+/// catalogue lands - their next tick is a second away, and the rows are already here.
+fn request_catalog_repaint(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>) {
+    let (install_open, settings_open) = {
+        let s = shared.lock().unwrap();
+        (s.install_packs_open, s.settings_open)
+    };
+    if install_open {
+        ctx.request_repaint_of(install_packs_viewport_id());
+    }
+    if settings_open {
+        ctx.request_repaint_of(settings_viewport_id());
+    }
+}
+
 /// The badge on a dashboard pack row that says how many settings the pack has that the row
 /// does not show: one setting → no badge, two settings → "+1".
 fn extra_settings(count: usize) -> Option<String> {
@@ -2856,30 +2993,94 @@ enum Picker {
 /// Download one catalog pack on its own thread, then hand the file to the daemon: the App
 /// drains `catalog_install_path` and sends the normal install request (the daemon still
 /// verifies and owns the packs folder).
-fn start_catalog_install(shared: &Arc<Mutex<Shared>>, entry: &CatalogPack) {
+///
+/// The download must not run on the thread that draws the window: this returns at once and
+/// the row says the pack is on its way, so the window keeps drawing while the pack comes
+/// down. `ctx` is the window's context, so the result can be shown at once and not at the
+/// window's next tick.
+fn start_catalog_install(shared: &Arc<Mutex<Shared>>, entry: &CatalogPack, ctx: &egui::Context) {
+    // The catalogue is named before the download starts, so the worker has nothing to do
+    // but wait for the network.
+    let url = catalogue_url();
+    download_pack_in_background(shared, entry, &url, ctx);
+}
+
+/// The download itself, on a worker thread. `url` is the catalogue manifest to read.
+///
+/// The pack is marked as on its way before the thread starts, so the row that asked for it
+/// says so at once. When the download ends, the verified file waits for the daemon. A pack
+/// that does not match the manifest never gets that far: the error goes to the user and
+/// nothing is installed.
+fn download_pack_in_background(
+    shared: &Arc<Mutex<Shared>>,
+    entry: &CatalogPack,
+    url: &str,
+    ctx: &egui::Context,
+) {
     let shared = Arc::clone(shared);
     let entry = entry.clone();
+    let url = url.to_string();
+    let ctx = ctx.clone();
     {
         let mut s = shared.lock().unwrap();
-        s.catalog_installing = Some(entry.id.clone());
+        s.catalog_installing.push(entry.id.clone());
     }
+    // The download runs on its own thread: the thread that draws the window returns at
+    // once, so the window keeps drawing while the pack comes down.
     thread::spawn(move || {
-        let configured = armoury_core::config::load_or_create()
-            .ok()
-            .and_then(|cfg| cfg.catalog_url);
-        let url = catalog::url_or_default(configured.as_deref());
-        let dest = std::env::temp_dir().join(format!("armoury-catalog-{}.json", entry.id));
+        let dest = catalog_temp_path(&entry.id);
         log::info!("catalog: downloading {}", entry.id);
+        let started = Instant::now();
         let result = catalog::download_to(&url, &entry, &dest);
-        let mut s = shared.lock().unwrap();
-        match result {
-            Ok(()) => s.catalog_install_path = Some(dest),
-            Err(e) => {
-                s.catalog_installing = None;
-                s.last_pack_op = Some((false, e));
+        {
+            let mut s = shared.lock().unwrap();
+            match result {
+                Ok(()) => {
+                    log::info!(
+                        "catalog: downloaded {} in {} ms",
+                        entry.id,
+                        started.elapsed().as_millis()
+                    );
+                    s.catalog_install_path.push(dest);
+                }
+                Err(e) => {
+                    // The pack never lands: the row must not keep saying "installing…".
+                    s.catalog_installing.retain(|id| id != &entry.id);
+                    s.last_pack_op = Some((false, e));
+                }
             }
         }
+        // The result is here now: the window that shows it has to redraw at once, not at
+        // its next tick.
+        request_catalog_repaint(&ctx, &shared);
     });
+}
+
+/// The catalogue to read: the one the config names, else the official one.
+fn catalogue_url() -> String {
+    let configured = armoury_core::config::load_or_create()
+        .ok()
+        .and_then(|cfg| cfg.catalog_url);
+    catalog::url_or_default(configured.as_deref())
+}
+
+/// The file a pack is downloaded into: the temp folder, under a name only the pack's own id
+/// can make.
+///
+/// The id comes from the network, so it is not trusted with the file system: a name like
+/// `../../x` must not write outside the temp folder.
+fn catalog_temp_path(id: &str) -> PathBuf {
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!("armoury-catalog-{safe}.json"))
 }
 
 /// Run the native picker on a worker thread: the dialog runs its own modal loop, and
@@ -3406,6 +3607,7 @@ fn classify(place: &mut Placement, pos: egui::Pos2, pinned: bool, now: Instant) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     /// A pack as the dashboard sees it.
     fn pack(name: &str, applied: bool, settings: usize) -> PackStatus {
@@ -4102,6 +4304,274 @@ mod tests {
         }
     }
 
+    /// An installed pack with the name the row shows.
+    fn named_pack(id: &str, name: &str) -> PackStatus {
+        PackStatus {
+            name: name.to_string(),
+            ..installed_pack(id, "1.0.0")
+        }
+    }
+
+    /// The names of the pack rows, in the order they are shown.
+    fn shown_names(packs: &[PackStatus]) -> Vec<String> {
+        sorted_packs(packs)
+            .iter()
+            .map(|p| p.name.clone())
+            .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn the_pack_rows_are_shown_by_name() {
+        // The packs as the daemon hands them over: the order it applies them in.
+        let packs = vec![
+            named_pack("wallpaper-engine", "Wallpaper Engine"),
+            named_pack("g-helper", "G-Helper"),
+            named_pack("rainmeter", "Rainmeter"),
+        ];
+        // The rows are shown by name instead.
+        assert_eq!(
+            shown_names(&packs),
+            vec!["G-Helper", "Rainmeter", "Wallpaper Engine"]
+        );
+    }
+
+    #[test]
+    fn the_pack_rows_are_sorted_without_caring_about_the_case() {
+        let packs = vec![
+            named_pack("beta", "beta"),
+            named_pack("alpha", "Alpha"),
+            named_pack("charlie", "CHARLIE"),
+        ];
+        assert_eq!(shown_names(&packs), vec!["Alpha", "beta", "CHARLIE"]);
+    }
+
+    #[test]
+    fn two_packs_with_the_same_name_are_told_apart_by_their_id() {
+        let packs = vec![
+            named_pack("zebra", "Same name"),
+            named_pack("aardvark", "Same name"),
+        ];
+        let ids: Vec<&str> = sorted_packs(&packs)
+            .iter()
+            .map(|p| p.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["aardvark", "zebra"]);
+    }
+
+    #[test]
+    fn a_renamed_pack_moves_to_its_new_place() {
+        let mut packs = vec![
+            named_pack("rainmeter", "Rainmeter"),
+            named_pack("g-helper", "G-Helper"),
+            named_pack("wallpaper-engine", "Wallpaper Engine"),
+        ];
+        assert_eq!(
+            shown_names(&packs),
+            vec!["G-Helper", "Rainmeter", "Wallpaper Engine"]
+        );
+        // The pack is renamed: it moves with the name, because the rows are sorted when
+        // they are drawn and not by an index that was stored somewhere.
+        packs[0].name = "Aardvark".to_string();
+        assert_eq!(
+            shown_names(&packs),
+            vec!["Aardvark", "G-Helper", "Wallpaper Engine"]
+        );
+    }
+
+    #[test]
+    fn the_application_order_is_not_touched_by_the_display_sort() {
+        // The shipped packs, as the daemon loads them: the order it applies them in.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let loaded = crate::packs::load(&[root]);
+        let orders: Vec<i32> = loaded.iter().map(|p| p.pack.order).collect();
+        assert_eq!(
+            orders,
+            vec![10, 20, 30],
+            "the shipped packs keep the order the daemon applies them in"
+        );
+        let packs: Vec<PackStatus> = loaded
+            .iter()
+            .map(|p| named_pack(&p.pack.id, &p.pack.name))
+            .collect();
+        // The rows are shown by name: G-Helper, Rainmeter, Wallpaper Engine.
+        assert_eq!(
+            shown_names(&packs),
+            vec!["G-Helper", "Rainmeter", "Wallpaper Engine"]
+        );
+        // And the daemon's own order is still there: the display sort works on a copy.
+        let order: Vec<&str> = packs.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["wallpaper-engine", "g-helper", "rainmeter"],
+            "the display sort must not reorder the list the daemon applies the packs from"
+        );
+    }
+
+    #[test]
+    fn the_catalogue_rows_are_shown_by_name() {
+        let catalog = vec![
+            catalog_entry("wallpaper-engine", "Wallpaper Engine", "1.4.0"),
+            catalog_entry("g-helper", "G-Helper", "1.3.1"),
+            catalog_entry("rainmeter", "Rainmeter", "1.5.0"),
+        ];
+        let shown: Vec<&str> = sorted_catalog(&catalog)
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(shown, vec!["G-Helper", "Rainmeter", "Wallpaper Engine"]);
+
+        // And the window draws them in that order.
+        let (text, _) = install_packs_frame_with(catalog);
+        let row = |name: &str| {
+            text.iter()
+                .find(|(t, _, _)| t == name)
+                .map(|(_, rect, _)| *rect)
+                .unwrap_or_else(|| panic!("the install-packs window has no {name:?} row"))
+        };
+        let g_helper = row("G-Helper");
+        let rainmeter = row("Rainmeter");
+        let wallpaper = row("Wallpaper Engine");
+        assert!(
+            g_helper.top() < rainmeter.top() && rainmeter.top() < wallpaper.top(),
+            "the catalogue rows are not sorted by name: {g_helper:?}, {rainmeter:?}, {wallpaper:?}"
+        );
+    }
+
+    #[test]
+    fn the_console_launcher_is_not_one_of_the_sorted_packs() {
+        // The console launcher is a built-in feature and not a pack: it has its own row
+        // in the settings window and is not in the list the sort works on.
+        let packs = vec![
+            named_pack("wallpaper-engine", "Wallpaper Engine"),
+            named_pack("g-helper", "G-Helper"),
+        ];
+        assert!(
+            !shown_names(&packs).iter().any(|n| n == CONSOLE_FEATURE),
+            "the console launcher must not be a pack"
+        );
+
+        // The settings window: the pack rows are sorted by name, and the console
+        // launcher sits in its own section below them.
+        let text = settings_frame(packs);
+        let row = |name: &str| {
+            text.iter()
+                .find(|(t, _, _)| t == name)
+                .map(|(_, rect, _)| *rect)
+                .unwrap_or_else(|| panic!("the settings window has no {name:?} row"))
+        };
+        let g_helper = row("G-Helper");
+        let wallpaper = row("Wallpaper Engine");
+        let console = row(CONSOLE_FEATURE);
+        assert!(
+            g_helper.top() < wallpaper.top(),
+            "the pack rows are not sorted by name: {g_helper:?} and {wallpaper:?}"
+        );
+        assert!(
+            console.top() > wallpaper.top(),
+            "the console launcher belongs in its own section, below the packs: {console:?} and \
+             {wallpaper:?}"
+        );
+    }
+
+    /// The settings window as it is drawn, with the given installed packs.
+    fn settings_frame(packs: Vec<PackStatus>) -> Vec<(String, Rect, usize)> {
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            let mut status = status_with_key(false, "");
+            status.packs = packs;
+            s.status = Some(status);
+        }
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| settings_ui(ui, &shared));
+        });
+        let text = painted_text(&output);
+        output.drop_without_applying_deltas();
+        text
+    }
+
+    #[test]
+    fn a_window_size_that_the_os_rounded_counts_as_settled() {
+        // 430 pt at 125% is 538 px, which is 430.4 pt again. The window has the size it
+        // asked for, so it is settled - even though the two sizes differ by 0.4 pt on
+        // each axis, which is more than half a point.
+        assert!(size_settled(
+            egui::vec2(430.4, 470.4),
+            egui::vec2(430.0, 470.0),
+            1.25
+        ));
+        // A window that really is a different size is not settled.
+        assert!(!size_settled(
+            egui::vec2(400.0, 470.4),
+            egui::vec2(430.0, 470.0),
+            1.25
+        ));
+        // At 100% the size matches to the point.
+        assert!(size_settled(
+            egui::vec2(430.0, 470.0),
+            egui::vec2(430.0, 470.0),
+            1.0
+        ));
+    }
+
+    #[test]
+    fn the_install_packs_window_is_not_stuck_on_its_size() {
+        // The window was created with the size it wants, and Windows rounds a window's
+        // size to whole pixels: 430 pt at 125% is 538 px, which is 430.4 pt again. The
+        // window has the size it asked for, so it must not sit in the first step until
+        // its six-second deadline.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.install_packs_open = true;
+            s.install_packs_stage = 0;
+            // The deadline is far away: the window may not use it to get past the size.
+            s.install_packs_deadline = Some(Instant::now() + Duration::from_secs(6));
+        }
+        let input = egui::RawInput {
+            viewports: {
+                let mut viewports = egui::ViewportIdMap::default();
+                viewports.insert(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo {
+                        inner_rect: Some(Rect::from_min_size(
+                            egui::pos2(0.0, 0.0),
+                            egui::vec2(INSTALL_PACKS_WIDTH + 0.4, INSTALL_PACKS_HEIGHT + 0.4),
+                        )),
+                        native_pixels_per_point: Some(1.25),
+                        ..Default::default()
+                    },
+                );
+                viewports
+            },
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| install_packs_ui(ui, &shared));
+        });
+        output.drop_without_applying_deltas();
+        let stage = shared.lock().unwrap().install_packs_stage;
+        assert_eq!(
+            stage, 1,
+            "the window is still waiting for its size: it is at step {stage}"
+        );
+    }
+
     #[test]
     fn the_check_summary_says_what_is_out_of_date() {
         // Everything is current.
@@ -4434,7 +4904,7 @@ mod tests {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     for entry in &entries {
-                        catalog_row(ui, &shared, entry, &packs, None);
+                        catalog_row(ui, &shared, entry, &packs, &[]);
                     }
                 });
         });
@@ -4485,6 +4955,22 @@ mod tests {
     /// The install-packs window as it is drawn, with a catalog of `count` packs.
     /// Returns the painted text, the rules and the window's frame.
     fn install_packs_frame(count: usize) -> (Vec<(String, Rect, usize)>, Vec<f32>) {
+        let entries: Vec<CatalogPack> = (0..count)
+            .map(|i| {
+                catalog_entry_with_description(
+                    &format!("pack-{i}"),
+                    &format!("Pack number {i}"),
+                    "1.4.0",
+                    "Stops the animated wallpaper while a tracked app runs and restores it \
+                     afterwards.",
+                )
+            })
+            .collect();
+        install_packs_frame_with(entries)
+    }
+
+    /// The install-packs window as it is drawn, with the given catalogue.
+    fn install_packs_frame_with(entries: Vec<CatalogPack>) -> (Vec<(String, Rect, usize)>, Vec<f32>) {
         let ctx = egui::Context::default();
         app_style(&ctx);
         let input = egui::RawInput {
@@ -4497,19 +4983,7 @@ mod tests {
         let shared = Arc::new(Mutex::new(Shared::default()));
         {
             let mut s = shared.lock().unwrap();
-            s.catalog = Some(Ok(
-                (0..count)
-                    .map(|i| {
-                        catalog_entry_with_description(
-                            &format!("pack-{i}"),
-                            &format!("Pack number {i}"),
-                            "1.4.0",
-                            "Stops the animated wallpaper while a tracked app runs and restores it \
-                             afterwards.",
-                        )
-                    })
-                    .collect(),
-            ));
+            s.catalog = Some(Ok(entries));
         }
         let output = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default()
@@ -4707,6 +5181,220 @@ mod tests {
         assert!(
             worker.wait_stopped(Duration::from_secs(5)),
             "the worker did not stop"
+        );
+    }
+
+    /// A stand-in for the packs repo: it answers every request with the same bytes, after
+    /// a delay. The catalogue tests are the only place a network is used, and this is the
+    /// only network they use.
+    struct TestRepo {
+        /// The catalogue manifest URL. The pack files hang under it.
+        url: String,
+    }
+
+    impl TestRepo {
+        fn start(body: Vec<u8>, delay: Duration) -> TestRepo {
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("the test repo must bind");
+            let port = listener
+                .local_addr()
+                .expect("the test repo must have an address")
+                .port();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let body = body.clone();
+                    thread::spawn(move || {
+                        // The request head is read and ignored: the answer is the same for
+                        // every path.
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                            match stream.read(&mut byte) {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => head.push(byte[0]),
+                            }
+                        }
+                        thread::sleep(delay);
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(&body);
+                    });
+                }
+            });
+            TestRepo {
+                url: format!("http://127.0.0.1:{port}/catalog/index.json"),
+            }
+        }
+    }
+
+    /// A pack id of this test's own, so the temp file of one test never touches another's.
+    fn test_pack_id(name: &str) -> String {
+        format!("ui-test-{name}-{}", std::process::id())
+    }
+
+    /// An entry that promises exactly the bytes the test repo serves.
+    fn entry_for(body: &[u8], id: &str) -> CatalogPack {
+        let mut entry = catalog_entry(id, id, "1.0.0");
+        entry.size = Some(body.len() as u64);
+        entry.sha256 = catalog::hex_sha256(body);
+        entry
+    }
+
+    /// Ask for one pack and wait until the download has ended.
+    fn download_from(repo: &TestRepo, entry: &CatalogPack) -> Arc<Mutex<Shared>> {
+        let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
+        let ctx = egui::Context::default();
+        download_pack_in_background(&shared, entry, &repo.url, &ctx);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            let done = {
+                let s = shared.lock().unwrap();
+                s.last_pack_op.is_some() || !s.catalog_install_path.is_empty()
+            };
+            if done {
+                return shared;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the download never ended");
+    }
+
+    /// Wait until the queue of verified files holds `count` of them.
+    fn wait_for_files(shared: &Arc<Mutex<Shared>>, count: usize) -> Vec<PathBuf> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let landed = {
+                let s = shared.lock().unwrap();
+                s.catalog_install_path.len()
+            };
+            if landed >= count {
+                return shared.lock().unwrap().catalog_install_path.clone();
+            }
+            if Instant::now() >= deadline {
+                panic!("only {landed} of {count} downloads landed");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn the_catalogue_download_does_not_hold_up_the_thread_that_asked_for_it() {
+        // The pack takes a moment to come down. The call that asks for it must come back
+        // long before that: the thread that draws the window may not wait for the network.
+        let body = b"the bytes the manifest promises".to_vec();
+        let repo = TestRepo::start(body.clone(), Duration::from_millis(700));
+        let id = test_pack_id("slow");
+        let entry = entry_for(&body, &id);
+
+        let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        download_pack_in_background(&shared, &entry, &repo.url, &ctx);
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(300),
+            "the caller waited for the download: {waited:?}"
+        );
+        // The pack is on its way: the row says so before the download ends.
+        assert_eq!(shared.lock().unwrap().catalog_installing, vec![id.clone()]);
+        // And the download ends on its own, on the worker.
+        let paths = wait_for_files(&shared, 1);
+        assert_eq!(
+            std::fs::read(&paths[0]).expect("the verified file"),
+            body,
+            "the file holds the bytes that were served"
+        );
+        let _ = std::fs::remove_file(&paths[0]);
+    }
+
+    #[test]
+    fn a_pack_whose_size_does_not_match_the_manifest_is_not_installed() {
+        // The manifest promises a size the bytes on the wire do not have.
+        let body = b"the bytes the wire carries".to_vec();
+        let repo = TestRepo::start(body.clone(), Duration::from_millis(0));
+        let id = test_pack_id("size");
+        let mut entry = entry_for(&body, &id);
+        entry.size = Some(body.len() as u64 + 1);
+
+        let shared = download_from(&repo, &entry);
+        let s = shared.lock().unwrap();
+        let (ok, message) = s.last_pack_op.clone().expect("the failure reaches the user");
+        assert!(!ok, "the download failed: {message}");
+        assert!(message.contains("size"), "the message says what is wrong: {message}");
+        assert!(s.catalog_install_path.is_empty(), "nothing waits for the daemon");
+        assert!(
+            s.catalog_installing.is_empty(),
+            "the row does not stay on 'installing…'"
+        );
+        drop(s);
+        assert!(!catalog_temp_path(&id).exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_pack_whose_hash_does_not_match_the_manifest_is_not_installed() {
+        // The manifest promises a hash the bytes on the wire do not have.
+        let body = b"the bytes the wire carries".to_vec();
+        let repo = TestRepo::start(body.clone(), Duration::from_millis(0));
+        let id = test_pack_id("hash");
+        let mut entry = entry_for(&body, &id);
+        entry.sha256 = "0".repeat(64);
+
+        let shared = download_from(&repo, &entry);
+        let s = shared.lock().unwrap();
+        let (ok, message) = s.last_pack_op.clone().expect("the failure reaches the user");
+        assert!(!ok, "the download failed: {message}");
+        assert!(message.contains("sha256"), "the message says what is wrong: {message}");
+        assert!(s.catalog_install_path.is_empty(), "nothing waits for the daemon");
+        assert!(
+            s.catalog_installing.is_empty(),
+            "the row does not stay on 'installing…'"
+        );
+        drop(s);
+        assert!(!catalog_temp_path(&id).exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_second_pack_does_not_throw_the_first_one_away() {
+        // Two packs are asked for while the first one is still coming down. Both are on
+        // their way, and both files wait for the daemon: the second one must not push the
+        // first one out of the way.
+        let body = b"the bytes the manifest promises".to_vec();
+        let repo = TestRepo::start(body.clone(), Duration::from_millis(0));
+        let first = entry_for(&body, &test_pack_id("first"));
+        let second = entry_for(&body, &test_pack_id("second"));
+
+        let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
+        let ctx = egui::Context::default();
+        download_pack_in_background(&shared, &first, &repo.url, &ctx);
+        download_pack_in_background(&shared, &second, &repo.url, &ctx);
+        assert_eq!(
+            shared.lock().unwrap().catalog_installing,
+            vec![first.id.clone(), second.id.clone()],
+            "both packs are on their way"
+        );
+        let paths = wait_for_files(&shared, 2);
+        assert_eq!(paths.len(), 2, "both downloads are kept");
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn the_temp_file_of_a_pack_cannot_leave_the_temp_folder() {
+        // The id comes from the network, so it is not trusted with the file system.
+        let path = catalog_temp_path("../../Windows/System32/evil");
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'),
+            "the name holds nothing a path can walk: {path:?}"
         );
     }
 }
