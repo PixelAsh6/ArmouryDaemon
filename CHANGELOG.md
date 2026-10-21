@@ -3,6 +3,24 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.1.2] - 2026-10-21
+
+### Added
+
+- The packs are listed alphabetically by name in the dashboard, in the Settings window and in the
+  Install packs window. The built-in console launcher stays where it is, and the order the packs
+  are **applied** in is unchanged.
+
+### Fixed
+
+- The Install packs window opened only after its six-second settle deadline, because its size was
+  compared in logical points while Windows rounds the window to whole physical pixels. It now opens
+  in about 50 ms, and the same fault in the Settings window and the pack windows is fixed.
+- Asking for a second pack while the first was downloading dropped the first one silently. The
+  in-flight state is now tracked per pack.
+- A pack's temporary file name was built from its id, which comes from the catalogue manifest, so a
+  crafted id could write outside the temporary folder. The name is sanitised now.
+
 ## [1.1.1] - 2026-10-21
 
 ### Fixed
@@ -58,6 +76,7 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 - The spec 2 pack script host: a pack may carry a small Rhai script, and the daemon runs it in a
   sandboxed interpreter.
 
+[1.1.2]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2
 [1.1.1]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.1
 [1.1.0]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.0
 [1.0.0]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.0.0
