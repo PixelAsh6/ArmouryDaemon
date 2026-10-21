@@ -9,7 +9,12 @@
 //!      user's rule); only the few matches get their full image path resolved,
 //!   3. one process handle per running tracked app, waited on with `WaitForMultipleObjects`
 //!      so exits are exact (a signaled handle means *that* process object exited) and
-//!      PID-reuse safe.
+//!      PID-reuse safe,
+//!   4. a **recycled** PID — the old process exited and a new one took its PID — is a
+//!      genuine stop followed by a start: the handle wait reports the stop, and the next
+//!      sample that shows the PID again is reported as a start. The sample diff cannot see
+//!      that on its own (the same PID with the same exe name looks unchanged), so the
+//!      watcher looks the exited PIDs up again.
 
 use armoury_core::config::TrackedApp;
 use crossbeam_channel::Sender;
@@ -116,9 +121,7 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
             if r < handles.len() as u32 {
                 let (pid, id, _) = chunk[(r - WAIT_OBJECT_0) as usize];
                 // the id guards against a PID that was recycled meanwhile
-                if watcher.running.get(&pid).map(|e| e.id) == Some(id)
-                    && watcher.forget(pid, &tx, wake)
-                {
+                if watcher.exited(pid, id, &tx, wake) {
                     version += 1;
                 }
             } else {
@@ -143,6 +146,10 @@ struct Watcher {
     last_hash: Option<u64>,
     wanted: Vec<Wanted>,
     previous: Sample,
+    /// The PIDs whose process object exited: the stop was reported, but the PID may be
+    /// taken by a new process. The next sample that shows one of them again is a *new*
+    /// process, and that is a start.
+    recycled: Vec<u32>,
 }
 
 impl Watcher {
@@ -153,6 +160,7 @@ impl Watcher {
             last_hash: None,
             wanted: Vec::new(),
             previous: Sample::new(),
+            recycled: Vec::new(),
         }
     }
 
@@ -187,6 +195,15 @@ impl Watcher {
         if !self.wanted.is_empty() {
             let current = sample();
             let (started, gone) = diff_samples(&self.previous, &current);
+            // A PID whose process object exited may have been recycled: the sample diff
+            // cannot see that — the same PID with the same exe name looks unchanged — so
+            // the exited PIDs are looked at again. The handle is the proof that the old
+            // process is gone.
+            for (pid, name) in self.take_recycled(&current) {
+                if self.consider(pid, &name, tx, wake) {
+                    changed = true;
+                }
+            }
             if list_changed {
                 // The tracked list changed: re-check everything currently running, so an
                 // app added to the list while it was already running is picked up.
@@ -229,6 +246,19 @@ impl Watcher {
         }
 
         changed
+    }
+
+    /// The PIDs the current sample shows again: their process object exited, so whatever
+    /// holds the PID now is a *new* process. The list is emptied — every exit is looked
+    /// at exactly once.
+    fn take_recycled(&mut self, current: &Sample) -> Vec<(u32, String)> {
+        let out: Vec<(u32, String)> = self
+            .recycled
+            .iter()
+            .filter_map(|pid| current.get(pid).map(|name| (*pid, name.clone())))
+            .collect();
+        self.recycled.clear();
+        out
     }
 
     /// Is this PID one of the tracked apps we are not watching yet?
@@ -302,6 +332,21 @@ impl Watcher {
             pid,
         });
         signal(wake);
+        true
+    }
+
+    /// The process object behind the handle exited: the app is gone and the stop is
+    /// reported now. The PID may be **recycled** — a new process may take it — so the PID
+    /// is remembered: the next sample that shows it again is a new process, and that is a
+    /// start. The id guards against an entry that was replaced meanwhile.
+    fn exited(&mut self, pid: u32, id: u64, tx: &Sender<WatchEvent>, wake: usize) -> bool {
+        if self.running.get(&pid).map(|e| e.id) != Some(id) {
+            return false; // the entry belongs to another process now
+        }
+        if !self.forget(pid, tx, wake) {
+            return false;
+        }
+        self.recycled.push(pid);
         true
     }
 }
@@ -593,6 +638,75 @@ mod tests {
                 assert_eq!(seen, pid);
             }
             WatchEvent::Stopped { .. } => panic!("the app started, it did not stop"),
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_recycled_pid_is_reported_as_a_stop_and_then_a_start() {
+        // A game exits and a new one takes the same PID with the same exe name. The sample
+        // diff cannot see that — the same PID with the same name looks unchanged — so the
+        // watcher looks the exited PID up again: the handle is the proof that the old
+        // process is gone. The engine has to hear both, or the packs would revert and
+        // never come back (2026-10-21).
+        let probe = std::path::Path::new("C:\\Windows\\System32\\ping.exe");
+        if !probe.is_file() {
+            return;
+        }
+        let mut child = Command::new(probe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ping.exe starts");
+        let pid = child.id();
+
+        let tracked = Arc::new(Mutex::new(vec![TrackedApp {
+            name: "Ping".into(),
+            exe: "C:\\Windows\\System32\\ping.exe".into(),
+        }]));
+        let (tx, rx) = unbounded();
+        let mut watcher = Watcher::new();
+        let mut walk = || sample(&[(pid, "ping.exe")]);
+
+        // the app is tracked and running: the watcher watches it
+        watcher.step(&tracked, &tx, 0, &mut walk);
+        match rx
+            .try_recv()
+            .expect("the tracked app must be reported as started")
+        {
+            WatchEvent::Started { key, pid: seen, .. } => {
+                assert_eq!(key, "ping.exe");
+                assert_eq!(seen, pid);
+            }
+            WatchEvent::Stopped { .. } => panic!("the app started, it did not stop"),
+        }
+
+        // the process object exits: the stop is reported at once
+        let id = watcher.running.get(&pid).expect("the app is watched").id;
+        assert!(watcher.exited(pid, id, &tx, 0), "the exit is reported");
+        match rx.try_recv().expect("the exit must be reported") {
+            WatchEvent::Stopped { key, pid: seen } => {
+                assert_eq!(key, "ping.exe");
+                assert_eq!(seen, pid);
+            }
+            WatchEvent::Started { .. } => panic!("the app stopped, it did not start"),
+        }
+
+        // the PID is taken by a new process with the same exe name: the sample diff sees
+        // nothing, but the watcher must report the start
+        watcher.step(&tracked, &tx, 0, &mut walk);
+        match rx
+            .try_recv()
+            .expect("the recycled PID must be reported as started")
+        {
+            WatchEvent::Started { key, pid: seen, .. } => {
+                assert_eq!(key, "ping.exe");
+                assert_eq!(seen, pid);
+            }
+            WatchEvent::Stopped { .. } => panic!("the recycled PID is a start, not a stop"),
         }
 
         let _ = child.kill();

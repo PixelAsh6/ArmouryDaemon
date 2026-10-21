@@ -1,15 +1,18 @@
 //! Trigger engine: pure state machine driven by tracked-app start/stop events.
 //!
-//! Semantics (user-specified, revised 2026-10-20):
+//! Semantics (user-specified, revised 2026-10-21):
 //! - A tracked-app event states the **intent**: the packs belong to the applied state while a
 //!   tracked app runs, and back to their own state once the last one is gone. `desired` is that
 //!   intent, `applied` is what the machine does — the two are allowed to differ, and that gap is
 //!   exactly a deferred change.
-//! - The packs follow the intent, but only when no **lockout** is running. Every change starts a
-//!   lockout of `cooldown` seconds; while it runs no other change may touch the packs, and the
-//!   intent that arrives meanwhile is *deferred*, not dropped — it is applied when the lockout
-//!   expires.
-//! - The lockout is a minimum spacing between two changes, and only a change that actually
+//! - The **apply is never deferred**: the moment the intent says that a tracked app is running,
+//!   the packs go to the applied state — whatever the lockout is doing. The change starts a
+//!   lockout of `cooldown` seconds, so the next revert waits the full window.
+//! - The **revert is held** by the lockout: when the last tracked app closes, the revert waits
+//!   for a window and lands when that window is over. A fast restart inside the window cancels
+//!   the hold, so the packs simply stay applied and the machine is never put back to its old
+//!   state while the app is running again (2026-10-21).
+//! - The lockout is a minimum spacing before a **revert**, and only a change that actually
 //!   happened starts one: a lockout that expires while the intent still holds changes nothing.
 //! - The capture of the "previous" state therefore always happens on a settled machine: a fast
 //!   app restart can no longer capture the daemon's own value back (the "stuck on Turbo" bug),
@@ -52,8 +55,11 @@ pub struct Engine {
     desired: bool,
     idle: bool,
     paused: bool,
-    /// The settling window. While it is running, NO pack change may be made.
+    /// The settling window. While it is running, no *revert* may be made.
     lock_until: Option<Instant>,
+    /// A revert is waiting for the window to expire (the intent is gone while the packs
+    /// are applied). A fast restart inside the window cancels it.
+    revert_pending: bool,
     /// exe file name (lowercase, the tracked identity) -> (display name, live pids)
     running: BTreeMap<String, (String, Vec<u32>)>,
     last_source: Option<String>,
@@ -68,6 +74,7 @@ impl Engine {
             idle: false,
             paused: false,
             lock_until: None,
+            revert_pending: false,
             running: BTreeMap::new(),
             last_source: None,
         }
@@ -134,6 +141,7 @@ impl Engine {
         if paused {
             // Freeze: drop the lockout, and let nothing be pending.
             self.lock_until = None;
+            self.revert_pending = false;
             self.desired = self.applied;
             return None;
         }
@@ -141,6 +149,7 @@ impl Engine {
         if !self.running.is_empty() {
             self.desired = true;
             self.lock_until = None;
+            self.revert_pending = false;
             if !self.applied {
                 self.applied = true;
                 self.last_source = Some(self.source_label());
@@ -155,6 +164,7 @@ impl Engine {
         } else {
             None
         };
+        self.revert_pending = self.applied;
         None
     }
 
@@ -167,6 +177,7 @@ impl Engine {
         }
         self.idle = idle;
         self.lock_until = None;
+        self.revert_pending = false;
         if idle {
             if self.applied {
                 self.applied = false;
@@ -197,6 +208,7 @@ impl Engine {
             Transition::Reverted => self.applied = true,
         }
         self.lock_until = None;
+        self.revert_pending = false;
     }
 
     /// A tracked app was removed from the user's list: forget it entirely. This is a manual
@@ -218,6 +230,7 @@ impl Engine {
             self.applied = false;
             self.last_source = None;
             self.lock_until = None;
+            self.revert_pending = false;
             return Some(Transition::Reverted);
         }
         self.try_change(now)
@@ -263,41 +276,72 @@ impl Engine {
         self.try_change(now)
     }
 
-    /// Advance time (called ~1/s). When the lockout expires the intent is applied under the
-    /// same rules: if it still matches the state nothing happens (and no new lockout starts),
-    /// otherwise the packs change and a new lockout begins.
+    /// Advance time (called ~1/s). When the window that holds a revert expires, the revert
+    /// lands — unless the intent holds again, in which case nothing happens (and no new
+    /// lockout starts).
     pub fn tick(&mut self, now: Instant) -> Option<Transition> {
         self.try_change(now)
     }
 
-    /// Make the packs match the intent — if that is allowed right now.
+    /// Make the packs match the intent.
     ///
-    /// A change is only allowed when no lockout is running: while one runs the intent is
-    /// deferred, not dropped, and the lockout is not restarted. Idle and pause freeze the
-    /// switching entirely. A change that does not happen starts no lockout.
+    /// The **apply is never deferred**: the moment the intent says that a tracked app is
+    /// running, the packs go to the applied state — whatever the lockout is doing. The change
+    /// starts a lockout of its own, so the next revert waits the full window.
+    ///
+    /// The **revert is held** by the lockout: when the intent goes away (the last tracked app
+    /// closed), the revert waits for a window and lands when that window is over. A fast
+    /// restart inside that window cancels the hold and the packs stay applied. Without that, a
+    /// close that lands between two lockouts would put the machine back while the app is
+    /// already running again — and the re-apply would then wait for the lockout the revert
+    /// started, so the packs would flip back late, under the running app.
+    ///
+    /// Idle and pause freeze the switching entirely. A change that does not happen starts no
+    /// lockout.
     fn try_change(&mut self, now: Instant) -> Option<Transition> {
-        // An expired lockout is gone.
-        if self.lock_until.is_some_and(|until| until <= now) {
-            self.lock_until = None;
-        }
         if self.idle || self.paused {
             return None;
         }
-        if self.lock_until.is_some() {
-            return None; // the lockout runs: the change is deferred
-        }
-        if self.desired == self.applied {
-            return None; // nothing to do — and no lockout for it
-        }
-        self.applied = self.desired;
-        self.lock_until = Some(now + self.cooldown);
-        if self.applied {
+        if self.desired && !self.applied {
+            // The intent is "a tracked app is running": the packs go to the applied state
+            // at once. The lockout holds the revert, not the apply.
+            self.applied = true;
+            self.revert_pending = false;
+            self.lock_until = Some(now + self.cooldown);
             self.last_source = Some(self.source_label());
-            Some(Transition::Applied)
-        } else {
-            self.last_source = None;
-            Some(Transition::Reverted)
+            return Some(Transition::Applied);
         }
+        if !self.desired && self.applied {
+            // The intent is gone while the packs are applied: the revert is pending.
+            if !self.revert_pending {
+                // The close starts the window that holds the revert. A lockout that is
+                // already running holds it as well — it is not restarted — and without one
+                // the window starts now.
+                let until = match self.lock_until {
+                    Some(until) if until > now => until,
+                    _ => now + self.cooldown,
+                };
+                self.revert_pending = true;
+                self.lock_until = Some(until);
+                return None;
+            }
+            if self.lock_until.is_some_and(|until| until <= now) {
+                // The window is over: the revert lands and starts a lockout of its own.
+                self.applied = false;
+                self.revert_pending = false;
+                self.lock_until = Some(now + self.cooldown);
+                self.last_source = None;
+                return Some(Transition::Reverted);
+            }
+            return None; // the window still runs: the revert is held
+        }
+        // The intent holds and the machine is where it should be: a held revert is
+        // cancelled, and an expired lockout is gone — it starts no new one.
+        self.revert_pending = false;
+        if self.lock_until.is_some_and(|until| until <= now) {
+            self.lock_until = None;
+        }
+        None
     }
 
     /// Is the lockout still running?
@@ -354,22 +398,177 @@ mod tests {
     }
 
     #[test]
-    fn closing_after_the_lockout_reverts_immediately() {
+    fn closing_after_the_lockout_holds_the_revert() {
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("game.exe", "game.exe", 10, now);
         // the lockout ends with the game still running: nothing happens
         assert_eq!(e.tick(now + Duration::from_secs(C)), None);
 
-        // an hour later the game ends: no lockout runs, so the packs revert at once
+        // an hour later the game ends: the lockout holds the revert
         let closed = now + Duration::from_secs(3600);
-        assert_eq!(
-            e.on_stopped("game.exe", 10, closed),
-            Some(Transition::Reverted)
-        );
-        assert!(!e.is_applied());
+        assert_eq!(e.on_stopped("game.exe", 10, closed), None);
+        assert!(e.is_applied(), "the packs stay applied while the lockout runs");
         assert_eq!(e.state(closed), EngineState::Cooldown);
         assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
+
+        // the lockout ends: the revert lands now and starts a lockout of its own
+        let expiry = closed + Duration::from_secs(C);
+        assert_eq!(e.tick(expiry), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.cooldown_remaining(expiry), Some(Duration::from_secs(C)));
+    }
+
+    #[test]
+    fn a_fast_restart_outside_the_lockout_never_reverts() {
+        // The user's scenario (2026-10-21): the game starts, the packs apply, the lockout runs
+        // out while the game is still up, and the game is closed and opened again. The close
+        // lands between two lockouts, so the lockout has to hold the revert: the restart inside
+        // the window cancels it, the packs stay applied, and when the window finally expires the
+        // machine is not put back while the game is running.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 1, now),
+            Some(Transition::Applied)
+        );
+        assert!(e.is_applied());
+
+        // the lockout runs out with the game still up: nothing changes, no new lockout
+        let expiry = now + Duration::from_secs(C);
+        assert_eq!(e.tick(expiry), None);
+        assert!(e.is_applied());
+        assert_eq!(e.cooldown_remaining(expiry), None);
+
+        // the game is closed: the lockout holds the revert
+        let closed = now + Duration::from_secs(C + 5);
+        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
+        assert!(e.is_applied(), "the packs stay applied");
+        assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
+
+        // the game is opened again inside the window: the held revert is cancelled
+        let reopened = closed + Duration::from_secs(5);
+        assert_eq!(e.on_started("game.exe", "game.exe", 2, reopened), None);
+        assert!(e.is_applied(), "a fast restart never reverts");
+
+        // the window expires with the game running: the machine is not put back
+        let held = closed + Duration::from_secs(C);
+        assert_eq!(e.tick(held), None);
+        assert!(e.is_applied(), "the packs are still applied while the game runs");
+        assert_eq!(e.cooldown_remaining(held), None);
+        assert_eq!(e.state(held), EngineState::Triggered);
+    }
+
+    #[test]
+    fn a_start_while_the_packs_are_reverted_applies_at_once() {
+        // The apply is never deferred (2026-10-21): when the intent says that a tracked app is
+        // running, the packs go to the applied state at once — whatever the lockout is doing.
+        // The lockout holds the *revert*, not the apply.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        // the game closes: the window that holds the revert starts
+        assert_eq!(
+            e.on_stopped("game.exe", 1, now + Duration::from_secs(5)),
+            None
+        );
+        // the window runs out with the game gone: the revert lands and starts a lockout
+        let reverted = now + Duration::from_secs(C);
+        assert_eq!(e.tick(reverted), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(
+            e.cooldown_remaining(reverted),
+            Some(Duration::from_secs(C)),
+            "the revert starts a lockout of its own"
+        );
+
+        // the game starts again: the packs come back at once, the lockout does not hold them
+        let started = reverted + Duration::from_secs(1);
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 2, started),
+            Some(Transition::Applied),
+            "the apply is never deferred"
+        );
+        assert!(e.is_applied());
+        // the change starts a lockout of its own: the next revert waits the full window
+        assert_eq!(e.cooldown_remaining(started), Some(Duration::from_secs(C)));
+    }
+
+    #[test]
+    fn a_close_holds_the_revert_and_a_restart_cancels_it() {
+        // The close holds the revert for a window, and a restart inside that window cancels
+        // it: the packs stay applied and the machine is never put back.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        // the machine settles: the lockout of the start runs out
+        assert_eq!(e.tick(now + Duration::from_secs(C)), None);
+
+        // the game closes: the revert is held, not performed
+        let closed = now + Duration::from_secs(C + 5);
+        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
+        assert!(e.is_applied(), "the revert is held");
+        assert_eq!(e.state(closed), EngineState::Cooldown);
+        assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
+
+        // the game starts again inside the window: the held revert is cancelled
+        let reopened = closed + Duration::from_secs(5);
+        assert_eq!(e.on_started("game.exe", "game.exe", 2, reopened), None);
+        assert!(e.is_applied(), "a fast restart never reverts");
+
+        // the window expires with the game running: nothing is put back
+        let held = closed + Duration::from_secs(C);
+        assert_eq!(e.tick(held), None);
+        assert!(e.is_applied());
+        assert_eq!(e.cooldown_remaining(held), None);
+        assert_eq!(e.state(held), EngineState::Triggered);
+    }
+
+    #[test]
+    fn a_held_revert_lands_exactly_once() {
+        // The revert waits for the window, lands when it is over — and only once: a lockout
+        // that expires while the intent is gone changes nothing a second time.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert_eq!(e.tick(now + Duration::from_secs(C)), None);
+
+        // the game closes: the revert is held
+        let closed = now + Duration::from_secs(C + 5);
+        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
+        assert!(e.is_applied());
+
+        // the window is over: the revert lands, and it starts a lockout of its own
+        let expiry = closed + Duration::from_secs(C);
+        assert_eq!(e.tick(expiry), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.cooldown_remaining(expiry), Some(Duration::from_secs(C)));
+
+        // nothing more happens: the revert is not performed twice
+        assert_eq!(e.tick(expiry + Duration::from_secs(1)), None);
+        assert_eq!(e.tick(expiry + Duration::from_secs(C + 1)), None);
+        assert!(!e.is_applied());
+        assert_eq!(e.cooldown_remaining(expiry + Duration::from_secs(C + 1)), None);
+        assert_eq!(e.state(expiry + Duration::from_secs(C + 1)), EngineState::Idle);
+    }
+
+    #[test]
+    fn a_manual_action_bypasses_a_running_lockout() {
+        // A manual action happens at once, even while the lockout runs: removing the tracked
+        // app reverts the packs right away and leaves no lockout behind.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(C));
+        e.on_started("game.exe", "game.exe", 1, now);
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+
+        assert_eq!(e.on_untracked("game.exe", now), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.state(now), EngineState::Idle);
+        assert_eq!(
+            e.cooldown_remaining(now),
+            None,
+            "a manual action leaves no lockout behind"
+        );
     }
 
     #[test]

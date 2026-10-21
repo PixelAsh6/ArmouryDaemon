@@ -2099,15 +2099,11 @@ fn focus_color(t: f32, alpha: f32) -> egui::Color32 {
     )
 }
 
-/// A rounded-rect outline sampled into points, clockwise from the top edge. The corner arc
-/// is sampled in physical pixels, so it takes more steps on a bigger display. Used for
-/// both edges of the 2 pt gradient ring.
-fn rounded_outline(rect: egui::Rect, radius: f32, ppp: f32) -> Vec<egui::Pos2> {
-    let r = radius
-        .min(rect.width() / 2.0)
-        .min(rect.height() / 2.0)
-        .max(0.0);
-    let steps = arc_steps(r, ppp);
+/// The outline's points: `steps` per corner arc, clockwise from the top edge.
+///
+/// The step count is the caller's: the focus ring joins its two edges point by point, so
+/// both of them have to be sampled with the same number of steps.
+fn outline_points(rect: egui::Rect, r: f32, steps: usize) -> Vec<egui::Pos2> {
     let (l, t, rgt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let corners = [
         (egui::pos2(rgt - r, t + r), -90.0),
@@ -2125,11 +2121,29 @@ fn rounded_outline(rect: egui::Rect, radius: f32, ppp: f32) -> Vec<egui::Pos2> {
     out
 }
 
+/// The corner radius an outline gets: the radius asked for, or the largest the rectangle
+/// can carry.
+fn corner_radius(rect: egui::Rect, radius: f32) -> f32 {
+    radius
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .max(0.0)
+}
+
 /// The focus border: a mesh strip around the rounded tile, violet → magenta left to right.
 fn paint_focus_ring(painter: &egui::Painter, rect: egui::Rect, alpha: f32) {
     let ppp = painter.pixels_per_point();
-    let outer = rounded_outline(rect.expand(1.0), TILE_RADIUS + 1.0, ppp);
-    let inner = rounded_outline(rect.expand(-1.0), TILE_RADIUS - 1.0, ppp);
+    let outer_rect = rect.expand(1.0);
+    let inner_rect = rect.expand(-1.0);
+    let outer_r = corner_radius(outer_rect, TILE_RADIUS + 1.0);
+    let inner_r = corner_radius(inner_rect, TILE_RADIUS - 1.0);
+    // The two edges are joined point by point, so they are sampled with the same number
+    // of steps: the outer edge has the longer arc and sets the count. Each edge with a
+    // count of its own would leave the shorter one short of points, and the mesh would
+    // index past its end.
+    let steps = arc_steps(outer_r, ppp);
+    let outer = outline_points(outer_rect, outer_r, steps);
+    let inner = outline_points(inner_rect, inner_r, steps);
     let width = rect.width().max(1.0);
     let color = |p: egui::Pos2| focus_color((p.x - rect.left()) / width, alpha);
     let mut m = Mesh::default();
@@ -2609,9 +2623,28 @@ mod tests {
             let steps = arc_steps(TILE_RADIUS, ppp);
             assert_eq!(scrim_rows(tile, ppp).len(), 2 + steps);
             assert_eq!(
-                rounded_outline(tile, TILE_RADIUS, ppp).len(),
+                outline_points(tile, TILE_RADIUS, steps).len(),
                 4 * (steps + 1)
             );
+        }
+    }
+
+    #[test]
+    fn the_focus_ring_draws_at_every_scale() {
+        // The ring is a strip between two outlines, and the mesh joins them point by
+        // point: both have to be sampled with the same number of steps. Each edge with a
+        // count of its own left the shorter one short of points, and the mesh indexed
+        // past its end — the band died on its first frame with the focus ring on it.
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(197.568, 241.92));
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(ppp);
+            let out = ctx.run_pass(egui::RawInput::default(), |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                paint_focus_ring(&painter, tile, 1.0);
+            });
+            assert!(!out.shapes.is_empty(), "the ring must draw at {ppp}");
+            out.drop_without_applying_deltas();
         }
     }
 

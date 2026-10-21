@@ -1866,7 +1866,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut cd_commit: Option<u64> = None;
         let mut fs_commit: Option<u64> = None;
         ui.horizontal(|ui| {
-            ui.label("Revert after");
+            ui.label("Cooldown");
             let resp = ui.add_sized(
                 [46.0, 20.0],
                 egui::TextEdit::singleline(&mut cd_text).char_limit(5),
@@ -2208,7 +2208,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         for text in ["No console apps yet.", "No key set."] {
             w = w.max(tw(&small_font, text));
         }
-        for text in ["Leave idle after", "Revert after", "Idle failsafe"] {
+        for text in ["Leave idle after", "Cooldown", "Idle failsafe"] {
             w = w.max(tw(&body_font, text));
         }
         // Two buttons share a row, so the pair has to fit side by side.
@@ -4878,9 +4878,9 @@ mod tests {
         let text = painted_text(&output);
         let revert = text
             .iter()
-            .find(|(t, _, _)| t == "Revert after")
+            .find(|(t, _, _)| t == "Cooldown")
             .map(|(_, rect, _)| *rect)
-            .expect("the settings window has no 'Revert after' row");
+            .expect("the settings window has no 'Cooldown' row");
         let rules_above = painted_rules(&output)
             .into_iter()
             .filter(|y| *y < revert.top())
@@ -4889,6 +4889,38 @@ mod tests {
         assert_eq!(
             rules_above, 1,
             "the settings window opens with {rules_above} rules above the first row, not one"
+        );
+    }
+
+    #[test]
+    fn the_settings_window_calls_the_lockout_the_cooldown() {
+        // The dashboard has said "cooldown" and "Cooling down" for a while; the Settings
+        // window was the last place still calling the lockout "Revert after". The setting
+        // is the same one, under the name the rest of the daemon uses.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(420.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| settings_ui(ui, &shared));
+        });
+        let text = painted_text(&output);
+        output.drop_without_applying_deltas();
+        assert!(
+            text.iter().any(|(t, _, _)| t == "Cooldown"),
+            "the settings window does not show the 'Cooldown' label"
+        );
+        assert!(
+            !text.iter().any(|(t, _, _)| t.contains("Revert after")),
+            "the settings window still shows the old 'Revert after' label"
         );
     }
 

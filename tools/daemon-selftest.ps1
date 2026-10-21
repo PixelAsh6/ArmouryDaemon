@@ -333,10 +333,11 @@ try {
     Check 'packs disabled + cooldown 5 s' ((@($s.packs | Where-Object enabled).Count -eq 0) -and ($s.cooldown_seconds -eq 5))
 
     # ---- 4. a tracked app start applies the packs and starts a lockout ----
-    # The engine (2026-10-20): the packs follow the intent, but only when no lockout runs.
-    # Every change that really happens starts a lockout of `cooldown` seconds, and while it
-    # runs no other change may touch the packs. The daemon reports the lockout as the
-    # "cooldown" state plus the time that is left.
+    # The engine (2026-10-21): the apply is never deferred — a tracked app that starts gets
+    # the packs at once. The change starts a lockout of `cooldown` seconds, and that lockout
+    # holds the *revert*: a close waits for the window, and a fast restart inside it cancels
+    # the wait. The daemon reports the lockout as the "cooldown" state plus the time that is
+    # left.
     $applies = @(Get-ChangeTimes 'apply').Count
     Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     $p1 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
@@ -355,16 +356,19 @@ try {
     Check 'no lockout is left behind' ($null -eq $s.cooldown_remaining_ms) "remaining=$($s.cooldown_remaining_ms)"
     Check 'nothing was reverted' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
 
-    # ---- 6. a close with no lockout running reverts at once ----
-    # Nothing defers the change any more, so the packs go back right away.
+    # ---- 6. a close with no lockout running holds the revert ----
+    # The lockout holds the revert: the close starts one and the revert lands when it expires,
+    # so a fast restart inside the window cancels it and the packs stay applied.
     $reverts = @(Get-ChangeTimes 'revert').Count
     $closeAt = Get-Date
     $p1 | Stop-Process -Force
+    Start-Sleep -Milliseconds 700
+    Check 'the close holds the revert' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
     $times = @(Wait-Change 'revert' $reverts 15)
-    Check 'a close with no lockout running reverts at once' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    Check 'the held revert lands when the lockout expires' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
     $revertAt = $times[$times.Count - 1]
     $revertSeenAt = Get-Date
-    Check 'the revert is not delayed by a countdown' ((Get-Gap $closeAt $revertAt) -ge -1 -and (Get-Gap $closeAt $revertAt) -le 4) "close=$closeAt revert=$revertAt"
+    Check 'the revert waits for the lockout' ((Get-Gap $closeAt $revertAt) -ge 3 -and (Get-Gap $closeAt $revertAt) -le 12) "close=$closeAt revert=$revertAt"
     $s = Wait-State 'cooldown' 8
     Check 'the revert starts a lockout of its own' ($s.state -eq 'cooldown') "state=$($s.state)"
 
@@ -423,6 +427,44 @@ try {
     Check 'a fast restart leaves the packs applied' ($s.state -eq 'triggered') "state=$($s.state)"
     Check 'a fast restart never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
     Check 'a fast restart does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+
+    # ---- 9b. a fast restart after the lockout ended never reverts ----
+    # The close lands between two lockouts (2026-10-21): the lockout holds the revert, the
+    # restart inside that window cancels it, and the packs stay applied the whole time.
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $p4 | Stop-Process -Force
+    Start-Sleep -Milliseconds 700
+    Check 'a close after the lockout ended holds the revert' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
+    $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'triggered' 20
+    Check 'a fast restart after the lockout ended leaves the packs applied' ($s.state -eq 'triggered') "state=$($s.state)"
+    Check 'a fast restart after the lockout ended never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
+    Check 'a fast restart after the lockout ended does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+
+    # ---- 9c. a start while the lockout runs applies at once ----
+    # The lockout holds the revert, not the apply: an app that starts while the daemon is
+    # still inside the lockout of the last change gets the packs at once. The revert below
+    # leaves the daemon in a lockout, so the start lands inside it.
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $p4 | Stop-Process -Force
+    $times = @(Wait-Change 'revert' $reverts 15)
+    Check 'the close lets the revert land' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $s = Wait-State 'cooldown' 8
+    Check 'the revert starts a lockout of its own' ($s.state -eq 'cooldown') "state=$($s.state)"
+
+    # the app starts again while that lockout still runs: the packs must come back at once
+    $startAt = Get-Date
+    $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $times = @(Wait-Change 'apply' $applies 15)
+    Check 'a start inside the lockout applies the packs' ($times.Count -ge $applies + 1) "applies=$applies now=$($times.Count)"
+    $applyAt = $times[$times.Count - 1]
+    Check 'the apply is not delayed by the lockout' ((Get-Gap $startAt $applyAt) -ge -1 -and (Get-Gap $startAt $applyAt) -le 3) "start=$startAt apply=$applyAt"
+
+    # the apply starts a lockout of its own, and the daemon settles again
+    $s = Wait-State 'triggered' 20
+    Check 'the daemon settles back to triggered' ($s.state -eq 'triggered') "state=$($s.state)"
 
     # ---- 10. a second tracked app changes nothing and starts no lockout ----
     # The packs are already applied, so the intent does not change: no apply and no lockout.
