@@ -7,6 +7,15 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ### Fixed
 
+- The lockout held the wrong change. A tracked app that started had to wait for the lockout
+  before the packs came on, and a close that landed between two lockouts put the machine back
+  at once — so the packs flipped back and forth under the running game. The apply is not
+  deferred any more: a tracked app that starts gets the packs at once. The lockout holds the
+  **revert** now: a close waits for the window, a fast restart inside it cancels the wait, and
+  the revert lands when the window is over — if the app is not running by then.
+- A tracked app that exited and was replaced by a new one on the same PID was reported as
+  stopped and never as started, so the packs went back and never came back. A recycled PID is
+  a stop followed by a start now.
 - The pack script's sandbox built a new interpreter and registered its host functions on every
   run. It keeps one engine now: the 432.7 µs the build used to cost is paid once, and a run
   spends 4.7 µs on the engine.
@@ -15,6 +24,9 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ### Changed
 
+- The Settings window calls the lockout **Cooldown**. The setting itself is unchanged: the same
+  lockout window, the same seconds and the same `cooldown_seconds` key in `config.json`. Only the
+  label changed, so it matches the dashboard's "cooldown" and "Cooling down".
 - The build is no longer specific to the machine that compiled it. The build now targets the
   fixed **x86-64 v3** level — AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE and XSAVE — so the
   executable is the same on every machine, and it runs on Intel Haswell (2013) and later and AMD

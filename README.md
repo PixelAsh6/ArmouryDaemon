@@ -62,17 +62,25 @@ pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
 is `1.1.3`.
 
-### The lockout ("Revert after")
+### The lockout ("Cooldown")
 
-Every change that actually happens starts a **lockout** — the settling window the Settings window
-shows, 60 seconds by default. While a lockout runs, no other change may touch the packs. An event
-that arrives inside that window is **deferred, not dropped**: it lands when the lockout expires.
+The lockout is the settling window the Settings window shows, 60 seconds by default. It has one
+job: it **holds the revert**.
 
-The lockout is a minimum spacing between two changes, not a scheduled switch. A lockout that
-expires while the intent still holds changes nothing and starts no new one. A consequence worth
-knowing: a **fast restart** (close the game and reopen it inside the lockout) never reverts at
-all — the packs simply stay applied. Because the "previous state" is always captured on a
-settled machine, the capture can never read the daemon's own value back.
+- A tracked app **starts** → the packs go to the applied state **at once**. The apply is never
+  deferred — the lockout does not hold it.
+- That change starts a lockout of its own, so the **next** revert waits the full window.
+- The last tracked app **closes** → the revert is **held**: it waits for a window and lands when
+  that window is over. The machine stays in the applied state until then.
+- The app **starts again inside that window** → the held revert is cancelled. The packs stay
+  applied — the machine is already in the state the app wants, so nothing needs doing.
+- When the window is over: if the app is **not** running, the revert lands and the packs go back
+  to their own state. If it **is** running, nothing happens.
+
+The lockout is a minimum spacing before a **revert**, and only a change that actually happened
+starts one: a lockout that expires while the app still runs changes nothing and starts no new
+one. Because the "previous state" is always captured on a settled machine, the capture can never
+read the daemon's own value back.
 
 Manual actions — removing a tracked app, pausing, entering or leaving idle mode — bypass the
 lockout: they change the packs at once.
@@ -202,7 +210,7 @@ small, undecorated windows plus a tray icon:
   the state, the daemon's version, the uptime, the pack count, the tracked apps and the packs,
   with a status band for *paused* and *cooling down*. Its Packs section also carries the built-in
   **Console launcher** row.
-- **The Settings window** opens to the left of the dashboard: the **Revert after** value, the
+- **The Settings window** opens to the left of the dashboard: the **Cooldown** value, the
   idle failsafe, the installed packs (each with a **Remove**), the console launcher's open mode
   and the apps pinned to it, the SteamGridDB key, and the two buttons **Install packs** and
   **Open packs folder**. The catalogue is checked in the Install packs window; the line under the

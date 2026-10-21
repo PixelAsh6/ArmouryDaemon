@@ -10,7 +10,7 @@ the exact ACL, updating and uninstalling. The overview and the lone-exe install 
 - **Packs** - Wallpaper Engine, G-Helper and Rainmeter. A pack may expose up to four dropdowns
   (what it should do while a tracked app runs, and how); Wallpaper Engine ships with two
   (`action` and `binary`). When the app closes, everything reverts to the state it was in before
-  (after the `Revert after` lockout you choose in Settings; a quick reopen keeps the packs
+  (after the `Cooldown` lockout you choose in Settings; a quick reopen keeps the packs
   applied).
 - **Killswitch** - **End** hides + mutes the running tracked apps; press again to restore. The key
   still reaches the app you are typing in (it is a low-level keyboard hook, not a registered hotkey).
