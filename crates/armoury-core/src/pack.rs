@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 fn default_spec() -> u32 {
     1
@@ -363,8 +363,12 @@ impl Pack {
         if self.settings.len() > 4 {
             errs.push("a pack may expose at most 4 dropdowns".into());
         }
-        for (i, s) in self.settings.iter().enumerate() {
-            if self.settings[..i].iter().any(|other| other.key == s.key) {
+        // The keys are collected in a set: comparing every key with every earlier one made
+        // the check quadratic, and a pack with thousands of dropdowns (a hostile file) kept
+        // the daemon busy for minutes before it could refuse it.
+        let mut seen_keys: HashSet<&str> = HashSet::new();
+        for s in &self.settings {
+            if !seen_keys.insert(s.key.as_str()) {
                 errs.push(format!("setting '{}': duplicate key", s.key));
             }
             if s.kind != "enum" {
@@ -503,7 +507,7 @@ impl Pack {
 
     /// Parse a pack and reject it if invalid.
     pub fn parse(text: &str) -> Result<Pack, String> {
-        let pack: Pack = serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+        let pack: Pack = serde_json::from_str(text).map_err(|e| explain_json_error(text, &e))?;
         let errs = pack.validate();
         if errs.is_empty() {
             Ok(pack)
@@ -511,6 +515,100 @@ impl Pack {
             Err(errs.join("; "))
         }
     }
+}
+
+/// The message for a JSON that does not fit the schema.
+///
+/// serde_json says what is wrong and where, but not *which field* is wrong: a pack author
+/// has to look for it. The field is the key the offending value belongs to, and it is found
+/// by walking back from the position over the token to the key that opens it.
+fn explain_json_error(text: &str, err: &serde_json::Error) -> String {
+    let detail = err.to_string();
+    // serde names a missing field itself.
+    if detail.starts_with("missing field") {
+        return format!("invalid JSON: {detail}");
+    }
+    match field_at(text, err.line(), err.column()) {
+        Some(field) => format!("invalid JSON: the field '{field}': {detail}"),
+        None => format!("invalid JSON: {detail}"),
+    }
+}
+
+/// The name of the field the error at `line`/`column` is about, if the text
+/// around it says so. `None` when the position does not sit in a value of a named field.
+///
+/// `line` is serde_json's line, 1-based. `column` is a *byte* offset inside that line —
+/// serde_json counts bytes, not characters — and it is not always 1-based: the errors
+/// built from `position()` count from 0, the ones built from `peek_position()` from 1.
+/// The column is used as the 1-based offset serde_json documents it to be, which is the
+/// place the old character index pointed at as well.
+fn field_at(text: &str, line: usize, column: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let mut pos = offset_of(text, line, column)?;
+    loop {
+        // Walk back over the whitespace to the last character of the offending token.
+        while pos > 0 && bytes.get(pos).is_some_and(|b| (*b as char).is_whitespace()) {
+            pos -= 1;
+        }
+        if bytes.get(pos) != Some(&b'"') {
+            // Not a quoted token: keep walking back.
+            if pos == 0 {
+                return None;
+            }
+            pos -= 1;
+            continue;
+        }
+        // A quoted token: a key is followed by a colon, a value is not.
+        let mut after = pos + 1;
+        while bytes.get(after).is_some_and(|b| (*b as char).is_whitespace()) {
+            after += 1;
+        }
+        if bytes.get(after) == Some(&b':') {
+            // The key: from its opening quote to the closing one.
+            let mut start = pos;
+            while start > 0 {
+                start -= 1;
+                if bytes[start] == b'"' && (start == 0 || bytes[start - 1] != b'\\') {
+                    break;
+                }
+            }
+            if bytes.get(start) != Some(&b'"') {
+                return None; // no opening quote: the text is not what it looks like
+            }
+            let key = text.get(start + 1..pos)?;
+            if key.is_empty() || key.contains('\\') {
+                return None; // an escaped key: the raw text would not be the name
+            }
+            return Some(key);
+        }
+        if pos == 0 {
+            return None;
+        }
+        pos -= 1;
+    }
+}
+
+/// The byte offset of the error in `text`: the column of `line` is a byte offset
+/// inside that line.
+///
+/// A byte offset is not a character position: with a character before the error it can
+/// land in the middle of a character, and then it is not a place in the text at all.
+/// The slice is taken with `get`, which gives `None` instead of panicking.
+fn offset_of(text: &str, line: usize, column: usize) -> Option<usize> {
+    let mut start = 0usize;
+    for (index, l) in text.split_inclusive('\n').enumerate() {
+        if index + 1 == line {
+            let l = l.strip_suffix('\n').unwrap_or(l);
+            let l = l.strip_suffix('\r').unwrap_or(l);
+            let at = column.saturating_sub(1);
+            // The byte has to be a character boundary: a byte offset inside a
+            // character is not a position in the text.
+            let _ = l.get(at..)?;
+            return Some(start + at);
+        }
+        start += l.len();
+    }
+    None
 }
 
 /// The setting keys a template refers to: `{{settings.mode}}` -> ["mode"].
@@ -533,6 +631,7 @@ fn settings_in(template: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     const WE: &str = include_str!("../../../packs/wallpaper-engine/pack.json");
     const GH: &str = include_str!("../../../packs/g-helper/pack.json");
@@ -778,6 +877,459 @@ mod tests {
     fn bad_json_is_rejected() {
         assert!(Pack::parse("{ not json").is_err());
         assert!(Pack::parse(r#"{"spec":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_json_error_names_the_field_even_after_a_non_ascii_value() {
+        // The column of a JSON error is a byte offset, not a character index: a
+        // non-ASCII value before the error shifts it, and the field the error is
+        // about still has to be named. The last field here is a decoy: the error is
+        // about "name", and the walk back from the end of the line finds "v".
+        let text = r#"{"id": "日本語日本語", "name": 42, "v": 1}"#;
+        let err = Pack::parse(text).expect_err("the name is not a string");
+        assert!(
+            err.contains("the field 'name'"),
+            "the error has to name the field it is about: {err}"
+        );
+        assert!(
+            !err.contains("the field 'v'"),
+            "the error must not name another field: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The validator against hostile input
+    //
+    // `Pack::parse` is the daemon's front door: every pack file and every pack of the
+    // catalogue goes through it. It has to be total — a panic here takes the daemon down
+    // while it loads a pack — and it has to refuse what it should refuse.
+
+    /// One mutation of a good pack: what was changed and what has to come out of it.
+    struct Mutation {
+        label: &'static str,
+        text: String,
+        /// The message has to name this: the field, the value or the limit.
+        names: &'static str,
+        /// true = the pack has to be refused, false = it may be accepted.
+        must_refuse: bool,
+    }
+
+    /// A pack as a tree, so a mutation does not have to be a text surgery.
+    fn tree_of(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).expect("the pack is JSON")
+    }
+
+    /// The pack after a change to its tree.
+    fn mutated(base: &str, change: impl FnOnce(&mut serde_json::Value)) -> String {
+        let mut tree = tree_of(base);
+        change(&mut tree);
+        serde_json::to_string(&tree).expect("the tree is JSON")
+    }
+
+    /// Set one field of the pack tree. The path names objects and arrays:
+    /// `["apply", "steps", "0", "mechanism"]` is the mechanism of the first apply step.
+    fn set(tree: &mut serde_json::Value, path: &[&str], value: serde_json::Value) {
+        let mut node = tree;
+        for key in &path[..path.len() - 1] {
+            node = match key.parse::<usize>() {
+                Ok(index) => node.get_mut(index).expect("the path exists"),
+                Err(_) => node.get_mut(*key).expect("the path exists"),
+            };
+        }
+        let last = path[path.len() - 1];
+        match last.parse::<usize>() {
+            Ok(index) => *node.get_mut(index).expect("the path exists") = value,
+            Err(_) => {
+                node.as_object_mut()
+                    .expect("an object")
+                    .insert(last.to_string(), value);
+            }
+        }
+    }
+
+    /// Remove one field of the pack tree.
+    fn remove(tree: &mut serde_json::Value, path: &[&str]) {
+        let mut node = tree;
+        for key in &path[..path.len() - 1] {
+            node = match key.parse::<usize>() {
+                Ok(index) => node.get_mut(index).expect("the path exists"),
+                Err(_) => node.get_mut(*key).expect("the path exists"),
+            };
+        }
+        let last = path[path.len() - 1];
+        match last.parse::<usize>() {
+            Ok(index) => {
+                node.as_array_mut().expect("an array").remove(index);
+            }
+            Err(_) => {
+                node.as_object_mut().expect("an object").remove(last);
+            }
+        }
+    }
+
+    /// A small pack with the numeric fields the shipped ones do not have.
+    const NUMERIC_PACK: &str = r#"{
+        "spec": 1, "id": "numeric", "name": "Numeric", "version": "1.0.0",
+        "targets": { "process": ["numeric.exe"] },
+        "apply": { "steps": [ { "mechanism": "registry_set", "sleep_ms": 5,
+            "registry": { "path": "HKEY_CURRENT_USER\\Software\\Numeric", "name": "flag", "dword": 1 } } ] },
+        "revert": { "steps": [ { "mechanism": "cli", "exe": "numeric.exe", "args": [], "expect_exit": 0 } ] }
+    }"#;
+
+    /// Every way a pack author (or a hostile file) can get the Rainmeter pack wrong.
+    fn mutations() -> Vec<Mutation> {
+        let mut list: Vec<Mutation> = Vec::new();
+        macro_rules! mutation {
+            ($label:literal, $text:expr, $names:literal, $refuse:literal) => {
+                list.push(Mutation {
+                    label: $label,
+                    text: $text,
+                    names: $names,
+                    must_refuse: $refuse,
+                });
+            };
+        }
+
+        // a wrong JSON type where a string is expected
+        mutation!(
+            "the id is a number",
+            mutated(RM, |t| set(t, &["id"], serde_json::json!(42))),
+            "id",
+            true
+        );
+        // a list where a string is expected
+        mutation!(
+            "the id is a list",
+            mutated(RM, |t| set(t, &["id"], serde_json::json!(["rainmeter"]))),
+            "id",
+            true
+        );
+        // a missing field
+        mutation!(
+            "the name is missing",
+            mutated(RM, |t| remove(t, &["name"])),
+            "name",
+            true
+        );
+        // a null
+        mutation!(
+            "the name is null",
+            mutated(RM, |t| set(t, &["name"], serde_json::Value::Null)),
+            "name",
+            true
+        );
+        // an empty string
+        mutation!(
+            "the id is empty",
+            mutated(RM, |t| set(t, &["id"], serde_json::json!(""))),
+            "id",
+            true
+        );
+        // a string where a number is expected
+        mutation!(
+            "the order is a string",
+            mutated(RM, |t| set(t, &["order"], serde_json::json!("30"))),
+            "order",
+            true
+        );
+        // a huge number
+        mutation!(
+            "the order does not fit a number",
+            RM.replace(r#""order": 30"#, r#""order": 1e400"#),
+            "order",
+            true
+        );
+        // a negative number: the order is a sort key, and any integer is one
+        mutation!(
+            "the order is negative",
+            mutated(RM, |t| set(t, &["order"], serde_json::json!(-30))),
+            "",
+            false
+        );
+        // a list that is a string
+        mutation!(
+            "the process list is a string",
+            mutated(RM, |t| set(
+                t,
+                &["targets", "process"],
+                serde_json::json!("Rainmeter.exe")
+            )),
+            "process",
+            true
+        );
+        // a list that is null
+        mutation!(
+            "the process list is null",
+            mutated(RM, |t| set(t, &["targets", "process"], serde_json::Value::Null)),
+            "process",
+            true
+        );
+        // a boolean that is a string
+        mutation!(
+            "a guard flag is a string",
+            mutated(RM, |t| set(
+                t,
+                &["apply", "guard", "targetRunning"],
+                serde_json::json!("yes")
+            )),
+            "targetRunning",
+            true
+        );
+        // a deeply nested value
+        mutation!(
+            "the id is a deeply nested value",
+            RM.replace(
+                r#""id": "rainmeter""#,
+                &format!(r#""id": {}{}"#, "[".repeat(300), "]".repeat(300))
+            ),
+            "id",
+            true
+        );
+        // an absurdly long string
+        mutation!(
+            "the name is an absurdly long string",
+            mutated(RM, |t| set(
+                t,
+                &["name"],
+                serde_json::json!("A".repeat(200_000))
+            )),
+            "",
+            false
+        );
+        // a min_engine that is not a dotted version
+        mutation!(
+            "the min_engine is not a dotted version",
+            mutated(RM, |t| set(t, &["min_engine"], serde_json::json!("one.two"))),
+            "min_engine",
+            true
+        );
+        // a min_engine with a part that does not fit a number
+        mutation!(
+            "the min_engine has a part that is too large",
+            mutated(
+                RM,
+                |t| set(t, &["min_engine"], serde_json::json!("99999999999999999999.0"))
+            ),
+            "min_engine",
+            true
+        );
+        // a setting value that is not in the dropdown's list
+        mutation!(
+            "the default is not one of the values",
+            mutated(RM, |t| set(
+                t,
+                &["settings", "0", "default"],
+                serde_json::json!("Nope")
+            )),
+            "layout",
+            true
+        );
+        // more than four dropdowns
+        mutation!(
+            "there are five dropdowns",
+            mutated(RM, |t| {
+                let settings = t
+                    .get_mut("settings")
+                    .and_then(|s| s.as_array_mut())
+                    .expect("the dropdowns");
+                for i in 0..4 {
+                    let mut extra = settings[0].clone();
+                    extra.as_object_mut().expect("an object").insert(
+                        "key".into(),
+                        serde_json::json!(format!("extra{i}")),
+                    );
+                    settings.push(extra);
+                }
+            }),
+            "dropdown",
+            true
+        );
+        // a spec the daemon does not understand
+        mutation!(
+            "the spec is one the daemon does not know",
+            mutated(RM, |t| set(t, &["spec"], serde_json::json!(3))),
+            "spec",
+            true
+        );
+        // a script on a spec-1 pack
+        mutation!(
+            "a script on a spec-1 pack",
+            mutated(RM, |t| set(t, &["spec"], serde_json::json!(1))),
+            "spec",
+            true
+        );
+        // a spec-2 pack with no script
+        mutation!(
+            "a spec-2 pack without a script",
+            mutated(RM, |t| remove(t, &["script"])),
+            "spec",
+            true
+        );
+        // a script that is not an object
+        mutation!(
+            "the script is not an object",
+            mutated(RM, |t| set(t, &["script"], serde_json::json!("hello"))),
+            "script",
+            true
+        );
+        // a duplicated key: serde refuses the second one
+        mutation!(
+            "the id is given twice",
+            RM.replace(r#""id": "rainmeter""#, r#""id": "rainmeter", "id": "other""#),
+            "id",
+            true
+        );
+        // a mechanism the daemon does not know
+        mutation!(
+            "a step mechanism that does not exist",
+            mutated(RM, |t| set(
+                t,
+                &["apply", "steps", "0", "mechanism"],
+                serde_json::json!("exec_shell")
+            )),
+            "mechanism",
+            true
+        );
+        // a step without a mechanism at all
+        mutation!(
+            "a step without a mechanism",
+            mutated(RM, |t| remove(
+                t,
+                &["apply", "steps", "0", "mechanism"]
+            )),
+            "mechanism",
+            true
+        );
+        // a capture mechanism the daemon does not know
+        mutation!(
+            "a capture mechanism that does not exist",
+            mutated(RM, |t| set(
+                t,
+                &["capture", "0", "mechanism"],
+                serde_json::json!("read_the_registry")
+            )),
+            "mechanism",
+            true
+        );
+        // a null where a list of dropdowns is expected
+        mutation!(
+            "the dropdowns are null",
+            mutated(RM, |t| set(t, &["settings"], serde_json::Value::Null)),
+            "settings",
+            true
+        );
+
+        // the numbers the shipped packs do not have
+        mutation!(
+            "the dword is negative",
+            mutated(NUMERIC_PACK, |t| set(
+                t,
+                &["apply", "steps", "0", "registry", "dword"],
+                serde_json::json!(-1)
+            )),
+            "dword",
+            true
+        );
+        mutation!(
+            "the dword does not fit",
+            mutated(NUMERIC_PACK, |t| set(
+                t,
+                &["apply", "steps", "0", "registry", "dword"],
+                serde_json::json!(4_294_967_296u64)
+            )),
+            "dword",
+            true
+        );
+        mutation!(
+            "the sleep is negative",
+            mutated(NUMERIC_PACK, |t| set(
+                t,
+                &["apply", "steps", "0", "sleep_ms"],
+                serde_json::json!(-1)
+            )),
+            "sleep_ms",
+            true
+        );
+        mutation!(
+            "the expected exit code does not fit",
+            mutated(NUMERIC_PACK, |t| set(
+                t,
+                &["revert", "steps", "0", "expect_exit"],
+                serde_json::json!(-2_147_483_649i64)
+            )),
+            "expect_exit",
+            true
+        );
+
+        list
+    }
+
+    #[test]
+    fn the_validator_survives_a_hostile_pack() {
+        let list = mutations();
+        assert!(list.len() >= 30, "the battery is complete: {}", list.len());
+        for m in &list {
+            let outcome = std::panic::catch_unwind(|| Pack::parse(&m.text));
+            let parsed = match outcome {
+                Ok(parsed) => parsed,
+                Err(_) => panic!("'{}' took the validator down", m.label),
+            };
+            match parsed {
+                Ok(pack) => {
+                    assert!(
+                        !m.must_refuse,
+                        "'{}' has to be refused, but it was accepted",
+                        m.label
+                    );
+                    assert!(
+                        pack.validate().is_empty(),
+                        "'{}' was accepted but is not valid",
+                        m.label
+                    );
+                }
+                Err(message) => {
+                    assert!(
+                        m.must_refuse,
+                        "'{}' has to be refused, but it was accepted: {message}",
+                        m.label
+                    );
+                    assert!(!message.is_empty(), "'{}' was refused without a reason", m.label);
+                    if !m.names.is_empty() {
+                        assert!(
+                            message.contains(m.names),
+                            "'{}' has to name '{}': {message}",
+                            m.label,
+                            m.names
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pack_with_thousands_of_dropdowns_is_refused_without_hanging() {
+        // The duplicate-key check compared every key with every earlier one, so a pack with
+        // thousands of dropdowns (a hostile file) kept the daemon busy for minutes before it
+        // could refuse it. The check is linear now; this is the margin that proves it.
+        let mut pack = Pack::parse(RM).expect("the shipped pack is valid");
+        for i in 0..200_000 {
+            pack.settings.push(Setting {
+                key: format!("extra{i:06}"),
+                label: "Extra".into(),
+                kind: "enum".into(),
+                values: vec!["a".into()],
+                default: None,
+            });
+        }
+        let started = Instant::now();
+        let errs = pack.validate();
+        let elapsed = started.elapsed();
+        assert!(errs.iter().any(|e| e.contains("at most 4 dropdowns")));
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the validator took {elapsed:?} on a pack with 200 000 dropdowns"
+        );
     }
 
     /// A minimal valid pack, with the `min_engine` line the tests vary.

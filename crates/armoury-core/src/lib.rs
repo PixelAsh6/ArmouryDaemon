@@ -6,6 +6,10 @@ pub mod pack;
 pub mod protocol;
 pub mod status;
 
+/// The scratch folders the tests write into. Only there while the tests run.
+#[cfg(test)]
+pub(crate) mod testutil;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Base name of the daemon's named pipe.

@@ -73,6 +73,29 @@ fn strip_bom(text: &str) -> &str {
     text.trim_start_matches('\u{feff}')
 }
 
+/// The search folders to use, in order.
+///
+/// The first one is the folder of the executable (the install folder) and is always used.
+/// Every other one is a fallback for a development build (`<repo>\target\release\ArmouryDaemon.exe`
+/// finds the repository's own `packs` folder), and it is only used when it really looks
+/// like a source checkout: a lone executable in `C:\Users\Someone\` must not fall back to
+/// `C:\` and use the packs of a folder that has nothing to do with it.
+pub fn usable_search_dirs(search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    search_dirs
+        .iter()
+        .enumerate()
+        .filter(|(index, dir)| *index == 0 || looks_like_a_checkout(dir))
+        .map(|(_, dir)| dir.clone())
+        .collect()
+}
+
+/// Does this folder hold a source checkout of the project? A `Cargo.toml` next to it is
+/// the mark: a development build in `target\release\` has to find the repository's own
+/// `packs` folder, and nothing else looks like that.
+fn looks_like_a_checkout(dir: &Path) -> bool {
+    dir.join("Cargo.toml").is_file()
+}
+
 pub fn load(search_dirs: &[PathBuf]) -> Vec<Installed> {
     let mut found: Vec<Installed> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -1341,27 +1364,27 @@ fn parse_chord(chord: &str) -> Result<Vec<u16>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
 
     #[test]
     fn the_packs_folder_is_created_when_it_is_missing() {
-        let dir = std::env::temp_dir().join(format!("armoury-packs-dir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = Scratch::dir("packs-dir");
+        let dir = scratch.root().to_path_buf();
         let search = vec![dir.clone()];
         let created = ensure_packs_dir(&search).expect("the folder is created");
         assert_eq!(created, dir.join("packs"));
         assert!(dir.join("packs").is_dir(), "the folder is there now");
         // the second call finds the folder and does nothing
         assert!(ensure_packs_dir(&search).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        // the scratch folder goes away with the guard
     }
 
     #[test]
     fn a_packs_folder_that_is_already_there_wins() {
         // the dev build: the repository's own packs folder must not be shadowed by a
         // second one next to the executable
-        let root = std::env::temp_dir().join(format!("armoury-packs-dir-2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let scratch = Scratch::dir("packs-dir-2");
+        let root = scratch.root().to_path_buf();
         let first = root.join("first");
         let second = root.join("second");
         std::fs::create_dir_all(second.join("packs")).unwrap();
@@ -1375,7 +1398,112 @@ mod tests {
             "the first folder of the search order is left alone"
         );
         assert_eq!(packs_root(&search), second.join("packs"));
-        let _ = std::fs::remove_dir_all(&root);
+        // the scratch folder goes away with the guard
+    }
+
+    /// A development build: the executable in `target\<profile>\`, the source checkout two
+    /// levels up. The checkout is what tells the two apart.
+    ///
+    /// The scratch folder is returned as well: the guard that owns it removes the whole tree
+    /// when the test ends, failed or not.
+    fn dev_layout(label: &str) -> (Scratch, PathBuf, PathBuf) {
+        let scratch = Scratch::dir(&format!("search-{label}"));
+        let checkout = scratch.root().join("repo");
+        let exe_dir = checkout.join("target").join("debug");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), "[package]\n").unwrap();
+        (scratch, checkout, exe_dir)
+    }
+
+    /// A pack in a `packs` folder, so the folder is not empty.
+    fn put_pack(packs: &Path, id: &str) {
+        let folder = packs.join(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("pack.json"), SAMPLE).unwrap();
+    }
+
+    #[test]
+    fn a_development_build_finds_the_packs_of_the_repository() {
+        // The search order is the folder of the executable first and the source checkout
+        // second: a build in `target\debug\` has to find the repository's own packs.
+        let (_scratch, checkout, exe_dir) = dev_layout("dev");
+        put_pack(&checkout.join("packs"), "sample");
+        let search = usable_search_dirs(&[exe_dir.clone(), checkout.clone()]);
+
+        assert_eq!(
+            search,
+            vec![exe_dir.clone(), checkout.clone()],
+            "the folder of the executable and the checkout are both searched"
+        );
+        assert_eq!(
+            packs_root(&search),
+            checkout.join("packs"),
+            "the repository's packs folder is the one a dev build uses"
+        );
+        let loaded = load(&search);
+        assert_eq!(loaded.len(), 1, "the pack of the repository is loaded");
+        assert_eq!(loaded[0].pack.id, "sample");
+
+        // the scratch folder goes away with the guard
+    }
+
+    #[test]
+    fn a_lone_executable_does_not_use_the_packs_of_its_grandparent() {
+        // `C:\Users\Someone\ArmouryDaemon.exe` must not fall back to `C:\packs`: the
+        // grandparent is only there for a development build, and a development build is a
+        // source checkout. A folder that is not one is nobody's business.
+        let scratch = Scratch::dir("search-lone");
+        let root = scratch.root().to_path_buf();
+        let exe_dir = root.join("Users").join("Someone");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        // the grandparent has a packs folder, and it is not a checkout
+        put_pack(&root.join("packs"), "stray");
+        let search = usable_search_dirs(&[exe_dir.clone(), root.clone()]);
+
+        assert_eq!(
+            search,
+            vec![exe_dir.clone()],
+            "the grandparent is not a checkout, so it is not searched"
+        );
+        assert_ne!(
+            packs_root(&search),
+            root.join("packs"),
+            "the packs of the grandparent must not be used"
+        );
+        assert_eq!(
+            packs_root(&search),
+            exe_dir.join("packs"),
+            "the folder of the executable is used instead"
+        );
+        assert!(
+            load(&search).is_empty(),
+            "the packs of the grandparent must not be loaded"
+        );
+        // and the folder that is used is the one next to the executable
+        assert_eq!(ensure_packs_dir(&search), Some(exe_dir.join("packs")));
+
+        // the scratch folder goes away with the guard
+    }
+
+    #[test]
+    fn a_checkout_next_to_the_executable_is_used() {
+        // The rule is about what the folder is, not about where it is: a folder with a
+        // `Cargo.toml` in it is a source checkout, and a source checkout holds the packs.
+        let scratch = Scratch::dir("search-checkout");
+        let root = scratch.root().to_path_buf();
+        let exe_dir = root.join("Apps").join("ArmouryDaemon");
+        let checkout = root.join("repo");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join("Cargo.toml"), "[package]\n").unwrap();
+        put_pack(&checkout.join("packs"), "sample");
+        let search = usable_search_dirs(&[exe_dir.clone(), checkout.clone()]);
+
+        assert_eq!(search, vec![exe_dir.clone(), checkout.clone()]);
+        assert_eq!(packs_root(&search), checkout.join("packs"));
+        assert_eq!(load(&search).len(), 1);
+
+        // the scratch folder goes away with the guard
     }
 
     #[test]
@@ -1582,9 +1710,9 @@ mod tests {
 
     #[test]
     fn json_pointer_walk() {
-        let dir = std::env::temp_dir().join("armoury-pack-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("t.json");
+        // a folder of our own: a fixed name would be shared by every run of the suite
+        let scratch = Scratch::dir("pack-test");
+        let file = scratch.root().join("t.json");
         std::fs::write(&file, r#"{"performance_mode":1,"nested":{"x":"y"}}"#).unwrap();
         assert_eq!(
             json_pointer(file.to_str().unwrap(), "/performance_mode").unwrap(),
@@ -1611,12 +1739,13 @@ mod tests {
         assert_eq!(packs.last().unwrap().pack.id, "rainmeter");
     }
 
-    /// A scratch install layout: <tmp>/install/packs
-    fn scratch_install(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("armoury-packs-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("packs")).unwrap();
-        dir
+    /// A scratch install layout: <tmp>/armoury-packs-{label}-{pid}-{n}/packs
+    ///
+    /// The guard owns the folder: it goes away when the test ends, failed or not.
+    fn scratch_install(label: &str) -> Scratch {
+        let scratch = Scratch::dir(&format!("packs-{label}"));
+        std::fs::create_dir_all(scratch.root().join("packs")).unwrap();
+        scratch
     }
 
     /// A minimal valid pack, used by the install/remove tests.
@@ -1783,7 +1912,8 @@ mod tests {
 
     #[test]
     fn install_then_remove_a_pack() {
-        let install = scratch_install("install");
+        let scratch = scratch_install("install");
+        let install = scratch.root().to_path_buf();
         let source = install.join("incoming");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("pack.json"), SAMPLE).unwrap();
@@ -1808,19 +1938,20 @@ mod tests {
         assert!(remove_id(std::slice::from_ref(&install), "sample").is_err());
         assert!(remove_id(std::slice::from_ref(&install), "../..").is_err());
         assert!(remove_id(std::slice::from_ref(&install), "C:evil").is_err());
-        let _ = std::fs::remove_dir_all(&install);
+        // the scratch folder goes away with the guard
     }
 
     #[test]
     fn install_rejects_an_invalid_pack() {
-        let install = scratch_install("invalid");
+        let scratch = scratch_install("invalid");
+        let install = scratch.root().to_path_buf();
         let bad = install.join("bad");
         std::fs::create_dir_all(&bad).unwrap();
         std::fs::write(bad.join("pack.json"), r#"{"spec":1}"#).unwrap();
         assert!(install_from_path(std::slice::from_ref(&install), &bad).is_err());
         assert!(!install.join("packs").join("x").exists());
         assert!(load(std::slice::from_ref(&install)).is_empty());
-        let _ = std::fs::remove_dir_all(&install);
+        // the scratch folder goes away with the guard
     }
 
     /// The sample pack with a `min_engine` line.
@@ -1833,7 +1964,8 @@ mod tests {
 
     #[test]
     fn install_refuses_a_pack_this_daemon_is_too_old_for() {
-        let install = scratch_install("too-old");
+        let scratch = scratch_install("too-old");
+        let install = scratch.root().to_path_buf();
         let source = install.join("incoming");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("pack.json"), sample_with_min_engine("99.0.0")).unwrap();
@@ -1848,12 +1980,13 @@ mod tests {
             "a refused pack must not land on disk"
         );
         assert!(load(std::slice::from_ref(&install)).is_empty());
-        let _ = std::fs::remove_dir_all(&install);
+        // the scratch folder goes away with the guard
     }
 
     #[test]
     fn install_accepts_a_pack_with_no_minimum_and_with_an_older_one() {
-        let install = scratch_install("older");
+        let scratch = scratch_install("older");
+        let install = scratch.root().to_path_buf();
         let source = install.join("incoming");
         std::fs::create_dir_all(&source).unwrap();
 
@@ -1868,12 +2001,15 @@ mod tests {
         // exactly this daemon
         std::fs::write(source.join("pack.json"), sample_with_min_engine(DAEMON_VERSION)).unwrap();
         assert!(install_from_path(std::slice::from_ref(&install), &source).is_ok());
-        let _ = std::fs::remove_dir_all(&install);
+        // the scratch folder goes away with the guard
     }
 
     #[test]
     fn journal_pending_revert_reads_the_last_applied_entry() {
-        let dir = scratch_install("journal").join("cfg");
+        let scratch = scratch_install("journal");
+        // the config folder inside the scratch install: the guard removes the whole scratch
+        // folder, this one included
+        let dir = scratch.root().join("cfg");
         std::fs::create_dir_all(&dir).unwrap();
 
         // nothing journalled yet
@@ -1912,7 +2048,7 @@ mod tests {
         )
         .unwrap();
         assert!(journal_pending_revert_in(&dir).is_none());
-        let _ = std::fs::remove_dir_all(&dir);
+        // the scratch folder goes away with the guard
     }
 
     /// A pack whose "before" state lives in a file (like G-Helper's config), plus a harmless step.
@@ -1964,8 +2100,8 @@ mod tests {
 
     #[test]
     fn an_apply_right_after_a_revert_reuses_the_reverts_capture() {
-        let dir = scratch_install("carry");
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = scratch_install("carry");
+        let dir = scratch.root().to_path_buf();
         // the file already shows OUR change - in real life the app writes it with a ~2 s delay
         let packs = carry_test_packs(&dir, r#"{"performance_mode": 1}"#);
         let mut carry: Option<(Instant, CaptureMap)> = None;
@@ -1986,13 +2122,13 @@ mod tests {
         assert_eq!(captured.get("was_running").map(String::as_str), Some("0"));
         assert!(carry.is_none(), "a used carry is spent");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // the scratch folder goes away with the guard
     }
 
     #[test]
     fn an_expired_carry_is_ignored() {
-        let dir = scratch_install("carry-old");
-        std::fs::create_dir_all(&dir).unwrap();
+        let scratch = scratch_install("carry-old");
+        let dir = scratch.root().to_path_buf();
         let packs = carry_test_packs(&dir, r#"{"performance_mode": 1}"#);
         // a carry from one second past the window must not be believed
         let mut carry: Option<(Instant, CaptureMap)> = Some((
@@ -2010,6 +2146,6 @@ mod tests {
             Some("1"),
             "outside the window the file is the only truth"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        // the scratch folder goes away with the guard
     }
 }

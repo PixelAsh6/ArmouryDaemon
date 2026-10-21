@@ -806,6 +806,7 @@ pub fn install_self() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
     use std::fs;
 
     /// The installer script is the reference for the task: the daemon and the script
@@ -997,9 +998,7 @@ mod tests {
 
     #[test]
     fn the_hash_of_a_file_is_the_one_the_installer_records() {
-        let dir = std::env::temp_dir().join(format!("armoury-sha256-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("sha256");
         let file = dir.join("ArmouryDaemon.exe");
         fs::write(&file, b"hello").unwrap();
         // SHA-256("hello")
@@ -1008,7 +1007,6 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
         assert!(file_sha256(&dir.join("missing.exe")).is_err());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1080,25 +1078,17 @@ mod tests {
 
     #[test]
     fn the_first_run_marker_is_written_once() {
-        let dir = std::env::temp_dir().join(format!(
-            "armoury-first-run-{}-{}",
-            std::process::id(),
-            FIRST_RUN_MARKER
-        ));
-        let _ = fs::remove_dir_all(&dir);
+        let dir = Scratch::dir("first-run-marker");
         let marker = dir.join(FIRST_RUN_MARKER);
         assert!(is_first_run(&marker), "a daemon that never ran is a first run");
         mark_first_run_done(&marker).expect("the marker is written");
         assert!(marker.exists());
         assert!(!is_first_run(&marker), "the marker ends the first run");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn the_same_file_is_the_same_path() {
-        let dir = std::env::temp_dir().join(format!("armoury-same-path-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("same-path");
         let file = dir.join("ArmouryDaemon.exe");
         fs::write(&file, b"x").unwrap();
         assert!(same_path(&file.to_string_lossy(), &file));
@@ -1107,6 +1097,5 @@ mod tests {
             &file
         ));
         assert!(!same_path(&dir.join("other.exe").to_string_lossy(), &file));
-        let _ = fs::remove_dir_all(&dir);
     }
 }

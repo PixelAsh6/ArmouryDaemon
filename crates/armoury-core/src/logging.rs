@@ -178,48 +178,14 @@ fn local_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::testutil::Scratch;
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    /// A throw-away directory that removes itself when the test ends. The name carries the
-    /// process id and a counter, so two concurrent test runs never share one.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> TempDir {
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "armoury-logging-test-{name}-{}-{n}",
-                std::process::id()
-            ));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            TempDir(dir)
-        }
-    }
-
-    impl std::ops::Deref for TempDir {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl AsRef<Path> for TempDir {
-        fn as_ref(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_dir(name: &str) -> TempDir {
-        TempDir::new(name)
+    /// A throw-away directory that removes itself when the test ends.
+    ///
+    /// The name carries the process id and a counter, so two concurrent test runs never
+    /// share one.
+    fn temp_dir(name: &str) -> Scratch {
+        Scratch::dir(&format!("logging-{name}"))
     }
 
     #[test]

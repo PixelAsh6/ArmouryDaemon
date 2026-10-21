@@ -1019,6 +1019,7 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
 
     #[test]
     fn key_is_stable_and_case_folded() {
@@ -1130,9 +1131,7 @@ mod tests {
 
     #[test]
     fn a_version_bump_drops_the_fetched_art_and_keeps_the_users_own() {
-        let dir = std::env::temp_dir().join(format!("armoury-art-version-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("art-version");
         let key = "aa11223344556677";
         let fetched = dir.join(format!("{key}.img"));
         let fetched_hero = dir.join(format!("{key}.hero.img"));
@@ -1149,14 +1148,11 @@ mod tests {
         assert!(!miss.exists() && !hero_miss.exists());
         assert!(mine.exists()); // the hand-dropped art is the user's own: it stays
         assert!(mine_hero.exists());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn hero_cache_prefers_the_hand_dropped_file() {
-        let dir = std::env::temp_dir().join(format!("armoury-art-hero-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("art-hero");
         let key = "0123456789abcdef";
         assert_eq!(cached_in(&dir, key, Kind::Hero), None);
         fs::write(dir.join(format!("{key}.hero.img")), b"x").unwrap();
@@ -1168,28 +1164,22 @@ mod tests {
             Some(dir.join(format!("{key}.hero.png")))
         );
         assert_eq!(cached_in(&dir, key, Kind::Cover), None); // the cover slot is its own
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_fresh_hero_miss_and_the_user_art_block_the_retry() {
-        let dir = std::env::temp_dir().join(format!("armoury-art-heromiss-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("art-heromiss");
         let key = "fedcba9876543210";
         assert!(wanted(&dir, key, Kind::Hero));
         fs::write(dir.join(format!("{key}{HERO_MISS_SUFFIX}")), b"").unwrap();
         assert!(!wanted(&dir, key, Kind::Hero)); // a fresh miss: not retried yet
         fs::write(dir.join(format!("{key}.hero.webp")), b"x").unwrap();
         assert!(!wanted(&dir, key, Kind::Hero)); // the user's own art: never compete
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn clear_misses_removes_only_the_markers() {
-        let dir = std::env::temp_dir().join(format!("armoury-art-clear-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("art-clear");
         let key = "abcdef0123456789";
         let cover_miss = dir.join(format!("{key}{MISS_SUFFIX}"));
         let hero_miss = dir.join(format!("{key}{HERO_MISS_SUFFIX}"));
@@ -1211,7 +1201,6 @@ mod tests {
         assert!(other.exists()); // an unrelated file stays
         assert!(nested.exists()); // subdirectories are not touched
         assert_eq!(clear_misses_in(&dir), 0); // nothing left to clear
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1289,9 +1278,7 @@ mod tests {
 
     #[test]
     fn the_users_own_photo_goes_in_the_hand_dropped_file() {
-        let dir = std::env::temp_dir().join(format!("armoury-art-pick-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("art-pick");
         let key = "aabbccddeeff0011";
 
         let png = image::DynamicImage::new_rgb8(2, 3);
@@ -1318,15 +1305,11 @@ mod tests {
 
         // bytes that are not a picture are refused
         assert!(write_manual(&dir, key, Kind::Cover, b"not a picture").is_err());
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn automatic_again_takes_the_users_own_art_away() {
-        let dir = std::env::temp_dir().join(format!("armoury-art-auto-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("art-auto");
         let key = "1122334455667788";
         let mine = dir.join(format!("{key}.png"));
         let mine_hero = dir.join(format!("{key}.hero.png"));
@@ -1353,7 +1336,6 @@ mod tests {
 
         // a second time is not an error
         use_automatic_in(&dir, key, ArtSlot::Icon).unwrap();
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1369,8 +1351,7 @@ mod tests {
 
     #[test]
     fn a_steam_game_resolves_its_appid_and_its_steam_client() {
-        let root = std::env::temp_dir().join(format!("armoury-steam-app-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
+        let root = Scratch::dir("steam-app");
         let game = root.join("Steam/steamapps/common/Some Game/sub");
         fs::create_dir_all(&game).unwrap();
         fs::write(
@@ -1395,13 +1376,11 @@ mod tests {
         let other = root.join("Steam/steamapps/common/Other Game");
         fs::create_dir_all(&other).unwrap();
         assert!(steam_app(&other.join("game.exe")).is_none());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn steam_appid_walks_an_appmanifest() {
-        let root = std::env::temp_dir().join(format!("armoury-art-test-{}", std::process::id()));
+        let root = Scratch::dir("art-test");
         let game_dir = root.join("library/steamapps/common/Rainbow Six Siege");
         fs::create_dir_all(&game_dir).unwrap();
         fs::write(
@@ -1412,6 +1391,5 @@ mod tests {
         let exe = game_dir.join("RainbowSix.exe");
         assert_eq!(steam_appid(&exe), Some(359550));
         assert_eq!(steam_appid(&root.join("elsewhere/game.exe")), None);
-        let _ = fs::remove_dir_all(&root);
     }
 }

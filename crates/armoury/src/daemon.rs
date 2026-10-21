@@ -2,6 +2,7 @@
 //! named-pipe server, UI process lifecycle (spawn/focus/kill), status broadcasts.
 
 use crate::art;
+use crate::catalog;
 use crate::console;
 use crate::hotkey;
 use crate::install;
@@ -87,6 +88,17 @@ fn console_open_allowed(reason: ConsoleOpen, tracked_running: bool) -> bool {
         ConsoleOpen::Automatic => !tracked_running,
         ConsoleOpen::Explicit => true,
     }
+}
+
+/// Does the dashboard open itself now?
+///
+/// The first run opens it — whatever is installed: a user who unpacked the zip has three
+/// packs and still lands on the dashboard instead of having to know that there is a tray
+/// icon. The marker is what ends the first run: it is written as the dashboard opens, so
+/// the dashboard never comes back on its own and closing it is final. A scheduled start
+/// (logon, resume from sleep) never opens anything.
+fn first_run_opens_dashboard(start: Start, is_first_run: bool) -> bool {
+    start == Start::Manual && is_first_run
 }
 
 pub fn run(start: Start) {
@@ -345,11 +357,12 @@ pub fn run(start: Start) {
     }
     info!("daemon ready");
     // ---- the first run: the dashboard opens itself ----
-    // A user who downloaded only the executable lands on the dashboard instead of having
-    // to know that there is a tray icon. It opens once: the marker remembers it, so the
-    // dashboard never comes back on its own and closing it is final.
+    // Every first run lands on the dashboard instead of having to know that there is a
+    // tray icon. It opens once: the marker remembers it, so the dashboard never comes
+    // back on its own and closing it is final. The packs make no difference — a zip
+    // install has three of them and still opens the dashboard.
     let first_run_marker = install::first_run_marker();
-    if start == Start::Manual && no_packs && install::is_first_run(&first_run_marker) {
+    if first_run_opens_dashboard(start, install::is_first_run(&first_run_marker)) {
         match install::mark_first_run_done(&first_run_marker) {
             Ok(()) => {
                 info!("first run: opening the dashboard");
@@ -628,6 +641,10 @@ fn make_tray_icon_active() -> tray_icon::Icon {
 
 /// Where packs are looked for: beside the executable first (the install folder), then the
 /// repository root for a dev build (`<repo>/target/release/ArmouryDaemon.exe`).
+///
+/// The second folder is only there for a dev build, so it is only used when it really is
+/// one: a lone executable in `C:\Users\Someone\` must not fall back to `C:\` and use the
+/// packs of a folder that has nothing to do with it.
 pub(crate) fn pack_search_dirs() -> Vec<std::path::PathBuf> {
     let mut search: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
@@ -638,7 +655,65 @@ pub(crate) fn pack_search_dirs() -> Vec<std::path::PathBuf> {
             }
         }
     }
-    search
+    packs::usable_search_dirs(&search)
+}
+
+/// Install a pack from a file and clean up after it.
+///
+/// The catalogue download leaves a verified copy of the pack in the temp folder: the
+/// daemon reads it, installs the pack and removes the file again — whether the install
+/// worked or not, so the temp folder does not fill up with one file per install. A file
+/// that cannot be removed is not worth an error: the install is what matters.
+fn install_pack_file(
+    search: &[std::path::PathBuf],
+    source: &std::path::Path,
+) -> Result<(String, bool), String> {
+    let result = packs::install_from_path(search, source);
+    remove_catalog_temp(source);
+    result
+}
+
+/// Remove the verified catalogue file the install has just read.
+///
+/// Only a file that is one of ours goes: it has to sit in the temp folder and to carry
+/// the name the catalogue download gives it. A pack.json the user picked in the file
+/// dialog is the user's own file and stays where it is.
+fn remove_catalog_temp(source: &std::path::Path) {
+    if !is_catalog_temp(source) {
+        return;
+    }
+    match std::fs::remove_file(source) {
+        Ok(()) => info!("removed the downloaded file {}", source.display()),
+        Err(e) => warn!("could not remove {} ({e})", source.display()),
+    }
+}
+
+/// Is this the temp file the catalogue download writes?
+fn is_catalog_temp(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if !name.starts_with(catalog::TEMP_PREFIX) || !name.ends_with(".json") {
+        return false;
+    }
+    // It also has to sit in the temp folder: a file with that name somewhere else is not
+    // ours to remove. The two folders are compared as paths and not as text: the temp
+    // folder can be spelled in the short 8.3 form ("C:\Users\PIXELA~1\..."), and the
+    // short and the long form of a name are the same folder.
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    same_folder(parent, &std::env::temp_dir())
+}
+
+/// Are these the same folder? The two paths are canonicalised first, so the short and
+/// the long form of a name are the same path. A path that cannot be read is not ours.
+fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(a), Ok(b)) = (a.canonicalize(), b.canonicalize()) else {
+        return false;
+    };
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(b.to_string_lossy().as_ref())
 }
 
 /// Rainmeter: guarantee a truly empty layout exists and offer the machine's real layouts.
@@ -2479,8 +2554,7 @@ impl App {
                     self.broadcast_status();
                 }
                 Request::InstallPack { source } => {
-                    let result =
-                        packs::install_from_path(&self.search, std::path::Path::new(&source));
+                    let result = install_pack_file(&self.search, std::path::Path::new(&source));
                     match result {
                         Ok((pack_id, updated)) => {
                             self.reload_packs();
@@ -2766,6 +2840,7 @@ fn nudge_existing_instance() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
 
     #[test]
     fn launcher_entries_drop_hidden_tracked_apps_and_dedupe_pins() {
@@ -2795,8 +2870,7 @@ mod tests {
 
     #[test]
     fn a_steam_game_is_started_through_steam_and_a_standalone_game_directly() {
-        let root = std::env::temp_dir().join(format!("armoury-launch-plan-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = Scratch::dir("launch-plan");
         let game = root.join("Steam/steamapps/common/Some Game/sub");
         std::fs::create_dir_all(&game).unwrap();
         std::fs::write(
@@ -2828,8 +2902,6 @@ mod tests {
             LaunchPlan::Direct { exe } => assert_eq!(exe, plain),
             LaunchPlan::Steam { .. } => panic!("a standalone game must be started directly"),
         }
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2863,6 +2935,194 @@ mod tests {
     #[test]
     fn a_live_console_launcher_with_a_window_is_kept() {
         assert_eq!(console_action(4242, false, false), ConsoleAction::Keep);
+    }
+
+    #[test]
+    fn the_first_run_opens_the_dashboard_even_with_packs_installed() {
+        // The packs are not what makes a first run a first run: a user who unpacked the
+        // zip has three of them and still lands on the dashboard.
+        assert!(
+            first_run_opens_dashboard(Start::Manual, true),
+            "the first run opens the dashboard"
+        );
+        // A scheduled start (logon, resume) must not disturb the user.
+        assert!(
+            !first_run_opens_dashboard(Start::Autostart, true),
+            "a scheduled start opens nothing"
+        );
+    }
+
+    #[test]
+    fn the_marker_ends_the_first_run() {
+        // The marker is what stops the dashboard from coming back: it is written as the
+        // dashboard opens, so the second start leaves it alone.
+        let dir = Scratch::dir("first-run");
+        let marker = dir.join(install::FIRST_RUN_MARKER);
+        assert!(
+            install::is_first_run(&marker),
+            "a daemon that never ran is a first run"
+        );
+        assert!(first_run_opens_dashboard(
+            Start::Manual,
+            install::is_first_run(&marker)
+        ));
+        install::mark_first_run_done(&marker).expect("the marker is written");
+        assert!(
+            !first_run_opens_dashboard(Start::Manual, install::is_first_run(&marker)),
+            "the marker ends the first run: the dashboard must not open again"
+        );
+    }
+
+    #[test]
+    fn the_first_run_does_not_ask_how_many_packs_are_installed() {
+        // The packs are not what makes a first run a first run: a user who unpacked the
+        // zip has three of them and still lands on the dashboard. The gate is read from
+        // the source, so a pack count cannot creep back into it.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("daemon.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let gate: Vec<&str> = source
+            .lines()
+            .map(|line| line.trim())
+            .filter(|line| line.starts_with("if ") && line.contains("first_run_opens_dashboard"))
+            .collect();
+        assert_eq!(gate.len(), 1, "the gate is one line: {gate:?}");
+        assert!(
+            !gate[0].contains("pack"),
+            "the gate must not ask about the packs: {}",
+            gate[0]
+        );
+    }
+
+    /// A pack that is valid: enough for the installer to take it.
+    const DEMO_PACK: &str = r#"{
+        "spec": 1,
+        "id": "demo",
+        "name": "Demo",
+        "version": "1.0.0",
+        "targets": { "process": ["demo.exe"] },
+        "apply": { "steps": [ { "mechanism": "process_kill" } ] },
+        "revert": { "steps": [ { "mechanism": "process_kill" } ] }
+    }"#;
+
+    #[test]
+    fn the_downloaded_pack_file_is_removed_after_the_install() {
+        let root = Scratch::dir("install-ok");
+        // The file the catalogue download leaves in the temp folder.
+        let download_guard = Scratch::file(&format!(
+            "{}{}.json",
+            catalog::TEMP_PREFIX,
+            std::process::id()
+        ));
+        let download = download_guard.root().to_path_buf();
+        std::fs::write(&download, DEMO_PACK).unwrap();
+
+        let installed = install_pack_file(&[root.root().to_path_buf()], &download);
+        assert!(installed.is_ok(), "the pack installs: {installed:?}");
+        assert!(
+            !download.exists(),
+            "the downloaded file is gone: it must not pile up in the temp folder"
+        );
+        assert!(
+            root.join("packs").join("demo").join("pack.json").is_file(),
+            "the pack landed in the packs folder"
+        );
+    }
+
+    #[test]
+    fn the_downloaded_pack_file_is_removed_after_a_failed_install() {
+        let root = Scratch::dir("install-bad");
+        let download_guard = Scratch::file(&format!(
+            "{}{}-broken.json",
+            catalog::TEMP_PREFIX,
+            std::process::id()
+        ));
+        let download = download_guard.root().to_path_buf();
+        std::fs::write(&download, "{ this is not a pack").unwrap();
+
+        let installed = install_pack_file(&[root.root().to_path_buf()], &download);
+        assert!(installed.is_err(), "a broken pack is refused");
+        assert!(
+            !download.exists(),
+            "the downloaded file is gone even when the install failed"
+        );
+    }
+
+    #[test]
+    fn a_pack_the_user_picked_is_never_removed() {
+        // The file dialog hands the daemon a path of the user's own: it stays where it
+        // is, and so does every other file that is not a catalogue download.
+        let dir = Scratch::dir("user-pack");
+        let picked = dir.join("pack.json");
+        std::fs::write(&picked, DEMO_PACK).unwrap();
+        // A file with the catalogue's name, but somewhere else: not ours either.
+        let elsewhere = dir.join(format!("{}.json", catalog::TEMP_PREFIX));
+        std::fs::write(&elsewhere, DEMO_PACK).unwrap();
+
+        let _ = install_pack_file(&[dir.root().to_path_buf()], &picked);
+        let _ = install_pack_file(&[dir.root().to_path_buf()], &elsewhere);
+        assert!(picked.exists(), "the user's own file stays where it is");
+        assert!(elsewhere.exists(), "a file outside the temp folder is not ours");
+    }
+
+    /// The short (8.3) form of a path, when the system has one for it.
+    fn short_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        use windows::core::PCWSTR;
+
+        // A folder has to be asked for with a trailing separator.
+        let mut text = path.as_os_str().encode_wide().collect::<Vec<u16>>();
+        if !text.ends_with(&[b'\\' as u16]) {
+            text.push(b'\\' as u16);
+        }
+        text.push(0);
+        let mut buffer = vec![0u16; 32768];
+        let len = unsafe { GetShortPathNameW(PCWSTR(text.as_ptr()), Some(buffer.as_mut_slice())) };
+        if len == 0 {
+            return None;
+        }
+        let short = String::from_utf16_lossy(&buffer[..(len as usize).min(buffer.len())]);
+        Some(std::path::PathBuf::from(
+            short.trim_end_matches(['\\', '/']).to_string(),
+        ))
+    }
+
+    #[test]
+    fn the_temp_file_guard_knows_the_short_and_the_long_form_of_the_folder() {
+        // The temp folder can be spelled in the short 8.3 form ("C:\Users\PIXELA~1\...")
+        // and in the long one: they are the same folder, and the file the catalogue
+        // download leaves there is ours in both spellings.
+        let name = format!("{}{}.json", catalog::TEMP_PREFIX, std::process::id());
+        let long = std::env::temp_dir().join(&name);
+        assert!(
+            is_catalog_temp(&long),
+            "the downloaded file is ours: {}",
+            long.display()
+        );
+        let short = short_path(&std::env::temp_dir()).unwrap_or_else(|| std::env::temp_dir());
+        let spelled = short.join(&name);
+        assert!(
+            is_catalog_temp(&spelled),
+            "the same file, spelled the short way, is ours too: {}",
+            spelled.display()
+        );
+
+        // A file the user picked is never ours: it does not sit in the temp folder.
+        let dir = Scratch::dir("picked");
+        let picked = dir.join("pack.json");
+        assert!(!is_catalog_temp(&picked), "the user's own file is not ours");
+        let elsewhere = dir.join(&name);
+        assert!(
+            !is_catalog_temp(&elsewhere),
+            "a file outside the temp folder is not ours"
+        );
+        // And a file in the temp folder that does not carry the catalogue's name is
+        // not ours either.
+        let named = std::env::temp_dir().join("pack.json");
+        assert!(!is_catalog_temp(&named), "another file in the temp folder is not ours");
     }
 
     #[test]

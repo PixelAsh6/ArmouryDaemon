@@ -45,6 +45,16 @@ const UI_MARGIN: f32 = 0.0;
 const CHAIN_GAP_PX: f32 = 5.0;
 /// The chain's margin from the work area's edges, in physical pixels.
 const UI_MARGIN_PX: f32 = 0.0;
+/// The Packs section's empty state: nothing is installed yet, and the catalogue is one
+/// click away.
+///
+/// Two short lines, not one long one: the dashboard is as narrow as its content, and a
+/// line that does not fit is a line that is cut off.
+///
+/// The folder that was looked in is not named here: the path is long and belongs to the
+/// machine, and a path that says nothing is worse than no path at all. The settings
+/// window has an "Open packs folder" button for the ones who want to see it.
+const NO_PACKS_HINT: &str = "No packs installed yet.\nFind them in Settings → Install packs.";
 
 /// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
 /// packs lists as a built-in row with one dropdown.
@@ -999,7 +1009,7 @@ impl eframe::App for App {
                 self.request(&Request::SetConsoleOpen { mode });
             }
             if packs.is_empty() {
-                ui.small("No packs found (looked in <app>/packs).");
+                ui.small(NO_PACKS_HINT);
             }
             let mut set_enabled: Option<(String, bool)> = None;
             let mut set_value: Option<(String, String, String)> = None;
@@ -3080,7 +3090,7 @@ fn catalog_temp_path(id: &str) -> PathBuf {
             }
         })
         .collect();
-    std::env::temp_dir().join(format!("armoury-catalog-{safe}.json"))
+    std::env::temp_dir().join(format!("{}{safe}.json", catalog::TEMP_PREFIX))
 }
 
 /// Run the native picker on a worker thread: the dialog runs its own modal loop, and
@@ -4318,6 +4328,33 @@ mod tests {
             .iter()
             .map(|p| p.name.clone())
             .collect::<Vec<_>>()
+    }
+
+    #[test]
+    fn the_empty_packs_message_points_at_the_catalogue() {
+        // The message used to carry a placeholder that was never substituted
+        // ("looked in <app>/packs"), so a first-time user saw broken templating.
+        assert!(
+            !NO_PACKS_HINT.contains('<') && !NO_PACKS_HINT.contains('>'),
+            "the message must have no placeholder: {NO_PACKS_HINT}"
+        );
+        assert!(
+            NO_PACKS_HINT.contains("No packs installed"),
+            "the message must say that nothing is installed: {NO_PACKS_HINT}"
+        );
+        assert!(
+            NO_PACKS_HINT.contains("Settings → Install packs"),
+            "the message must point at the catalogue: {NO_PACKS_HINT}"
+        );
+        // Every line has to fit the dashboard: it is as narrow as its content, and a
+        // line that does not fit is a line that is cut off. The longest line is 38
+        // characters, and the limit leaves room for it to grow.
+        for line in NO_PACKS_HINT.lines() {
+            assert!(
+                line.chars().count() <= 40,
+                "the line is too long for the dashboard: {line}"
+            );
+        }
     }
 
     #[test]

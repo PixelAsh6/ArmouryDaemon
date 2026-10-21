@@ -19,6 +19,13 @@ use crate::packs;
 pub const DEFAULT_URL: &str =
     "https://raw.githubusercontent.com/PixelAsh6/ArmouryDaemon_Packs/main/catalog/index.json";
 
+/// The name a downloaded pack gets in the temp folder: `armoury-catalog-<id>.json`.
+///
+/// The daemon reads the file, installs the pack and removes it again, so the temp folder
+/// does not fill up with one file per install. The name is also what tells the daemon
+/// that a file is its own: a pack.json the user picked in the file dialog is not.
+pub const TEMP_PREFIX: &str = "armoury-catalog-";
+
 const SCHEMA: u32 = 1;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -284,6 +291,7 @@ pub fn installed_ids(search_dirs: &[PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
 
     const MANIFEST: &str = r#"{
         "schema": 1,
@@ -378,13 +386,13 @@ mod tests {
 
     #[test]
     fn install_bytes_validates_before_writing() {
-        let dir = std::env::temp_dir().join(format!("armoury-catalog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("catalog");
         let bad = br#"{"spec": 1}"#;
-        assert!(packs::install_from_bytes(&[dir.clone()], bad).is_err());
-        assert!(!dir.join("packs").exists(), "nothing may be written for an invalid pack");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(packs::install_from_bytes(&[dir.root().to_path_buf()], bad).is_err());
+        assert!(
+            !dir.root().join("packs").exists(),
+            "nothing may be written for an invalid pack"
+        );
     }
 
     /// A manifest with three entries: one this daemon is too old for, one without a

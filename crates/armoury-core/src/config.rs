@@ -264,16 +264,13 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
 
     /// A throw-away directory of its own, so a concurrent test run cannot collide with it.
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "armoury-config-test-{name}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    ///
+    /// The guard owns the folder: it goes away when the test ends, failed or not.
+    fn temp_dir(name: &str) -> Scratch {
+        Scratch::dir(&format!("config-{name}"))
     }
 
     #[test]
@@ -379,7 +376,6 @@ mod tests {
         assert!(backup.exists());
         assert_eq!(fs::read_to_string(&backup).unwrap(), broken);
         assert_eq!(fs::read_to_string(&path).unwrap(), broken);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -396,7 +392,6 @@ mod tests {
             fs::read_to_string(dir.join("config.json.bad.2")).unwrap(),
             "second"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -413,7 +408,6 @@ mod tests {
         let before = fs::read(&path).unwrap();
         assert!(save_at(&path, &cfg).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -430,7 +424,6 @@ mod tests {
         save_at(&path, &cfg).unwrap();
         let back: AppConfig = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(back.schema_version, SUPPORTED_SCHEMA_VERSION);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -454,7 +447,6 @@ mod tests {
         assert_eq!(back.get("future_setting"), Some(&serde_json::json!(42)));
         assert_eq!(back.get("future_flag"), Some(&serde_json::json!(true)));
         assert_eq!(back.get("cooldown_seconds"), Some(&serde_json::json!(30)));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -481,7 +473,6 @@ mod tests {
         save_at(&path, &cfg).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(!text.contains("ui_position"), "{text}");
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

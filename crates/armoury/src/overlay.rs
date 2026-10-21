@@ -677,12 +677,12 @@ pub fn recover_if_needed() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("armoury-overlay-test-{name}"));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A throw-away folder for the ledger, owned by the guard: it goes away when the test
+    /// ends, failed or not.
+    fn temp_dir(name: &str) -> Scratch {
+        Scratch::dir(&format!("overlay-{name}"))
     }
 
     fn entry(id: &str, was_muted: bool) -> LedgerEntry {

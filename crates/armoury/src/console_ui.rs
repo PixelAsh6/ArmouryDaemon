@@ -39,6 +39,19 @@ const TILE_RADIUS: f32 = 16.0;
 const ICON: f32 = 108.0;
 /// How far above the work-area bottom the band sits: docked just above the taskbar.
 const BOTTOM_LIFT: f32 = 8.0;
+/// The dashboard's window title. The band looks the window up by it: the band and the
+/// dashboard are separate processes, so the band cannot ask the dashboard where it is —
+/// but the OS knows, and the dashboard's window has a fixed title.
+const DASHBOARD_TITLE: &str = "ArmouryDaemon";
+/// The column on the right of the screen the dashboard owns, in logical points.
+///
+/// The dashboard lives in the bottom-right corner of the work area and is 380-420 points
+/// wide, so a column of this width always clears it. The band keeps out of the column:
+/// its tiles are clickable, so a tile under the dashboard would take the click meant
+/// for the dashboard and launch an app instead of doing what the user asked.
+const DASHBOARD_COLUMN: f32 = 450.0;
+/// The gap between the band and the dashboard, in logical points.
+const DASHBOARD_GAP: f32 = 12.0;
 /// Gap under the tiles before the hint line (the names sit inside the tiles).
 const HINT_GAP: f32 = 14.0;
 /// Reserved height of the one-line hint: tiles + gap + hint center as one block.
@@ -278,8 +291,10 @@ pub fn run() {
 
     let work = work_area();
     let screen = screen_size();
-    // Size and position are fixed: everything is known before the window exists.
-    let band = band_rect(work, screen);
+    // Size and position are fixed: everything is known before the window exists. The
+    // band keeps out of the dashboard's column, so a click aimed at the dashboard never
+    // lands on a tile (a tile click launches the app under the cursor).
+    let band = band_rect(work, screen, band_limit(work, screen));
     let size = band.size();
     let (icon_rgba, icon_w, icon_h) = armoury_core::icon::rgba_icon(32);
     let options = eframe::NativeOptions {
@@ -318,17 +333,168 @@ fn tile_size(screen_h: f32) -> egui::Vec2 {
     egui::vec2(h * TILE_ASPECT, h)
 }
 
-/// The band inside a work area (logical points): a fixed 90% of the screen wide, centred
-/// horizontally, 35% of the screen tall, its bottom edge `BOTTOM_LIFT` above the work area.
-fn band_rect(work: egui::Rect, screen: egui::Vec2) -> egui::Rect {
-    let half = screen.x * BAND_W_FRAC / 2.0;
+/// The band's rectangle inside a work area (logical points): 35% of the screen tall, its
+/// bottom edge `BOTTOM_LIFT` above the work area, and 90% of the width it has — the
+/// width left of the dashboard's column, so the band never lies under the dashboard.
+fn band_rect(work: egui::Rect, screen: egui::Vec2, limit: f32) -> egui::Rect {
+    let left = work.left();
+    let right = limit.min(work.right()).max(left);
+    let room = right - left;
+    // One tile always fits: the band is useless without it. The floor may not make
+    // the band wider than the room, though: a band that reaches past the limit lies
+    // under the dashboard, and that is the one thing it must not do. A room too
+    // narrow for a tile gets a band that is too narrow for a tile.
+    let floor = tile_size(screen.y).x + 2.0 * SIDE;
+    let width = (room * BAND_W_FRAC).max(floor).min(room);
+    let centre = left + room / 2.0;
     egui::Rect::from_min_max(
         egui::pos2(
-            work.center().x - half,
+            centre - width / 2.0,
             work.bottom() - BOTTOM_LIFT - band_height(screen.y),
         ),
-        egui::pos2(work.center().x + half, work.bottom() - BOTTOM_LIFT),
+        egui::pos2(centre + width / 2.0, work.bottom() - BOTTOM_LIFT),
     )
+}
+
+/// The x the band must stay left of, given where the dashboard is.
+///
+/// The dashboard's column is always reserved: the dashboard lives in the bottom-right
+/// corner and the band must never lie under it — its tiles are clickable. When the
+/// dashboard is open and reaches further left than the column does (it was dragged, or
+/// it is wider than the column allows), the limit is the dashboard's own left edge.
+fn band_limit_for(work: egui::Rect, screen: egui::Vec2, dashboard: Option<egui::Rect>) -> f32 {
+    let column = work.right() - DASHBOARD_COLUMN;
+    let Some(dashboard) = dashboard else {
+        return column;
+    };
+    // A dashboard that is not in the band's way is not reserved: the band sits at the
+    // bottom of the screen, and a dashboard above it is never covered by the band.
+    let top = work.bottom() - BOTTOM_LIFT - band_height(screen.y);
+    let bottom = work.bottom() - BOTTOM_LIFT;
+    if dashboard.bottom() <= top || dashboard.top() >= bottom {
+        return column;
+    }
+    (dashboard.left() - DASHBOARD_GAP).min(column)
+}
+
+/// The x the band must stay left of: the dashboard's column, widened to the dashboard's
+/// own left edge when the dashboard is open and in the band's way.
+fn band_limit(work: egui::Rect, screen: egui::Vec2) -> f32 {
+    band_limit_for(work, screen, dashboard_rect())
+}
+
+/// The dashboard's window rectangle in logical points, straight from the OS.
+///
+/// `None` when the dashboard is not open. The band and the dashboard are separate
+/// processes, so this is how the band learns where the dashboard is: the OS knows, and
+/// the dashboard's window has a fixed title.
+fn dashboard_rect() -> Option<egui::Rect> {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let hwnd = find_dashboard_window()?;
+    let mut rect = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
+    // The dashboard may sit on the other monitor, and that monitor has its own
+    // scale: the rectangle is physical pixels, and they are worth a different
+    // number of points there than here.
+    Some(dashboard_points(
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left as f32, rect.top as f32),
+            egui::pos2(rect.right as f32, rect.bottom as f32),
+        ),
+        window_dpi(hwnd),
+    ))
+}
+
+/// The dashboard's rectangle in logical points: its physical rectangle at the scale of
+/// the window itself.
+fn dashboard_points(px: egui::Rect, dpi: u32) -> egui::Rect {
+    let scale = if dpi == 0 {
+        dpi_scale()
+    } else {
+        (dpi as f32 / 96.0).max(0.5)
+    };
+    egui::Rect::from_min_max(
+        egui::pos2(px.left() / scale, px.top() / scale),
+        egui::pos2(px.right() / scale, px.bottom() / scale),
+    )
+}
+
+/// The dashboard's window: the window titled "ArmouryDaemon" that belongs to a program
+/// of ours.
+///
+/// The window is looked up the way `ui::window_rect_px` looks its own windows up — by
+/// title — but the title alone is not enough here: another program with the same title,
+/// or a second copy of this one, would move the band for nothing. The dashboard is this
+/// same executable started with `--ui`, so the window has to be one of ours.
+fn find_dashboard_window() -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = DASHBOARD_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
+    let hwnd = unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) }.ok()?;
+    if !is_our_process(hwnd) {
+        return None;
+    }
+    Some(hwnd)
+}
+
+/// Is this window owned by this program? The dashboard is this same executable, so the
+/// process behind the window has to be this executable too.
+fn is_our_process(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    use windows::core::PWSTR;
+
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return false;
+    }
+    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return false;
+    };
+    let mut buffer = [0u16; 1024];
+    let mut len = buffer.len() as u32;
+    let path = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    let _ = unsafe { CloseHandle(process) };
+    path.is_ok() && same_program(&String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+/// Is this the path of this program? The two paths are canonicalised first: the same
+/// file can be written in more than one way.
+fn same_program(path: &str) -> bool {
+    let Ok(ours) = std::env::current_exe() else {
+        return false;
+    };
+    let (Ok(other), Ok(ours)) = (
+        std::path::Path::new(path).canonicalize(),
+        ours.canonicalize(),
+    ) else {
+        return false;
+    };
+    other
+        .to_string_lossy()
+        .eq_ignore_ascii_case(ours.to_string_lossy().as_ref())
+}
+
+/// The scale of a window: its own DPI, not the system's. A window on a monitor with
+/// another scale is measured with that monitor's scale.
+fn window_dpi(hwnd: windows::Win32::Foundation::HWND) -> u32 {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+
+    unsafe { GetDpiForWindow(hwnd.0) }
 }
 
 /// Whole tiles that fit the strip's inner width with the inter-tile gap: at least one, and
@@ -344,7 +510,8 @@ fn row_center_y(band: egui::Rect) -> f32 {
 
 /// DPI scale of the band: the primary monitor's. The band is primary-only and the primary
 /// runs at 125% here, so the system DPI is the right scale. Per-monitor limitation: a band
-/// on the 100% secondary would need that monitor's DPI, not the system one.
+/// on the 100% secondary would need that monitor's DPI, not the system one. The dashboard
+/// is measured with the scale of its own window (`window_dpi`), not with this one.
 fn dpi_scale() -> f32 {
     use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 
@@ -2321,32 +2488,187 @@ mod tests {
         assert!((to_points(1440.0, scale) - 1152.0).abs() < 1e-3);
     }
 
+    /// The primary monitor at 125%: 2560x1440 physical is 2048x1152 points, and the work
+    /// area is the same width with the taskbar off the bottom.
+    fn primary_work() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0))
+    }
+
+    /// The primary screen in logical points.
+    fn primary_screen() -> egui::Vec2 {
+        egui::vec2(2048.0, 1152.0)
+    }
+
     #[test]
-    fn band_is_fixed_90_by_35_percent_and_docked() {
-        // The primary at 125%: 2560x1440 physical is 2048x1152 points, and the work area is
-        // the same width with the taskbar off the bottom.
-        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1104.0));
-        let screen = egui::vec2(2048.0, 1152.0);
-        let band = band_rect(work, screen);
-        assert!((band.width() - 1843.2).abs() < 1e-3);
+    fn the_band_is_90_percent_of_the_width_it_has_and_docked() {
+        let work = primary_work();
+        let screen = primary_screen();
+        let limit = band_limit_for(work, screen, None);
+        let band = band_rect(work, screen, limit);
+        let room = limit - work.left();
+        // 90% of the width left of the dashboard's column, 35% of the screen tall
+        assert!((band.width() - room * BAND_W_FRAC).abs() < 1e-3);
         assert!((band.height() - 403.2).abs() < 1e-3);
-        // in physical pixels: 90% of the 2560-wide primary, 35% of its 1440
-        assert!((band.width() * 1.25 - 2304.0).abs() < 1e-3);
+        // in physical pixels: 35% of the 1440-tall primary
         assert!((band.height() * 1.25 - 504.0).abs() < 1e-3);
-        // centered on the work area, docked 8 above its bottom edge
-        assert!((band.center().x - work.center().x).abs() < 1e-3);
+        // centred in the space it has, docked 8 above the work area's bottom edge
+        assert!((band.center().x - (work.left() + room / 2.0)).abs() < 1e-3);
         assert!((band.bottom() - (work.bottom() - 8.0)).abs() < 1e-3);
+        // and it stays left of the limit: the dashboard is there
+        assert!(
+            band.right() <= limit,
+            "the band must not reach past the limit: {band:?} / {limit}"
+        );
         // a shorter work area moves the band, it does not resize it
+        let shorter_work =
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1000.0));
         let shorter = band_rect(
-            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1000.0)),
+            shorter_work,
             screen,
+            band_limit_for(shorter_work, screen, None),
         );
         assert!((shorter.height() - 403.2).abs() < 1e-3);
         assert!((shorter.bottom() - 992.0).abs() < 1e-3);
-        // centered on a non-zero work-area origin too
-        let shifted = band_rect(work.translate(egui::vec2(-1000.0, 40.0)), screen);
-        assert!((shifted.center().x - (work.center().x - 1000.0)).abs() < 1e-3);
+        // the same on a work area that does not start at the screen's left edge
+        let shifted_work = work.translate(egui::vec2(-1000.0, 40.0));
+        let shifted_limit = band_limit_for(shifted_work, screen, None);
+        let shifted = band_rect(shifted_work, screen, shifted_limit);
+        assert!(
+            (shifted.center().x - (shifted_work.left() + (shifted_limit - shifted_work.left()) / 2.0))
+                .abs()
+                < 1e-3
+        );
         assert!((shifted.height() - 403.2).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_band_never_lies_under_the_dashboard() {
+        // The dashboard in its corner: 380-420 points wide (475-523 physical pixels at
+        // 125%), flush to the right and the bottom of the work area.
+        let work = primary_work();
+        let screen = primary_screen();
+        for width in [380.0, 418.0, 460.0] {
+            let dashboard = egui::Rect::from_min_max(
+                egui::pos2(work.right() - width, work.bottom() - 500.0),
+                egui::pos2(work.right(), work.bottom()),
+            );
+            let band = band_rect(work, screen, band_limit_for(work, screen, Some(dashboard)));
+            assert!(
+                !band.intersects(dashboard),
+                "the band must not lie under the dashboard: {band:?} / {dashboard:?}"
+            );
+            assert!(
+                band.right() < dashboard.left(),
+                "the band must stay left of the dashboard: {band:?} / {dashboard:?}"
+            );
+        }
+        // A dashboard that was dragged into the middle of the screen is cleared too.
+        let dragged = egui::Rect::from_min_max(
+            egui::pos2(800.0, work.bottom() - 500.0),
+            egui::pos2(1218.0, work.bottom()),
+        );
+        let band = band_rect(work, screen, band_limit_for(work, screen, Some(dragged)));
+        assert!(
+            !band.intersects(dragged),
+            "a dragged dashboard is cleared too: {band:?} / {dragged:?}"
+        );
+        // A dashboard that is not in the band's way does not narrow the band.
+        let above = egui::Rect::from_min_max(
+            egui::pos2(work.right() - 418.0, 100.0),
+            egui::pos2(work.right(), 600.0),
+        );
+        assert!(
+            (band_limit_for(work, screen, Some(above)) - (work.right() - DASHBOARD_COLUMN)).abs()
+                < 1e-3,
+            "a dashboard above the band changes nothing"
+        );
+    }
+
+    #[test]
+    fn the_band_still_holds_its_tiles() {
+        let work = primary_work();
+        let screen = primary_screen();
+        let band = band_rect(work, screen, band_limit_for(work, screen, None));
+        let tile = tile_size(screen.y);
+        let inner = band.width() - 2.0 * SIDE;
+        let n = visible_tiles(inner, tile.x);
+        // The narrower band still shows a row of tiles.
+        assert!(n >= 5, "the band must still show its tiles: {n}");
+        // and the row sits inside the band, not beside it.
+        let row = egui::Rect::from_center_size(
+            egui::pos2(band.center().x, row_center_y(band)),
+            egui::vec2(n as f32 * (tile.x + GAP) - GAP, tile.y),
+        );
+        assert!(
+            band.contains_rect(row),
+            "the tiles stay inside the band: {row:?} / {band:?}"
+        );
+        // A band squeezed to the width of one tile still holds one.
+        let narrow = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 1104.0));
+        let squeezed = band_rect(narrow, screen, narrow.left() + 300.0);
+        assert!(
+            squeezed.width() >= tile.x + 2.0 * SIDE,
+            "the band keeps one tile: {squeezed:?}"
+        );
+        // and it stays left of the limit: a tile that does not fit is not worth a
+        // band that lies under the dashboard.
+        assert!(
+            squeezed.right() <= narrow.left() + 300.0,
+            "the band must not reach past the limit: {squeezed:?}"
+        );
+        // A room that is narrower than one tile gets a band that is narrower than one
+        // tile — and it still does not reach past the limit.
+        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 1104.0));
+        let squeezed_tiny = band_rect(tiny, screen, tiny.left() + 100.0);
+        assert!(
+            squeezed_tiny.right() <= tiny.left() + 100.0,
+            "the band must not reach past the limit: {squeezed_tiny:?}"
+        );
+    }
+
+    #[test]
+    fn the_dashboard_is_measured_with_the_scale_of_its_own_window() {
+        // The dashboard can sit on the other monitor, and that monitor has its own
+        // scale: the same window is a different number of points there than here.
+        let px = egui::Rect::from_min_max(egui::pos2(1000.0, 500.0), egui::pos2(1800.0, 1100.0));
+        // 200% (192 dpi): 800 physical pixels are 400 points.
+        let at_200 = dashboard_points(px, 192);
+        assert!((at_200.width() - 400.0).abs() < 1e-3);
+        assert!((at_200.left() - 500.0).abs() < 1e-3);
+        // 100% (96 dpi): the same rectangle is 800 points.
+        let at_100 = dashboard_points(px, 96);
+        assert!((at_100.width() - 800.0).abs() < 1e-3);
+        // The system's scale (125%) would have said 640: wrong for a window that is
+        // not on the primary monitor.
+        let at_system = dashboard_points(px, 120);
+        assert!((at_system.width() - 640.0).abs() < 1e-3);
+        assert!((at_200.width() - at_system.width()).abs() > 1.0);
+    }
+
+    #[test]
+    fn the_limit_follows_the_scale_of_the_dashboards_window() {
+        // The dashboard's window in physical pixels, and the band that keeps out of it.
+        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 1104.0));
+        let screen = egui::vec2(2000.0, 1152.0);
+        let px = egui::Rect::from_min_max(egui::pos2(1700.0, 800.0), egui::pos2(2000.0, 1100.0));
+        for dpi in [96u32, 192] {
+            let dashboard = dashboard_points(px, dpi);
+            let limit = band_limit_for(work, screen, Some(dashboard));
+            let band = band_rect(work, screen, limit);
+            assert!(
+                band.right() <= limit,
+                "the band must not reach past the limit: {band:?} / {limit}"
+            );
+            assert!(
+                !band.intersects(dashboard),
+                "the band must not lie under the dashboard: {band:?} / {dashboard:?}"
+            );
+        }
+        // The two scales give two different limits: the one of the window, not the
+        // one of the system.
+        let at_100 = dashboard_points(px, 96);
+        let at_200 = dashboard_points(px, 192);
+        assert!((at_100.left() - at_200.left()).abs() > 1.0);
     }
 
     #[test]

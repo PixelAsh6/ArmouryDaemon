@@ -519,6 +519,7 @@ pub(crate) fn allowed_roots(target_dir: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::Scratch;
     use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -592,7 +593,7 @@ mod tests {
 
     #[test]
     fn the_write_guard_compares_path_components() {
-        let dir = std::env::temp_dir().join(format!("armoury-guard-{}", std::process::id()));
+        let dir = Scratch::dir("guard");
         let root = dir.join("Roaming");
         let evil = dir.join("RoamingEvil");
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -611,7 +612,6 @@ mod tests {
         ));
         // a folder that cannot be resolved is refused, not guessed
         assert!(!allowed_in(&root.join("nope"), &roots));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -628,9 +628,7 @@ mod tests {
 
     #[test]
     fn a_write_may_create_a_new_folder_inside_the_allowed_roots() {
-        let dir = std::env::temp_dir().join(format!("armoury-write-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("write");
         let mut ctx = ctx();
         ctx.target_dir = dir.display().to_string(); // the target's own folder is an allowed root
         // the folder does not exist yet: the pack has to be able to create it
@@ -642,13 +640,11 @@ mod tests {
             "a new folder inside the target's folder must be writable"
         );
         assert!(file.exists(), "the folder must have been created");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_write_whose_closest_existing_folder_is_outside_the_roots_is_refused() {
-        let dir = std::env::temp_dir().join(format!("armoury-outside-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch::dir("outside");
         let root = dir.join("root");
         let outside = dir.join("outside");
         std::fs::create_dir_all(&root).unwrap();
@@ -664,20 +660,17 @@ mod tests {
             &root.join("deep").join("file.txt"),
             &roots
         ));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_write_through_a_symlink_is_refused() {
-        let dir = std::env::temp_dir().join(format!("armoury-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch::dir("link");
         let root = dir.join("root");
         std::fs::create_dir_all(&root).unwrap();
         let outside = dir.join("outside.txt");
         std::fs::write(&outside, "x").unwrap();
         let link = root.join("link.txt");
         if std::os::windows::fs::symlink_file(&outside, &link).is_err() {
-            let _ = std::fs::remove_dir_all(&dir);
             return; // this user may not create symlinks: nothing to check
         }
         let roots = vec![root.clone()];
@@ -685,7 +678,6 @@ mod tests {
             !write_allowed_in(&link, &roots),
             "a symlink must not be written through"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -746,8 +738,7 @@ mod tests {
 
     #[test]
     fn ini_reading_handles_sections_and_case() {
-        let dir = std::env::temp_dir().join(format!("armoury-ini-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::dir("ini");
         let file = dir.join("Rainmeter.ini");
         std::fs::write(
             &file,
@@ -760,7 +751,6 @@ mod tests {
         );
         assert_eq!(read_ini_value(&file, "Other", "ActiveLayout").as_deref(), Some("nope"));
         assert_eq!(read_ini_value(&file, "Missing", "x"), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

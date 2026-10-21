@@ -29,6 +29,10 @@ mod script;
 mod ui;
 mod watch;
 
+/// The scratch folders the tests write into. Only there while the tests run.
+#[cfg(test)]
+pub(crate) mod testutil;
+
 fn main() {
     // Per-Monitor-V2 awareness first: the daemon, the GUI and the band all measure the
     // screen before their window exists, and Win32 only hands out physical pixels to a
