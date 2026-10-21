@@ -34,24 +34,14 @@ const TILE_H_FRAC: f32 = 0.60;
 const TILE_ASPECT: f32 = 196.0 / 240.0;
 const GAP: f32 = 18.0;
 const SIDE: f32 = 48.0;
+/// The tile's corner radius, in points. The design is 16 px on a 100% display, and the
+/// points grow with the display, so the corner stays in step with the tile it belongs
+/// to: 16 px at 100%, 20 px at 125%, 24 px at 150%, 32 px at 200%.
 const TILE_RADIUS: f32 = 16.0;
 /// Fallback icon box inside a tile (square covers and exe icons).
 const ICON: f32 = 108.0;
 /// How far above the work-area bottom the band sits: docked just above the taskbar.
 const BOTTOM_LIFT: f32 = 8.0;
-/// The dashboard's window title. The band looks the window up by it: the band and the
-/// dashboard are separate processes, so the band cannot ask the dashboard where it is —
-/// but the OS knows, and the dashboard's window has a fixed title.
-const DASHBOARD_TITLE: &str = "ArmouryDaemon";
-/// The column on the right of the screen the dashboard owns, in logical points.
-///
-/// The dashboard lives in the bottom-right corner of the work area and is 380-420 points
-/// wide, so a column of this width always clears it. The band keeps out of the column:
-/// its tiles are clickable, so a tile under the dashboard would take the click meant
-/// for the dashboard and launch an app instead of doing what the user asked.
-const DASHBOARD_COLUMN: f32 = 450.0;
-/// The gap between the band and the dashboard, in logical points.
-const DASHBOARD_GAP: f32 = 12.0;
 /// Gap under the tiles before the hint line (the names sit inside the tiles).
 const HINT_GAP: f32 = 14.0;
 /// Reserved height of the one-line hint: tiles + gap + hint center as one block.
@@ -60,6 +50,10 @@ const HINT_H: f32 = 18.0;
 const BG_FADE: f32 = 0.30;
 /// Hero background: how tall the bottom gradient (the hint line's dark bed) is.
 const BG_GRADIENT: f32 = 140.0;
+/// The tile scrim: how far up the tile the cover art fades to black, in points. The
+/// design is 120 px on a 100% display, and it grows with the display like everything
+/// else: 120 px at 100%, 150 px at 125%, 180 px at 150%, 240 px at 200%.
+const SCRIM_H: f32 = 120.0;
 
 const BG: egui::Color32 = egui::Color32::from_rgb(9, 10, 13);
 const TILE: egui::Color32 = egui::Color32::from_rgb(24, 26, 32);
@@ -292,9 +286,11 @@ pub fn run() {
     let work = work_area();
     let screen = screen_size();
     // Size and position are fixed: everything is known before the window exists. The
-    // band keeps out of the dashboard's column, so a click aimed at the dashboard never
-    // lands on a tile (a tile click launches the app under the cursor).
-    let band = band_rect(work, screen, band_limit(work, screen));
+    // band is centred on the work area and is 90% of the screen wide, and it wins over
+    // the dashboard: the band's whole purpose is to launch a game from a controller
+    // while the user is away, so it is never shrunk or pushed aside for the other
+    // windows.
+    let band = band_rect(work, screen);
     let size = band.size();
     let (icon_rgba, icon_w, icon_h) = armoury_core::icon::rgba_icon(32);
     let options = eframe::NativeOptions {
@@ -333,168 +329,23 @@ fn tile_size(screen_h: f32) -> egui::Vec2 {
     egui::vec2(h * TILE_ASPECT, h)
 }
 
-/// The band's rectangle inside a work area (logical points): 35% of the screen tall, its
-/// bottom edge `BOTTOM_LIFT` above the work area, and 90% of the width it has — the
-/// width left of the dashboard's column, so the band never lies under the dashboard.
-fn band_rect(work: egui::Rect, screen: egui::Vec2, limit: f32) -> egui::Rect {
-    let left = work.left();
-    let right = limit.min(work.right()).max(left);
-    let room = right - left;
-    // One tile always fits: the band is useless without it. The floor may not make
-    // the band wider than the room, though: a band that reaches past the limit lies
-    // under the dashboard, and that is the one thing it must not do. A room too
-    // narrow for a tile gets a band that is too narrow for a tile.
-    let floor = tile_size(screen.y).x + 2.0 * SIDE;
-    let width = (room * BAND_W_FRAC).max(floor).min(room);
-    let centre = left + room / 2.0;
+/// The band's rectangle inside a work area (logical points): a fixed 90% of the screen
+/// wide, centred horizontally, 35% of the screen tall, its bottom edge `BOTTOM_LIFT`
+/// above the work area.
+///
+/// The band wins over the dashboard: it is centred and 90% of the screen wide, so it
+/// lies over the dashboard's lower half. That is the point of it — the band launches a
+/// game from a controller while the user is away from the computer, and it must never be
+/// shrunk or pushed aside for the other windows.
+fn band_rect(work: egui::Rect, screen: egui::Vec2) -> egui::Rect {
+    let half = screen.x * BAND_W_FRAC / 2.0;
     egui::Rect::from_min_max(
         egui::pos2(
-            centre - width / 2.0,
+            work.center().x - half,
             work.bottom() - BOTTOM_LIFT - band_height(screen.y),
         ),
-        egui::pos2(centre + width / 2.0, work.bottom() - BOTTOM_LIFT),
+        egui::pos2(work.center().x + half, work.bottom() - BOTTOM_LIFT),
     )
-}
-
-/// The x the band must stay left of, given where the dashboard is.
-///
-/// The dashboard's column is always reserved: the dashboard lives in the bottom-right
-/// corner and the band must never lie under it — its tiles are clickable. When the
-/// dashboard is open and reaches further left than the column does (it was dragged, or
-/// it is wider than the column allows), the limit is the dashboard's own left edge.
-fn band_limit_for(work: egui::Rect, screen: egui::Vec2, dashboard: Option<egui::Rect>) -> f32 {
-    let column = work.right() - DASHBOARD_COLUMN;
-    let Some(dashboard) = dashboard else {
-        return column;
-    };
-    // A dashboard that is not in the band's way is not reserved: the band sits at the
-    // bottom of the screen, and a dashboard above it is never covered by the band.
-    let top = work.bottom() - BOTTOM_LIFT - band_height(screen.y);
-    let bottom = work.bottom() - BOTTOM_LIFT;
-    if dashboard.bottom() <= top || dashboard.top() >= bottom {
-        return column;
-    }
-    (dashboard.left() - DASHBOARD_GAP).min(column)
-}
-
-/// The x the band must stay left of: the dashboard's column, widened to the dashboard's
-/// own left edge when the dashboard is open and in the band's way.
-fn band_limit(work: egui::Rect, screen: egui::Vec2) -> f32 {
-    band_limit_for(work, screen, dashboard_rect())
-}
-
-/// The dashboard's window rectangle in logical points, straight from the OS.
-///
-/// `None` when the dashboard is not open. The band and the dashboard are separate
-/// processes, so this is how the band learns where the dashboard is: the OS knows, and
-/// the dashboard's window has a fixed title.
-fn dashboard_rect() -> Option<egui::Rect> {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-    let hwnd = find_dashboard_window()?;
-    let mut rect = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
-    // The dashboard may sit on the other monitor, and that monitor has its own
-    // scale: the rectangle is physical pixels, and they are worth a different
-    // number of points there than here.
-    Some(dashboard_points(
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left as f32, rect.top as f32),
-            egui::pos2(rect.right as f32, rect.bottom as f32),
-        ),
-        window_dpi(hwnd),
-    ))
-}
-
-/// The dashboard's rectangle in logical points: its physical rectangle at the scale of
-/// the window itself.
-fn dashboard_points(px: egui::Rect, dpi: u32) -> egui::Rect {
-    let scale = if dpi == 0 {
-        dpi_scale()
-    } else {
-        (dpi as f32 / 96.0).max(0.5)
-    };
-    egui::Rect::from_min_max(
-        egui::pos2(px.left() / scale, px.top() / scale),
-        egui::pos2(px.right() / scale, px.bottom() / scale),
-    )
-}
-
-/// The dashboard's window: the window titled "ArmouryDaemon" that belongs to a program
-/// of ours.
-///
-/// The window is looked up the way `ui::window_rect_px` looks its own windows up — by
-/// title — but the title alone is not enough here: another program with the same title,
-/// or a second copy of this one, would move the band for nothing. The dashboard is this
-/// same executable started with `--ui`, so the window has to be one of ours.
-fn find_dashboard_window() -> Option<windows::Win32::Foundation::HWND> {
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
-    use windows::core::PCWSTR;
-
-    let wide: Vec<u16> = DASHBOARD_TITLE.encode_utf16().chain(std::iter::once(0)).collect();
-    let hwnd = unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) }.ok()?;
-    if !is_our_process(hwnd) {
-        return None;
-    }
-    Some(hwnd)
-}
-
-/// Is this window owned by this program? The dashboard is this same executable, so the
-/// process behind the window has to be this executable too.
-fn is_our_process(hwnd: windows::Win32::Foundation::HWND) -> bool {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-    use windows::core::PWSTR;
-
-    let mut pid = 0u32;
-    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-    if pid == 0 {
-        return false;
-    }
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
-    };
-    let mut buffer = [0u16; 1024];
-    let mut len = buffer.len() as u32;
-    let path = unsafe {
-        QueryFullProcessImageNameW(
-            process,
-            PROCESS_NAME_WIN32,
-            PWSTR(buffer.as_mut_ptr()),
-            &mut len,
-        )
-    };
-    let _ = unsafe { CloseHandle(process) };
-    path.is_ok() && same_program(&String::from_utf16_lossy(&buffer[..len as usize]))
-}
-
-/// Is this the path of this program? The two paths are canonicalised first: the same
-/// file can be written in more than one way.
-fn same_program(path: &str) -> bool {
-    let Ok(ours) = std::env::current_exe() else {
-        return false;
-    };
-    let (Ok(other), Ok(ours)) = (
-        std::path::Path::new(path).canonicalize(),
-        ours.canonicalize(),
-    ) else {
-        return false;
-    };
-    other
-        .to_string_lossy()
-        .eq_ignore_ascii_case(ours.to_string_lossy().as_ref())
-}
-
-/// The scale of a window: its own DPI, not the system's. A window on a monitor with
-/// another scale is measured with that monitor's scale.
-fn window_dpi(hwnd: windows::Win32::Foundation::HWND) -> u32 {
-    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
-
-    unsafe { GetDpiForWindow(hwnd.0) }
 }
 
 /// Whole tiles that fit the strip's inner width with the inter-tile gap: at least one, and
@@ -510,8 +361,7 @@ fn row_center_y(band: egui::Rect) -> f32 {
 
 /// DPI scale of the band: the primary monitor's. The band is primary-only and the primary
 /// runs at 125% here, so the system DPI is the right scale. Per-monitor limitation: a band
-/// on the 100% secondary would need that monitor's DPI, not the system one. The dashboard
-/// is measured with the scale of its own window (`window_dpi`), not with this one.
+/// on the 100% secondary would need that monitor's DPI, not the system one.
 fn dpi_scale() -> f32 {
     use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 
@@ -524,6 +374,12 @@ fn dpi_scale() -> f32 {
 /// by the window's `pixels_per_point`, which is the scale of the monitor it sits on.
 fn to_points(px: f32, scale: f32) -> f32 {
     px / scale
+}
+
+/// Logical points to physical pixels at the window's `pixels_per_point`: the ratio the
+/// window itself draws at, so a point is worth this many pixels on this monitor.
+fn to_pixels(points: f32, ppp: f32) -> f32 {
+    points * ppp
 }
 
 /// Primary work area in logical points, before any window exists.
@@ -2178,11 +2034,11 @@ fn cover_uv(image: egui::Vec2, rect: egui::Rect) -> (egui::Pos2, egui::Pos2) {
 }
 
 /// Fade the cover into the tile's bottom so the name stays readable: one continuous vertical
-/// gradient, transparent `H` above the bottom edge up to black_alpha(200) at it. The bottom
-/// rows trace the tile's corner arcs, so the fill stays rounded instead of squaring off.
+/// gradient, transparent `SCRIM_H` above the bottom edge up to black_alpha(200) at it. The
+/// bottom rows trace the tile's corner arcs, so the fill stays rounded instead of squaring off.
 fn paint_scrim(painter: &egui::Painter, rect: egui::Rect) {
     let mut m = Mesh::default();
-    for (y, left, right, a) in scrim_rows(rect) {
+    for (y, left, right, a) in scrim_rows(rect, painter.pixels_per_point()) {
         let c = egui::Color32::from_black_alpha(a);
         m.colored_vertex(egui::pos2(left, y), c);
         m.colored_vertex(egui::pos2(right, y), c);
@@ -2195,20 +2051,35 @@ fn paint_scrim(painter: &egui::Painter, rect: egui::Rect) {
     painter.add(egui::Shape::mesh(m));
 }
 
+/// Steps used to trace a corner arc of `radius` points.
+///
+/// The radius comes in points, so it is turned into pixels first: the arc is sampled in
+/// physical pixels, so the step count follows the pixel radius — eight steps per 16 px of
+/// radius, and never fewer than eight. At 200% the corner is twice as wide in pixels, and
+/// eight steps would show up as a chunky edge.
+fn arc_steps(radius: f32, ppp: f32) -> usize {
+    ((to_pixels(radius, ppp) / 16.0) * 8.0).round().max(8.0) as usize
+}
+
 /// The scrim's vertex rows, top to bottom as `(y, left_x, right_x, alpha)`. Straight sides above
 /// the corners; the last rows inset by the corner arc so they never paint past the rounding.
-fn scrim_rows(rect: egui::Rect) -> Vec<(f32, f32, f32, u8)> {
-    const H: f32 = 120.0; // gradient height above the tile bottom
+/// `ppp` is the window's pixel ratio: the corner is sampled in pixels, so it takes more rows
+/// on a bigger display.
+fn scrim_rows(rect: egui::Rect, ppp: f32) -> Vec<(f32, f32, f32, u8)> {
     const TOP_A: f32 = 200.0; // alpha at the bottom edge
-    const ARC: usize = 8; // rows tracing a 16 px corner arc
-    let (r, top, corner) = (TILE_RADIUS, rect.bottom() - H, rect.bottom() - TILE_RADIUS);
-    let alpha = |y: f32| ((y - top) / H * TOP_A).clamp(0.0, 255.0) as u8;
+    let (r, top, corner) = (
+        TILE_RADIUS,
+        rect.bottom() - SCRIM_H,
+        rect.bottom() - TILE_RADIUS,
+    );
+    let steps = arc_steps(r, ppp);
+    let alpha = |y: f32| ((y - top) / SCRIM_H * TOP_A).clamp(0.0, 255.0) as u8;
     let mut rows = vec![
         (top, rect.left(), rect.right(), alpha(top)),
         (corner, rect.left(), rect.right(), alpha(corner)),
     ];
-    for k in 1..=ARC {
-        let y = corner + r * k as f32 / ARC as f32;
+    for k in 1..=steps {
+        let y = corner + r * k as f32 / steps as f32;
         let dy = y - corner;
         let inset = r - (r * r - dy * dy).max(0.0).sqrt();
         rows.push((y, rect.left() + inset, rect.right() - inset, alpha(y)));
@@ -2228,14 +2099,15 @@ fn focus_color(t: f32, alpha: f32) -> egui::Color32 {
     )
 }
 
-/// A rounded-rect outline sampled into points (8 steps per 16 px corner arc), clockwise from
-/// the top edge. Used for both edges of the 2 px gradient ring.
-fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
-    const ARC: usize = 8;
+/// A rounded-rect outline sampled into points, clockwise from the top edge. The corner arc
+/// is sampled in physical pixels, so it takes more steps on a bigger display. Used for
+/// both edges of the 2 pt gradient ring.
+fn rounded_outline(rect: egui::Rect, radius: f32, ppp: f32) -> Vec<egui::Pos2> {
     let r = radius
         .min(rect.width() / 2.0)
         .min(rect.height() / 2.0)
         .max(0.0);
+    let steps = arc_steps(r, ppp);
     let (l, t, rgt, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
     let corners = [
         (egui::pos2(rgt - r, t + r), -90.0),
@@ -2243,10 +2115,10 @@ fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
         (egui::pos2(l + r, b - r), 90.0),
         (egui::pos2(l + r, t + r), 180.0),
     ];
-    let mut out = Vec::with_capacity(4 * (ARC + 1));
+    let mut out = Vec::with_capacity(4 * (steps + 1));
     for (center, start) in corners {
-        for k in 0..=ARC {
-            let a = (start + 90.0 * k as f32 / ARC as f32).to_radians();
+        for k in 0..=steps {
+            let a = (start + 90.0 * k as f32 / steps as f32).to_radians();
             out.push(egui::pos2(center.x + r * a.cos(), center.y + r * a.sin()));
         }
     }
@@ -2255,8 +2127,9 @@ fn rounded_outline(rect: egui::Rect, radius: f32) -> Vec<egui::Pos2> {
 
 /// The focus border: a mesh strip around the rounded tile, violet → magenta left to right.
 fn paint_focus_ring(painter: &egui::Painter, rect: egui::Rect, alpha: f32) {
-    let outer = rounded_outline(rect.expand(1.0), TILE_RADIUS + 1.0);
-    let inner = rounded_outline(rect.expand(-1.0), TILE_RADIUS - 1.0);
+    let ppp = painter.pixels_per_point();
+    let outer = rounded_outline(rect.expand(1.0), TILE_RADIUS + 1.0, ppp);
+    let inner = rounded_outline(rect.expand(-1.0), TILE_RADIUS - 1.0, ppp);
     let width = rect.width().max(1.0);
     let color = |p: egui::Pos2| focus_color((p.x - rect.left()) / width, alpha);
     let mut m = Mesh::default();
@@ -2500,87 +2373,88 @@ mod tests {
     }
 
     #[test]
-    fn the_band_is_90_percent_of_the_width_it_has_and_docked() {
+    fn the_band_is_90_percent_of_the_screen_and_centred() {
         let work = primary_work();
         let screen = primary_screen();
-        let limit = band_limit_for(work, screen, None);
-        let band = band_rect(work, screen, limit);
-        let room = limit - work.left();
-        // 90% of the width left of the dashboard's column, 35% of the screen tall
-        assert!((band.width() - room * BAND_W_FRAC).abs() < 1e-3);
+        let band = band_rect(work, screen);
+        // 90% of the screen's width, 35% of the screen's height
+        assert!((band.width() - screen.x * BAND_W_FRAC).abs() < 1e-3);
+        assert!((band.height() - screen.y * BAND_H_FRAC).abs() < 1e-3);
+        assert!((band.width() - 1843.2).abs() < 1e-3);
         assert!((band.height() - 403.2).abs() < 1e-3);
-        // in physical pixels: 35% of the 1440-tall primary
+        // in physical pixels: 90% of the 2560-wide primary, 35% of its 1440
+        assert!((band.width() * 1.25 - 2304.0).abs() < 1e-3);
         assert!((band.height() * 1.25 - 504.0).abs() < 1e-3);
-        // centred in the space it has, docked 8 above the work area's bottom edge
-        assert!((band.center().x - (work.left() + room / 2.0)).abs() < 1e-3);
-        assert!((band.bottom() - (work.bottom() - 8.0)).abs() < 1e-3);
-        // and it stays left of the limit: the dashboard is there
-        assert!(
-            band.right() <= limit,
-            "the band must not reach past the limit: {band:?} / {limit}"
-        );
+        // centred: the work area is the screen's width here, so the band sits on the
+        // screen's centre (1024 points, 1280 physical pixels)
+        assert!((band.center().x - work.center().x).abs() < 1e-3);
+        assert!((band.center().x - screen.x / 2.0).abs() < 1e-3);
+        assert!((band.center().x * 1.25 - 1280.0).abs() < 1e-3);
+        // docked 8 points above the work area's bottom edge
+        assert!((band.bottom() - (work.bottom() - BOTTOM_LIFT)).abs() < 1e-3);
+        // the whole rectangle in physical pixels: L=128, T=866, R=2432, B=1370
+        assert!((band.left() * 1.25 - 128.0).abs() < 1e-3);
+        assert!((band.top() * 1.25 - 866.0).abs() < 1e-3);
+        assert!((band.right() * 1.25 - 2432.0).abs() < 1e-3);
+        assert!((band.bottom() * 1.25 - 1370.0).abs() < 1e-3);
         // a shorter work area moves the band, it does not resize it
         let shorter_work =
             egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2048.0, 1000.0));
-        let shorter = band_rect(
-            shorter_work,
-            screen,
-            band_limit_for(shorter_work, screen, None),
-        );
+        let shorter = band_rect(shorter_work, screen);
         assert!((shorter.height() - 403.2).abs() < 1e-3);
+        assert!((shorter.width() - band.width()).abs() < 1e-3);
         assert!((shorter.bottom() - 992.0).abs() < 1e-3);
-        // the same on a work area that does not start at the screen's left edge
+        // the same on a work area that does not start at the screen's left edge: the
+        // band keeps its size and its centring on the work area
         let shifted_work = work.translate(egui::vec2(-1000.0, 40.0));
-        let shifted_limit = band_limit_for(shifted_work, screen, None);
-        let shifted = band_rect(shifted_work, screen, shifted_limit);
-        assert!(
-            (shifted.center().x - (shifted_work.left() + (shifted_limit - shifted_work.left()) / 2.0))
-                .abs()
-                < 1e-3
-        );
+        let shifted = band_rect(shifted_work, screen);
+        assert!((shifted.center().x - shifted_work.center().x).abs() < 1e-3);
         assert!((shifted.height() - 403.2).abs() < 1e-3);
+        assert!((shifted.width() - band.width()).abs() < 1e-3);
     }
 
     #[test]
-    fn the_band_never_lies_under_the_dashboard() {
+    fn the_band_wins_over_the_dashboard() {
         // The dashboard in its corner: 380-420 points wide (475-523 physical pixels at
         // 125%), flush to the right and the bottom of the work area.
         let work = primary_work();
         let screen = primary_screen();
+        let band = band_rect(work, screen);
         for width in [380.0, 418.0, 460.0] {
             let dashboard = egui::Rect::from_min_max(
                 egui::pos2(work.right() - width, work.bottom() - 500.0),
                 egui::pos2(work.right(), work.bottom()),
             );
-            let band = band_rect(work, screen, band_limit_for(work, screen, Some(dashboard)));
+            // The band is not moved aside for the dashboard: it is centred and 90% of
+            // the screen wide, so it lies over the dashboard's lower half.
             assert!(
-                !band.intersects(dashboard),
-                "the band must not lie under the dashboard: {band:?} / {dashboard:?}"
+                band.intersects(dashboard),
+                "the band lies over the dashboard: {band:?} / {dashboard:?}"
             );
             assert!(
-                band.right() < dashboard.left(),
-                "the band must stay left of the dashboard: {band:?} / {dashboard:?}"
+                band.right() > dashboard.left(),
+                "the band is not narrowed for the dashboard: {band:?} / {dashboard:?}"
             );
         }
-        // A dashboard that was dragged into the middle of the screen is cleared too.
+        // A dashboard that was dragged into the middle of the screen is covered too.
         let dragged = egui::Rect::from_min_max(
             egui::pos2(800.0, work.bottom() - 500.0),
             egui::pos2(1218.0, work.bottom()),
         );
-        let band = band_rect(work, screen, band_limit_for(work, screen, Some(dragged)));
         assert!(
-            !band.intersects(dragged),
-            "a dragged dashboard is cleared too: {band:?} / {dragged:?}"
+            band.intersects(dragged),
+            "a dragged dashboard is covered too: {band:?} / {dragged:?}"
         );
-        // A dashboard that is not in the band's way does not narrow the band.
-        let above = egui::Rect::from_min_max(
-            egui::pos2(work.right() - 418.0, 100.0),
-            egui::pos2(work.right(), 600.0),
+        // The dashboard's title row stays clear of the band: the gear, Pause and ✕
+        // are still clickable. The band's top edge is at 692.8 points, and the title
+        // row of a dashboard this tall ends well above it.
+        let title_row = egui::Rect::from_min_max(
+            egui::pos2(work.right() - 418.0, work.bottom() - 500.0),
+            egui::pos2(work.right(), work.bottom() - 460.0),
         );
         assert!(
-            (band_limit_for(work, screen, Some(above)) - (work.right() - DASHBOARD_COLUMN)).abs()
-                < 1e-3,
-            "a dashboard above the band changes nothing"
+            title_row.bottom() <= band.top(),
+            "the dashboard's title row stays clear: {title_row:?} / {band:?}"
         );
     }
 
@@ -2588,11 +2462,10 @@ mod tests {
     fn the_band_still_holds_its_tiles() {
         let work = primary_work();
         let screen = primary_screen();
-        let band = band_rect(work, screen, band_limit_for(work, screen, None));
+        let band = band_rect(work, screen);
         let tile = tile_size(screen.y);
         let inner = band.width() - 2.0 * SIDE;
         let n = visible_tiles(inner, tile.x);
-        // The narrower band still shows a row of tiles.
         assert!(n >= 5, "the band must still show its tiles: {n}");
         // and the row sits inside the band, not beside it.
         let row = egui::Rect::from_center_size(
@@ -2603,72 +2476,16 @@ mod tests {
             band.contains_rect(row),
             "the tiles stay inside the band: {row:?} / {band:?}"
         );
-        // A band squeezed to the width of one tile still holds one.
-        let narrow = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 1104.0));
-        let squeezed = band_rect(narrow, screen, narrow.left() + 300.0);
-        assert!(
-            squeezed.width() >= tile.x + 2.0 * SIDE,
-            "the band keeps one tile: {squeezed:?}"
+        // One tile always fits, whatever the screen is: the band is useless without it.
+        let small_screen = egui::vec2(640.0, 480.0);
+        let small = band_rect(
+            egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 440.0)),
+            small_screen,
         );
-        // and it stays left of the limit: a tile that does not fit is not worth a
-        // band that lies under the dashboard.
         assert!(
-            squeezed.right() <= narrow.left() + 300.0,
-            "the band must not reach past the limit: {squeezed:?}"
+            small.width() >= tile_size(small_screen.y).x,
+            "the band keeps one tile: {small:?}"
         );
-        // A room that is narrower than one tile gets a band that is narrower than one
-        // tile — and it still does not reach past the limit.
-        let tiny = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(600.0, 1104.0));
-        let squeezed_tiny = band_rect(tiny, screen, tiny.left() + 100.0);
-        assert!(
-            squeezed_tiny.right() <= tiny.left() + 100.0,
-            "the band must not reach past the limit: {squeezed_tiny:?}"
-        );
-    }
-
-    #[test]
-    fn the_dashboard_is_measured_with_the_scale_of_its_own_window() {
-        // The dashboard can sit on the other monitor, and that monitor has its own
-        // scale: the same window is a different number of points there than here.
-        let px = egui::Rect::from_min_max(egui::pos2(1000.0, 500.0), egui::pos2(1800.0, 1100.0));
-        // 200% (192 dpi): 800 physical pixels are 400 points.
-        let at_200 = dashboard_points(px, 192);
-        assert!((at_200.width() - 400.0).abs() < 1e-3);
-        assert!((at_200.left() - 500.0).abs() < 1e-3);
-        // 100% (96 dpi): the same rectangle is 800 points.
-        let at_100 = dashboard_points(px, 96);
-        assert!((at_100.width() - 800.0).abs() < 1e-3);
-        // The system's scale (125%) would have said 640: wrong for a window that is
-        // not on the primary monitor.
-        let at_system = dashboard_points(px, 120);
-        assert!((at_system.width() - 640.0).abs() < 1e-3);
-        assert!((at_200.width() - at_system.width()).abs() > 1.0);
-    }
-
-    #[test]
-    fn the_limit_follows_the_scale_of_the_dashboards_window() {
-        // The dashboard's window in physical pixels, and the band that keeps out of it.
-        let work = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 1104.0));
-        let screen = egui::vec2(2000.0, 1152.0);
-        let px = egui::Rect::from_min_max(egui::pos2(1700.0, 800.0), egui::pos2(2000.0, 1100.0));
-        for dpi in [96u32, 192] {
-            let dashboard = dashboard_points(px, dpi);
-            let limit = band_limit_for(work, screen, Some(dashboard));
-            let band = band_rect(work, screen, limit);
-            assert!(
-                band.right() <= limit,
-                "the band must not reach past the limit: {band:?} / {limit}"
-            );
-            assert!(
-                !band.intersects(dashboard),
-                "the band must not lie under the dashboard: {band:?} / {dashboard:?}"
-            );
-        }
-        // The two scales give two different limits: the one of the window, not the
-        // one of the system.
-        let at_100 = dashboard_points(px, 96);
-        let at_200 = dashboard_points(px, 192);
-        assert!((at_100.left() - at_200.left()).abs() > 1.0);
     }
 
     #[test]
@@ -2723,8 +2540,9 @@ mod tests {
     #[test]
     fn scrim_rows_fade_and_round_the_corners() {
         let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(196.0, 240.0));
-        let rows = scrim_rows(tile);
-        // starts transparent 120 px up, ends at alpha 200 exactly on the bottom edge
+        let rows = scrim_rows(tile, 1.25);
+        // starts transparent 120 pt up (150 px at 125%), ends at alpha 200 exactly on the
+        // bottom edge
         assert_eq!(rows[0], (120.0, 0.0, 196.0, 0));
         let last = *rows.last().unwrap();
         assert_eq!((last.0, last.3), (240.0, 200));
@@ -2735,6 +2553,83 @@ mod tests {
             assert!(w[0].3 <= w[1].3);
             assert!(w[1].1 >= w[0].1 && w[1].2 <= w[0].2);
         }
+    }
+
+    #[test]
+    fn the_corner_radius_grows_with_the_display() {
+        // The corner is drawn in points, so the same 16 points is worth more pixels on a
+        // bigger display: the corner grows with the tile it belongs to.
+        assert!((to_pixels(TILE_RADIUS, 1.0) - 16.0).abs() < 1e-3);
+        assert!((to_pixels(TILE_RADIUS, 1.25) - 20.0).abs() < 1e-3);
+        assert!((to_pixels(TILE_RADIUS, 1.5) - 24.0).abs() < 1e-3);
+        assert!((to_pixels(TILE_RADIUS, 2.0) - 32.0).abs() < 1e-3);
+        // the scrim insets by that very radius in points, so the fill never paints past
+        // the tile's own rounding
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(196.0, 240.0));
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let rows = scrim_rows(tile, ppp);
+            let last = *rows.last().unwrap();
+            assert!((last.1 - TILE_RADIUS).abs() < 1e-3);
+            assert!((last.2 - (196.0 - TILE_RADIUS)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn the_scrim_fade_grows_with_the_display() {
+        // The fade's height is points too: 120 points is 120 px at 100% and 240 px at 200%.
+        assert!((to_pixels(SCRIM_H, 1.0) - 120.0).abs() < 1e-3);
+        assert!((to_pixels(SCRIM_H, 1.25) - 150.0).abs() < 1e-3);
+        assert!((to_pixels(SCRIM_H, 1.5) - 180.0).abs() < 1e-3);
+        assert!((to_pixels(SCRIM_H, 2.0) - 240.0).abs() < 1e-3);
+        // and the fade always starts the same distance above the tile's bottom edge
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(196.0, 240.0));
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let rows = scrim_rows(tile, ppp);
+            assert!((rows[0].0 - (tile.bottom() - SCRIM_H)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn the_corner_is_sampled_finer_on_a_bigger_display() {
+        // Eight steps per 16 px of radius, and never fewer than eight.
+        assert_eq!(arc_steps(TILE_RADIUS, 1.0), 8);
+        assert_eq!(arc_steps(TILE_RADIUS, 1.25), 10);
+        assert_eq!(arc_steps(TILE_RADIUS, 1.5), 12);
+        assert_eq!(arc_steps(TILE_RADIUS, 2.0), 16);
+        // a radius of nothing still gets a smooth-enough arc
+        assert_eq!(arc_steps(0.0, 2.0), 8);
+        // the arc is stepped every two physical pixels, whatever the display's scale
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let steps = arc_steps(TILE_RADIUS, ppp);
+            assert!((to_pixels(TILE_RADIUS, ppp) / steps as f32 - 2.0).abs() < 1e-3);
+        }
+        // the scrim takes one row per step, the focus ring one point per step
+        let tile = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(196.0, 240.0));
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let steps = arc_steps(TILE_RADIUS, ppp);
+            assert_eq!(scrim_rows(tile, ppp).len(), 2 + steps);
+            assert_eq!(
+                rounded_outline(tile, TILE_RADIUS, ppp).len(),
+                4 * (steps + 1)
+            );
+        }
+    }
+
+    #[test]
+    fn the_tile_geometry_did_not_move() {
+        // This is about the sampling, not about the shapes: the tiles and the scrim's
+        // place on the tile are exactly where they were. The band itself did move: it
+        // is now 90% of the screen wide, so its numbers below are the new ones.
+        let work = primary_work();
+        let band = band_rect(work, primary_screen());
+        assert!((band.width() - 1843.2).abs() < 1e-3);
+        assert!((band.height() - 403.2).abs() < 1e-3);
+        assert!((band.bottom() - (work.bottom() - BOTTOM_LIFT)).abs() < 1e-3);
+        let tile = tile_size(primary_screen().y);
+        assert!((tile.x - 197.568).abs() < 1e-3);
+        assert!((tile.y - 241.92).abs() < 1e-3);
+        assert!((TILE_RADIUS - 16.0).abs() < 1e-6);
+        assert!((SCRIM_H - 120.0).abs() < 1e-6);
     }
 
     #[test]

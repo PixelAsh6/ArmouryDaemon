@@ -1,9 +1,10 @@
 //! Spec 2 — scripted packs (Rhai).
 //!
 //! A pack may carry a script in `script.apply` / `script.revert`. The **pack never executes it**:
-//! the daemon compiles the source, runs it in a fresh Rhai engine with hard limits, and exposes only
-//! the functions registered below. Nothing else exists inside a script — no filesystem, network or
-//! process API beyond these, no `eval`, no imports.
+//! the daemon compiles the source and runs it in one Rhai engine per thread — built once and
+//! kept between runs — with hard limits, and exposes only the functions registered below.
+//! Nothing else exists inside a script — no filesystem, network or process API beyond these,
+//! no `eval`, no imports.
 //!
 //! Every host call is appended to the run's log (which the daemon writes to the pack journal).
 //! Writes are restricted to the usual config locations and the target's own folder (a write may
@@ -14,6 +15,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use armoury_core::pack::TemplateCtx;
@@ -47,10 +50,72 @@ fn err(msg: impl Into<String>) -> Box<EvalAltResult> {
     ))
 }
 
+/// How many operations a script may perform in one run.
+const MAX_OPERATIONS: u64 = 500_000;
+
+/// How long a script may run in one run: a pack may not hold the pack worker hostage.
+const WALL_BUDGET: Duration = Duration::from_secs(10);
+
+/// The budget as it is written down: "10 s" or "300 ms".
+fn budget_text(budget: Duration) -> String {
+    if budget.as_secs() >= 1 {
+        format!("{} s", budget.as_secs())
+    } else {
+        format!("{} ms", budget.as_millis())
+    }
+}
+
+/// The message the wall clock guard stops a script with.
+fn budget_message(budget: Duration) -> String {
+    format!("script exceeded its {} budget", budget_text(budget))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many engines this thread has built. A run must not build one.
+    static BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 thread_local! {
     /// Compiled scripts, keyed by their source. A pack's script never changes, but it is run
     /// again on every apply and every revert.
     static ASTS: RefCell<HashMap<String, Rc<AST>>> = RefCell::new(HashMap::new());
+    /// The one engine, with the host API registered on it. Building it and registering the
+    /// host functions costs about half a millisecond, so it is built once per thread and
+    /// kept: the pack worker is a single serial thread, so no locking is needed.
+    static SANDBOX: RefCell<Sandbox> = RefCell::new(new_sandbox());
+}
+
+/// The sandbox: the engine, and the two budgets it enforces. The budgets are **per run**, so
+/// they live next to the engine and are re-armed before every evaluation — never once, at
+/// build time.
+struct Sandbox {
+    engine: Engine,
+    /// The wall-clock deadline of the run in progress, in milliseconds since `base`. The
+    /// progress callback reads it, so the engine and the run share it.
+    deadline: Arc<AtomicU64>,
+    /// The wall-clock budget of the run in progress, in milliseconds.
+    budget: Arc<AtomicU64>,
+    /// The zero point the deadline is counted from.
+    base: Instant,
+}
+
+impl Sandbox {
+    /// Re-arm both budgets for a run that is about to start: the operation budget is the
+    /// engine's limit, the wall clock the deadline the progress callback watches.
+    ///
+    /// Re-arming the operation budget is belt and braces: Rhai builds its runtime state
+    /// per evaluation, so the operation count resets on its own. Re-arming the wall clock
+    /// is the load-bearing one: the deadline lives in a shared cell, so without it the
+    /// next run would inherit the previous run's expired deadline and be killed on its
+    /// first tick.
+    fn arm(&mut self, budget: Duration) {
+        self.engine.set_max_operations(MAX_OPERATIONS);
+        let millis = budget.as_millis() as u64;
+        self.budget.store(millis, Ordering::Relaxed);
+        let now = self.base.elapsed().as_millis() as u64;
+        self.deadline.store(now + millis, Ordering::Relaxed);
+    }
 }
 
 /// The AST of a script, compiled once and kept for the next run.
@@ -60,8 +125,8 @@ fn compile_ast(source: &str) -> Result<Rc<AST>, String> {
         return Ok(ast);
     }
     let ast = Rc::new(
-        engine()
-            .compile(source)
+        SANDBOX
+            .with(|cell| cell.borrow().engine.compile(source))
             .map_err(|e| format!("script error: {e}"))?,
     );
     ASTS.with(|cache| {
@@ -82,6 +147,16 @@ pub fn compile(source: &str) -> Result<(), String> {
 /// Run one block script. Returns the host-call log; `ctx.captured` receives anything the script
 /// captured (so a revert can replay it).
 pub fn run(source: &str, ctx: &mut TemplateCtx) -> Result<Vec<String>, String> {
+    run_with_budget(source, ctx, WALL_BUDGET)
+}
+
+/// The run itself, with the wall-clock budget it gets. The budget is re-armed on **every**
+/// run, so a script can never spend the allowance of the run before it.
+fn run_with_budget(
+    source: &str,
+    ctx: &mut TemplateCtx,
+    budget: Duration,
+) -> Result<Vec<String>, String> {
     let ast = compile_ast(source)?;
 
     let host = ScriptHost {
@@ -93,9 +168,17 @@ pub fn run(source: &str, ctx: &mut TemplateCtx) -> Result<Vec<String>, String> {
         log: Vec::new(),
     };
 
+    // The scope is the per-run state: a fresh one every time, so two scripts never see each
+    // other's variables. The engine itself keeps no state between evaluations, so there
+    // is nothing else to clear.
     let mut scope = Scope::new();
     scope.push("ctx", host.clone());
-    let result = engine().eval_ast_with_scope::<()>(&mut scope, &ast);
+    let result = SANDBOX.with(|cell| {
+        let mut sandbox = cell.borrow_mut();
+        // A run must never inherit the allowance of the run before it.
+        sandbox.arm(budget);
+        sandbox.engine.eval_ast_with_scope::<()>(&mut scope, &ast)
+    });
 
     // the captures are harvested even when the script failed: a script that captured and then
     // failed must still leave the journal something to replay
@@ -103,15 +186,29 @@ pub fn run(source: &str, ctx: &mut TemplateCtx) -> Result<Vec<String>, String> {
     if let Some(host) = &host {
         ctx.captured = host.captured.clone();
     }
-    result.map_err(|e| format!("script failed: {e}"))?;
+    // Rhai drops the token of a terminated script, so the daemon writes the message
+    // itself, from the budget it gave the run.
+    if let Err(e) = result {
+        if matches!(*e, EvalAltResult::ErrorTerminated(..)) {
+            return Err(format!(
+                "script failed: it ran into its {} budget",
+                budget_text(budget)
+            ));
+        }
+        return Err(format!("script failed: {e}"));
+    }
     let host = host.ok_or_else(|| "script lost its context".to_string())?;
     Ok(host.log)
 }
 
-/// The engine: limits first, then only the whitelisted host API.
-fn engine() -> Engine {
+/// The sandbox: limits first, then only the whitelisted host API. It is built once per
+/// thread and kept between runs — see [`SANDBOX`].
+fn new_sandbox() -> Sandbox {
+    #[cfg(test)]
+    BUILDS.with(|c| c.set(c.get() + 1));
+
     let mut engine = Engine::new();
-    engine.set_max_operations(500_000);
+    engine.set_max_operations(MAX_OPERATIONS);
     engine.set_max_call_levels(32);
     engine.set_max_expr_depths(64, 32);
     engine.set_max_string_size(64 * 1024);
@@ -119,11 +216,20 @@ fn engine() -> Engine {
     engine.set_max_map_size(256);
     engine.set_max_modules(0);
 
-    // Wall clock guard: a pack may not hold the pack worker hostage.
-    let started = Instant::now();
-    engine.on_progress(move |_| {
-        if started.elapsed() > Duration::from_secs(10) {
-            Some(Dynamic::from("script exceeded its 10 s budget"))
+    // Wall clock guard: a pack may not hold the pack worker hostage. The deadline is read
+    // from the shared cell, so it can be re-armed for every run.
+    let base = Instant::now();
+    // The operation budget is armed here, at build time. The wall clock is not: nothing
+    // is armed until a run arms it, and an unarmed wall clock never stops a script.
+    let deadline = Arc::new(AtomicU64::new(u64::MAX));
+    let budget = Arc::new(AtomicU64::new(0));
+    let watch_deadline = Arc::clone(&deadline);
+    let watch_budget = Arc::clone(&budget);
+    engine.on_progress(move |_ops| {
+        let now = base.elapsed().as_millis() as u64;
+        if now >= watch_deadline.load(Ordering::Relaxed) {
+            let budget = Duration::from_millis(watch_budget.load(Ordering::Relaxed));
+            Some(Dynamic::from(ImmutableString::from(budget_message(budget))))
         } else {
             None
         }
@@ -292,7 +398,12 @@ fn engine() -> Engine {
         },
     );
 
-    engine
+    Sandbox {
+        engine,
+        deadline,
+        budget,
+        base,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +681,108 @@ mod tests {
             started.elapsed() < Duration::from_secs(20),
             "the guard took too long"
         );
+    }
+
+    #[test]
+    fn one_engine_serves_every_run() {
+        // The engine and its host functions are built once and kept: building them again
+        // for every run is what made a run cost half a millisecond more than it should.
+        let mut ctx = ctx();
+        let before = BUILDS.with(|c| c.get());
+        for _ in 0..5 {
+            run("ctx.log(\"hello\");", &mut ctx).expect("the script runs");
+        }
+        let after = BUILDS.with(|c| c.get());
+        assert!(
+            after - before <= 1,
+            "the engine must be built once and kept, not built per run ({before} -> {after})"
+        );
+    }
+
+    #[test]
+    fn the_operation_budget_is_rearmed_on_every_run() {
+        // A script that never ends. The operation budget must stop it — and it must stop
+        // the *second* run too, with a budget of its own: the script reports how far it
+        // got, so the test can see that the second run was not left with an empty budget.
+        let runaway = r#"
+            let i = 0;
+            while true {
+                i += 1;
+                if i % 1000 == 0 { ctx.capture("progress", i.to_string()); }
+            }
+        "#;
+        let mut ctx = ctx();
+        let first = run(runaway, &mut ctx).expect_err("the runaway script must be stopped");
+        assert!(first.contains("Too many operations"), "{first}");
+        let progress = ctx
+            .captured
+            .get("progress")
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("the first run must have made progress");
+        assert!(progress > 0, "the first run must have made progress");
+
+        // the second run starts with an empty capture: a run that gets no budget at all
+        // leaves nothing behind
+        ctx.captured.remove("progress");
+        let second = run(runaway, &mut ctx).expect_err("the second run must be stopped too");
+        assert!(second.contains("Too many operations"), "{second}");
+        let again = ctx
+            .captured
+            .get("progress")
+            .and_then(|v| v.parse::<u64>().ok())
+            .expect("the second run must have got a budget of its own");
+        assert!(
+            again >= progress / 2,
+            "the second run must get a fresh budget: {progress} then {again}"
+        );
+    }
+
+    #[test]
+    fn the_wall_clock_budget_is_rearmed_on_every_run() {
+        // A script that spends its time in a host call, so that the operation budget never
+        // gets near it: only the wall clock can stop this one. The second run must get a
+        // budget of its own — if the deadline were left over from the first run, the second
+        // one would be cut off at once instead of running into its own budget.
+        let busy = "let i = 0; while true { i += 1; ctx.sleep(50); }";
+        let budget = Duration::from_millis(300);
+        let mut ctx = ctx();
+
+        let started = Instant::now();
+        let first = run_with_budget(busy, &mut ctx, budget).expect_err("the first run must be cut off");
+        let first_took = started.elapsed();
+        assert!(first.contains("budget"), "{first}");
+        assert!(
+            first_took >= budget,
+            "the first run must run into its budget: {first_took:?}"
+        );
+
+        let started = Instant::now();
+        let second =
+            run_with_budget(busy, &mut ctx, budget).expect_err("the second run must be cut off too");
+        let second_took = started.elapsed();
+        assert!(second.contains("budget"), "{second}");
+        assert!(
+            second_took >= budget,
+            "the second run must get a budget of its own, not the first one's: {second_took:?}"
+        );
+    }
+
+    #[test]
+    fn two_scripts_do_not_see_each_others_state() {
+        // The scope is the per-run state: the second script must not see what the first one
+        // left behind, even though both run on the same engine.
+        let mut ctx = ctx();
+        run(
+            "let secret = \"first\"; fn helper() { 42 } ctx.log(secret);",
+            &mut ctx,
+        )
+        .expect("the first script runs");
+        let err = run("ctx.log(secret);", &mut ctx)
+            .expect_err("the second script must not see the first one's variables");
+        assert!(err.contains("secret"), "{err}");
+        let err = run("let x = helper();", &mut ctx)
+            .expect_err("the second script must not see the first one's functions");
+        assert!(err.contains("helper"), "{err}");
     }
 
     #[test]

@@ -1,7 +1,10 @@
-//! Tracked-app watcher — one process walk per second, diffed by PID:
+//! Tracked-app watcher — one process walk per second while something is tracked, diffed
+//! by PID:
 //!   1. a `CreateToolhelp32Snapshot` walk (~13 ms) hands over every process's PID and
 //!      exe file name in one call — the PID *set* is the change detector, so a start and
-//!      an unrelated exit in the same second can never cancel each other out,
+//!      an unrelated exit in the same second can never cancel each other out. The walk
+//!      is skipped entirely while nothing is tracked: there is nothing it could match,
+//!      and it is the whole cost of the tick,
 //!   2. a PID that appeared is matched by exe file name against the tracked list (the
 //!      user's rule); only the few matches get their full image path resolved,
 //!   3. one process handle per running tracked app, waited on with `WaitForMultipleObjects`
@@ -46,7 +49,8 @@ pub enum WatchEvent {
     },
 }
 
-const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+/// How long the watcher waits before it looks again.
+const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One process sample: PID -> lowercased exe file name.
 type Sample = BTreeMap<u32, String>;
@@ -70,95 +74,32 @@ pub fn start(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake:
 }
 
 fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize) {
-    let mut running: HashMap<u32, Running> = HashMap::new();
-    let mut next_id: u64 = 0;
-    let mut version: u64 = 0; // bumps whenever `running` changes
+    let mut watcher = Watcher::new();
+    let mut version: u64 = 0; // bumps whenever the watch list changes
     let mut pairs: Vec<(u32, u64, HANDLE)> = Vec::new();
     let mut pairs_version: u64 = u64::MAX; // forces the first build
-    let mut last_hash: Option<u64> = None;
-    let mut wanted: Vec<Wanted> = Vec::new();
-    let mut previous: Sample = Sample::new();
     info!("watcher started");
 
     loop {
-        // ---- 1. the tracked list, rebuilt only when it actually changed ----
-        let hash = tracked_hash(&tracked);
-        let list_changed = last_hash != Some(hash);
-        if list_changed {
-            wanted = tracked_wanted(&tracked);
-            last_hash = Some(hash);
+        // ---- 1. the tracked list, the walk and the starts and stops ----
+        if watcher.step(&tracked, &tx, wake, &mut || enum_processes()) {
+            version += 1;
         }
 
-        // ---- 2. one walk per tick; the PID set is the change detector ----
-        let current = enum_processes();
-        let (started, gone) = diff_samples(&previous, &current);
-        if list_changed {
-            // The tracked list changed: re-check everything currently running, so an
-            // app added to the list while it was already running is picked up.
-            for (pid, name) in &current {
-                if consider(
-                    *pid,
-                    name,
-                    &wanted,
-                    &mut running,
-                    &mut next_id,
-                    &tx,
-                    wake,
-                ) {
-                    version += 1;
-                }
-            }
-        } else {
-            // Only the PIDs that appeared since the previous sample can be starts.
-            for (pid, name) in &started {
-                if consider(
-                    *pid,
-                    name,
-                    &wanted,
-                    &mut running,
-                    &mut next_id,
-                    &tx,
-                    wake,
-                ) {
-                    version += 1;
-                }
-            }
-        }
-        // Belt and braces: a watched PID that vanished is a stop (the handle wait
-        // normally reports it first).
-        for pid in gone {
-            if forget(pid, &mut running, &tx, wake) {
-                version += 1;
-            }
-        }
-        if list_changed {
-            // forget handles for apps that are no longer tracked
-            let stale: Vec<u32> = running
-                .iter()
-                .filter(|(_, r)| !wanted.iter().any(|w| w.base == r.exe))
-                .map(|(pid, _)| *pid)
-                .collect();
-            for pid in stale {
-                if forget(pid, &mut running, &tx, wake) {
-                    version += 1;
-                }
-            }
-        }
-        previous = current;
-
-        // ---- 3. wait for exits (exact, one handle per running tracked app) ----
+        // ---- 2. the handles to wait on ----
         if pairs_version != version {
             pairs.clear();
-            pairs.extend(running.iter().map(|(pid, r)| (*pid, r.id, r.handle)));
+            pairs.extend(watcher.running.iter().map(|(pid, r)| (*pid, r.id, r.handle)));
             pairs.sort_unstable_by_key(|(pid, _, _)| *pid);
             pairs_version = version;
         }
 
         if pairs.is_empty() {
-            thread::sleep(PROBE_INTERVAL);
+            thread::sleep(TICK_INTERVAL);
             continue;
         }
 
+        // ---- 3. wait for exits (exact, one handle per running tracked app) ----
         for chunk in pairs.chunks(MAXIMUM_WAIT_OBJECTS as usize) {
             let handles: Vec<HANDLE> = chunk.iter().map(|(_, _, h)| *h).collect();
             let r = unsafe {
@@ -166,7 +107,7 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
                     handles.len() as u32,
                     handles.as_ptr(),
                     0,
-                    PROBE_INTERVAL.as_millis() as u32,
+                    TICK_INTERVAL.as_millis() as u32,
                 )
             };
             if r == WAIT_TIMEOUT {
@@ -175,8 +116,8 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
             if r < handles.len() as u32 {
                 let (pid, id, _) = chunk[(r - WAIT_OBJECT_0) as usize];
                 // the id guards against a PID that was recycled meanwhile
-                if running.get(&pid).map(|e| e.id) == Some(id)
-                    && forget(pid, &mut running, &tx, wake)
+                if watcher.running.get(&pid).map(|e| e.id) == Some(id)
+                    && watcher.forget(pid, &tx, wake)
                 {
                     version += 1;
                 }
@@ -194,84 +135,175 @@ fn signal(wake: usize) {
     }
 }
 
-/// Is this PID one of the tracked apps we are not watching yet?
-/// Matching is by **file name** (the user's choice): any process whose exe name is in
-/// the tracked list counts, regardless of where it runs from.
-/// Returns true when the watch list changed.
-fn consider(
-    pid: u32,
-    name: &str,
-    wanted: &[Wanted],
-    running: &mut HashMap<u32, Running>,
-    next_id: &mut u64,
-    tx: &Sender<WatchEvent>,
-    wake: usize,
-) -> bool {
-    if wanted.is_empty() || pid == 0 {
-        return false;
-    }
-    let mut changed = false;
-    if let Some(old) = running.get(&pid) {
-        if old.exe == name {
-            return false; // already watched
-        }
-        // the PID was recycled: the old process is gone, this is a new one
-        forget(pid, running, tx, wake);
-        changed = true;
-    }
-    let Some(w) = wanted.iter().find(|w| w.base == name) else {
-        return changed; // not one of ours
-    };
-    // Only the matches need their full path (pack templates).
-    let Some(path) = process_path(pid) else {
-        return changed; // protected/exiting process
-    };
-    match open_for_wait(pid) {
-        Some(handle) => {
-            info!("tracked app started: {} (pid {pid})", w.display);
-            *next_id += 1;
-            running.insert(
-                pid,
-                Running {
-                    id: *next_id,
-                    handle,
-                    exe: w.base.clone(),
-                    name: w.display.clone(),
-                },
-            );
-            let _ = tx.send(WatchEvent::Started {
-                key: w.base.clone(),
-                display: w.display.clone(),
-                path,
-                pid,
-            });
-            signal(wake);
-            true
-        }
-        None => {
-            warn!("cannot watch {} (pid {pid}) for exit: access denied", w.display);
-            changed
-        }
-    }
+/// The watcher's own state: the apps it is watching, the tracked list it matches against
+/// and the sample of the last walk.
+struct Watcher {
+    running: HashMap<u32, Running>,
+    next_id: u64,
+    last_hash: Option<u64>,
+    wanted: Vec<Wanted>,
+    previous: Sample,
 }
 
-/// Drop a PID from the watch list and report it as stopped. True when it was watched.
-fn forget(
-    pid: u32,
-    running: &mut HashMap<u32, Running>,
-    tx: &Sender<WatchEvent>,
-    wake: usize,
-) -> bool {
-    let Some(r) = running.remove(&pid) else {
-        return false;
-    };
-    info!("tracked app stopped: {} (pid {pid})", r.name);
-    let _ = tx.send(WatchEvent::Stopped {
-        key: r.exe.clone(),
-        pid,
-    });
-    signal(wake);
-    true
+impl Watcher {
+    fn new() -> Self {
+        Watcher {
+            running: HashMap::new(),
+            next_id: 0,
+            last_hash: None,
+            wanted: Vec::new(),
+            previous: Sample::new(),
+        }
+    }
+
+    /// One tick: refresh the tracked list, walk the process table and report the starts
+    /// and the stops. True when the set of watched apps changed.
+    ///
+    /// The walk is a full snapshot of every process on the machine, so it is skipped when
+    /// nothing is tracked: there is nothing it could match. The tracked list itself is
+    /// still read every tick, so a list that becomes non-empty is walked in the very tick
+    /// it changes — a start is never noticed a tick later than it was before.
+    fn step(
+        &mut self,
+        tracked: &Arc<Mutex<Vec<TrackedApp>>>,
+        tx: &Sender<WatchEvent>,
+        wake: usize,
+        sample: &mut dyn FnMut() -> Sample,
+    ) -> bool {
+        let mut changed = false;
+
+        // the tracked list, rebuilt only when it actually changed
+        let hash = tracked_hash(tracked);
+        let list_changed = self.last_hash != Some(hash);
+        if list_changed {
+            self.wanted = tracked_wanted(tracked);
+            self.last_hash = Some(hash);
+        }
+
+        // one walk per tick, and only while something is tracked: the PID set is the
+        // change detector
+        // Nothing is tracked: the walk cannot match anything, and it is the expensive
+        // part of the tick.
+        if !self.wanted.is_empty() {
+            let current = sample();
+            let (started, gone) = diff_samples(&self.previous, &current);
+            if list_changed {
+                // The tracked list changed: re-check everything currently running, so an
+                // app added to the list while it was already running is picked up.
+                for (pid, name) in &current {
+                    if self.consider(*pid, name, tx, wake) {
+                        changed = true;
+                    }
+                }
+            } else {
+                // Only the PIDs that appeared since the previous sample can be starts.
+                for (pid, name) in &started {
+                    if self.consider(*pid, name, tx, wake) {
+                        changed = true;
+                    }
+                }
+            }
+            // Belt and braces: a watched PID that vanished is a stop (the handle wait
+            // normally reports it first).
+            for pid in gone {
+                if self.forget(pid, tx, wake) {
+                    changed = true;
+                }
+            }
+            self.previous = current;
+        }
+
+        if list_changed {
+            // forget handles for apps that are no longer tracked
+            let stale: Vec<u32> = self
+                .running
+                .iter()
+                .filter(|(_, r)| !self.wanted.iter().any(|w| w.base == r.exe))
+                .map(|(pid, _)| *pid)
+                .collect();
+            for pid in stale {
+                if self.forget(pid, tx, wake) {
+                    changed = true;
+                }
+            }
+        }
+
+        changed
+    }
+
+    /// Is this PID one of the tracked apps we are not watching yet?
+    /// Matching is by **file name** (the user's choice): any process whose exe name is in
+    /// the tracked list counts, regardless of where it runs from.
+    /// Returns true when this PID joined the watched set — a start, or a recycled PID
+    /// whose old entry was dropped.
+    fn consider(
+        &mut self,
+        pid: u32,
+        name: &str,
+        tx: &Sender<WatchEvent>,
+        wake: usize,
+    ) -> bool {
+        if self.wanted.is_empty() || pid == 0 {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(old) = self.running.get(&pid) {
+            if old.exe == name {
+                return false; // already watched
+            }
+            // the PID was recycled: the old process is gone, this is a new one
+            self.forget(pid, tx, wake);
+            changed = true;
+        }
+        let Some(w) = self.wanted.iter().find(|w| w.base == name) else {
+            return changed; // not one of ours
+        };
+        // Only the matches need their full path (pack templates).
+        let Some(path) = process_path(pid) else {
+            return changed; // protected/exiting process
+        };
+        match open_for_wait(pid) {
+            Some(handle) => {
+                info!("tracked app started: {} (pid {pid})", w.display);
+                self.next_id += 1;
+                self.running.insert(
+                    pid,
+                    Running {
+                        id: self.next_id,
+                        handle,
+                        exe: w.base.clone(),
+                        name: w.display.clone(),
+                    },
+                );
+                let _ = tx.send(WatchEvent::Started {
+                    key: w.base.clone(),
+                    display: w.display.clone(),
+                    path,
+                    pid,
+                });
+                signal(wake);
+                true
+            }
+            None => {
+                warn!("cannot watch {} (pid {pid}) for exit: access denied", w.display);
+                changed
+            }
+        }
+    }
+
+    /// Drop a PID from the watch list and report it as stopped. True when it was watched.
+    fn forget(&mut self, pid: u32, tx: &Sender<WatchEvent>, wake: usize) -> bool {
+        let Some(r) = self.running.remove(&pid) else {
+            return false;
+        };
+        info!("tracked app stopped: {} (pid {pid})", r.name);
+        let _ = tx.send(WatchEvent::Stopped {
+            key: r.exe.clone(),
+            pid,
+        });
+        signal(wake);
+        true
+    }
 }
 
 /// What changed between two samples: the PIDs that appeared (the only possible starts)
@@ -428,6 +460,8 @@ fn open_for_wait(pid: u32) -> Option<HANDLE> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::unbounded;
+    use std::cell::Cell;
     use std::process::{Command, Stdio};
 
     fn sample(pairs: &[(u32, &str)]) -> Sample {
@@ -493,6 +527,76 @@ mod tests {
             exe: "C:\\Windows\\System32\\notepad.exe".into(),
         });
         assert_ne!(tracked_hash(&tracked), before);
+    }
+
+    #[test]
+    fn an_empty_tracked_list_never_walks_the_process_table() {
+        // The walk is a full snapshot of every process on the machine. With nothing
+        // tracked it cannot match anything, so it must not happen at all.
+        let tracked = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = unbounded();
+        let mut watcher = Watcher::new();
+        let walks = Cell::new(0);
+        let mut walk = || {
+            walks.set(walks.get() + 1);
+            Sample::new()
+        };
+        for _ in 0..3 {
+            watcher.step(&tracked, &tx, 0, &mut walk);
+        }
+        assert_eq!(
+            walks.get(),
+            0,
+            "an empty tracked list must not walk the process table"
+        );
+    }
+
+    #[test]
+    fn a_newly_tracked_app_is_picked_up_on_the_next_tick() {
+        // A real process, so that the watcher can resolve its path and wait for its exit.
+        let probe = std::path::Path::new("C:\\Windows\\System32\\ping.exe");
+        if !probe.is_file() {
+            return;
+        }
+        let mut child = Command::new(probe)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ping.exe starts");
+        let pid = child.id();
+
+        let tracked = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = unbounded();
+        let mut watcher = Watcher::new();
+        let mut walk = || sample(&[(pid, "ping.exe")]);
+
+        // nothing is tracked: the walk is skipped and nothing is reported
+        watcher.step(&tracked, &tx, 0, &mut walk);
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing may be reported while nothing is tracked"
+        );
+
+        // the app is tracked now: the next tick must notice it, not the one after
+        tracked.lock().unwrap().push(TrackedApp {
+            name: "Ping".into(),
+            exe: "C:\\Windows\\System32\\ping.exe".into(),
+        });
+        watcher.step(&tracked, &tx, 0, &mut walk);
+        match rx
+            .try_recv()
+            .expect("the newly tracked app must be noticed on the next tick")
+        {
+            WatchEvent::Started { key, pid: seen, .. } => {
+                assert_eq!(key, "ping.exe");
+                assert_eq!(seen, pid);
+            }
+            WatchEvent::Stopped { .. } => panic!("the app started, it did not stop"),
+        }
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
