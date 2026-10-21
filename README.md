@@ -254,11 +254,15 @@ see [Building from source](#building-from-source).
    ```
 
    The installer registers the same scheduled task — at logon and whenever Windows resumes from
-   sleep, **with the highest privileges** — and starts it immediately. It writes the SHA-256 of
-   the executable into an `ArmouryDaemon.exe.sha256` sidecar (and into the task's description),
-   so a swapped binary is detectable, and it applies an explicit ACL to the folder:
-   Administrators and SYSTEM keep full control, your account keeps *modify* (the daemon writes
-   the `packs` folder there), everybody else gets read and execute only.
+   sleep, **with the highest privileges** — and starts it immediately. It agrees with the task the
+   executable registers for itself in every field that affects the daemon's behaviour; the task XML
+   itself differs in two fields that change nothing (the script writes task schema `1.3` where the
+   daemon's own registration writes `1.2`, and only the script sets
+   `UseUnifiedSchedulingEngine`). It writes the SHA-256 of the executable into an
+   `ArmouryDaemon.exe.sha256` sidecar (and into the task's description), so a swapped binary is
+   detectable, and it applies an explicit ACL to the folder: Administrators and SYSTEM keep full
+   control, your account keeps *modify* (the daemon writes the `packs` folder there), everybody
+   else gets read and execute only.
 
    The task is registered first on purpose: a failing ACL or a failing sidecar only warns and the
    script carries on, so the install can no longer leave the daemon down.

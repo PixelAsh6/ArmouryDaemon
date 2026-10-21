@@ -34,6 +34,10 @@ The executable can install itself - the [README](../README.md) has that path. Th
 scripted one: `setup.ps1` registers the same scheduled task, writes the checksum sidecar and
 applies the folder ACL, and it needs the `packs` folder next to the executable.
 
+The two registrations agree in every field that affects the daemon's behaviour. The task XML
+itself differs in two fields that change nothing: the script writes task schema `1.3` where the
+daemon's own registration writes `1.2`, and only the script sets `UseUnifiedSchedulingEngine`.
+
 The executable is built for this machine's CPU and needs AVX2 - Intel from 2013, AMD from 2015;
 see [Building from source](../README.md#building-from-source).
 

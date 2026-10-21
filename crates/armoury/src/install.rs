@@ -1,14 +1,27 @@
 //! The daemon installs itself: the autostart task it registers for itself and the
 //! first-run marker that decides whether the dashboard opens itself.
 //!
-//! The scheduled task is the same one `deploy/setup.ps1` registers: the same name, the
-//! same action (`<exe> --autostart`), the same triggers (logon and resume from sleep)
-//! and the same settings (highest privileges). The script stays authoritative when it
-//! runs; this module is what makes the executable usable on its own, without the script.
+//! The scheduled task is the one `deploy/setup.ps1` registers: the same name, the same
+//! action (`<exe> --autostart`) in the same working directory, the same principal (this
+//! user, interactive token, highest privileges), the same triggers (logon and resume
+//! from sleep) and the same settings to the same values (the machine may run on
+//! battery, the task starts as soon as it can, a second instance is ignored, and it
+//! never times out). The script stays authoritative when it runs; this module is what
+//! makes the executable usable on its own, without the script.
+//!
+//! The two registrations are not the same XML, though. The raw COM API writes task
+//! schema `version="1.2"` where the ScheduledTasks module writes `1.3`, and it leaves
+//! `UseUnifiedSchedulingEngine` out where the module writes it as `true` (a
+//! `New-ScheduledTaskSettingsSet` default; the setting lives on `ITaskSettings2`, which
+//! this code does not use). Neither changes what the task does - the schema version is
+//! the version the scheduler reads the XML as, and the unified engine only picks the
+//! scheduler's internal engine when the machine is busy. Every other field - every
+//! field that affects the daemon's behaviour - is the same.
 //!
 //! The task the daemon registers carries the same tamper record the script writes: the
 //! SHA-256 of the executable, in a sidecar next to it and in the description of the
-//! task. A task registered by either path is therefore indistinguishable.
+//! task - the same bytes and the same wording, so a task registered by either path
+//! carries the same record.
 //!
 //! The Windows API is used directly (the Task Scheduler COM API through the `windows`
 //! crate), so nothing is shelled out to and the task is defined in one place only.
@@ -38,7 +51,8 @@ use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, Shel
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 /// The scheduled task the daemon registers for itself. `deploy/setup.ps1` registers the
-/// same task under the same name — the two have to agree, and a test keeps them in step.
+/// same task under the same name — the two have to agree in every field that affects
+/// the daemon's behaviour, and a test keeps them in step.
 pub const TASK_NAME: &str = "ArmouryDaemon";
 
 /// What the task passes to the executable: the daemon starts without opening the
@@ -160,8 +174,9 @@ pub fn mark_first_run_done(marker: &Path) -> std::io::Result<()> {
 // The hash of the executable (pure where it can be)
 // ---------------------------------------------------------------------------
 
-/// The description of the task, in the wording `deploy/setup.ps1` uses. A task
-/// registered by the script and one registered by the daemon are indistinguishable.
+/// The description of the task, in the wording `deploy/setup.ps1` uses: a task
+/// registered by the script and one registered by the daemon carry the same
+/// description, and so the same tamper record.
 pub fn task_description(hash: &str) -> String {
     format!("ArmouryDaemon autostart. exe SHA256 {hash} (see ArmouryDaemon.exe.sha256).")
 }
@@ -416,7 +431,8 @@ fn record_hash(exe: &Path) -> Option<String> {
     }
 }
 
-/// Register the task for this executable: the same one `deploy/setup.ps1` registers.
+/// Register the task for this executable: the same task `deploy/setup.ps1` registers, in
+/// every field that affects the daemon's behaviour.
 pub fn register(exe: &Path) -> Result<(), String> {
     // The tamper record, in the two places the installer puts it: the sidecar next to
     // the executable and the description of the task. Both are written before the task
@@ -498,7 +514,9 @@ pub fn register(exe: &Path) -> Result<(), String> {
         let who = sid.as_deref().unwrap_or(user.as_str());
         set_principal(&principal, who)?;
 
-        // The settings: the same ones the installer uses.
+        // The settings: the same five the installer sets. The installer's set also
+        // carries `UseUnifiedSchedulingEngine` (it lives on `ITaskSettings2`, which
+        // this code does not use), and it does not change what the task does.
         let settings = definition
             .Settings()
             .map_err(|e| format!("the task settings cannot be set ({e})"))?;
@@ -536,9 +554,11 @@ fn set_principal(principal: &IPrincipal, user: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The settings of the task: the same ones the installer uses (the machine may run on
+/// The settings of the task: the same five the installer sets (the machine may run on
 /// battery, the task starts as soon as it can, a second instance is ignored, and it
-/// never times out).
+/// never times out). The installer's settings set also carries
+/// `UseUnifiedSchedulingEngine`, which lives on `ITaskSettings2` and not on the
+/// `ITaskSettings` this function has - so a task registered here does not carry it.
 fn set_settings(settings: &ITaskSettings) -> Result<(), String> {
     unsafe {
         settings
@@ -918,8 +938,8 @@ mod tests {
 
     #[test]
     fn the_description_carries_the_hash() {
-        // The wording of the installer, so a task registered by either path is
-        // indistinguishable.
+        // The wording of the installer: a task registered by either path carries the
+        // same description, and so the same tamper record.
         let hash = "a164d04318dac86be5d411bfba6a09e1603f6004490989af43497f7d54fcf29d";
         assert_eq!(
             task_description(hash),
