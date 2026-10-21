@@ -11,6 +11,10 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   Install packs window. The built-in console launcher stays where it is, and the order the packs
   are **applied** in is unchanged.
 
+### Changed
+
+- A JSON error in a pack file now names the field that is wrong, instead of a line and a column.
+
 ### Fixed
 
 - The Install packs window opened only after its six-second settle deadline, because its size was
@@ -20,6 +24,24 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   in-flight state is now tracked per pack.
 - A pack's temporary file name was built from its id, which comes from the catalogue manifest, so a
   crafted id could write outside the temporary folder. The name is sanitised now.
+- The pack validator's duplicate-setting check was quadratic, so a pack file with 200,000 dropdowns
+  took over ten minutes to validate; the check is now linear, and such a pack is refused in seconds.
+- The daemon's pipe read a message into an ever-growing buffer, so a client that never sent a
+  newline could make the daemon allocate without limit; a message is now capped at 1 MiB and
+  anything longer is refused like a malformed one.
+- The daemon looked for its `packs\` folder in the executable's folder and then in that folder's
+  grandparent, so a lone executable could pick up a `packs\` folder from the wrong place; the
+  grandparent is only searched when it is a source checkout.
+- The file the catalogue downloads is now deleted once the daemon has installed it, whether the
+  install succeeded or failed; a pack file the user picked in the file dialog is never deleted.
+- The dashboard's empty state said "No packs found (looked in `<app>`/packs)", with an
+  unsubstituted placeholder; it now says no packs are installed and points at Settings → Install
+  packs.
+- The dashboard opened on the first run only when no packs were installed, so an install that
+  shipped the three packs never showed it; it now opens on the first run whatever is installed.
+- The console band was laid out across the whole width of the screen and covered 58.8% of the
+  dashboard, so a click meant for the dashboard landed on a band tile and launched that
+  application. The band now leaves the dashboard's column clear and the two no longer overlap.
 
 ## [1.1.1] - 2026-10-21
 
