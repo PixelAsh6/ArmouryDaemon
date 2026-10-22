@@ -710,6 +710,50 @@ try {
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     Remove-Item -Recurse -Force $srcDir -ErrorAction SilentlyContinue
 
+    # ---- 19b. the host API is scoped: a pack may only call what it was granted ----
+    # A pack declares the capabilities it wants. The daemon grants only those, and a call
+    # to a function of a capability that was not granted fails as an *unknown function*:
+    # the denial is structural, not a check a call site could forget. The denial names the
+    # missing capability and what the pack asked for, and it lands in the pack's log.
+    $capDir = Join-Path $env:TEMP "armoury-cappack-$ns"
+    New-Item -ItemType Directory -Force -Path $capDir | Out-Null
+    $capPack = @'
+{
+  "spec": 2,
+  "id": "captest",
+  "name": "Capability test",
+  "version": "1.0.0",
+  "order": 6,
+  "targets": { "process": ["timeout.exe"] },
+  "capabilities": ["files"],
+  "script": {
+    "apply":  "ctx.run_cli(\"C:\\Windows\\System32\\cmd.exe\", [\"/c\", \"echo hi\"]);",
+    "revert": "ctx.log(\"the revert must not run\");"
+  },
+  "apply": { "steps": [] },
+  "revert": { "guard": { "targetRunning": false, "capturedRunning": true }, "steps": [] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $capDir 'pack.json'), $capPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($capDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a pack that declares its capabilities installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"set_pack_enabled","id":"captest","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p8 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'triggered' 25
+    Start-Sleep -Milliseconds 800
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the ungranted call is in the pack log' ($logText -match 'captest: script apply failed') "no failure line for the pack"
+    Check 'the denial names the missing capability' ($logText -match "run_cli REFUSED: it needs the 'exec' capability") "no capability in the denial"
+    Check 'the denial names what the pack asked for' ($logText -match 'the pack asked for: files') "no grant set in the denial"
+    $p8 | Stop-Process -Force
+    Send-Pipe '{"type":"set_pack_enabled","id":"captest","enabled":false}' | Out-Null
+    $op = Send-And-Wait '{"type":"remove_pack","id":"captest"}' 'pack_op'
+    Check 'the pack with capabilities removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Remove-Item -Recurse -Force $capDir -ErrorAction SilentlyContinue
+
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
     # desktop. They run in a namespace of their own ($cliNs), see the top of this file.

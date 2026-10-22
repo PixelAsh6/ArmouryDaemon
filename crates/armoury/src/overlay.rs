@@ -5,6 +5,7 @@ use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BLACK_BRUSH, EndPaint, EnumDisplayMonitors, FillRect, GetMonitorInfoW,
@@ -548,6 +549,60 @@ fn restore_device(entry: &LedgerEntry) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         set_device_mute(&device, false).map_err(|e| e.to_string())
     }
+}
+
+/// The output devices a host call muted, by endpoint id: exactly the ones it has to
+/// unmute again. A device the user had muted already is not in here — it was not
+/// changed, and it must never be unmuted again.
+static MUTED_BY_HOST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Mute every active output device, or unmute the ones this call muted.
+///
+/// This is the `audio_mute_all` of the host API. The devices it muted are remembered by
+/// their endpoint id, so the unmute puts back exactly what was changed: a device the
+/// user had muted already stays muted.
+pub fn mute_all_host(muted: bool) -> Result<String, String> {
+    if muted {
+        let outcome = mute_all()?;
+        let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
+        for device in &outcome.muted {
+            if !ledger.contains(&device.id) {
+                ledger.push(device.id.clone());
+            }
+        }
+        return Ok(format!(
+            "{} device(s) muted, {} left alone",
+            outcome.changed,
+            outcome.enumerated.saturating_sub(outcome.changed)
+        ));
+    }
+
+    let ids: Vec<String> = {
+        let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *ledger)
+    };
+    let mut restored = 0usize;
+    let mut failed = 0usize;
+    for id in ids {
+        match restore_device(&LedgerEntry {
+            id: id.clone(),
+            was_muted: false,
+        }) {
+            Ok(()) => restored += 1,
+            Err(e) => {
+                failed += 1;
+                // the device stays in the ledger: the next call tries again
+                MUTED_BY_HOST
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(id);
+                warn!("idle: the output device could not be unmuted: {e}");
+            }
+        }
+    }
+    Ok(format!(
+        "{restored} device(s) unmuted, {failed} could not be unmuted"
+    ))
 }
 
 /// Marker file that exists while idle mode is active, so a crash can be recovered.

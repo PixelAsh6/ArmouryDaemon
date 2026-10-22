@@ -11,11 +11,13 @@ use log::{info, warn};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::script;
 
-use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Foundation::{GetLastError, HWND};
+use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -154,6 +156,10 @@ pub fn start(
 ) {
     std::thread::spawn(move || {
         info!("pack worker started with {} pack(s)", packs.len());
+        // COM for the audio interfaces: a pack may ask for the 'audio' capability, and
+        // the audio sessions are COM objects. COM is per thread, so the apartment has to
+        // be set up here and not only on the daemon's main thread.
+        crate::killswitch::init_com();
         // The previous successful revert's captured values, kept for a short window: an apply that
         // follows it must restore *those*, not re-read a file the app has not rewritten yet.
         let mut carry: Option<(Instant, CaptureMap)> = None;
@@ -295,7 +301,10 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
             pack.script.revert.as_deref()
         };
         if let Some(src) = script_src.filter(|s| !s.trim().is_empty()) {
-            match script::run(src, &mut ctx) {
+            // The pack's script runs on the engine of its own capability set: only the
+            // functions it was granted are on it, so a call to anything else fails as an
+            // unknown function.
+            match script::run_with_capabilities(src, &mut ctx, pack.capabilities) {
                 Ok(lines) => {
                     if let Ok(done) = &mut result {
                         done.extend(lines);
@@ -1158,6 +1167,98 @@ pub(crate) fn script_process_start(path: &str) -> Result<(), String> {
 
 pub(crate) fn script_json_pointer(path: &str, pointer: &str) -> Option<String> {
     json_pointer(path, pointer)
+}
+
+/// `ctx.windows_of(pid)` — the visible, unowned, non-tool windows of a process.
+pub(crate) fn script_windows_of(pid: u32) -> Vec<isize> {
+    crate::killswitch::windows_of(pid)
+}
+
+/// The windows a host call hid, with the visibility they had before: the exact state a
+/// revert has to put back. A window that is hidden twice keeps the state it had before
+/// the first hide.
+static HIDDEN_WINDOWS: Mutex<Vec<(isize, bool)>> = Mutex::new(Vec::new());
+
+/// `ctx.window_hide(hwnd)` — hide a window and report whether it was visible before.
+pub(crate) fn script_window_hide(hwnd: isize) -> bool {
+    let mut hidden = HIDDEN_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, was)) = hidden.iter().find(|(w, _)| *w == hwnd) {
+        return *was; // already hidden by us: the state we found is the one that counts
+    }
+    let was = window_visible(hwnd);
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd as *mut _), SW_HIDE);
+    }
+    hidden.push((hwnd, was));
+    was
+}
+
+/// `ctx.window_show(hwnd)` — show a window and report whether it was visible before.
+pub(crate) fn script_window_show(hwnd: isize) -> bool {
+    let was = window_visible(hwnd);
+    unsafe {
+        let _ = ShowWindow(HWND(hwnd as *mut _), SW_SHOW);
+    }
+    HIDDEN_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(w, _)| *w != hwnd);
+    was
+}
+
+/// Is the window visible right now?
+fn window_visible(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
+}
+
+/// `ctx.audio_sessions()` — the audio sessions of the machine, as "pid:state" strings.
+pub(crate) fn script_audio_sessions() -> Vec<String> {
+    crate::killswitch::session_states()
+        .into_iter()
+        .map(|(pid, state)| format!("{pid}:{state}"))
+        .collect()
+}
+
+/// `ctx.audio_mute(pid, on)` — mute (or unmute) the audio sessions of a process.
+pub(crate) fn script_audio_mute(pid: u32, muted: bool) -> String {
+    crate::killswitch::mute_pid(pid, muted)
+}
+
+/// `ctx.audio_mute_all(on)` — mute (or unmute) every output device.
+pub(crate) fn script_audio_mute_all(muted: bool) -> Result<String, String> {
+    crate::overlay::mute_all_host(muted)
+}
+
+/// What a pack asked the daemon to do with the idle overlay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayRequest {
+    /// Show the overlay — the daemon's idle mode.
+    Show,
+    /// Take the overlay away again.
+    Hide,
+}
+
+/// The overlay requests the pack worker made, waiting for the daemon's main loop.
+///
+/// The pack worker cannot show the overlay itself: the black windows belong to the thread
+/// that pumps their messages, and that is the daemon's main loop. The request is carried
+/// over to that loop, which does the work and keeps owning the crash-recovery ledger and
+/// the keypress dismissal.
+static OVERLAY_REQUESTS: Mutex<Vec<OverlayRequest>> = Mutex::new(Vec::new());
+
+/// Ask the daemon to show or take away the idle overlay.
+pub fn request_overlay(request: OverlayRequest) {
+    let mut requests = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    requests.push(request);
+}
+
+/// The overlay requests that are waiting, taken away so the daemon does them once.
+pub fn take_overlay_requests() -> Vec<OverlayRequest> {
+    let mut requests = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *requests)
 }
 
 /// Reject a pack whose scripts do not compile, before it is loaded or installed.
