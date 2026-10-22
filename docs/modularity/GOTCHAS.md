@@ -151,7 +151,7 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
    That fix is **another agent's work** (`fix/art-fetch-windows-root-store`); a tree
    without it still has the bug in the art fetches, and the binary still carries
    Mozilla's bundled roots because of it.
-2. **The pack worker is a single serial thread** (`packs.rs:168`,
+2. **The pack worker is a single serial thread** (`packs.rs:171`,
    `while let Ok(job) = jobs.recv()`). A slow mode would block every later apply and
    revert. Modes need their own worker.
 3. **The engine is cached, and the cache is keyed by the capability set** (A2). Since

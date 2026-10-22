@@ -100,7 +100,7 @@ defaults and the two trigger rules the folder did not state.
 
 ### A4. A separate worker queue for modes
 
-The pack worker is a **single serial thread** (`packs.rs:168`,
+The pack worker is a **single serial thread** (`packs.rs:171`,
 `while let Ok(job) = jobs.recv()`). A slow mode must never block a pack apply/revert.
 Give modes their own thread and channel.
 

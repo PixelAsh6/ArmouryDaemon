@@ -125,7 +125,7 @@ mutes and were therefore left alone. A process without an audio session gets
 
 **`overlay_show` is a request, not a call.** The black windows belong to the thread that
 pumps their messages, and that is the daemon's main loop — the pack worker cannot show
-them itself. The host function therefore hands the request over (`packs.rs:1268`), and
+them itself. The host function therefore hands the request over (`packs.rs:1302`), and
 the daemon's main loop carries it out (`daemon.rs:461`), which keeps owning the
 crash-recovery ledger, the keypress dismissal and the idle-mode policy.
 
@@ -159,9 +159,9 @@ thread_local! {
 }
 ```
 
-The pack worker is a **single serial thread** (`packs.rs:168`), so no locking is
+The pack worker is a **single serial thread** (`packs.rs:171`), so no locking is
 needed. A pack then gets an engine on which **only the granted functions are
-registered** (`script.rs:298`, `new_sandbox`), so an ungranted call fails as an
+registered** (`script.rs:294`, `new_sandbox`), so an ungranted call fails as an
 *unknown function* — a structural denial, not a runtime check a call site could forget.
 Each distinct capability set costs ~433 µs to build, once.
 
@@ -320,7 +320,7 @@ module needs.
 | The console helper | `daemon.rs:2024` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
 | The killswitch | `daemon.rs:1794` (`toggle_killswitch`) | it has **no config key and no IPC request** today; add both |
 
-The pack worker is a **single serial thread** (`packs.rs:168`,
+The pack worker is a **single serial thread** (`packs.rs:171`,
 `while let Ok(job) = jobs.recv()`) — that is the reason for the second worker.
 
 ---

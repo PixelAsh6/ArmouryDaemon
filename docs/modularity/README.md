@@ -64,7 +64,7 @@ background.
   **published and installed** — the copy in `C:\Apps\ArmouryDaemon` hashes to
   `947ef3dc…24a4`, the published asset's hash.
 - **The next action is Phase A4** — a separate worker queue for modes. The pack worker is
-  a single serial thread (`packs.rs:168`), so a slow mode must never block a pack
+  a single serial thread (`packs.rs:171`), so a slow mode must never block a pack
   apply/revert: modes get their own thread and channel. `WORK-ORDER.md` A4.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
@@ -101,7 +101,7 @@ background.
 ## The next action
 
 **Phase A4 — a separate worker queue for modes.** The pack worker is a **single serial
-thread** (`packs.rs:168`, `while let Ok(job) = jobs.recv()`), so a slow mode would block
+thread** (`packs.rs:171`, `while let Ok(job) = jobs.recv()`), so a slow mode would block
 every later apply and revert. Modes get their own thread and their own channel.
 `WORK-ORDER.md` A4.
 
