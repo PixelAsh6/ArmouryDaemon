@@ -562,9 +562,9 @@ pattern.
 `"mode"`) and `triggers` (what starts the pack). A pack that carries neither loads and
 behaves exactly as it did — the three shipped packs carry neither, and the catalogue in
 `D:\ArmouryDaemon_Packs` needs no change. `spec` stays 1 or 2; there is no `spec: 3`. A
-malformed `kind` is a **named error** — `unknown kind 'widget' (expected 'pack' or 'mode')` —
-refused when the pack is
-parsed: never a panic, never a silent default to `"pack"`.
+malformed `kind` is a **named error** — `unknown kind 'widget' (expected 'pack' or
+'mode')` — refused when the pack is parsed: never a panic, never a silent default to
+`"pack"`.
 
 The **daemon does not act on the fields yet**, and that is what makes the phase additive:
 the mode machinery — a worker of its own, a hotkey that dispatches to it — is A4 and A5.
@@ -613,8 +613,8 @@ the daemon's hotkey table, and the daemon not acting on the fields yet. §19: th
 - **A custom serde error has no position of its own, and serde_json gives it one.**
   `Error::custom` builds it at line 0, column 0, but serde_json's `fix_position` replaces
   that with the position it was reading — so the named error reads *"invalid JSON: the
-  field 'kind': unknown kind 'widget'"*, with the field named by the walk back over the
-  text (`GOTCHAS.md` trap 42).
+  field 'kind': unknown kind 'widget' (expected 'pack' or 'mode')"*, with the field named
+  by the walk back over the text (`GOTCHAS.md` trap 42).
 - **The folder's `triggers` default is one default for every kind.** A mode that does
   not say what starts it inherits the tracked app; the rule "a mode needs at least one
   trigger" therefore bites on an **explicitly empty** list, not on an absent one. A

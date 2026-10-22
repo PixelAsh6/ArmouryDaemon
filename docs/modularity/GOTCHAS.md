@@ -357,8 +357,9 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     serde_json's `fix_position` replaces that with the position it was reading when
     the error came back (`de.rs`, `Error::fix_position`). That is why the named
     errors of the schema read *"invalid JSON: the field 'kind': unknown kind
-    'widget'"* — the field is named by the walk back over the text, and it works
-    for a custom error exactly as it works for a type error.
+    'widget' (expected 'pack' or 'mode')"* — the field is named by the walk back
+    over the text, and it works for a custom error exactly as it works for a type
+    error.
 
 ---
 
