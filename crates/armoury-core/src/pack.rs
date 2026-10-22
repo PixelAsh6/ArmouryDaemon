@@ -1745,7 +1745,7 @@ mod tests {
             assert_eq!(Capability::from_name(capability.name()), Some(capability));
         }
         // the host API has exactly these functions
-        assert_eq!(seen.len(), 25, "{seen:?}");
+        assert_eq!(seen.len(), 26, "{seen:?}");
         assert!(!seen.contains(&"no_such_host_function"));
     }
 

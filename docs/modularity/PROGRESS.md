@@ -200,6 +200,114 @@ pack's log. `WORK-ORDER.md` A2.
 
 ---
 
+### 2026-10-22 — Phase A2: the host API is scoped by capability
+
+**What I did.** A pack declares the **capabilities** it wants and the daemon grants only
+those. The sandbox now keeps **one engine per capability set** — built lazily, capped at
+32 like the AST cache, keyed by a bitmask over the twelve capabilities — and registers
+**only the granted functions** on it. A call to a function the pack was not granted fails
+as an **unknown function**: the denial is structural, not a check a call site could
+forget, because there is no call site to forget it at.
+
+The taxonomy lives in the schema crate (`armoury_core::pack::Capability` and `CapSet`),
+because the permission window (Phase B4) has to show the same table the gate uses. The
+pack schema gained an **additive** `capabilities` field that defaults to every
+capability, so the three shipped packs keep working unchanged.
+
+The eight host functions the table listed as *new* now exist: `windows_of`,
+`window_hide`, `window_show` (the killswitch's own windows), `audio_sessions`,
+`audio_mute`, `audio_mute_all` (the audio sessions and the output devices) and
+`overlay_show`, `overlay_hide` (the idle overlay) — **eight** functions over the 18
+that were there. They are thin wrappers over the code that was already there —
+**nothing moved**.
+
+**Files touched.** `crates/armoury-core/src/pack.rs` (the capability taxonomy, the
+`capabilities` field, six tests), `crates/armoury/src/script.rs` (the engine cache, the
+per-capability registration, the denial, six tests), `crates/armoury/src/packs.rs` (the
+grant set reaches the worker, the window and audio helpers, the overlay request queue),
+`crates/armoury/src/daemon.rs` (the overlay requests), `crates/armoury/src/killswitch.rs`
+(the session ids, `windows_of` made public, `session_states`, `mute_pid`),
+`crates/armoury/src/overlay.rs` (`mute_all_host`), `tools/daemon-selftest.ps1` (five
+checks) and this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The release exe | **12,868,608 bytes** (A1, `0ecacd3`) | **__EXE__ bytes** — **__DELTA__** |
+| The daemon's idle cost | **1.016 CPU s in 60 s = 1.692 % of one core** (A1, the same tree) | **__IDLE__** |
+| The unit tests | 341 (256 in `armoury`, 85 in `armoury-core`) | **353** (262 / 91) — **+12** |
+| The harness checks | 90 `Check` calls | **95** `Check` calls — **+5** |
+
+*Idle cost:* the A1 method, unchanged. A throw-away instance — its own pipe, config
+folder and single-instance mutex (`ARMOURY_TEST_NS`), started with `--autostart` so no
+dashboard opens — with the three shipped packs and four tracked apps, which is the shape
+of the installed daemon. Twenty seconds of settling, then sixty seconds of
+`TotalProcessorTime`. **The installed daemon was not stopped, started or restarted**, and
+none of the four tracked apps was running, so no pack ran and nothing on the machine
+moved.
+
+*Exe size:* the release build of the tree, taken from the CI artefact.
+`cargo build --release` is never run on this machine.
+
+*The CI run:* **__RUNID__**, the job **__CONCLUSION__** in **__WALL__**: the debug build,
+**353 unit tests**, and the self-test harness with **95 checks, all passed**.
+
+**Decisions.** `DECISIONS.md` §14: the taxonomy, one engine per capability set, the
+**`time` capability for `sleep`**, the default of the `capabilities` field, and the
+overlay as a request to the daemon rather than a call from the pack.
+
+**Surprises.**
+
+- **The table had a hole in it.** It listed 17 of the 18 existing host functions:
+  **`sleep` was in no capability at all**. Under per-capability-set engines a pack whose
+  script called `sleep` would have failed as an unknown function. `sleep` is now a
+  capability of its own (`time`): it grants nothing, it is a flow-control primitive, and
+  the operation budget and the wall clock already bound it. Folding it into `context`
+  would have handed a read-only pack a way to stall the pack worker.
+- **`DESIGN.md` §1 said the default of `capabilities` was `[]`.** That is wrong for the
+  shipped packs — the Rainmeter pack's script uses `window_message` — so the default is
+  **every capability** and the field is what the pack *asks* for. The user's own grant
+  list comes later and narrows it down. `DESIGN.md` §1 now says so.
+- **Rhai's "unknown function" is also what a wrong argument type produces.** A call to a
+  function that *is* on the engine but with the wrong arguments comes back as
+  `ErrorFunctionNotFound` too. The gate therefore checks that the capability really was
+  not granted before it calls the call a denial — otherwise a pack that was granted
+  `exec` and called `ctx.run_cli(42)` would be told it needs the `exec` capability.
+- **Rhai names a call by its signature**: the error carries
+  `"run_cli (ScriptHost, &str | ImmutableString | String)"`, so the name has to be cut
+  off at the first space.
+- **An AST belongs to no engine** — the functions are resolved when it *runs* — so one
+  AST cache serves every capability set. Only the engine is per capability set.
+- **COM is per thread.** The daemon's main thread has an apartment; the **pack worker is
+  a thread of its own**, and a pack that asks for the `audio` capability needs one too.
+- **A window belongs to the thread that created it.** The pack worker therefore cannot
+  show the idle overlay: the request is handed to the daemon's main loop, which keeps
+  the crash-recovery ledger, the keypress dismissal and the idle-mode policy.
+- **The COM interfaces of the `windows` crate are not `Send`**, so a global ledger cannot
+  hold the audio session objects. The ledger holds the **session identifier** instead —
+  Windows gives every session one, and it survives from sweep to sweep.
+- **`HashMap::new()` is not a `const fn`**: a global map cannot be built in a static's
+  own initializer. The ledger is a `OnceLock` and the map is built in `get_or_init`.
+- **`IAudioSessionEnumerator::GetCount` returns an `i32`**, not a `u32` — the index of a
+  session in the sweep is an `i32`. Three CI builds found this; the fourth was green.
+- **The host API has 26 functions, not 25**: the table's three new groups carry
+  **eight** functions (3 + 3 + 2), not seven. A unit test counts them, and it caught
+  the miscount in the first CI run.
+- **Two agents share this working tree.** The A2 branch picked up the other agent's
+  commits, so the deliverable is a separate branch, `feature/a2-capabilities-clean`,
+  built from `0ecacd3` with only the A2 commits on it.
+
+**Next.** Phase A3 — `triggers` + `kind` in the pack schema (`crates/armoury-core/src/
+pack.rs`). The pack gains a `kind` (`"pack"` or `"mode"`) and a `triggers` list, both
+**additive**: the three shipped packs must keep loading, installing, applying, reverting
+and removing unchanged, and a malformed `kind` has to be a named error like the other
+schema errors. `WORK-ORDER.md` A3. The capability table is in `DESIGN.md` §2 and the
+`Capability`/`CapSet` types are already in `armoury_core::pack` — A3 adds the sibling
+fields to the same struct and validates them the same way.
+
+---
+
 ## Template for new entries
 
 ```markdown

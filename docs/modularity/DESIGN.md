@@ -45,9 +45,9 @@ permission window) comes later and narrows this down; the field is what the pack
 
 ## 2. The capability taxonomy
 
-The 25 Rhai host functions (`crates/armoury/src/script.rs`, the registration block) group
-into capabilities. A pack declares what it needs; the daemon grants only that. The last
-three groups are **new** and are exactly what the killswitch and idle need.
+The 26 Rhai host functions (`crates/armoury/src/script.rs`, the registration block) group
+into capabilities: the 18 that were there and the 8 the table lists as new. A pack
+declares what it needs; the daemon grants only that.
 
 **The table as it was written down was missing one function.** It listed 17 of the 18
 existing host functions: `sleep` (`script.rs:308` before this phase) was in **no**

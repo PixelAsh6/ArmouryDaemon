@@ -246,10 +246,13 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     cannot hold the audio session objects (the killswitch's own `Ledger` is a plain
     struct on the main thread for that reason). The host's ledger therefore holds the
     **session identifier** — a string — and matches the sessions of a sweep by it.
-31. **The test and harness counts in this folder were low.** The A1 entry says 341
-    unit tests and 90 harness checks; the same scan over the same tree counts **345
-    and 95**. The numbers in this file are the measured ones — count them again
-    before writing them down.
+31. **Count the tests line by line, not with a loose regex.** The scan that counts the
+    tree's tests has to be anchored to the **end of the line**
+    (`(?m)^[ \t]*#\[test\][ \t]*$`): a pattern with a `\s*` that may cross a newline
+    counts **four tests too many**, and the number then disagrees with what CI reports.
+    The same goes for the harness's `Check` calls (`^[ \t]*Check[ \t]`). The honest
+    numbers for the A1 tree are **341 unit tests** (256 in `armoury`, 85 in
+    `armoury-core`) and **90 harness checks** — the ones the folder already carries.
 32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
     built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
     `HashMap` is not) — use a `OnceLock` and build the map in `get_or_init`.
