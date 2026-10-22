@@ -37,7 +37,14 @@ background.
 
 ## Current state
 
-- Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`.
+- Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The phase is
+  integrated on **`feature/phase-a`** — A2, with the lockout re-timing and the art fetch
+  through the Windows certificate store merged into it — and it is the **1.1.5** release.
+  An **A2-only** copy of the phase is still on `feature/a2-capabilities-clean`; the trees
+  have **different numbers** — a number without its tree is not a number.
+- The **1.1.5** release is out: the **capability-scoped host API**, the **Windows
+  certificate store** for the catalogue **and the cover art**, and the **cooldown
+  re-timing** — a change of the cooldown re-times the window that is running.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -45,8 +52,13 @@ background.
   store**, not Mozilla's bundled roots, so it works behind a corporate CA. The client is
   one `ureq::Agent`, the user's WinINet proxy settings are read, and the responses are
   compressed. See `PROGRESS.md`.
-- **The tree is clean and everything is committed.** There is no uncommitted work to
-  protect.
+- **Phase A2 is done** — the host API is **scoped by capability**. A pack declares the
+  capabilities it wants; the daemon keeps **one engine per capability set** and
+  registers only the granted functions on it, so a call to a function the pack was not
+  granted fails as an *unknown function*. The denial names the missing capability and
+  what the pack asked for, and it lands in the pack's log. The host functions report
+  what they changed: `audio_mute` returns the **previous mute state** of every session
+  it touched and never unmutes a session the user had muted. See `PROGRESS.md`.
 - ~60 % of the request is **already shipped**: G-Helper, Rainmeter and Wallpaper
   Engine are data packs that the catalog already downloads, verifies and installs.
 - The gap is the **killswitch**, **idle mode** and the **console launcher**.
@@ -55,10 +67,11 @@ background.
 
 | Done | Effect | Where |
 |---|---|---|
-| The script sandbox keeps **one engine per thread**; budgets re-armed per run | 432.7 µs build cost paid once; a run spends 4.7 µs | `crates/armoury/src/script.rs:86` |
-| The killswitch enumerates audio sessions **once per press**; release restores from the ledger without enumerating | ~45 ms off the event loop per press | `crates/armoury/src/killswitch.rs:108`, `:271` |
+| The script sandbox keeps **one engine per capability set** (since A2); budgets re-armed per run | 432.7 µs build cost paid once; a run spends 4.7 µs | `crates/armoury/src/script.rs:90` |
+| The killswitch enumerates audio sessions **once per press**; release restores from the ledger without enumerating | ~45 ms off the event loop per press | `crates/armoury/src/killswitch.rs:121`, `:415` |
 | The watcher **skips the process-table walk when nothing is tracked** | ~19.5 ms/s of idle cost gone | `crates/armoury/src/watch.rs:174` |
 | The **lockout model was rewritten** — again on 2026-10-22: it holds a change in **both** directions | the packs no longer flip under a running game, and a start inside a window no longer changes the machine in the middle of a cooldown | `crates/armoury-core/src/engine.rs` (`try_change` `:314`, `tick` `:291`) |
+| A change of the cooldown **re-times the window that is running** (1.1.5) | the window keeps its start and takes the new length, so it ends at `start + cooldown` and the change it holds lands at the new expiry | `crates/armoury-core/src/engine.rs` (`Window`, `set_cooldown`) |
 | The **release carries only the executable and its 85-byte sidecar** — no zip, no scripts | the executable installs itself; the scripted install lives in the repository's `deploy\` folder | `.github/workflows/release.yml` |
 | The **build targets x86-64 v3**, not `native` | the same binary on every machine | `.cargo/config.toml` |
 
@@ -66,14 +79,17 @@ background.
 
 ## The next action
 
-**Phase A2 — the capability-scoped host API.** A pack declares the capabilities it needs
-and the daemon grants only those: a call to a function that was not granted has to fail as
-an **unknown function**, not as a runtime check a call site could forget.
+**Phase A3 — `triggers` + `kind` in the pack schema.** The pack gains a `kind`
+(`"pack"` or `"mode"`) and a `triggers` list, both **additive**: the three shipped
+packs must keep working unchanged, and a malformed `kind` has to be a named error like
+the other schema errors. `WORK-ORDER.md` A3.
 
-`DESIGN.md` §2 has the capability table and §3 the mechanism — **one engine per capability
-set**, because the sandbox keeps one engine per thread since 1.1.3, so "register less" is
-no longer free. The full phase list is in `WORK-ORDER.md`. Phases run in order:
-**A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and settled.
+A2 is the phase before it, and it is done: the capability-scoped host API. A pack declares
+the capabilities it needs and the daemon grants only those — **one engine per capability
+set** (`DESIGN.md` §3), because the sandbox keeps an engine per thread since 1.1.3, so
+"register less" is no longer free. The full phase list is in `WORK-ORDER.md`. Phases run
+in order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and
+settled.
 
 ---
 

@@ -35,9 +35,10 @@ pub struct StatusSnapshot {
     pub trigger_source: Option<String>,
     #[serde(default)]
     pub cooldown_remaining_ms: Option<u64>,
-    /// Always `None`. The engine no longer plans a switch: it only knows the lockout, which
-    /// `cooldown_remaining_ms` reports as the time that is left. The field stays in the wire
-    /// format so that older clients keep loading.
+    /// The change the lockout is holding back, if any: `"apply"` or `"revert"`. `None` when
+    /// nothing is waiting - the machine is where the intent says it is, or the window is not
+    /// holding anything. The field stays in the wire format so that older clients keep
+    /// loading.
     #[serde(default)]
     pub cooldown_action: Option<String>,
     #[serde(default)]

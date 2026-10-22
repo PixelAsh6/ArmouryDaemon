@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A — **A1 done** (the TLS root store), A2 next |
-| **Next action** | **A2** — the capability-scoped host API (`WORK-ORDER.md` A2) |
-| **Branch** | `main` (the A1 commit is on top of `9276196`, version **1.1.4**, released) |
+| **Phase** | A — **A1 and A2 done and released** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API), A3 next |
+| **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) — the next phase, and it is not started |
+| **Branch** | The phase is integrated on **`feature/phase-a`** — A2, with the lockout re-timing and the art fetch merged into it — and it is the **v1.1.5** release. `main` was at `0ecacd3` (version 1.1.4) when the integration started |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |
@@ -179,6 +179,13 @@ is accepted — the size rule bends for a fix that makes the catalogue reachable
   catalogue — but it is the same bug and it is **still open**. It is also why the binary
   grew: the **Mozilla roots are still in it** (they are only used by those two calls), and
   moving them to the shared client would take them out again.
+  **Superseded on 2026-10-22 (the same day, later):** the art fetches now share the
+  catalogue's client (`art.rs:995`, `console_ui.rs:1324`), so they are validated against
+  the Windows certificate store too, and the bundled roots are out of the binary. That is
+  **another agent's work** (`fix/art-fetch-windows-root-store`), and it is why the size
+  baseline on this branch is *lower* than the A1 one — see the entry at the end of this
+  file and `GOTCHAS.md` trap 36. On a tree without that commit, the bullet above still
+  holds.
 - A **self-signed certificate cannot be used for a local TLS server** on Windows: `SslStream`
   refuses it with *"the platform does not support ephemeral keys"*. A probe that shows the
   daemon **refusing** an untrusted certificate is therefore not possible without a key in the
@@ -197,6 +204,333 @@ per thread since 1.1.3, so "register less" is no longer free), built lazily in a
 map capped like the AST cache. A pack that calls a function it was not granted has to fail as
 an **unknown function**, and the denial has to name the missing capability and land in the
 pack's log. `WORK-ORDER.md` A2.
+
+---
+
+### 2026-10-22 — Phase A2: the host API is scoped by capability
+
+**What I did.** A pack declares the **capabilities** it wants and the daemon grants only
+those. The sandbox now keeps **one engine per capability set** — built lazily, capped at
+32 like the AST cache, keyed by a bitmask over the twelve capabilities — and registers
+**only the granted functions** on it. A call to a function the pack was not granted fails
+as an **unknown function**: the denial is structural, not a check a call site could
+forget, because there is no call site to forget it at.
+
+The taxonomy lives in the schema crate (`armoury_core::pack::Capability` and `CapSet`),
+because the permission window (Phase B4) has to show the same table the gate uses. The
+pack schema gained an **additive** `capabilities` field that defaults to every
+capability, so the three shipped packs keep working unchanged.
+
+The eight host functions the table listed as *new* now exist: `windows_of`,
+`window_hide`, `window_show` (the killswitch's own windows), `audio_sessions`,
+`audio_mute`, `audio_mute_all` (the audio sessions and the output devices) and
+`overlay_show`, `overlay_hide` (the idle overlay) — **eight** functions over the 18
+that were there. They are thin wrappers over the code that was already there —
+**nothing moved**.
+
+**Files touched.** `crates/armoury-core/src/pack.rs` (the capability taxonomy, the
+`capabilities` field, six tests), `crates/armoury/src/script.rs` (the engine cache, the
+per-capability registration, the denial, six tests), `crates/armoury/src/packs.rs` (the
+grant set reaches the worker, the window and audio helpers, the overlay request queue),
+`crates/armoury/src/daemon.rs` (the overlay requests), `crates/armoury/src/killswitch.rs`
+(the session ids, `windows_of` made public, `session_states`, `mute_pid`),
+`crates/armoury/src/overlay.rs` (`mute_all_host`), `tools/daemon-selftest.ps1` (five
+checks) and this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The release exe | **12,868,608 bytes** (A1, `0ecacd3`) | **12,925,440 bytes** — **+56,832 (+0.44 %)** |
+| The daemon's idle cost | **1.016 CPU s in 60 s = 1.692 % of one core** (A1, the same tree) | **0.984 CPU s in 60 s = 1.641 %** — no regression |
+| The unit tests | 341 (256 in `armoury`, 85 in `armoury-core`) | **353** (262 / 91) — **+12** |
+| The harness checks | 90 `Check` calls | **95** `Check` calls — **+5** |
+
+*Idle cost:* the A1 method, unchanged. A throw-away instance — its own pipe, config
+folder and single-instance mutex (`ARMOURY_TEST_NS`), started with `--autostart` so no
+dashboard opens — with the three shipped packs and four tracked apps, which is the shape
+of the installed daemon. Twenty seconds of settling, then sixty seconds of
+`TotalProcessorTime`. **The installed daemon was not stopped, started or restarted**, and
+none of the four tracked apps was running, so no pack ran and nothing on the machine
+moved.
+
+*Exe size:* the release build of the tree, taken from the CI artefact.
+`cargo build --release` is never run on this machine. **The executable grew by 56,832
+bytes.** `DECISIONS.md` §15 says where the bytes are (a Rhai registration costs about
+5 KB of machine code per *shape*, and the phase adds eight host functions over six new
+shapes) and what was rejected. **The size rule bends here, once** — and the baseline
+for the next phase is now 12,925,440 bytes.
+
+*The CI run:* **39707130123** (the workflow dispatch on the measurement branch), the job
+**green** in **9 min 31 s**: the debug build, **353 unit tests**, and the self-test
+harness with **95 checks, all passed** — plus the release build and the artefact the
+size was measured from. A later run on the branch's tip was green as well
+(**39708602555**, **7 min 48 s**): the same 353 tests, the same 95 checks, and the same
+**12,925,440-byte** executable.
+
+**Decisions.** `DECISIONS.md` §14: the taxonomy, one engine per capability set, the
+**`time` capability for `sleep`**, the default of the `capabilities` field, and the
+overlay as a request to the daemon rather than a call from the pack.
+
+**Surprises.**
+
+- **The table had a hole in it.** It listed 17 of the 18 existing host functions:
+  **`sleep` was in no capability at all**. Under per-capability-set engines a pack whose
+  script called `sleep` would have failed as an unknown function. `sleep` is now a
+  capability of its own (`time`): it grants nothing, it is a flow-control primitive, and
+  the operation budget and the wall clock already bound it. Folding it into `context`
+  would have handed a read-only pack a way to stall the pack worker.
+- **`DESIGN.md` §1 said the default of `capabilities` was `[]`.** That is wrong for the
+  shipped packs — the Rainmeter pack's script uses `window_message` — so the default is
+  **every capability** and the field is what the pack *asks* for. The user's own grant
+  list comes later and narrows it down. `DESIGN.md` §1 now says so.
+- **Rhai's "unknown function" is also what a wrong argument type produces.** A call to a
+  function that *is* on the engine but with the wrong arguments comes back as
+  `ErrorFunctionNotFound` too. The gate therefore checks that the capability really was
+  not granted before it calls the call a denial — otherwise a pack that was granted
+  `exec` and called `ctx.run_cli(42)` would be told it needs the `exec` capability.
+- **Rhai names a call by its signature**: the error carries
+  `"run_cli (ScriptHost, &str | ImmutableString | String)"`, so the name has to be cut
+  off at the first space.
+- **An AST belongs to no engine** — the functions are resolved when it *runs* — so one
+  AST cache serves every capability set. Only the engine is per capability set.
+- **COM is per thread.** The daemon's main thread has an apartment; the **pack worker is
+  a thread of its own**, and a pack that asks for the `audio` capability needs one too.
+- **A window belongs to the thread that created it.** The pack worker therefore cannot
+  show the idle overlay: the request is handed to the daemon's main loop, which keeps
+  the crash-recovery ledger, the keypress dismissal and the idle-mode policy.
+- **The COM interfaces of the `windows` crate are not `Send`**, so a global ledger cannot
+  hold the audio session objects. The ledger holds the **session identifier** instead —
+  Windows gives every session one, and it survives from sweep to sweep.
+- **`HashMap::new()` is not a `const fn`**: a global map cannot be built in a static's
+  own initializer. The ledger is a `OnceLock` and the map is built in `get_or_init`.
+- **`IAudioSessionEnumerator::GetCount` returns an `i32`**, not a `u32` — the index of a
+  session in the sweep is an `i32`. Two CI builds found this.
+- **The host API has 26 functions, not 25**: the table's three new groups carry
+  **eight** functions (3 + 3 + 2), not seven. A unit test counts them, and it caught
+  the miscount in the first CI run.
+- **The executable grew by 56,832 bytes** (+0.44 %) and the size rule says only Phase E
+  may add bytes. The bytes are the eight new host functions: a Rhai registration costs
+  about 5 KB of machine code per *shape*, and the phase adds six new shapes.
+  `DECISIONS.md` §15 has the measurement, the reason and the alternative (the eight
+  functions can move to the killswitch/idle phase, B/C, if the user wants the size
+  flat).
+- **Two agents share this working tree.** The A2 branch picked up the other agent's
+  commits, so an A2-only copy was made on `feature/a2-capabilities-clean`, built from
+  `0ecacd3` with only the A2 commits on it. **The phase was later finished on the
+  shared branch `feature/a2-capabilities`**, which is the branch it is delivered on —
+  see the entry below, and note that the two trees have different numbers.
+
+**Next.** Phase A3 — `triggers` + `kind` in the pack schema (`crates/armoury-core/src/
+pack.rs`). The pack gains a `kind` (`"pack"` or `"mode"`) and a `triggers` list, both
+**additive**: the three shipped packs must keep loading, installing, applying, reverting
+and removing unchanged, and a malformed `kind` has to be a named error like the other
+schema errors. `WORK-ORDER.md` A3. The capability table is in `DESIGN.md` §2 and the
+`Capability`/`CapSet` types are already in `armoury_core::pack` — A3 adds the sibling
+fields to the same struct and validates them the same way.
+
+**This entry measures the A2-only tree** (`0ecacd3` + A2), which is the branch
+`feature/a2-capabilities-clean`. The phase was **finished** later on the shared branch
+`feature/a2-capabilities`, which carries another agent's commits and therefore has
+**different numbers** — the entry below has them.
+
+---
+
+### 2026-10-22 — Phase A2 finished: the host API reports what it changed, and the tree is measured honestly
+
+**What I did.** The A2 work was already committed (`e537d70` and the fixes after it), so
+this session did not build the gate again — it **finished** it. Three things were
+missing or wrong, and all three are fixed:
+
+1. **`audio_mute` did not return the previous mute state.** `DESIGN.md` §2 requires it:
+   *"must return the previous mute state, and must not unmute a session the user
+   muted"*. The implementation returned only counts (`2 session(s) muted, 1 left alone,
+   0 could not be changed`), which says *how much* happened but not *what the state
+   was*. It now names **every session of the process and the state it was in before the
+   call** — `muted {session} (was playing)`, `unmuted {session} (was muted)`,
+   `left alone {session} (was muted)`, `could not be changed {session} (was playing)` —
+   and a process without an audio session gets `no audio session for pid {pid}`.
+2. **The rule that a session the user muted is never unmuted again had no test.** The
+   mute pass called the real session sweep, so nothing could be proved about it. The
+   sweep and the ledger are now arguments of `mute_sessions`, and a unit test proves
+   both halves: the user's own mute is left alone, the report says so, and the unmute
+   puts back exactly what was changed.
+3. **`window_hide` could report the visibility of a window that is not there any more.**
+   A window handle outlives its window and Windows hands the same handle to another
+   window later, so the recorded state was about a window that had gone. The handle is
+   now checked with `IsWindow` before the old state is reported.
+
+The self-test harness grew by **one** check: the capability pack now calls a **granted**
+function (`read_file`) before the ungranted one, so the harness proves the gate is
+**selective** — the pack's own function still ran, and only the other one was refused.
+Its revert script uses granted functions only, so the revert cannot fail on a denial.
+
+**Files touched.** `crates/armoury/src/killswitch.rs` (the mute pass, the report, two
+tests), `crates/armoury/src/packs.rs` (the stale-handle check), `crates/armoury/src/script.rs`
+(the mute reached end to end in a test), `tools/daemon-selftest.ps1` (one check, the
+capability pack), `docs/modularity/DESIGN.md`, `DECISIONS.md` (§16), `GOTCHAS.md`
+(traps 35–38), `README.md`, `PROGRESS.md`, and the gitignored plan file
+`docs/plans/2026-10-21-modular-modules.md`.
+
+**Measured.** All of it on the branch this phase is delivered on
+(`feature/a2-capabilities`), whose parent is the art fetch through the Windows
+certificate store.
+
+| | before | after |
+|---|---|---|
+| The release exe | **12,857,344 bytes** (the tip before this session, `c104f32`) | **12,862,976 bytes** — **+5,632 (+0.04 %)** |
+| The daemon's idle cost | **0.969 CPU s in 60 s = 1.615 % of one core** (median of 3) | **0.969 CPU s in 60 s = 1.615 % of one core** (median of 3) — **no regression** |
+| The unit tests | 357 (266 in `armoury`, 91 in `armoury-core`) | **359** (268 / 91) — **+2** |
+| The harness checks | 100 `Check` calls | **101** `Check` calls — **+1** |
+
+*Idle cost:* the A1 method, unchanged. A throw-away instance — its own pipe, config
+folder and single-instance mutex (`ARMOURY_TEST_NS`), started with `--autostart` so no
+dashboard opens — with the three shipped packs **enabled** and **four tracked apps**,
+which is the shape of the installed daemon. Twenty seconds of settling, then sixty
+seconds of `TotalProcessorTime`. **The installed daemon was not stopped, started or
+restarted**, and none of the four tracked apps exists on this machine, so no pack ran
+and nothing on the machine moved. **Three samples of each binary, alternating, on the
+same machine** — the single 60-second samples scatter over 0.812–1.016 CPU s, so one
+sample proves nothing; the medians are identical.
+
+*Exe size:* the release build of the tree, taken from the CI artefact.
+`cargo build --release` is never run on this machine. **+5,632 bytes**, and the PE
+section table says where: **+4,608 bytes of `.text`** (the mute pass, its report and
+the `IsWindow` check) and **+1,024 bytes of `.rdata`** (the format strings). The
+`.pdata` did not move.
+
+*The phase as a whole on this tree:* the tree started at **12,796,416 bytes** (the art
+fetch, which takes Mozilla's bundled roots **out** of the binary), so the whole of A2
+costs **+66,560 bytes (+0.52 %)** here, against **+56,832 (+0.44 %)** on the A2-only
+tree. **The baseline for the size rule on the delivered branch is 12,862,976 bytes.**
+
+*The CI run:* **39731173747** (the workflow dispatch on the commit that carries the
+phase's code), the job **green** in **6 min 22 s**: the debug build, **359 unit tests**
+(268 + 91), and the self-test harness with **101 checks, all passed** — plus the
+release build and the artefact the size was measured from. The branch's tip was
+confirmed green afterwards, in **39733574798** (**6 min 41 s**), **39734338552**
+(**6 min 34 s**) and **39735476837** (**5 min 29 s**): the same 359 tests and the same
+101 checks every time. **The commits after those touch this folder only.**
+
+**Decisions.** `DECISIONS.md` §16: `audio_mute` returns the previous mute state **per
+session**, not per process and not as a count — a process can own several sessions and
+they need not be in the same state, and one word for the whole process would either
+lose that distinction or be a guess. §15 now carries the size of the delivered tree
+next to the size of the A2-only tree, because a number without its tree is not a number.
+
+**Surprises.**
+
+- **The branch this work is delivered on is not the A2 tree.** It also carries the art
+  fetch through the Windows certificate store, so it has **four more unit tests**,
+  **five more harness checks** and a **68 KB smaller executable** than the A2-only
+  copy. Every number in the folder therefore needs its tree, and the folder now says
+  so (`GOTCHAS.md` trap 35).
+- **The size baseline moved *down* without anybody touching the size rule.** The art
+  fetch takes Mozilla's bundled roots out of the binary, so the "current size" went
+  from 12,868,608 (A1) to 12,796,416. A baseline carried over from another branch
+  would have been wrong in the *good* direction, which is the dangerous kind of wrong
+  (`GOTCHAS.md` trap 36).
+- **A single 60-second idle sample proves nothing.** The samples of one and the same
+  binary scattered over 0.812–1.016 CPU s (1.35 %–1.69 % of a core). The A1 and A2
+  entries each quote one sample; the numbers were close enough, but the honest way is
+  a median of several, alternating between the two binaries.
+- **`windows::Win32::UI::WindowsAndMessaging::IsWindow` takes an `Option<HWND>`,**
+  while `IsWindowVisible` next to it takes a plain `HWND`. The first CI run of this
+  session failed on exactly that one line (`packs.rs:1225`, `window_exists`) — and
+  because it was the only error, it also proved that the rest of the change
+  type-checked. The vendored source is in
+  `%USERPROFILE%\.cargo\registry\src\…\windows-0.62.2`: read it, do not remember it.
+- **A pack whose capability list does not include `journal` cannot call `ctx.log`** —
+  and the harness's capability pack had exactly that in its revert script. It was
+  harmless (the revert is skipped by its guard), but it was one guard away from a
+  failed removal. The revert now uses a granted function only.
+- **`HashMap::new` really is not a `const fn`** — the map is randomly seeded and the
+  seed is the HashDoS protection, so it cannot be made at compile time. The folder's
+  trap was right; it now says *why*, so that nobody "fixes" the ledger with
+  `HashMap::with_hasher(BuildHasherDefault::new())`, which has a fixed hash
+  (`GOTCHAS.md` trap 37).
+
+**Next.** Phase A3 — `triggers` + `kind` in the pack schema (`crates/armoury-core/src/
+pack.rs`). The pack gains a `kind` (`"pack"` or `"mode"`) and a `triggers` list, both
+**additive**: the three shipped packs must keep loading, installing, applying, reverting
+and removing unchanged, and a malformed `kind` has to be a named error like the other
+schema errors. `WORK-ORDER.md` A3. The `Capability`/`CapSet` types and the additive
+`capabilities` field are already in `armoury_core::pack` — A3 adds the sibling fields
+to the same struct and validates them the same way, and it should reuse the same
+`#[serde(default = ...)]` pattern the capability field uses.
+
+---
+
+### 2026-10-22 — the three branches integrated, and the re-timing released
+
+**What I did.** The three green branches were integrated into one, `feature/phase-a`, and
+the result is the **1.1.5** release.
+
+| Branch | Tip | What it carried |
+|---|---|---|
+| `feature/a2-capabilities` | `ac404ec` | **Phase A2** — the capability-scoped host API |
+| `fix/lockout-retime` | `494aa1b` | the cooldown re-timing, and the dashboard that names the app and says a change is waiting |
+| `fix/art-fetch-windows-root-store` | `79ad7be` | the cover art through the Windows certificate store, `rustls-webpki-roots` dropped |
+
+The branch was cut from A2 and the other two were merged into it. **Both merges were
+clean**, and the reason is worth writing down: the art fetch was **already an ancestor**
+of A2 (`2b119c6`), so that merge brought nothing new in content, and the harness's accept
+fix is the same change twice (`aca3414` on A2, `79ad7be` on the art branch), which git
+resolves on its own. The merged harness therefore carries **both** sets of checks — A2's
+capability checks and the art branch's five root-store checks — and nothing was dropped.
+
+The one line that was still missing: the snapshot's `cooldown_action` was hard-coded to
+`None`, although the wire format has carried the field since the first release. The
+daemon publishes it now, from the engine's own `pending_change`, so the dashboard's
+cooldown row can say that a change is waiting behind the window — and the harness checks
+that it does.
+
+**Files touched.** `crates/armoury/src/daemon.rs` (the one line), `crates/armoury-core/
+src/status.rs` (the field's doc comment), `tools/daemon-selftest.ps1` (the re-timing
+section, seven checks), `Cargo.toml` and `Cargo.lock` (the version), `README.md`,
+`CHANGELOG.md`, `release-notes/v1.1.5.md`, and this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The unit tests | 359 (268 in `armoury`, 91 in `armoury-core`) | **364** (270 / 94) — the lockout branch's five |
+| The harness checks | 101 `Check` calls | **108** — **+7** (the re-timing section) |
+
+**Decisions.** `DECISIONS.md` §17: a change of the cooldown **re-times the window that is
+running** — the window keeps its start and takes the new length, so it ends at
+`start + cooldown`, and the change it holds lands at the new expiry. The row **H21** of
+the local-only `DECISIONS-2026-10-17.md` records the same decision, with the log excerpt
+it is based on.
+
+**Surprises.**
+
+- **The merge that was supposed to conflict did not.** The folder's plan and the session
+  notes expected the art branch's harness changes and A2's to collide. They do not: the
+  art branch's work is **in** A2 (it is the ancestor `2b119c6`), and the one commit that
+  was not — the accept fix — is byte-for-byte the same change as A2's `aca3414`. Git
+  resolved it on its own, and the merged harness has both sets of checks. **A merge that
+  resolves itself is not a merge that was checked**: the harness still had to be read to
+  be sure that nothing was dropped.
+- **The lockout branch touches no harness at all.** It changed `engine.rs` and `ui.rs`
+  and nothing else, so the defect it fixed had **no harness check** — the harness set the
+  cooldown only *before* each scenario, never while a window was running. That gap is
+  the defect's real home, and the harness now closes it: a scenario that changes the
+  cooldown while a window runs, and asserts that the window takes the new length and that
+  the change it holds lands at the new expiry.
+- **`cooldown_action` was `None` in the snapshot while the field was live in the wire
+  format and in the dashboard's row.** The UI that reads it was written first and the
+  daemon that fills it was not — one line in `App::status`, the last thing missing
+  between the lockout model and what the user sees.
+
+**Next.** Phase A3 — `triggers` + `kind` in the pack schema (`crates/armoury-core/src/
+pack.rs`). The pack gains a `kind` (`"pack"` or `"mode"`) and a `triggers` list, both
+**additive**: the three shipped packs must keep loading, installing, applying, reverting
+and removing unchanged, and a malformed `kind` has to be a named error like the other
+schema errors. `WORK-ORDER.md` A3. The `Capability`/`CapSet` types and the additive
+`capabilities` field are already in `armoury_core::pack` — A3 adds the sibling fields to
+the same struct and validates them the same way, with the same `#[serde(default = ...)]`
+pattern.
 
 ---
 

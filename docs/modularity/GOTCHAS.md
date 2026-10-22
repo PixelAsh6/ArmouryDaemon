@@ -82,6 +82,15 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 > **After A1 (2026-10-22): 12,868,608 bytes** — **+60,416 bytes (+0.47 %)** for the platform
 > verifier, the WinINet proxy reader and the gzip decoder. `DECISIONS.md` §12 says why that
 > is accepted, and what would pay it back.
+>
+> **After A2, on the A2-only tree (`0ecacd3` + A2): 12,925,440 bytes** — **+56,832 bytes
+> (+0.44 %)** for the eight new host functions. `DECISIONS.md` §15 has the measurement.
+> **After A2, on the branch this phase is delivered on** (the same A2 work on a tree that
+> also carries the art fetch through the Windows certificate store): **12,857,344 bytes**,
+> which is **+60,928 bytes (+0.48 %)** over *that* tree's baseline of 12,796,416 — the art
+> fetch takes Mozilla's bundled roots out of the binary, so that tree starts lower.
+> **The baseline for the size rule on the delivered branch is 12,857,344 bytes.** A number
+> without its tree is not a number (trap 35).
 
 ### Runtime
 
@@ -95,7 +104,7 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 | Named-pipe JSON round trip | **28.0 µs** (50 sequential: 32.5 µs/trip) |
 | SHA-256 | 1,312 MiB/s (32 MiB in 24.18 ms) |
 | Resident daemon | 2.0 MB private / 12.7 MB WS / 0.078 % of one core (measured pre-1.1.3) |
-| Resident daemon, **four tracked apps** | **1.72 % of one core** — 1.031 CPU seconds in 60 s (2026-10-22, A1). The difference is the 1 Hz process-table walk (trap 5): with nothing tracked it is skipped. **After A1: 1.692 %** (1.016 CPU s in 60 s) — unchanged, as it has to be. |
+| Resident daemon, **four tracked apps** | **1.72 % of one core** — 1.031 CPU seconds in 60 s (2026-10-22, A1). The difference is the 1 Hz process-table walk (trap 5): with nothing tracked it is skipped. **After A1: 1.692 %** (1.016 CPU s in 60 s) — unchanged, as it has to be. **After A2 (the delivered branch): 1.615 %** (0.969 CPU s in 60 s) — the **median of three 60 s samples**, alternating with the binary before it; the medians are the same, so the phase costs nothing at idle. |
 
 ### What the numbers decide
 
@@ -118,15 +127,20 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 1. **The `ureq` root store bug — fixed in A1.** `features = ["rustls"]` only → Mozilla
    roots, not the Windows cert store → the catalog failed behind any corporate CA. The
    fix is the `platform-verifier` feature **and** `RootCerts::PlatformVerifier` together.
-   **The art fetches still have it**: `art.rs:991` and `console_ui.rs:1320` make their own
-   `ureq::get(...)` calls with no TLS config, so the SteamGridDB lookups are still
-   validated against the bundled roots. Same bug, still open.
-2. **The pack worker is a single serial thread** (`packs.rs:160`,
+   **The art fetches had the same bug and had it fixed as well** — they now share the
+   catalogue's client (`art.rs:995` and `console_ui.rs:1324`, both `catalog::agent()`),
+   so the SteamGridDB lookups are validated against the Windows certificate store too.
+   That fix is **another agent's work** (`fix/art-fetch-windows-root-store`); a tree
+   without it still has the bug in the art fetches, and the binary still carries
+   Mozilla's bundled roots because of it.
+2. **The pack worker is a single serial thread** (`packs.rs:168`,
    `while let Ok(job) = jobs.recv()`). A slow mode would block every later apply and
    revert. Modes need their own worker.
-3. **The engine is cached per thread** since 1.1.3 (`script.rs:86`, `SANDBOX`). This
-   **changes how capability scoping must be built** — it is no longer "build an engine
-   per run and register less". See `DESIGN.md` §3.
+3. **The engine is cached, and the cache is keyed by the capability set** (A2). Since
+   1.1.3 the sandbox kept one engine per thread; since A2 it keeps **one engine per
+   capability set** (`script.rs:90`, `ENGINES`), built lazily and capped at 32 like
+   the AST cache. This **changed how capability scoping had to be built** — it was no
+   longer "build an engine per run and register less". See `DESIGN.md` §3.
 4. **The killswitch no longer re-sweeps audio per pid** (1.1.3). One sweep per press;
    the release restores from the ledger without enumerating at all.
 5. **The daemon still walks the whole process table every second when something IS
@@ -158,14 +172,19 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     **exactly once**; a close is **always held** (it starts a window if none is
     running and keeps the running one rather than restarting it); a **restart inside
     the window cancels the hold**; a **manual action bypasses** the window. Read
-    `engine.rs:291` (`tick`), `:314` (`try_change`), `:366` (`lock_running`), `:145`
-    (`set_paused`), `:183` (`set_idle`) before touching it.
+    `engine.rs:344` (`tick`), `:367` (`try_change`), `:419` (`lock_running`), `:198`
+    (`set_paused`), `:236` (`set_idle`) before touching it — and, for the re-timing,
+    `:65` (`Window`), `:126` (`set_cooldown`), `:178` (`pending_change`).
     The 2026-10-21 model — *"the apply is never deferred, the lockout holds the
     revert"* — is **rejected**: it was an over-correction, it was not needed for the
     21 Oct flip-flop, and the user rejected it on 2026-10-22. The older model —
     "the lockout is a minimum spacing between two changes" — is gone for good.
     **The trap:** a start inside a window means the packs are *late*. That is the
     intended behaviour, not a bug — do not "fix" it by applying at once.
+    **And the rule added on 2026-10-22 (1.1.5):** a change of the cooldown
+    **re-times the window that is running** — it keeps its start and takes the new
+    length, so it ends at `start + cooldown`. A window is never a mix of the old and
+    the new length, and the change it holds lands at the new expiry.
 14. **`/docs/plans/` and `/docs/research/` are gitignored**, along with `HANDOVER.md`,
     `PLAN.md`, `RESEARCH.md`, `PACK-SPEC-PROPOSAL.md`, `SPEC3-SCRIPTING.md`,
     `DECISIONS-2026-10-17.md` and **`/docs/scope.md`** — the private scope note for
@@ -219,6 +238,93 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     harness probes the public catalogue instead.
 24. **`Cargo.lock` carries two `windows-sys` versions now**: 0.61.2 (the project's) and
     0.52.0 (from `rustls-platform-verifier`). That is normal — do not "fix" it.
+25. **Rhai's "unknown function" is also what a wrong argument type produces.** A call
+    to a function that is on the engine but with the wrong arguments comes back as
+    `ErrorFunctionNotFound` too — exactly like a call to a function that is not on the
+    engine at all. The capability gate reads the function name out of that error
+    (`script.rs:265`, `denial`), so it **must** check that the capability really was
+    not granted before it calls the call a denial. A pack that was granted `exec` and
+    called `ctx.run_cli(42)` must not be told it needs the `exec` capability.
+26. **Rhai names a call by its signature, not by its name**: the error carries
+    `"run_cli (ScriptHost, &str | ImmutableString | String)"`. The name has to be cut
+    off at the first space before it can be looked up in the capability table.
+27. **An AST belongs to no engine.** The compiled script is resolved against the
+    engine when it *runs*, so one AST cache serves every capability set — only the
+    engine is per capability set. A pack's script may therefore be compiled by the
+    daemon's main thread (the install-time check) and run on the pack worker's
+    restricted engine.
+28. **COM is per thread.** The daemon's main thread has an apartment
+    (`killswitch::init_com()`), but the **pack worker is a thread of its own** — a pack
+    that asks for the `audio` capability needs one too, or every audio call fails.
+    `packs::start` sets it up.
+29. **A window belongs to the thread that created it.** The message queue of the
+    overlay's windows lives on the thread that created them, so a pack worker cannot
+    show the idle overlay itself: the daemon's main loop owns it, and the host
+    function hands the request over.
+30. **The COM interfaces of the `windows` crate are not `Send`.** A global ledger
+    cannot hold the audio session objects (the killswitch's own `Ledger` is a plain
+    struct on the main thread for that reason). The host's ledger therefore holds the
+    **session identifier** — a string — and matches the sessions of a sweep by it.
+31. **Count the tests line by line, not with a loose regex.** The scan that counts the
+    tree's tests has to be anchored to the **end of the line**
+    (`(?m)^[ \t]*#\[test\][ \t]*$`): a pattern with a `\s*` that may cross a newline
+    counts **four tests too many**, and the number then disagrees with what CI reports.
+    The same goes for the harness's `Check` calls (`^[ \t]*Check[ \t]`). The honest
+    numbers for the A1 tree are **341 unit tests** (256 in `armoury`, 85 in
+    `armoury-core`) and **90 harness checks** — the ones the folder already carries.
+    The delivered tree (A2 + the art fetch + the lockout re-timing) carries **364 unit
+    tests** (270 / 94) and **108 harness checks**.
+32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
+    built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
+    `HashMap` is not) — use a `OnceLock` and build the map in `get_or_init`.
+33. **A Rhai host function is not free: about 5 KB of machine code per *shape*.**
+    Every shape of registered function gets its own instantiation of the
+    argument-marshalling code — the `Dynamic` unboxing of each parameter and the
+    wrapping of the return value. Eight host functions with six shapes cost the
+    executable **47,616 bytes of `.text`** (measured: the section tables of the two
+    release builds). A "thin wrapper" over a Win32 call is therefore not thin in the
+    binary, and the host API's size is worth watching before it grows again.
+34. **The PE section table tells you where the bytes went.** The release build is a PE
+    file; reading the section headers (`.text`, `.rdata`, `.pdata`, …) of two builds
+    says in one minute whether a change grew *code* or *data*. That is how the
+    registration cost above was found.
+35. **The numbers in this folder are per tree, and a shared tree is not the A2 tree.**
+    The branch this work is delivered on carries another agent's commits (the art
+    fetch through the Windows certificate store), so it has **four more unit tests**,
+    **five more harness checks** and a **different executable size** than the A2-only
+    copy of the same phase. Quote the numbers of the tree you actually measured, and
+    say which tree that is. A number without its tree is not a number.
+36. **The size baseline moves when another branch lands — and it can move *down*.**
+    The art fetch took Mozilla's bundled roots out of the binary, so the release exe
+    went from 12,868,608 bytes (A1) to **12,796,416** without anybody touching the
+    size rule. Re-measure the baseline on the tree you are on; never carry a baseline
+    over from another branch.
+37. **`HashMap::new` is not a `const fn` because the map is randomly seeded.** The
+    seed is the HashDoS protection, and a seed cannot be made at compile time — so
+    `static M: Mutex<HashMap<..>> = Mutex::new(HashMap::new())` does not compile.
+    `HashMap::with_hasher(BuildHasherDefault::new())` *is* const (since 1.85), but it
+    has a **fixed** hash: do not "fix" the ledger with it. Use a `OnceLock` (or
+    `LazyLock`) and build the map in `get_or_init`. (`Mutex::new` and `Vec::new` are
+    const, so a `Vec` in a static is fine.)
+38. **A window handle outlives its window.** `ShowWindow` on a handle whose window was
+    closed does nothing, and Windows may hand the same handle to another window later.
+    A ledger of "the visibility this handle had before we hid it" is therefore wrong
+    after the window is gone: check `IsWindow` before you report the old state, or a
+    revert shows a window it should not.
+39. **One 60-second idle sample of the daemon proves nothing.** The samples of one and
+    the same binary scattered over **0.812–1.016 CPU s in 60 s** (1.35 %–1.69 % of a
+    core) on this machine, with the user's own desktop running. Measure **three
+    samples of each binary, alternating**, and compare the medians. A single sample
+    can make a change look like a 0.2 % swing that is really the noise.
+40. **A harness that only sets a setting *before* a scenario cannot catch a setting
+    that changes *during* one.** The lockout re-timing defect lived in exactly that
+    gap: the harness set the cooldown before every scenario, so a window that was
+    already running was never re-timed and the change it was holding landed at the
+    old expiry — and no check failed, because no check ever changed the setting
+    while a window ran. The harness now does that (`12b`), and it asserts both the
+    remaining time **and** the moment the held change lands. **When a defect is
+    "the setting did not take effect *now*", the harness has to change the setting
+    *now*.**
 
 ---
 
@@ -248,7 +354,7 @@ Required defences:
    `["windows","audio"]` gets those and nothing else; an ungranted call must fail.
 5. **A pack script may not write outside** `%APPDATA%`, `%LOCALAPPDATA%`,
    `%PROGRAMDATA%` and the target app's own folder — the existing guard
-   (`script.rs:471-533`, `script.rs:610`) compares path *components*, not string
+   (`script.rs:668`, `write_allowed`) compares path *components*, not string
    prefixes, and refuses symlinks. Do not weaken it. Note that
    `%APPDATA%\ArmouryDaemon` is inside `%APPDATA%`, so a pack script can already
    write `config.json` and `journal.json` — decide deliberately whether that stays

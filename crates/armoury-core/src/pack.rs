@@ -21,6 +21,15 @@ fn default_true() -> bool {
     true
 }
 
+/// The default for a pack that does not declare its capabilities: everything.
+///
+/// The three shipped packs predate the field, and a pack that asked for nothing would
+/// lose the host functions it uses. The user's own grant list (the permission window)
+/// comes later and narrows this down.
+fn default_capabilities() -> CapSet {
+    CapSet::ALL
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pack {
     #[serde(default = "default_spec")]
@@ -46,6 +55,10 @@ pub struct Pack {
     /// Spec 2: a script per block, run by the daemon after the steps (Rhai, sandboxed).
     #[serde(default)]
     pub script: PackScript,
+    /// What this pack asks the host for: the capabilities it needs. A pack that declares
+    /// none gets the whole host API (see [`default_capabilities`]).
+    #[serde(default = "default_capabilities")]
+    pub capabilities: CapSet,
     pub apply: StepBlock,
     pub revert: StepBlock,
 }
@@ -64,6 +77,231 @@ impl PackScript {
     pub fn is_empty(&self) -> bool {
         self.apply.as_deref().map_or(true, |s| s.trim().is_empty())
             && self.revert.as_deref().map_or(true, |s| s.trim().is_empty())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The capabilities
+//
+// A pack declares the capabilities it needs and the daemon grants only those. A call to
+// a host function of a capability that was **not** granted fails as an *unknown
+// function*: the denial is structural, not a check a call site could forget.
+
+/// One capability: a group of host functions a pack may ask the host for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum Capability {
+    /// Read-only context about the app the pack drives.
+    Context,
+    /// The pack's own journal: what it logs and what it captures.
+    Journal,
+    /// Read a file anywhere on the machine.
+    Files,
+    /// Write a file — only inside the folders a pack may write in.
+    FilesWrite,
+    /// Look at, kill and start processes.
+    Process,
+    /// Run a program.
+    Exec,
+    /// Inject keystrokes.
+    Input,
+    /// Send a message to another app's window.
+    Ipc,
+    /// Hide and show the windows of other apps.
+    Windows,
+    /// Mute and unmute audio.
+    Audio,
+    /// The idle overlay: black screens over the monitors.
+    Overlay,
+    /// Wait. A flow-control primitive: it grants nothing.
+    Time,
+}
+
+/// Every capability, in the order of the table.
+pub const ALL_CAPABILITIES: [Capability; 12] = [
+    Capability::Context,
+    Capability::Journal,
+    Capability::Files,
+    Capability::FilesWrite,
+    Capability::Process,
+    Capability::Exec,
+    Capability::Input,
+    Capability::Ipc,
+    Capability::Windows,
+    Capability::Audio,
+    Capability::Overlay,
+    Capability::Time,
+];
+
+impl Capability {
+    /// The name a pack writes in its `capabilities` list.
+    pub fn name(self) -> &'static str {
+        match self {
+            Capability::Context => "context",
+            Capability::Journal => "journal",
+            Capability::Files => "files",
+            Capability::FilesWrite => "files-write",
+            Capability::Process => "process",
+            Capability::Exec => "exec",
+            Capability::Input => "input",
+            Capability::Ipc => "ipc",
+            Capability::Windows => "windows",
+            Capability::Audio => "audio",
+            Capability::Overlay => "overlay",
+            Capability::Time => "time",
+        }
+    }
+
+    /// The host functions this capability carries.
+    pub fn functions(self) -> &'static [&'static str] {
+        match self {
+            Capability::Context => &[
+                "target_name",
+                "target_exe",
+                "target_dir",
+                "setting",
+                "captured",
+            ],
+            Capability::Journal => &["capture", "log"],
+            Capability::Files => &["read_file", "read_json", "read_ini"],
+            Capability::FilesWrite => &["write_file"],
+            Capability::Process => &["process_running", "process_kill", "process_start"],
+            Capability::Exec => &["run_cli"],
+            Capability::Input => &["hotkey"],
+            Capability::Ipc => &["window_message"],
+            Capability::Windows => &["windows_of", "window_hide", "window_show"],
+            Capability::Audio => &["audio_sessions", "audio_mute", "audio_mute_all"],
+            Capability::Overlay => &["overlay_show", "overlay_hide"],
+            Capability::Time => &["sleep"],
+        }
+    }
+
+    /// What the capability does, in the words of a permission list: the effect, not the
+    /// API. The permission window shows this, not the function names.
+    pub fn effect(self) -> &'static str {
+        match self {
+            Capability::Context => "Read the app it drives and its own settings",
+            Capability::Journal => "Write to its own journal",
+            Capability::Files => "Read files",
+            Capability::FilesWrite => "Write files",
+            Capability::Process => "Look at, kill and start processes",
+            Capability::Exec => "Run external programs",
+            Capability::Input => "Send keystrokes",
+            Capability::Ipc => "Talk to other apps",
+            Capability::Windows => "Hide windows belonging to other apps",
+            Capability::Audio => "Mute the audio of other apps",
+            Capability::Overlay => "Take over the screen",
+            Capability::Time => "Wait",
+        }
+    }
+
+    /// The capability with this name, if the daemon knows one.
+    pub fn from_name(name: &str) -> Option<Capability> {
+        let name = name.trim().to_ascii_lowercase();
+        ALL_CAPABILITIES.into_iter().find(|c| c.name() == name)
+    }
+
+    /// The capability a host function belongs to. `None` for a function that is not part
+    /// of the host API at all (a typo in a pack's script).
+    pub fn of_function(function: &str) -> Option<Capability> {
+        ALL_CAPABILITIES
+            .into_iter()
+            .find(|c| c.functions().contains(&function))
+    }
+
+    /// The bit this capability occupies in a [`CapSet`].
+    const fn bit(self) -> u32 {
+        1u32 << (self as u8)
+    }
+}
+
+/// The capabilities a pack was granted.
+///
+/// A bitmask: twelve capabilities fit in a u32, and "was this granted" is a bit test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CapSet(u32);
+
+impl CapSet {
+    /// Every capability — the default for a pack that declares none.
+    pub const ALL: CapSet = CapSet(
+        Capability::Context.bit()
+            | Capability::Journal.bit()
+            | Capability::Files.bit()
+            | Capability::FilesWrite.bit()
+            | Capability::Process.bit()
+            | Capability::Exec.bit()
+            | Capability::Input.bit()
+            | Capability::Ipc.bit()
+            | Capability::Windows.bit()
+            | Capability::Audio.bit()
+            | Capability::Overlay.bit()
+            | Capability::Time.bit(),
+    );
+
+    /// The set of these capabilities.
+    pub fn of(list: &[Capability]) -> CapSet {
+        let mut set = CapSet::default();
+        for capability in list {
+            set = set.with(*capability);
+        }
+        set
+    }
+
+    /// Was this capability granted?
+    pub fn grants(self, capability: Capability) -> bool {
+        self.0 & capability.bit() != 0
+    }
+
+    /// The set with one more capability.
+    pub fn with(self, capability: Capability) -> CapSet {
+        CapSet(self.0 | capability.bit())
+    }
+
+    /// The set without one capability.
+    pub fn without(self, capability: Capability) -> CapSet {
+        CapSet(self.0 & !capability.bit())
+    }
+
+    /// Nothing granted.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// How many capabilities are granted.
+    pub fn len(self) -> usize {
+        self.iter().count()
+    }
+
+    /// The granted capabilities, in the order of the table.
+    pub fn iter(self) -> impl Iterator<Item = Capability> {
+        ALL_CAPABILITIES
+            .into_iter()
+            .filter(move |c| self.grants(*c))
+    }
+
+    /// The names of the granted capabilities: what a denial message lists.
+    pub fn names(self) -> Vec<&'static str> {
+        self.iter().map(|c| c.name()).collect()
+    }
+}
+
+impl Serialize for CapSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.names().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CapSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<CapSet, D::Error> {
+        let names = Vec::<String>::deserialize(deserializer)?;
+        let mut set = CapSet::default();
+        for name in names {
+            let capability = Capability::from_name(&name).ok_or_else(|| {
+                <D::Error as serde::de::Error>::custom(format!("unknown capability '{name}'"))
+            })?;
+            set = set.with(capability);
+        }
+        Ok(set)
     }
 }
 
@@ -1429,5 +1667,98 @@ mod tests {
         let json = serde_json::to_string(&pack).unwrap();
         assert!(!json.contains("something_new"), "{json}");
         assert_eq!(pack.min_engine.as_deref(), Some("1.1.0"));
+    }
+
+    // -----------------------------------------------------------------------
+    // The capabilities
+
+    /// A pack with a `capabilities` list and nothing else that matters.
+    const CAPABILITY_PACK: &str = r#"{
+        "spec": 2, "id": "caps", "name": "Caps", "version": "1.0.0",
+        "targets": { "process": ["caps.exe"] },
+        "capabilities": ["files", "exec"],
+        "script": { "apply": "ctx.log(\"hi\");", "revert": "ctx.log(\"bye\");" },
+        "apply": { "steps": [] }, "revert": { "steps": [] }
+    }"#;
+
+    #[test]
+    fn a_pack_that_declares_nothing_gets_the_whole_host_api() {
+        // The three shipped packs predate the field: they must keep working unchanged.
+        let pack = Pack::parse(RM).expect("the Rainmeter pack must be valid");
+        assert_eq!(pack.capabilities, CapSet::ALL);
+        assert!(pack.capabilities.grants(Capability::Ipc));
+        assert!(pack.capabilities.grants(Capability::Time));
+        for text in [WE, GH] {
+            let pack = Pack::parse(text).unwrap();
+            assert_eq!(pack.capabilities, CapSet::ALL);
+        }
+    }
+
+    #[test]
+    fn a_pack_declares_the_capabilities_it_asks_for() {
+        let pack = Pack::parse(CAPABILITY_PACK).expect("the pack must be valid");
+        assert!(pack.capabilities.grants(Capability::Files));
+        assert!(pack.capabilities.grants(Capability::Exec));
+        assert!(!pack.capabilities.grants(Capability::Process));
+        assert!(!pack.capabilities.grants(Capability::Audio));
+        assert_eq!(pack.capabilities.len(), 2);
+        assert_eq!(pack.capabilities.names(), vec!["files", "exec"]);
+    }
+
+    #[test]
+    fn an_unknown_capability_is_a_named_error() {
+        let text = CAPABILITY_PACK.replace("\"files\", \"exec\"", "\"files\", \"teleport\"");
+        let err = Pack::parse(&text).expect_err("an unknown capability must be refused");
+        assert!(err.contains("teleport"), "{err}");
+        assert!(err.contains("capabilit"), "{err}");
+    }
+
+    #[test]
+    fn the_capabilities_survive_a_json_round_trip() {
+        let pack = Pack::parse(CAPABILITY_PACK).unwrap();
+        let json = serde_json::to_string(&pack).expect("a pack serialises");
+        assert!(json.contains("\"capabilities\":[\"files\",\"exec\"]"), "{json}");
+        let again: Pack = serde_json::from_str(&json).expect("the pack parses again");
+        assert_eq!(again.capabilities, pack.capabilities);
+    }
+
+    #[test]
+    fn every_capability_names_its_own_functions() {
+        // The table is the contract between the schema and the host API: a function that
+        // belongs to no capability could never be granted, and a function that belongs to
+        // two could be denied by one and granted by the other.
+        let mut seen: Vec<&str> = Vec::new();
+        for capability in ALL_CAPABILITIES {
+            assert!(!capability.functions().is_empty(), "{capability:?} has no functions");
+            for function in capability.functions() {
+                assert!(
+                    !seen.contains(function),
+                    "'{function}' is in two capabilities"
+                );
+                seen.push(function);
+                assert_eq!(
+                    Capability::of_function(function),
+                    Some(capability),
+                    "'{function}' does not point back at its capability"
+                );
+            }
+            assert_eq!(Capability::from_name(capability.name()), Some(capability));
+        }
+        // the host API has exactly these functions
+        assert_eq!(seen.len(), 26, "{seen:?}");
+        assert!(!seen.contains(&"no_such_host_function"));
+    }
+
+    #[test]
+    fn a_capability_set_is_a_set() {
+        let one = CapSet::default().with(Capability::Files);
+        let two = one.with(Capability::Files);
+        assert_eq!(one, two, "the same capability twice is the same set");
+        assert!(one.grants(Capability::Files));
+        assert!(!one.grants(Capability::Exec));
+        assert!(!one.without(Capability::Files).grants(Capability::Files));
+        assert!(CapSet::default().is_empty());
+        assert!(!CapSet::ALL.is_empty());
+        assert_eq!(CapSet::ALL.len(), ALL_CAPABILITIES.len());
     }
 }

@@ -20,6 +20,9 @@
 //!   (2026-10-21).
 //! - A window that expires while the intent still holds changes **nothing** and starts **no new**
 //!   window: only a change that actually happened starts one.
+//! - A change of the cooldown **re-times the window that is running**: the window keeps its
+//!   start and takes the new length, so it ends at `start + cooldown`. The setting is in force
+//!   at once, and a window is never a mix of the old and the new length (2026-10-22).
 //! - The capture of the "previous" state therefore always happens on a settled machine: a fast
 //!   app restart can no longer capture the daemon's own value back (the "stuck on Turbo" bug),
 //!   and the carry no longer has to paper over it.
@@ -53,6 +56,28 @@ pub enum Transition {
     Reverted,
 }
 
+/// The settling window: it began at `start` and runs for `len`.
+///
+/// The window is kept as its **start** and its **length**, not as a deadline, so that a
+/// change of the cooldown can re-time the window that is running: the window keeps its
+/// start and takes the new length.
+#[derive(Debug, Clone, Copy)]
+struct Window {
+    start: Instant,
+    len: Duration,
+}
+
+impl Window {
+    fn new(start: Instant, len: Duration) -> Self {
+        Self { start, len }
+    }
+
+    /// When the window ends.
+    fn end(&self) -> Instant {
+        self.start + self.len
+    }
+}
+
 pub struct Engine {
     cooldown: Duration,
     /// Are the packs applied right now?
@@ -62,7 +87,7 @@ pub struct Engine {
     idle: bool,
     paused: bool,
     /// The settling window. While it is running, no change may touch the packs.
-    lock_until: Option<Instant>,
+    lock: Option<Window>,
     /// A change is waiting for the window to expire. This is the flag the 21 Oct fix brought in
     /// (it was called `revert_pending` there): it separates *the window this change started*
     /// from *the leftover window of the previous change*, so a close that lands between two
@@ -82,15 +107,27 @@ impl Engine {
             desired: false,
             idle: false,
             paused: false,
-            lock_until: None,
+            lock: None,
             pending: false,
             running: BTreeMap::new(),
             last_source: None,
         }
     }
 
+    /// Set the length of the settling window.
+    ///
+    /// A window that is running is **re-timed**: it keeps its start and takes the new
+    /// length, so it ends at `start + cooldown`. The setting is in force at once, and a
+    /// window is never a mix of the old and the new length.
+    ///
+    /// A new length that is shorter than the time the window has already run ends the
+    /// window at once — a window cannot end before it began — and the change it was
+    /// holding lands with the next tick.
     pub fn set_cooldown(&mut self, cooldown: Duration) {
         self.cooldown = cooldown;
+        if let Some(w) = self.lock.as_mut() {
+            w.len = cooldown;
+        }
     }
 
     /// What the user should see: the lockout first, then the state of the packs.
@@ -110,9 +147,10 @@ impl Engine {
 
     /// How much of the lockout is left.
     pub fn cooldown_remaining(&self, now: Instant) -> Option<Duration> {
-        self.lock_until
-            .filter(|until| *until > now)
-            .map(|until| until.saturating_duration_since(now))
+        self.lock
+            .map(|w| w.end())
+            .filter(|end| *end > now)
+            .map(|end| end.saturating_duration_since(now))
     }
 
     /// Display names of the tracked apps that are currently running.
@@ -133,6 +171,21 @@ impl Engine {
         self.applied
     }
 
+    /// The change that is waiting for the window, if there is one: the packs are not where
+    /// the intent says they should be, and the window is holding the change back. `None`
+    /// when nothing is waiting — the machine is where the intent says it is, or the window
+    /// is not holding anything.
+    pub fn pending_change(&self) -> Option<Transition> {
+        if !self.pending {
+            return None;
+        }
+        if self.desired {
+            Some(Transition::Applied)
+        } else {
+            Some(Transition::Reverted)
+        }
+    }
+
     pub fn is_idle_mode(&self) -> bool {
         self.idle
     }
@@ -149,7 +202,7 @@ impl Engine {
         self.paused = paused;
         if paused {
             // Freeze: drop the lockout, and let nothing be pending.
-            self.lock_until = None;
+            self.lock = None;
             self.pending = false;
             self.desired = self.applied;
             return None;
@@ -157,7 +210,7 @@ impl Engine {
         // Unpause: catch up with whatever is running.
         if !self.running.is_empty() {
             self.desired = true;
-            self.lock_until = None;
+            self.lock = None;
             self.pending = false;
             if !self.applied {
                 self.applied = true;
@@ -168,8 +221,8 @@ impl Engine {
         }
         // Nothing is running: schedule the revert, the lockout times it.
         self.desired = false;
-        self.lock_until = if self.applied {
-            Some(now + self.cooldown)
+        self.lock = if self.applied {
+            Some(Window::new(now, self.cooldown))
         } else {
             None
         };
@@ -185,7 +238,7 @@ impl Engine {
             return None;
         }
         self.idle = idle;
-        self.lock_until = None;
+        self.lock = None;
         self.pending = false;
         if idle {
             if self.applied {
@@ -216,7 +269,7 @@ impl Engine {
             Transition::Applied => self.applied = false,
             Transition::Reverted => self.applied = true,
         }
-        self.lock_until = None;
+        self.lock = None;
         self.pending = false;
     }
 
@@ -238,7 +291,7 @@ impl Engine {
             // Manual: revert at once, drop the lockout, start none.
             self.applied = false;
             self.last_source = None;
-            self.lock_until = None;
+            self.lock = None;
             self.pending = false;
             return Some(Transition::Reverted);
         }
@@ -319,8 +372,8 @@ impl Engine {
             // The intent holds and the machine is where it should be: a held change is
             // cancelled, and an expired lockout is gone — it starts no new one.
             self.pending = false;
-            if self.lock_until.is_some_and(|until| until <= now) {
-                self.lock_until = None;
+            if self.lock.is_some_and(|w| w.end() <= now) {
+                self.lock = None;
             }
             return None;
         }
@@ -334,7 +387,7 @@ impl Engine {
             // The machine is free: the apply lands at once and starts a window of its own.
             self.applied = true;
             self.pending = false;
-            self.lock_until = Some(now + self.cooldown);
+            self.lock = Some(Window::new(now, self.cooldown));
             self.last_source = Some(self.source_label());
             return Some(Transition::Applied);
         }
@@ -343,19 +396,19 @@ impl Engine {
             // The close starts the window that holds the revert. A lockout that is
             // already running holds it as well — it is not restarted — and without one
             // the window starts now.
-            let until = match self.lock_until {
-                Some(until) if until > now => until,
-                _ => now + self.cooldown,
+            let window = match self.lock {
+                Some(w) if w.end() > now => w,
+                _ => Window::new(now, self.cooldown),
             };
             self.pending = true;
-            self.lock_until = Some(until);
+            self.lock = Some(window);
             return None;
         }
-        if self.lock_until.is_some_and(|until| until <= now) {
+        if self.lock.is_some_and(|w| w.end() <= now) {
             // The window is over: the revert lands and starts a lockout of its own.
             self.applied = false;
             self.pending = false;
-            self.lock_until = Some(now + self.cooldown);
+            self.lock = Some(Window::new(now, self.cooldown));
             self.last_source = None;
             return Some(Transition::Reverted);
         }
@@ -364,7 +417,7 @@ impl Engine {
 
     /// Is the lockout still running?
     fn lock_running(&self, now: Instant) -> bool {
-        self.lock_until.is_some_and(|until| until > now)
+        self.lock.is_some_and(|w| w.end() > now)
     }
 
     fn source_label(&self) -> String {
@@ -1016,5 +1069,105 @@ mod tests {
         assert_eq!(e.set_idle(false), None);
         assert!(!e.is_applied());
         assert_eq!(e.state(now), EngineState::Idle);
+    }
+
+    #[test]
+    fn a_cooldown_changed_while_a_window_runs_re_times_that_window() {
+        // The setting must be in force at once (2026-10-22): a window is never a mix of the
+        // old and the new length. The window keeps its start and takes the new length, so
+        // it ends at `start + cooldown`.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(10));
+        // the first launch: the apply lands at once and starts a window of 10 s
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 1, now),
+            Some(Transition::Applied)
+        );
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(10)));
+
+        // the user changes the cooldown to 60 s while that window is running
+        e.set_cooldown(Duration::from_secs(60));
+
+        // the window in flight now runs 60 s from its start, not 10 s
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(60)));
+        assert_eq!(
+            e.cooldown_remaining(now + Duration::from_secs(59)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            e.cooldown_remaining(now + Duration::from_secs(60)),
+            None,
+            "the window ends at its start plus the new length"
+        );
+    }
+
+    #[test]
+    fn a_cooldown_changed_while_a_window_runs_moves_the_expiry_the_change_waits_for() {
+        // The mirror of the case above: the change the window is holding lands at the NEW
+        // expiry, not at the old one (2026-10-22). This is the 22 Oct report: the window
+        // was armed with the old 10 s, the setting landed a second later, and the revert
+        // landed in the gap before the game came back.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(10));
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 1, now),
+            Some(Transition::Applied)
+        );
+        // the game closes inside the window: the revert is held
+        assert_eq!(e.on_stopped("game.exe", 1, now + Duration::from_secs(5)), None);
+        assert!(e.is_applied());
+        assert_eq!(e.pending_change(), Some(Transition::Reverted));
+
+        // the user changes the cooldown to 60 s while the window is running
+        e.set_cooldown(Duration::from_secs(60));
+
+        // the old expiry passes: nothing lands — the window now ends 60 s after the start
+        let old_expiry = now + Duration::from_secs(10);
+        assert_eq!(e.tick(old_expiry), None);
+        assert!(e.is_applied(), "the revert waits for the new expiry");
+        assert_eq!(e.pending_change(), Some(Transition::Reverted));
+
+        // the new expiry: the revert lands, and it starts a window of its own
+        let new_expiry = now + Duration::from_secs(60);
+        assert_eq!(e.tick(new_expiry), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+        assert_eq!(e.pending_change(), None, "nothing is waiting any more");
+        assert_eq!(
+            e.cooldown_remaining(new_expiry),
+            Some(Duration::from_secs(60)),
+            "the window of its own has the new length"
+        );
+    }
+
+    #[test]
+    fn a_cooldown_shortened_past_the_time_the_window_ran_ends_the_window() {
+        // A window cannot end before it began: a new length that is shorter than the time
+        // the window has already run ends it at once, and the change it was holding lands
+        // with the next tick. The window is not re-armed from now — the user asked for a
+        // short window, and more than that has passed.
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(60));
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 1, now),
+            Some(Transition::Applied)
+        );
+        // the game closes inside the window: the revert is held
+        assert_eq!(e.on_stopped("game.exe", 1, now + Duration::from_secs(30)), None);
+        assert!(e.is_applied());
+
+        // the user shortens the cooldown to 5 s, but the window has already run 30 s
+        e.set_cooldown(Duration::from_secs(5));
+        assert_eq!(
+            e.cooldown_remaining(now + Duration::from_secs(30)),
+            None,
+            "the window cannot end before it began"
+        );
+
+        // the change it was holding lands now
+        assert_eq!(
+            e.tick(now + Duration::from_secs(30)),
+            Some(Transition::Reverted)
+        );
+        assert!(!e.is_applied());
     }
 }

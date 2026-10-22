@@ -293,3 +293,248 @@ files this phase was told not to touch.
 - Rewriting the pack format wholesale. `spec: 1` and `spec: 2` stay; `kind` and
   `triggers` are additive.
 - Moving the engine's mode semantics anywhere new (see §2).
+
+---
+
+## 14. The host API is scoped by capability, one engine per capability set
+
+**Settled — implemented in A2.** A pack declares the capabilities it wants
+(`"capabilities": ["files"]`) and the daemon grants only those. A call to a host
+function of a capability that was **not** granted fails as an **unknown function**:
+the function is not on the engine at all, so the denial is structural — there is no
+call site that could forget to check.
+
+The taxonomy lives in the schema (`armoury_core::pack::Capability` and `CapSet`), the
+engine cache in the sandbox (`script.rs`, `ENGINES`).
+
+**Why one engine per capability set.** The sandbox has kept one engine per thread
+since 1.1.3, so "register fewer functions" is no longer free — a second engine costs
+~433 µs to build. The alternatives were both rejected:
+
+- **One shared engine plus a dispatcher** that consults the grant set at call time.
+  Cheaper in memory, but the denial becomes a runtime branch — a call site could
+  forget it, and that is exactly the property the phase is buying.
+- **One engine per pack.** Throws the 1.1.3 caching win away.
+
+Rhai has no `unregister_fn`, and `disable_symbol` only disables keywords and
+operators, so "register less" and "check at call time" are the only two mechanisms
+available. The engines are keyed by the capability set, so packs that ask for the same
+capabilities share one, and the map is capped at 32 like the AST cache.
+
+**Why the taxonomy is in the schema crate.** The permission window (Phase B4) has to
+show what a module may do, and it has to know the same table the gate uses. Two lists
+would drift.
+
+### The `sleep` decision: `time` is a capability of its own
+
+**Settled.** The table as it was written down listed 17 of the 18 existing host
+functions: **`sleep` was in no capability at all**. Under per-capability-set engines a
+pack whose script called `sleep` would have failed as an unknown function — the
+taxonomy had a hole in it.
+
+`time` is the capability for it, and it is a capability of its own because:
+
+- **It grants nothing.** `sleep` is a flow-control primitive: it touches no file, no
+  process and no window. Every other capability is a *power*; `time` is not.
+- **The budgets already bound it.** The operation budget (500 000 operations) and the
+  wall clock (10 s) are re-armed before every run, and `sleep` is clamped to 10 s.
+  A capability that grants nothing needs no second limit of its own.
+- **Folding it in would give it away.** Putting `sleep` in `context` would hand a
+  pack that only reads the context a way to stall the pack worker; putting it in
+  `time` keeps the grant list honest — a pack that wants to wait says so.
+
+**Rejected:**
+
+- **Putting `sleep` in `context`** (the read-only capability). It would have made
+  every pack that reads the context able to block the worker, for no reason.
+- **Putting `sleep` in `journal`** (the pack's own log). Same problem, and it would
+  have made the read-only capability a write.
+- **Leaving it out of the table** and special-casing it in the engine (always
+  registered). That is a hole in the taxonomy: the table would not be the list of what
+  a pack may call, and the permission window could not show it.
+- **A `sleep` with a tighter clamp** (say 1 s). The 10 s clamp is not this phase's
+  business, and the wall clock already stops the run.
+
+### The default of the `capabilities` field is every capability
+
+**Settled.** `DESIGN.md` §1 originally said the default was `[]`. That is wrong for
+the shipped packs: the Rainmeter pack's script uses `window_message`, and a pack that
+asks for nothing would lose it. The field is **additive** and defaults to every
+capability, so the three shipped packs keep working unchanged.
+
+The field is what the pack **asks** for. The user's own grant list (the permission
+window, Phase B4) comes later and narrows it down: the effective grant is the
+intersection of the two. Until the permission window exists, the ask is everything.
+
+**Rejected: refusing a pack that declares no capability.** It is a legal thing to
+write — a pack that only reads its context — and the daemon can serve it.
+
+### The overlay is a request to the daemon, not a call from the pack
+
+**Settled.** `overlay_show()` and `overlay_hide()` do not touch a window. The black
+windows belong to the thread that pumps their messages, and that is the daemon's main
+loop; a window created on the pack worker would never be painted and could not be
+dismissed by a keypress.
+
+So the host function hands a request over (`packs::request_overlay`), the daemon's main
+loop picks it up and carries it out as its own **idle mode** (`enter_idle` /
+`exit_idle`), and the daemon keeps owning the crash-recovery ledger, the keypress
+dismissal and the idle-mode policy. `overlay_show` therefore means "the daemon enters
+idle mode", and the pack sees the request accepted, not the overlay on the screen.
+
+**Rejected: creating the windows on the pack worker.** The message queue belongs to
+the creating thread, so the daemon's pump would never reach those windows, and
+`DestroyWindow` from another thread is not a thing to rely on.
+
+---
+
+## 15. The executable grows by 56,832 bytes - the size rule bends here, once
+
+**Settled — measured in A2.** The release build of the tree goes from **12,868,608
+bytes** (A1) to **12,925,440 bytes**: **+56,832 bytes, +0.44 %**.
+
+**The same phase on the branch it is delivered on costs a little more.** That branch
+also carries the art fetch through the Windows certificate store, and that work takes
+Mozilla's bundled roots **out** of the binary: its own baseline is **12,796,416
+bytes**, and the A2 work on top of it ends at **12,862,976 bytes** — **+66,560 bytes,
++0.52 %**. Both numbers are true; they are measured against different parents, and a
+number without its tree is not a number (`GOTCHAS.md` trap 35). **The baseline for the
+size rule on the delivered branch is 12,862,976 bytes.**
+
+**Why.** The phase delivers the design's capability table, and the table has **eight
+host functions that did not exist** (`windows_of`, `window_hide`, `window_show`,
+`audio_sessions`, `audio_mute`, `audio_mute_all`, `overlay_show`, `overlay_hide`). They
+are thin wrappers, but **a Rhai registration is not free**: every *shape* of host
+function gets its own instantiation of the argument-marshalling code (the `Dynamic`
+unboxing of each parameter and the wrapping of the return value), and the eight
+functions add **six new shapes**. That is where the bytes are — the section table of
+the two release builds shows it: **+47,616 bytes of `.text`** (code), +6,656 of
+`.rdata` (the string literals and the vtables of the new registrations), +1,536 of
+`.pdata` (the unwind tables of that code). The **gate itself is nearly free**: a
+bitmask over twelve capabilities, a table, and a lookup.
+
+There is no new dependency, no framework and no new runtime: the growth is the host API
+the phase is about.
+
+**What was rejected:**
+
+- **Dropping the eight functions to keep the size flat.** The design's table would
+  name functions that do not exist, and the killswitch and idle modules — the things
+  that need them — would arrive in a later phase with a host API that cannot do their
+  job. The table is the contract between the schema, the gate and the permission
+  window (B4); a table with holes in it is worse than 56 KB.
+- **Making the registrations cheaper by turning the closures into function pointers.**
+  The marshalling code would then be shared between the functions of the same shape —
+  but that shrinks the *whole tree*, the baseline included, so the **difference** against
+  the A1 build would not close.
+- **`#[inline(never)]` on the engine builder and boxing the engines.** Measured: the
+  executable grew by 512 bytes, not less. The builder was not being inlined twice, and
+  the change was reverted — the shortest working diff is the rule here too.
+
+**Known trade-off, accepted:** the phase adds bytes, and `WORK-ORDER.md` says only
+Phase E may. The reason is the one above, and the number is written down here so the
+next phase starts from the truth: **the baseline for the size rule is now 12,925,440
+bytes on the A2-only tree and 12,862,976 bytes on the delivered branch, not
+12,868,608.**
+
+**The alternative, if the user wants the size flat:** the eight functions can move to
+the phase that brings the killswitch and idle modules (B/C), and A2 then ships the
+gate alone. That is a decision about the *order* of the phases, not about the design —
+and it should be taken by the user, not by the phase that happens to be running.
+
+**The size rule bends on a tree that carries another branch's work.** The number above
+is the A2-only tree (`0ecacd3` + A2). The branch this phase is delivered on also
+carries the art fetch through the Windows certificate store, and that work takes
+Mozilla's bundled roots **out** of the binary — so the same phase costs
+**+60,928 bytes** there, measured against that tree's own baseline of 12,796,416
+bytes. Both numbers are true; they are measured against different parents. See
+`PROGRESS.md` for which tree carries which number.
+
+---
+
+## 16. `audio_mute` returns the previous mute state, per session
+
+**Settled — implemented in A2.** `DESIGN.md` §2 requires the host function to return
+the previous mute state. The first implementation returned only counts
+(`2 session(s) muted, 1 left alone, 0 could not be changed`), which says *how much*
+happened but not *what the state was*. A pack's revert needs the state.
+
+So the report names **every session of the process and the state it was in before the
+call**:
+
+```
+muted {session} (was playing), left alone {session} (was muted)
+```
+
+with `unmuted {session} (was muted)` for a session this call had muted before, and
+`could not be changed {session} (was playing)` when Windows refused. A process without
+an audio session gets `no audio session for pid {pid}`.
+
+**Why per session and not per process.** A process can own several audio sessions, and
+they do not have to be in the same state — a game may have one session the user muted
+by hand and another that was playing. One word for the whole process would either lose
+that distinction or be a guess ("mixed").
+
+**Why the state is named and not just counted.** The counts alone cannot answer "was
+that the user's own mute or ours?" — and that is the difference between a revert that
+restores the machine and one that unmutes something the user silenced.
+
+**Rejected:**
+
+- **The counts alone** (what the first implementation did). It does not carry the
+  previous state, which is the one thing the design asks for.
+- **A separate host function that only reports the state** (`audio_state(pid)`). The
+  report already carries it, and a second function would be a second thing to gate.
+- **A boolean "was muted" per process.** Lossy, as above — and it cannot say which of
+  the sessions was the user's own.
+
+**The second half of the same rule — never unmute a session the user muted — is
+enforced by the ledger, not by the report.** The sessions this call muted are
+remembered by their session id, so the unmute touches exactly those. The report says
+so out loud (`left alone {session} (was muted)`), and a unit test proves both halves.
+
+---
+
+## 17. A change of the cooldown re-times the window that is running
+
+**Settled — implemented in 1.1.5.** The lockout model is unchanged (§10): the window
+still holds a change in **both** directions. What is settled here is what a new cooldown
+does to a window that is **already running**.
+
+When the cooldown is changed while a window is running, the window **keeps its start and
+takes the new length**: it ends at `start + cooldown`. The setting is in force at once, and
+a window is never a mix of the old and the new length.
+
+**Why.** The daemon log of 22 Oct 08:46 shows the defect. The apply at 08:46:26 armed a
+**10 s** window (the old value); the setting landed a second later (10 s → 60 s) and
+changed only the length of *future* windows, so that window expired at 08:46:36 — three
+seconds before the game came back at 08:46:39. The revert landed in that gap (the packs
+went to Silent), and the game's return then sat **held** inside the new 60 s window with
+the packs off: they only came back at 08:47:37. With the re-timing the window ends at
+08:47:26, the game comes back at 08:46:39 — inside the window — so the held revert is
+**cancelled** and the packs stay applied.
+
+**How it is built.** The window is kept as its **start** and its **length**, not as a
+deadline (`Window` in `engine.rs`), so it can be re-timed at all; `set_cooldown` sets the
+length of the window in flight. The engine also names the change the window is holding
+(`pending_change`), and the daemon publishes it in the snapshot's `cooldown_action` — the
+field the wire format has carried since the first release, and which the dashboard's
+cooldown row reads to say that a change is waiting behind the window.
+
+**Rejected:**
+
+- **Letting the change apply only to future windows.** The old behaviour, and the defect
+  itself: the window in flight ends at the old expiry and the change it holds lands in
+  that gap.
+- **Re-arming the window from *now*.** The window would then run the full new length from
+  the moment of the change, so it could outlast the setting and the change it holds would
+  be delayed — the setting would be longer than the user asked for.
+- **Extending a window that would end earlier than now.** A new length that is **shorter**
+  than the time the window has already run ends the window **at once** instead, because a
+  window cannot end before it began: the user asked for a short window, and more than that
+  has passed. The change the window was holding lands with the next tick.
+
+**The local-only record.** `DECISIONS-2026-10-17.md` (on disk, not published) carries the
+same decision as row **H21**, with the log excerpt it is based on. That file is the
+private decision log of the earlier sessions; this section is the versioned copy.
+

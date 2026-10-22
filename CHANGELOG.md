@@ -5,12 +5,44 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-10-22
+
+### Added
+
+- The pack script's host API is **scoped by capability**. A pack declares the capabilities it
+  wants (`"capabilities": ["files"]`) and the daemon grants only those. The sandbox keeps **one
+  engine per capability set** and registers only the granted functions on it, so a call to a
+  function of a capability that was not granted fails as an **unknown function** — the denial is
+  structural, not a check a call site could forget. The denial names the missing capability and
+  what the pack asked for, and it lands in the pack's log. The field is **additive** and defaults
+  to every capability, so the shipped packs keep working unchanged.
+- The host functions report **what they changed**: `audio_mute` names every session of the
+  process and the state it was in before the call, and it never unmutes a session the user had
+  muted themselves.
+
 ### Fixed
 
 - The catalogue fetch validated TLS against **Mozilla's bundled roots** instead of the **Windows
   certificate store**, so it failed on any machine with a corporate CA or with TLS interception.
   The root store is the platform's now: the enterprise roots, the constraints and the revocation
   checks of the machine's own certificate store decide what is trusted.
+- The **cover art** was fetched with the client's default configuration — Mozilla's bundled roots
+  — so the same bug was left in a second place: a machine behind a corporate CA could fetch the
+  catalogue but not the art. The art fetches go through the **same client** as the catalogue now
+  — one agent, built once, with the platform verifier — so they share its root store and its
+  connection pool, and no client is built for a request any more. The Mozilla bundle leaves the
+  binary with it: the build has exactly one root store, and the client refuses the bundled roots
+  instead of falling back to them.
+- A change of the cooldown did **not** re-time the window that was running: it changed only the
+  length of *future* windows, so the window in flight ended at the old expiry and the change it
+  was holding landed in that gap — the packs went back to their idle state while the game was
+  starting, and the game's return then sat held inside the new window with the packs off. The
+  window keeps its **start** and takes the **new length** now, so it ends at `start + cooldown`,
+  and the change it holds lands at the new expiry.
+- The dashboard said only "Cooling down — 2s" and gave no hint which app the window belonged to,
+  and the cooldown row said nothing about a change waiting behind the window. The band names the
+  app now, and the row says that a change is waiting — the daemon publishes what the window is
+  holding, so the queue is visible.
 
 ### Changed
 
@@ -179,6 +211,7 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 - The spec 2 pack script host: a pack may carry a small Rhai script, and the daemon runs it in a
   sandboxed interpreter.
 
+[1.1.5]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.5
 [1.1.4]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.4
 [1.1.3]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3
 [1.1.2]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.2

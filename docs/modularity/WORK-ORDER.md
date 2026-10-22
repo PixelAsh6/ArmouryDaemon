@@ -94,7 +94,7 @@ unchanged. A malformed `kind` is a named error, like the other schema errors.
 
 ### A4. A separate worker queue for modes
 
-The pack worker is a **single serial thread** (`packs.rs:160`,
+The pack worker is a **single serial thread** (`packs.rs:168`,
 `while let Ok(job) = jobs.recv()`). A slow mode must never block a pack apply/revert.
 Give modes their own thread and channel.
 
@@ -121,7 +121,7 @@ trade-off, not a free win. Record the decision in `DECISIONS.md`.
 
 ### B1. `kind` in the manifest
 
-`crates/armoury/src/catalog.rs:41-59` (`CatalogPack`). Manifest schema → 2. Read
+`crates/armoury/src/catalog.rs:44` (`CatalogPack`). Manifest schema → 2. Read
 `packs` **and** `modules` for one release so an old manifest still works.
 
 **Also update the release workflow** — the "Check the packs against the catalogue" step
@@ -139,7 +139,7 @@ signature; never install anything unverified.
 
 ### B3. Install paths per kind
 
-- `pack` / `mode` → the existing `packs::install_text` path (`packs.rs:966-989`),
+- `pack` / `mode` → the existing `packs::install_text` path (`packs.rs:977`),
   unchanged.
 - `helper` → a new path: download → verify sha256 + size → extract into
   `modules/<id>/` → record the resolved path. **The helper's directory needs its own

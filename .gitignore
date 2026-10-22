@@ -31,6 +31,10 @@ config.json
 # The private scope note for the orchestrator and the user: our eyes only
 /docs/scope.md
 
+# The session orientation file: it lives at the root, it is a session artefact,
+# not project content. The versioned memory is docs/modularity\.
+/compact.md
+
 # The working notes of the current session: the handover, the test checklists,
 # the decision log and the two specs. They stay on disk, they are not published.
 /HANDOVER.md

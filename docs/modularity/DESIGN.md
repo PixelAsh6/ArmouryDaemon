@@ -26,7 +26,13 @@ The concrete shapes for the module system. `DECISIONS.md` says *why*; this says 
 | `triggers` | `[{ "kind": "tracked_app" }]` | what starts it. `"hotkey"` with a key name is the first new kind |
 | `suspends_packs` | `false` | while on, freeze the tracked-app engine (`Engine::set_idle`) |
 | `react_to_tracked` | `false` | a tracked app that starts while this is engaged is handled too |
-| `capabilities` | `[]` | what this pack asks the host for (§2) |
+| `capabilities` | **every capability** | what this pack asks the host for (§2) |
+
+**The default of `capabilities` is every capability, not none.** The three shipped packs
+predate the field, and the Rainmeter pack's script uses `window_message` — a pack that
+asked for nothing would lose the host functions it uses. The user's own grant list (the
+permission window) comes later and narrows this down; the field is what the pack
+*asks* for, and until the user can narrow it, the ask is everything.
 
 **Do not invent a `spec: 3`.** `spec` is the *script* axis and stays 1 or 2. `kind` and
 `triggers` are new, separate axes.
@@ -39,9 +45,15 @@ The concrete shapes for the module system. `DECISIONS.md` says *why*; this says 
 
 ## 2. The capability taxonomy
 
-The 18 existing Rhai host functions (`crates/armoury/src/script.rs:242+`) group into
-capabilities. A pack declares what it needs; the daemon grants only that. The last
-three groups are **new** and are exactly what the killswitch and idle need.
+The 26 Rhai host functions (`crates/armoury/src/script.rs`, the registration block) group
+into capabilities: the 18 that were there and the 8 the table lists as new. A pack
+declares what it needs; the daemon grants only that.
+
+**The table as it was written down was missing one function.** It listed 17 of the 18
+existing host functions: `sleep` (`script.rs:308` before this phase) was in **no**
+capability, and under per-capability-set engines a pack whose script called it would have
+failed as an unknown function. `sleep` is now a capability of its own — see
+`DECISIONS.md` §14 for the reason and for what was rejected.
 
 | Capability | Functions | Severity | Notes |
 |---|---|---|---|
@@ -56,17 +68,40 @@ three groups are **new** and are exactly what the killswitch and idle need.
 | `windows` *(new)* | `window_hide`, `window_show`, `windows_of` | **high** | hides other apps' windows |
 | `audio` *(new)* | `audio_mute`, `audio_mute_all`, `audio_sessions` | **high** | mutes any process or device |
 | `overlay` *(new)* | `overlay_show`, `overlay_hide` | **high** | full-screen takeover |
+| `time` *(new)* | `sleep` | none | a flow-control primitive: it grants nothing |
 
 The new host functions are thin wrappers over code that already exists and must stay
 where it is:
 
 | New function | Wraps | Notes |
 |---|---|---|
-| `windows_of(pid)` | `killswitch::windows_of` — `killswitch.rs:194` | the visible, unowned, non-tool windows of a process |
-| `window_hide(hwnd)` / `window_show(hwnd)` | `ShowWindow` as in `killswitch.rs:108` | must report the *previous* visibility so a revert is exact |
-| `audio_mute(pid, on)` | the session sweep — `killswitch.rs:228`, `:271` | must return the previous mute state, and must not unmute a session the user muted |
-| `audio_mute_all(on)` | `overlay::mute_all` | for idle mode |
-| `overlay_show()` / `overlay_hide()` | `overlay::show` / `overlay::hide` | the daemon keeps owning the crash-recovery ledger and the keypress dismissal |
+| `windows_of(pid)` | `killswitch::windows_of` — `killswitch.rs:202` | the visible, unowned, non-tool windows of a process |
+| `window_hide(hwnd)` / `window_show(hwnd)` | `ShowWindow`, as in `killswitch.rs:137` | must report the *previous* visibility so a revert is exact |
+| `audio_mute(pid, on)` | the session sweep — `killswitch.rs:236`, `killswitch.rs:339` | must return the previous mute state, and must not unmute a session the user muted |
+| `audio_mute_all(on)` | `overlay::mute_all` — `overlay.rs:499` | for idle mode |
+| `overlay_show()` / `overlay_hide()` | `overlay::show` / `overlay::hide` — `overlay.rs:248`, `overlay.rs:347` | the daemon keeps owning the crash-recovery ledger and the keypress dismissal |
+
+**The vocabulary of the audio functions.** `audio_sessions()` returns one
+`{pid}:{state}` per session of the machine — the state is `muted`, `playing` or
+`unknown` — so a pack can see what is playing without knowing a session id.
+`audio_mute(pid, on)` works on a **pid** and reports per **session**, because one
+process can own several sessions and they need not be in the same state. The session
+id is a diagnostic detail, not a handle: the two functions answer two different
+questions.
+
+**`audio_mute` returns the previous mute state, per session.** The report names every
+session of the process and the state it was in *before* the call:
+`muted {session} (was playing)`, `unmuted {session} (was muted)`,
+`left alone {session} (was muted)`, `could not be changed {session} (was playing)`.
+That is what a revert needs, and it says plainly which sessions were the user's own
+mutes and were therefore left alone. A process without an audio session gets
+`no audio session for pid {pid}`.
+
+**`overlay_show` is a request, not a call.** The black windows belong to the thread that
+pumps their messages, and that is the daemon's main loop — the pack worker cannot show
+them itself. The host function therefore hands the request over (`packs.rs:1268`), and
+the daemon's main loop carries it out (`daemon.rs:461`), which keeps owning the
+crash-recovery ledger, the keypress dismissal and the idle-mode policy.
 
 **The killswitch and idle modes are then almost trivial packs**, because the ledger
 and the crash recovery stay in Rust:
@@ -85,11 +120,12 @@ while implementing; the taxonomy above is the shape, not a fixed list.
 
 ## 3. How the capability gate is enforced
 
-**One engine per capability set.** The sandbox keeps **one engine per thread** since
-1.1.3 (`script.rs:86`, `SANDBOX`), and the host API is registered on it once. So
-"register fewer functions per run" is no longer free.
+**One engine per capability set.** Before this phase the sandbox kept **one engine per
+thread** (since 1.1.3) and registered the host API on it once, so "register fewer
+functions per run" was no longer free. That engine is now a **map** of engines, one per
+capability set (`script.rs:90`, `ENGINES`).
 
-Keep a second thread-local map, built lazily, capped like the AST cache (32 entries):
+A second thread-local map, built lazily, capped like the AST cache (32 entries):
 
 ```
 thread_local! {
@@ -97,15 +133,21 @@ thread_local! {
 }
 ```
 
-The pack worker is a **single serial thread** (`packs.rs:160`), so no locking is
+The pack worker is a **single serial thread** (`packs.rs:168`), so no locking is
 needed. A pack then gets an engine on which **only the granted functions are
-registered**, so an ungranted call fails as an *unknown function* — a structural
-denial, not a runtime check a call site could forget. Each distinct capability set
-costs ~433 µs to build, once.
+registered** (`script.rs:298`, `new_sandbox`), so an ungranted call fails as an
+*unknown function* — a structural denial, not a runtime check a call site could forget.
+Each distinct capability set costs ~433 µs to build, once.
+
+The key of the map is the **capability set** (`armoury_core::pack::CapSet`), a bitmask
+over the twelve capabilities: two packs that ask for the same capabilities share one
+engine, and a pack that asks for nothing gets an engine with no host function on it at
+all.
 
 The per-run budget re-arming (the `Sandbox::arm` pattern) still applies per engine:
 the operation budget and the wall clock must be re-armed before **every** evaluation,
-so a run can never inherit the previous run's allowance.
+so a run can never inherit the previous run's allowance — not even the run before it on
+another engine.
 
 **Two alternatives, if the first does not work out:**
 1. One shared engine plus a dispatcher — register one function per capability that
@@ -119,7 +161,16 @@ operators, so "register less" and "check at call time" are the only two mechanis
 
 **The error the user sees** must name the missing capability and the one the pack
 asked for, and the denial must be written to the pack's log like every other host
-call.
+call. A denied call comes back from Rhai as `ErrorFunctionNotFound`; the daemon reads
+the function name out of it (`script.rs:265`, `denial`) and turns it into:
+
+```
+run_cli REFUSED: it needs the 'exec' capability, which this pack was not granted (the pack asked for: files)
+```
+
+That line is what the pack's log gets, and it is the whole error the daemon records.
+A function the pack **was** granted but called wrongly (a wrong argument type) comes
+back the same way from Rhai — that is not a denial and is not reported as one.
 
 ---
 
@@ -191,7 +242,7 @@ call.
     ☐ Run external programs        ← separate, explicitly labelled group
   ```
 - **Discovered dropdown values.** The last piece of per-pack hardcoding is
-  `crates/armoury/src/daemon.rs:733` (`if p.pack.id == "rainmeter"`) plus
+  `crates/armoury/src/daemon.rs:749` (`if p.pack.id == "rainmeter"`) plus
   `packs::rainmeter_layouts()` (`packs.rs:795-814`). A pack must be able to declare
   that its dropdown values are *discovered* (e.g. from a directory) rather than
   hardcoded in the daemon.
@@ -215,14 +266,14 @@ module needs.
 | Concern | Where | What changes |
 |---|---|---|
 | Mode worker | `packs.rs:149` (`packs::start`) | a **second** worker thread and channel for modes, so a slow mode never blocks a pack apply/revert |
-| Mode triggers | `daemon.rs:1693` / `:1697` (the hotkey handlers) and the tray menu | a mode's trigger dispatches to its own worker |
-| `suspends_packs` | `daemon.rs:1710` (`enter_idle`) / `:1743` (`exit_idle`) | the mode drives `Engine::set_idle` |
-| `react_to_tracked` | `daemon.rs:1334-1339` | a tracked app starting while the mode is engaged re-engages it |
-| Installing a module | `daemon.rs:2556` (the `InstallPack` handler) | one handler per kind |
-| The console helper | `daemon.rs:2008` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
-| The killswitch | `daemon.rs:1778` (`toggle_killswitch`) | it has **no config key and no IPC request** today; add both |
+| Mode triggers | `daemon.rs:1709` / `:1713` (the hotkey handlers) and the tray menu | a mode's trigger dispatches to its own worker |
+| `suspends_packs` | `daemon.rs:1726` (`enter_idle`) / `:1759` (`exit_idle`) | the mode drives `Engine::set_idle` |
+| `react_to_tracked` | `daemon.rs:1350` | a tracked app starting while the mode is engaged re-engages it |
+| Installing a module | `daemon.rs:2572` (the `InstallPack` handler) | one handler per kind |
+| The console helper | `daemon.rs:2024` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
+| The killswitch | `daemon.rs:1794` (`toggle_killswitch`) | it has **no config key and no IPC request** today; add both |
 
-The pack worker is a **single serial thread** (`packs.rs:160`,
+The pack worker is a **single serial thread** (`packs.rs:168`,
 `while let Ok(job) = jobs.recv()`) — that is the reason for the second worker.
 
 ---
@@ -237,7 +288,7 @@ The pack worker is a **single serial thread** (`packs.rs:160`,
   `Request::ConsoleHello`. **No new protocol is needed.**
 - **Consider moving the SteamGridDB key out of the elevated daemon.** Today
   `cfg.sgdb_api_key` is in the daemon's config and the daemon does the art lookups
-  (`daemon.rs:2456`, `daemon.rs:2507`). If the console owns the art code, the key can
+  (`daemon.rs:2135`, `daemon.rs:2469`). If the console owns the art code, the key can
   live with it — but a child of an elevated daemon inherits elevation, so a
   *non-elevated* helper needs a linked-token `CreateProcessWithTokenW`. **Decide
   explicitly; do not half-do it.**

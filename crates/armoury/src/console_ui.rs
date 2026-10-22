@@ -24,6 +24,7 @@ use eframe::egui::epaint::{CornerRadius, Mesh, RectShape};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
 
 use crate::art;
+use crate::catalog;
 use crate::pad;
 
 /// The launcher's window is the band itself: a fixed 90% x 35% of the full screen, console style.
@@ -1315,12 +1316,19 @@ fn invalidate_art<T>(
     hero_want.remove(key);
 }
 
+/// The client the thumbnails are fetched with: the process-wide one (see `catalog::agent`).
+///
+/// The band is a process of its own, so this is an agent of its own too — but the same one
+/// the catalogue and the cover art use: the Windows certificate store is the root store, and
+/// the connections are pooled.
+fn client() -> &'static ureq::Agent {
+    catalog::agent()
+}
+
 /// Download one thumbnail and decode it.
 fn fetch_thumb(url: &str) -> Option<(Vec<u8>, u32, u32)> {
-    let bytes = ureq::get(url)
-        .config()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build()
+    let bytes = client()
+        .get(url)
         .call()
         .ok()?
         .body_mut()
@@ -2212,6 +2220,7 @@ fn first_char(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ureq::tls::RootCerts;
 
     #[test]
     fn short_name_trims_visibly() {
@@ -2676,5 +2685,27 @@ mod tests {
         let (min, max) = cover_uv(egui::vec2(1920.0, 620.0), tile);
         assert!(min.x > 0.0 && (min.x - (1.0 - max.x)).abs() < 1e-6);
         assert!((min.y - 0.0).abs() < 1e-6 && (max.y - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_thumbnails_are_fetched_through_the_windows_certificate_store() {
+        // The bug this guards: the thumbnails had a client of their own, validated against
+        // Mozilla's bundled roots, so a machine with a corporate CA could fetch the catalogue
+        // but not the band.
+        let roots = client().config().tls_config().root_certs();
+        assert!(
+            matches!(roots, RootCerts::PlatformVerifier),
+            "the thumbnails must be validated against the Windows certificate store, not {roots:?}"
+        );
+    }
+
+    #[test]
+    fn the_thumbnails_share_the_client_with_the_catalogue() {
+        // One client, one connection pool: a client of its own would rebuild the rustls config
+        // and the platform verifier for every single thumbnail.
+        assert!(
+            std::ptr::eq::<ureq::Agent>(client(), catalog::agent()),
+            "the thumbnails must share the client's connection pool with the catalogue"
+        );
     }
 }

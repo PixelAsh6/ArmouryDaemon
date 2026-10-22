@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use armoury_core::pack::TemplateCtx;
+use armoury_core::pack::{Capability, CapSet, TemplateCtx};
 use log::info;
 use rhai::{Array, AST, Dynamic, Engine, EvalAltResult, ImmutableString, Scope};
 
@@ -80,11 +80,19 @@ thread_local! {
     /// Compiled scripts, keyed by their source. A pack's script never changes, but it is run
     /// again on every apply and every revert.
     static ASTS: RefCell<HashMap<String, Rc<AST>>> = RefCell::new(HashMap::new());
-    /// The one engine, with the host API registered on it. Building it and registering the
-    /// host functions costs about half a millisecond, so it is built once per thread and
-    /// kept: the pack worker is a single serial thread, so no locking is needed.
-    static SANDBOX: RefCell<Sandbox> = RefCell::new(new_sandbox());
+    /// **One engine per capability set.** A pack gets an engine on which only the functions
+    /// it was granted are registered, so a call to a function it was not granted fails as
+    /// an *unknown function* — a structural denial, not a check a call site could forget.
+    ///
+    /// The engines are built lazily and kept: building one and registering its host
+    /// functions costs about half a millisecond, and the pack worker is a single serial
+    /// thread, so no locking is needed. The map is capped like the AST cache.
+    static ENGINES: RefCell<HashMap<CapSet, Sandbox>> = RefCell::new(HashMap::new());
 }
+
+/// How many engines this thread keeps. The AST cache has the same cap: a pack that was
+/// replaced or removed starts over.
+const MAX_ENGINES: usize = 32;
 
 /// The sandbox: the engine, and the two budgets it enforces. The budgets are **per run**, so
 /// they live next to the engine and are re-armed before every evaluation — never once, at
@@ -119,14 +127,16 @@ impl Sandbox {
 }
 
 /// The AST of a script, compiled once and kept for the next run.
-fn compile_ast(source: &str) -> Result<Rc<AST>, String> {
+///
+/// The AST does not belong to an engine — the functions it calls are resolved when it
+/// runs — so one cache serves every capability set.
+fn compile_ast(source: &str, caps: CapSet) -> Result<Rc<AST>, String> {
     let cached = ASTS.with(|cache| cache.borrow().get(source).cloned());
     if let Some(ast) = cached {
         return Ok(ast);
     }
     let ast = Rc::new(
-        SANDBOX
-            .with(|cell| cell.borrow().engine.compile(source))
+        with_engine(caps, |sandbox| sandbox.engine.compile(source))
             .map_err(|e| format!("script error: {e}"))?,
     );
     ASTS.with(|cache| {
@@ -139,15 +149,47 @@ fn compile_ast(source: &str) -> Result<Rc<AST>, String> {
     Ok(ast)
 }
 
-/// Compile a script once (used to reject broken packs at load/install time).
-pub fn compile(source: &str) -> Result<(), String> {
-    compile_ast(source).map(|_| ())
+/// The engine for a capability set: built once, kept, and re-armed before every run.
+fn with_engine<T>(caps: CapSet, f: impl FnOnce(&mut Sandbox) -> T) -> T {
+    ENGINES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if !cache.contains_key(&caps) {
+            if cache.len() >= MAX_ENGINES {
+                cache.clear(); // a pack was replaced or removed: start over
+            }
+            cache.insert(caps, new_sandbox(caps));
+        }
+        let sandbox = cache
+            .get_mut(&caps)
+            .expect("the engine for this capability set was just built");
+        f(sandbox)
+    })
 }
 
-/// Run one block script. Returns the host-call log; `ctx.captured` receives anything the script
-/// captured (so a revert can replay it).
+/// Compile a script once (used to reject broken packs at load/install time).
+pub fn compile(source: &str) -> Result<(), String> {
+    compile_ast(source, CapSet::ALL).map(|_| ())
+}
+
+/// Run one block script with the whole host API. Returns the host-call log; `ctx.captured`
+/// receives anything the script captured (so a revert can replay it).
+///
+/// The daemon does not use this: a pack runs on the engine of its own capability set (see
+/// [`run_with_capabilities`]). It is here for the tests, which run scripts without a
+/// grant list.
+#[cfg(test)]
 pub fn run(source: &str, ctx: &mut TemplateCtx) -> Result<Vec<String>, String> {
-    run_with_budget(source, ctx, WALL_BUDGET)
+    run_with_budget(source, ctx, WALL_BUDGET, CapSet::ALL)
+}
+
+/// Run one block script with the capabilities the pack was granted. Everything else is
+/// missing from the engine, so a call to it fails as an unknown function.
+pub fn run_with_capabilities(
+    source: &str,
+    ctx: &mut TemplateCtx,
+    caps: CapSet,
+) -> Result<Vec<String>, String> {
+    run_with_budget(source, ctx, WALL_BUDGET, caps)
 }
 
 /// The run itself, with the wall-clock budget it gets. The budget is re-armed on **every**
@@ -156,8 +198,9 @@ fn run_with_budget(
     source: &str,
     ctx: &mut TemplateCtx,
     budget: Duration,
+    caps: CapSet,
 ) -> Result<Vec<String>, String> {
-    let ast = compile_ast(source)?;
+    let ast = compile_ast(source, caps)?;
 
     let host = ScriptHost {
         target_name: ctx.target_name.clone(),
@@ -173,8 +216,7 @@ fn run_with_budget(
     // is nothing else to clear.
     let mut scope = Scope::new();
     scope.push("ctx", host.clone());
-    let result = SANDBOX.with(|cell| {
-        let mut sandbox = cell.borrow_mut();
+    let result = with_engine(caps, |sandbox| {
         // A run must never inherit the allowance of the run before it.
         sandbox.arm(budget);
         sandbox.engine.eval_ast_with_scope::<()>(&mut scope, &ast)
@@ -182,7 +224,7 @@ fn run_with_budget(
 
     // the captures are harvested even when the script failed: a script that captured and then
     // failed must still leave the journal something to replay
-    let host: Option<ScriptHost> = scope.get_value("ctx");
+    let mut host: Option<ScriptHost> = scope.get_value("ctx");
     if let Some(host) = &host {
         ctx.captured = host.captured.clone();
     }
@@ -195,15 +237,65 @@ fn run_with_budget(
                 budget_text(budget)
             ));
         }
+        // A call to a function the pack was not granted comes back as "unknown function".
+        // The pack is told which capability it needs and what it asked for, and the
+        // denial is written to its log like every other host call.
+        if let Some(denial) = denial(caps, &e) {
+            if let Some(host) = host.as_mut() {
+                host.note(denial.clone());
+            }
+            return Err(format!("script failed: {denial}"));
+        }
         return Err(format!("script failed: {e}"));
     }
     let host = host.ok_or_else(|| "script lost its context".to_string())?;
     Ok(host.log)
 }
 
-/// The sandbox: limits first, then only the whitelisted host API. It is built once per
-/// thread and kept between runs — see [`SANDBOX`].
-fn new_sandbox() -> Sandbox {
+/// Is this error a call to a host function the pack was not granted?
+///
+/// The engine of a capability set carries only the granted functions, so an ungranted
+/// call comes back as an unknown function. A function the pack *was* granted but called
+/// wrongly (a wrong argument type) comes back the same way — that is not a denial, and
+/// it must not be reported as one.
+///
+/// The line that comes back is the one the pack's log gets: the denial is a host call
+/// like every other one, and it says which capability it needs and what the pack asked
+/// for.
+fn denial(caps: CapSet, error: &EvalAltResult) -> Option<String> {
+    let EvalAltResult::ErrorFunctionNotFound(signature, _) = error else {
+        return None;
+    };
+    // Rhai names the call by its signature: "run_cli (ScriptHost, &str | ...)".
+    let name = signature.split(' ').next().unwrap_or(signature);
+    let capability = Capability::of_function(name)?;
+    if caps.grants(capability) {
+        return None; // the function is there: the call itself is wrong
+    }
+    Some(format!(
+        "{name} REFUSED: it needs the '{}' capability, which this pack was not granted (the pack asked for: {})",
+        capability.name(),
+        asked_for(caps)
+    ))
+}
+
+/// The capabilities a pack asked for, as a sentence: what a denial message lists.
+fn asked_for(caps: CapSet) -> String {
+    let names = caps.names();
+    if names.is_empty() {
+        return "nothing".to_string();
+    }
+    names.join(", ")
+}
+
+/// The sandbox: limits first, then only the host API the pack was granted. It is built
+/// once per capability set and kept between runs — see [`ENGINES`].
+///
+/// The host API is registered per capability: a function of a capability that was not
+/// granted is simply **not there**, so a call to it fails as an unknown function. That is
+/// the whole point of the gate: the denial cannot be forgotten at a call site, because
+/// there is no call site to forget it at.
+fn new_sandbox(caps: CapSet) -> Sandbox {
     #[cfg(test)]
     BUILDS.with(|c| c.set(c.get() + 1));
 
@@ -238,165 +330,260 @@ fn new_sandbox() -> Sandbox {
 
     engine.register_type_with_name::<ScriptHost>("ctx");
 
+    // ---- the host API, capability by capability ----
+    //
+    // Only the functions of a granted capability are registered. A function of a
+    // capability that was not granted is not on the engine at all, so a call to it fails
+    // as an unknown function.
+
     // ---- read-only context ----
-    engine.register_fn("target_name", |host: &mut ScriptHost| -> ImmutableString {
-        host.target_name.clone().into()
-    });
-    engine.register_fn("target_exe", |host: &mut ScriptHost| -> ImmutableString {
-        host.target_exe.clone().into()
-    });
-    engine.register_fn("target_dir", |host: &mut ScriptHost| -> ImmutableString {
-        host.target_dir.clone().into()
-    });
-    engine.register_fn("setting", |host: &mut ScriptHost, key: &str| -> ImmutableString {
-        host.settings.get(key).cloned().unwrap_or_default().into()
-    });
-    engine.register_fn("captured", |host: &mut ScriptHost, key: &str| -> ImmutableString {
-        host.captured.get(key).cloned().unwrap_or_default().into()
-    });
-    engine.register_fn("log", |host: &mut ScriptHost, msg: &str| {
-        host.note(msg.to_string());
-    });
-    engine.register_fn("capture", |host: &mut ScriptHost, key: &str, value: &str| {
-        host.captured
-            .insert(key.to_string(), value.to_string());
-        host.note(format!("capture {key} = {value}"));
-    });
+    if caps.grants(Capability::Context) {
+        engine.register_fn("target_name", |host: &mut ScriptHost| -> ImmutableString {
+            host.target_name.clone().into()
+        });
+        engine.register_fn("target_exe", |host: &mut ScriptHost| -> ImmutableString {
+            host.target_exe.clone().into()
+        });
+        engine.register_fn("target_dir", |host: &mut ScriptHost| -> ImmutableString {
+            host.target_dir.clone().into()
+        });
+        engine.register_fn("setting", |host: &mut ScriptHost, key: &str| -> ImmutableString {
+            host.settings.get(key).cloned().unwrap_or_default().into()
+        });
+        engine.register_fn("captured", |host: &mut ScriptHost, key: &str| -> ImmutableString {
+            host.captured.get(key).cloned().unwrap_or_default().into()
+        });
+    }
+
+    // ---- the pack's own journal ----
+    if caps.grants(Capability::Journal) {
+        engine.register_fn("log", |host: &mut ScriptHost, msg: &str| {
+            host.note(msg.to_string());
+        });
+        engine.register_fn("capture", |host: &mut ScriptHost, key: &str, value: &str| {
+            host.captured
+                .insert(key.to_string(), value.to_string());
+            host.note(format!("capture {key} = {value}"));
+        });
+    }
 
     // ---- actions (all routed through the same mechanisms the data packs use) ----
-    engine.register_fn(
-        "run_cli",
-        |host: &mut ScriptHost, exe: &str, args: Array| -> Result<(), Box<EvalAltResult>> {
-            let args: Vec<String> = args
-                .iter()
-                .map(|a| a.clone().into_string().unwrap_or_default())
-                .collect();
-            // a script may only run programs from the same places it may write files: an
-            // unrestricted spawn would hand it the whole machine (cmd.exe lives in System32)
-            let target_dir = host.target_dir.clone();
-            if !exe_allowed(exe, &target_dir) {
-                host.note(format!("run_cli {exe} REFUSED (outside the allowed folders)"));
-                return Err(err(format!(
-                    "run_cli refused: {exe} is outside %APPDATA%, %LOCALAPPDATA%, %PROGRAMDATA% and the target's folder"
-                )));
-            }
-            host.note(format!("run_cli {exe} {}", args.join(" ")));
-            crate::packs::script_cli(exe, &args).map_err(err)
-        },
-    );
-    engine.register_fn(
-        "hotkey",
-        |host: &mut ScriptHost, chord: &str| -> Result<(), Box<EvalAltResult>> {
-            host.note(format!("hotkey {chord}"));
-            crate::packs::send_chord(chord).map_err(err)
-        },
-    );
-    engine.register_fn(
-        "window_message",
-        |host: &mut ScriptHost,
-         class: &str,
-         title: &str,
-         payload: &str|
-         -> Result<(), Box<EvalAltResult>> {
-            host.note(format!("window_message {class} / {title}: {payload}"));
-            send_window_message(class, title, payload).map_err(|e| {
-                host.note(format!("window_message {class} REFUSED: {e}"));
-                err(e)
-            })
-        },
-    );
-    engine.register_fn("sleep", |host: &mut ScriptHost, ms: i64| {
-        let ms = ms.clamp(0, 10_000) as u64;
-        host.note(format!("sleep {ms} ms"));
-        std::thread::sleep(Duration::from_millis(ms));
-    });
-    engine.register_fn("process_running", |host: &mut ScriptHost, name: &str| -> bool {
-        let running = crate::packs::script_process_running(name);
-        host.note(format!("process_running {name} -> {running}"));
-        running
-    });
-    engine.register_fn(
-        "process_kill",
-        |host: &mut ScriptHost, name: &str| -> Result<(), Box<EvalAltResult>> {
-            host.note(format!("process_kill {name}"));
-            crate::packs::script_process_kill(name).map_err(err)
-        },
-    );
-    engine.register_fn(
-        "process_start",
-        |host: &mut ScriptHost, path: &str| -> Result<(), Box<EvalAltResult>> {
-            // a script may only start programs from the same places it may write files: an
-            // unrestricted spawn would hand it the whole machine
-            let target_dir = host.target_dir.clone();
-            if !exe_allowed(path, &target_dir) {
-                host.note(format!("process_start {path} REFUSED (outside the allowed folders)"));
-                return Err(err(format!(
-                    "process_start refused: {path} is outside %APPDATA%, %LOCALAPPDATA%, %PROGRAMDATA% and the target's folder"
-                )));
-            }
-            host.note(format!("process_start {path}"));
-            crate::packs::script_process_start(path).map_err(err)
-        },
-    );
+    if caps.grants(Capability::Exec) {
+        engine.register_fn(
+            "run_cli",
+            |host: &mut ScriptHost, exe: &str, args: Array| -> Result<(), Box<EvalAltResult>> {
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|a| a.clone().into_string().unwrap_or_default())
+                    .collect();
+                // a script may only run programs from the same places it may write files: an
+                // unrestricted spawn would hand it the whole machine (cmd.exe lives in System32)
+                let target_dir = host.target_dir.clone();
+                if !exe_allowed(exe, &target_dir) {
+                    host.note(format!("run_cli {exe} REFUSED (outside the allowed folders)"));
+                    return Err(err(format!(
+                        "run_cli refused: {exe} is outside %APPDATA%, %LOCALAPPDATA%, %PROGRAMDATA% and the target's folder"
+                    )));
+                }
+                host.note(format!("run_cli {exe} {}", args.join(" ")));
+                crate::packs::script_cli(exe, &args).map_err(err)
+            },
+        );
+    }
+    if caps.grants(Capability::Input) {
+        engine.register_fn(
+            "hotkey",
+            |host: &mut ScriptHost, chord: &str| -> Result<(), Box<EvalAltResult>> {
+                host.note(format!("hotkey {chord}"));
+                crate::packs::send_chord(chord).map_err(err)
+            },
+        );
+    }
+    if caps.grants(Capability::Ipc) {
+        engine.register_fn(
+            "window_message",
+            |host: &mut ScriptHost,
+             class: &str,
+             title: &str,
+             payload: &str|
+             -> Result<(), Box<EvalAltResult>> {
+                host.note(format!("window_message {class} / {title}: {payload}"));
+                send_window_message(class, title, payload).map_err(|e| {
+                    host.note(format!("window_message {class} REFUSED: {e}"));
+                    err(e)
+                })
+            },
+        );
+    }
+    if caps.grants(Capability::Time) {
+        engine.register_fn("sleep", |host: &mut ScriptHost, ms: i64| {
+            let ms = ms.clamp(0, 10_000) as u64;
+            host.note(format!("sleep {ms} ms"));
+            std::thread::sleep(Duration::from_millis(ms));
+        });
+    }
+    if caps.grants(Capability::Process) {
+        engine.register_fn("process_running", |host: &mut ScriptHost, name: &str| -> bool {
+            let running = crate::packs::script_process_running(name);
+            host.note(format!("process_running {name} -> {running}"));
+            running
+        });
+        engine.register_fn(
+            "process_kill",
+            |host: &mut ScriptHost, name: &str| -> Result<(), Box<EvalAltResult>> {
+                host.note(format!("process_kill {name}"));
+                crate::packs::script_process_kill(name).map_err(err)
+            },
+        );
+        engine.register_fn(
+            "process_start",
+            |host: &mut ScriptHost, path: &str| -> Result<(), Box<EvalAltResult>> {
+                // a script may only start programs from the same places it may write files: an
+                // unrestricted spawn would hand it the whole machine
+                let target_dir = host.target_dir.clone();
+                if !exe_allowed(path, &target_dir) {
+                    host.note(format!("process_start {path} REFUSED (outside the allowed folders)"));
+                    return Err(err(format!(
+                        "process_start refused: {path} is outside %APPDATA%, %LOCALAPPDATA%, %PROGRAMDATA% and the target's folder"
+                    )));
+                }
+                host.note(format!("process_start {path}"));
+                crate::packs::script_process_start(path).map_err(err)
+            },
+        );
+    }
 
     // ---- files (reads anywhere, writes only in config locations / the target folder) ----
-    engine.register_fn("read_file", |host: &mut ScriptHost, path: &str| -> ImmutableString {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                host.note(format!("read_file {path} ({} bytes)", text.len()));
-                text.into()
-            }
-            Err(e) => {
-                host.note(format!("read_file {path} FAILED: {e}"));
-                "".into()
-            }
-        }
-    });
-    engine.register_fn(
-        "write_file",
-        |host: &mut ScriptHost, path: &str, text: &str| -> Result<(), Box<EvalAltResult>> {
-            let target_dir = host.target_dir.clone();
-            let path = Path::new(path);
-            if !write_allowed(path, &target_dir) {
-                host.note(format!(
-                    "write_file {} REFUSED (outside the allowed folders)",
-                    path.display()
-                ));
-                return Err(err(format!(
-                    "write_file refused: {} is outside %APPDATA%, %LOCALAPPDATA%, %PROGRAMDATA% and the target's folder",
-                    path.display()
-                )));
-            }
-            // the folders the pack needs do not have to exist yet
-            if let Some(parent) = path.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
-            {
-                return Err(err(format!("write_file {}: {e}", path.display())));
-            }
-            host.note(format!("write_file {} ({} bytes)", path.display(), text.len()));
-            std::fs::write(path, text).map_err(|e| err(format!("write_file {}: {e}", path.display())))
-        },
-    );
-    engine.register_fn(
-        "read_json",
-        |host: &mut ScriptHost, path: &str, pointer: &str| -> ImmutableString {
-            let value = crate::packs::script_json_pointer(path, pointer).unwrap_or_default();
-            host.note(format!("read_json {path} {pointer} -> {value}"));
-            value.into()
-        },
-    );
-    engine.register_fn(
-        "read_ini",
-        |host: &mut ScriptHost, path: &str, section: &str, key: &str| -> ImmutableString {
-            let value = read_ini_value(Path::new(path), section, key)
-                .map(|v| {
-                    host.note(format!("read_ini {path} [{section}] {key} -> {v}"));
-                    v
-                })
-                .unwrap_or_default();
-            value.into()
-        },
-    );
+    if caps.grants(Capability::Files) {
+        engine.register_fn(
+            "read_file",
+            |host: &mut ScriptHost, path: &str| -> ImmutableString {
+                match std::fs::read_to_string(path) {
+                    Ok(text) => {
+                        host.note(format!("read_file {path} ({} bytes)", text.len()));
+                        text.into()
+                    }
+                    Err(e) => {
+                        host.note(format!("read_file {path} FAILED: {e}"));
+                        "".into()
+                    }
+                }
+            },
+        );
+        engine.register_fn(
+            "read_json",
+            |host: &mut ScriptHost, path: &str, pointer: &str| -> ImmutableString {
+                let value = crate::packs::script_json_pointer(path, pointer).unwrap_or_default();
+                host.note(format!("read_json {path} {pointer} -> {value}"));
+                value.into()
+            },
+        );
+        engine.register_fn(
+            "read_ini",
+            |host: &mut ScriptHost, path: &str, section: &str, key: &str| -> ImmutableString {
+                let value = read_ini_value(Path::new(path), section, key)
+                    .map(|v| {
+                        host.note(format!("read_ini {path} [{section}] {key} -> {v}"));
+                        v
+                    })
+                    .unwrap_or_default();
+                value.into()
+            },
+        );
+    }
+    if caps.grants(Capability::FilesWrite) {
+        engine.register_fn(
+            "write_file",
+            |host: &mut ScriptHost, path: &str, text: &str| -> Result<(), Box<EvalAltResult>> {
+                let target_dir = host.target_dir.clone();
+                let path = Path::new(path);
+                if !write_allowed(path, &target_dir) {
+                    host.note(format!(
+                        "write_file {} REFUSED (outside the allowed folders)",
+                        path.display()
+                    ));
+                    return Err(err(format!(
+                        "write_file refused: {} is outside %APPDATA%, %LOCALAPPDATA%, %PROGRAMDATA% and the target's folder",
+                        path.display()
+                    )));
+                }
+                // the folders the pack needs do not have to exist yet
+                if let Some(parent) = path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    return Err(err(format!("write_file {}: {e}", path.display())));
+                }
+                host.note(format!("write_file {} ({} bytes)", path.display(), text.len()));
+                std::fs::write(path, text)
+                    .map_err(|e| err(format!("write_file {}: {e}", path.display())))
+            },
+        );
+    }
+
+    // ---- the windows of other apps ----
+    if caps.grants(Capability::Windows) {
+        engine.register_fn("windows_of", |host: &mut ScriptHost, pid: i64| -> Array {
+            let windows = crate::packs::script_windows_of(pid as u32);
+            let list: Array = windows.into_iter().map(|w| Dynamic::from(w as i64)).collect();
+            host.note(format!("windows_of {pid} -> {} window(s)", list.len()));
+            list
+        });
+        engine.register_fn("window_hide", |host: &mut ScriptHost, hwnd: i64| -> bool {
+            let was = crate::packs::script_window_hide(hwnd as isize);
+            host.note(format!("window_hide {hwnd} (was visible: {was})"));
+            was
+        });
+        engine.register_fn("window_show", |host: &mut ScriptHost, hwnd: i64| -> bool {
+            let was = crate::packs::script_window_show(hwnd as isize);
+            host.note(format!("window_show {hwnd} (was visible: {was})"));
+            was
+        });
+    }
+
+    // ---- audio ----
+    if caps.grants(Capability::Audio) {
+        engine.register_fn("audio_sessions", |host: &mut ScriptHost| -> Array {
+            let sessions = crate::packs::script_audio_sessions();
+            let list: Array = sessions.into_iter().map(Dynamic::from).collect();
+            host.note(format!("audio_sessions -> {} session(s)", list.len()));
+            list
+        });
+        engine.register_fn(
+            "audio_mute",
+            |host: &mut ScriptHost, pid: i64, muted: bool| -> ImmutableString {
+                let report = crate::packs::script_audio_mute(pid as u32, muted);
+                host.note(format!("audio_mute {pid} {muted}: {report}"));
+                report.into()
+            },
+        );
+        engine.register_fn(
+            "audio_mute_all",
+            |host: &mut ScriptHost, muted: bool| -> Result<ImmutableString, Box<EvalAltResult>> {
+                match crate::packs::script_audio_mute_all(muted) {
+                    Ok(report) => {
+                        host.note(format!("audio_mute_all {muted}: {report}"));
+                        Ok(report.into())
+                    }
+                    Err(e) => {
+                        host.note(format!("audio_mute_all REFUSED: {e}"));
+                        Err(err(e))
+                    }
+                }
+            },
+        );
+    }
+
+    // ---- the idle overlay ----
+    if caps.grants(Capability::Overlay) {
+        engine.register_fn("overlay_show", |host: &mut ScriptHost| {
+            host.note("overlay_show (the daemon was asked to show the idle overlay)");
+            crate::packs::request_overlay(crate::packs::OverlayRequest::Show);
+        });
+        engine.register_fn("overlay_hide", |host: &mut ScriptHost| {
+            host.note("overlay_hide (the daemon was asked to take the idle overlay away)");
+            crate::packs::request_overlay(crate::packs::OverlayRequest::Hide);
+        });
+    }
 
     Sandbox {
         engine,
@@ -699,6 +886,148 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // The capability gate
+
+    /// The capabilities of the acceptance case: a pack that asks for the files and
+    /// nothing else.
+    fn files_only() -> CapSet {
+        CapSet::default().with(Capability::Files)
+    }
+
+    #[test]
+    fn a_pack_that_asks_for_files_cannot_run_a_program() {
+        // The acceptance of the phase: the call fails, the message names the missing
+        // capability and what the pack asked for, and the denial is in the pack's log.
+        let mut ctx = ctx();
+        let err = run_with_capabilities(
+            r#"ctx.run_cli("C:\\Windows\\System32\\cmd.exe", ["/c", "echo hi"]);"#,
+            &mut ctx,
+            files_only(),
+        )
+        .expect_err("a pack that was not granted 'exec' must not run a program");
+        assert!(err.contains("run_cli"), "{err}");
+        assert!(err.contains("exec"), "the missing capability: {err}");
+        assert!(err.contains("files"), "what the pack asked for: {err}");
+        assert!(
+            err.contains("REFUSED"),
+            "the denial is written to the pack's log: {err}"
+        );
+    }
+
+    #[test]
+    fn only_the_granted_functions_are_on_the_engine() {
+        let mut ctx = ctx();
+        let context = CapSet::default().with(Capability::Context);
+        // the granted function is there
+        run_with_capabilities(
+            r#"if ctx.target_name() != "app.exe" { throw "wrong target" }"#,
+            &mut ctx,
+            context,
+        )
+        .expect("the granted function must be there");
+        // a function of another capability is not
+        let err = run_with_capabilities(r#"ctx.log("hi");"#, &mut ctx, context)
+            .expect_err("the journal capability was not granted");
+        assert!(err.contains("journal"), "{err}");
+        assert!(err.contains("context"), "{err}");
+    }
+
+    #[test]
+    fn one_engine_per_capability_set() {
+        // Each distinct capability set gets its own engine, built once and kept.
+        let mut ctx = ctx();
+        let files = files_only();
+        let exec = CapSet::default().with(Capability::Exec);
+        let before = BUILDS.with(|c| c.get());
+        run_with_capabilities(r#"let t = ctx.read_file("nope.txt");"#, &mut ctx, files)
+            .expect("the script runs");
+        run_with_capabilities(r#"let t = ctx.read_file("nope.txt");"#, &mut ctx, files)
+            .expect("the script runs");
+        // the second capability set: its own engine, even though the script is the same
+        let _ = run_with_capabilities(r#"ctx.run_cli("x", []);"#, &mut ctx, exec);
+        let after = BUILDS.with(|c| c.get());
+        assert_eq!(
+            after - before,
+            2,
+            "one engine per capability set, built once ({before} -> {after})"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_rearmed_on_every_engine() {
+        // Every engine carries its own budgets, and they are re-armed before every run:
+        // a run cannot inherit the allowance of the run before it, not even the run
+        // before it on another engine.
+        let mut ctx = ctx();
+        let one = CapSet::default().with(Capability::Time);
+        let two = one.with(Capability::Journal);
+        let busy = "let i = 0; while true { i += 1; ctx.sleep(50); }";
+        let budget = Duration::from_millis(300);
+
+        let err = run_with_budget(busy, &mut ctx, budget, one).expect_err("the run must be cut off");
+        assert!(err.contains("budget"), "{err}");
+
+        // the first run on the *second* engine: it must get a budget of its own, not the
+        // expired deadline of the first engine
+        let started = Instant::now();
+        let err = run_with_budget(busy, &mut ctx, budget, two).expect_err("must be cut off too");
+        assert!(err.contains("budget"), "{err}");
+        assert!(
+            started.elapsed() >= budget,
+            "the second engine must get a budget of its own: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_new_capabilities_are_reachable_and_gated() {
+        // COM for the audio sessions: the audio interfaces are COM objects and COM is
+        // per thread.
+        crate::killswitch::init_com();
+        let mut ctx = ctx();
+
+        let windows = CapSet::default().with(Capability::Windows);
+        run_with_capabilities(r#"let w = ctx.windows_of(1);"#, &mut ctx, windows)
+            .expect("the windows capability must be there");
+
+        let audio = CapSet::default().with(Capability::Audio);
+        run_with_capabilities(r#"let s = ctx.audio_sessions();"#, &mut ctx, audio)
+            .expect("the audio capability must be there");
+
+        // and the mute reports the previous state of the sessions it touched. The pid
+        // cannot exist, so nothing on this machine is really muted.
+        let report = run_with_capabilities(
+            r#"let r = ctx.audio_mute(4294967295, true);"#,
+            &mut ctx,
+            audio,
+        )
+        .expect("the mute must run");
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("no audio session for pid 4294967295")),
+            "{report:?}"
+        );
+
+        let overlay = CapSet::default().with(Capability::Overlay);
+        run_with_capabilities(r#"ctx.overlay_show();"#, &mut ctx, overlay)
+            .expect("the overlay capability must be there");
+
+        // and each of them is refused without its capability
+        let err = run_with_capabilities(r#"let w = ctx.windows_of(1);"#, &mut ctx, CapSet::default())
+            .expect_err("the windows capability was not granted");
+        assert!(err.contains("windows"), "{err}");
+    }
+
+    #[test]
+    fn a_capability_the_pack_asked_for_nothing_says_so() {
+        let mut ctx = ctx();
+        let err = run_with_capabilities(r#"ctx.log("hi");"#, &mut ctx, CapSet::default())
+            .expect_err("nothing was granted");
+        assert!(err.contains("nothing"), "{err}");
+    }
+
     #[test]
     fn the_operation_budget_is_rearmed_on_every_run() {
         // A script that never ends. The operation budget must stop it — and it must stop
@@ -748,7 +1077,8 @@ mod tests {
         let mut ctx = ctx();
 
         let started = Instant::now();
-        let first = run_with_budget(busy, &mut ctx, budget).expect_err("the first run must be cut off");
+        let first = run_with_budget(busy, &mut ctx, budget, CapSet::ALL)
+            .expect_err("the first run must be cut off");
         let first_took = started.elapsed();
         assert!(first.contains("budget"), "{first}");
         assert!(
@@ -757,8 +1087,8 @@ mod tests {
         );
 
         let started = Instant::now();
-        let second =
-            run_with_budget(busy, &mut ctx, budget).expect_err("the second run must be cut off too");
+        let second = run_with_budget(busy, &mut ctx, budget, CapSet::ALL)
+            .expect_err("the second run must be cut off too");
         let second_took = started.elapsed();
         assert!(second.contains("budget"), "{second}");
         assert!(

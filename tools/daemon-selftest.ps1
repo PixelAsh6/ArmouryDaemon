@@ -424,7 +424,7 @@ try {
     Check 'the apply starts a lockout' ($s.state -eq 'cooldown') "state=$($s.state)"
     Check 'the lockout counts down' ($s.cooldown_remaining_ms -gt 0 -and $s.cooldown_remaining_ms -le 5000) "remaining=$($s.cooldown_remaining_ms)"
     Check 'the applied state names the app' ($s.trigger_source -eq 'timeout.exe') "source=$($s.trigger_source)"
-    Check 'the daemon plans no switch any more' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
+    Check 'no change is waiting behind the window' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
 
     # ---- 5. the lockout ends while the app runs: nothing changes ----
     # A lockout that expires while the intent still holds changes nothing and starts no new one.
@@ -587,6 +587,45 @@ try {
     Check 'the manual revert leaves no lockout behind' (($s.state -eq 'idle') -and ($null -eq $s.cooldown_remaining_ms)) "state=$($s.state) remaining=$($s.cooldown_remaining_ms)"
     $p6 | Stop-Process -Force -ErrorAction SilentlyContinue
 
+    # ---- 12b. a change of the cooldown re-times the window that is running ----
+    # The gap that let the defect through: the harness set the cooldown only *before* a
+    # scenario, so a window that was already running was never re-timed, and the change the
+    # window was holding landed at the old expiry. The window keeps its start and takes the
+    # new length, so the change lands at start + cooldown.
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $startAt = Get-Date
+    $p7 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'cooldown' 8
+    Check 'the start opens a window' ($s.state -eq 'cooldown') "state=$($s.state)"
+    $left = $s.cooldown_remaining_ms
+    Check 'the window runs with the old cooldown' ($left -gt 2000 -and $left -le 5000) "remaining=$left"
+    # the close is held by the window that is running
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $p7 | Stop-Process -Force
+    $held = $null
+    for ($i = 0; $i -lt 40 -and $null -eq $held; $i++) {
+        Start-Sleep -Milliseconds 250
+        $t = Status
+        if ($t -and $t.cooldown_action -eq 'revert') { $held = $t }
+    }
+    Check 'the close is held by the running window' ($null -ne $held) "action=$(($held).cooldown_action)"
+    # the user lengthens the cooldown while the window is running
+    Send-Pipe '{"type":"set_cooldown","seconds":20}' | Out-Null
+    Start-Sleep -Milliseconds 300
+    $after = (Status).cooldown_remaining_ms
+    Check 'the window in flight takes the new length' ($after -gt 14000 -and $after -le 20000) "before=$left now=$after"
+    # and the change the window holds lands at the new expiry, not at the old one
+    $times = @(Wait-Change 'revert' $reverts 40)
+    Check 'the held revert lands on the re-timed window' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $revertAt = $times[$times.Count - 1]
+    Check 'the change lands at the new expiry' ((Get-Gap $startAt $revertAt) -ge 12 -and (Get-Gap $startAt $revertAt) -le 32) "start=$startAt revert=$revertAt"
+    # the rest of the run uses the short cooldown again
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $s = Wait-State 'idle' 20
+    Check 'the daemon goes idle after the re-timed window' ($s.state -eq 'idle') "state=$($s.state)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+
     # ---- 13. config lives in the throw-away folder, not in %APPDATA% ----
     $tempConfig = Join-Path $configDir 'config.json'
     Check 'the test instance used its own config folder' (Test-Path $tempConfig) "expected $tempConfig"
@@ -710,6 +749,51 @@ try {
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     Remove-Item -Recurse -Force $srcDir -ErrorAction SilentlyContinue
 
+    # ---- 19b. the host API is scoped: a pack may only call what it was granted ----
+    # A pack declares the capabilities it wants. The daemon grants only those, and a call
+    # to a function of a capability that was not granted fails as an *unknown function*:
+    # the denial is structural, not a check a call site could forget. The denial names the
+    # missing capability and what the pack asked for, and it lands in the pack's log.
+    $capDir = Join-Path $env:TEMP "armoury-cappack-$ns"
+    New-Item -ItemType Directory -Force -Path $capDir | Out-Null
+    $capPack = @'
+{
+  "spec": 2,
+  "id": "captest",
+  "name": "Capability test",
+  "version": "1.0.0",
+  "order": 6,
+  "targets": { "process": ["timeout.exe"] },
+  "capabilities": ["files"],
+  "script": {
+    "apply":  "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\"); ctx.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]);",
+    "revert": "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\");"
+  },
+  "apply": { "steps": [] },
+  "revert": { "guard": { "targetRunning": false, "capturedRunning": true }, "steps": [] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $capDir 'pack.json'), $capPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($capDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a pack that declares its capabilities installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"set_pack_enabled","id":"captest","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p8 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'triggered' 25
+    Start-Sleep -Milliseconds 800
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the granted call still ran' ($logText -match 'read_file C:/armoury-capability-probe-does-not-exist.txt') "the granted function of the pack did not run"
+    Check 'the ungranted call is in the pack log' ($logText -match 'captest: script apply failed') "no failure line for the pack"
+    Check 'the denial names the missing capability' ($logText -match "run_cli REFUSED: it needs the 'exec' capability") "no capability in the denial"
+    Check 'the denial names what the pack asked for' ($logText -match 'the pack asked for: files') "no grant set in the denial"
+    $p8 | Stop-Process -Force
+    Send-Pipe '{"type":"set_pack_enabled","id":"captest","enabled":false}' | Out-Null
+    $op = Send-And-Wait '{"type":"remove_pack","id":"captest"}' 'pack_op'
+    Check 'the pack with capabilities removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Remove-Item -Recurse -Force $capDir -ErrorAction SilentlyContinue
+
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
     # desktop. They run in a namespace of their own ($cliNs), see the top of this file.
@@ -726,7 +810,7 @@ try {
         $probe = Invoke-CliProbe @('--version')
         $r = $probe.Run
         Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
-        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.4')) "output=$(Get-FirstLine $r.Text)"
+        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.5')) "output=$(Get-FirstLine $r.Text)"
 
         # --help: the usage, exit 0, with every flag the parser accepts
         $probe = Invoke-CliProbe @('--help')
@@ -827,15 +911,94 @@ try {
             Check 'a pack from the catalogue installs and verifies' ($run.Exit -eq 0) "output=$(Get-FirstLine $run.Text)"
         }
 
+        # -- 20c. one client, not one per request --
+        #
+        # The manifest and the pack file are two requests to the same host, and they travel
+        # over **one** connection. A client of its own for every request would open a
+        # connection for each - and would rebuild the rustls config and the platform verifier
+        # every time.
+        #
+        # The pack is the shipped G-Helper pack under a name of its own, so the probe installs
+        # nothing that is really there: the folder it leaves behind is removed again below.
+        $localPack = (Resolve-Path (Join-Path $PSScriptRoot '..\packs\g-helper\pack.json')).Path
+        $packText = ([IO.File]::ReadAllText($localPack)).Replace('"id": "g-helper"', '"id": "harness-test"')
+        $packBytes = [Text.Encoding]::UTF8.GetBytes($packText)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $packSha = ([System.BitConverter]::ToString($sha.ComputeHash($packBytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+        $manifest = '{"schema":1,"updated":"2026-10-22","packs":[{"id":"harness-test","name":"Harness test","version":"9.9.9","description":"served by the harness","file":"packs/harness-test/pack.json","sha256":"' + $packSha + '","size":' + $packBytes.Length + '}]}'
+        $manifestBytes = [Text.Encoding]::UTF8.GetBytes($manifest)
+        $server = Start-LoopbackListener
+        $script:requests = @()
+        $script:connections = 0
+        $probe = Invoke-CatalogProbe @('--catalog-install', 'harness-test', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
+            # the server answers until the daemon has both files, or until it runs out of time
+            $deadline = (Get-Date).AddSeconds(20)
+            while ((Get-Date) -lt $deadline -and $script:requests.Count -lt 2) {
+                # the helper already started the first accept: a second one would compete with
+                # it for the connection, and the daemon would wait for an answer that never
+                # comes
+                if ($script:connections -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
+                if (-not $accept.Wait(2000)) { break }   # no further connection
+                $client = $accept.GetAwaiter().GetResult()
+                $script:connections++
+                $client.ReceiveTimeout = 5000
+                try {
+                    while ($true) {
+                        try { $request = Read-Request $client } catch { break }
+                        if (-not $request) { break }
+                        $script:requests += $request
+                        $body = if (($request -split "`r`n")[0] -like '*pack.json*') { $packBytes } else { $manifestBytes }
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($body.Length)`r`n`r`n"
+                        $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
+                        $stream = $client.GetStream()
+                        $stream.Write($headBytes, 0, $headBytes.Length)
+                        $stream.Write($body, 0, $body.Length)
+                        $stream.Flush()
+                        if ($script:requests.Count -ge 2) { break }
+                    }
+                }
+                finally { $client.Close() }
+            }
+        }
+        $server.Listener.Stop()
+        # the pack the probe installed is not one of ours: it goes away again, from wherever
+        # the daemon put it (the build folder if it is there, the repository's own folder if
+        # the daemon resolved that one)
+        Remove-Item -LiteralPath (Join-Path $buildPacks 'harness-test') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $repoRoot 'packs\harness-test') -Recurse -Force -ErrorAction SilentlyContinue
+        Check 'the pack installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit) $(Get-FirstLine $probe.Text)"
+        Check 'the manifest and the pack file travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 2)) "connections=$($script:connections) requests=$($script:requests.Count)"
+
         $env:ARMOURY_TEST_NS = $ns
     }
     else {
         "SKIP  the command-line probes (--version, --help, an unknown argument, a flag without"
-        "      its value) and the two catalogue probes (a gzip manifest, the real catalogue):"
+        "      its value) and the catalogue probes (a gzip manifest, the real catalogue, the local"
+        "      one):"
         "      the executable asks Windows for administrator rights, and this harness is not"
         "      elevated - every probe would raise a UAC prompt and the harness would wait for"
         "      the answer. Run the harness from an elevated shell to run them."
     }
+
+    # ---- 21. the root store the binary carries ----
+    #
+    # The build has exactly **one** root store: the Windows certificate store. The Mozilla
+    # bundle is not in the binary, and the HTTP client refuses the bundled roots instead of
+    # using them - so the catalogue, the cover art and the band's thumbnails can only be
+    # validated against the Windows store. The unit tests in catalog.rs, art.rs and
+    # console_ui.rs say that they use that client; these checks say that there is no other
+    # one to use.
+    #
+    # These checks read the binary, so they need no elevation and they run either way.
+    $binary = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Exe))
+    # the subject of one of Mozilla's bundled roots: it is in the binary as long as the
+    # bundle is
+    Check 'the binary carries no bundled root certificates' (-not $binary.Contains('DigiCert TLS ECC P384 Root G5')) 'the Mozilla root bundle is in the binary'
+    # ureq's own refusal, compiled in when the bundled roots are not linked: the client
+    # cannot fall back to them
+    Check 'the client refuses the bundled roots instead of using them' ($binary.Contains('WebPki is disabled')) 'the refusal is not in the binary'
+    # the Windows verifier, called by the platform verifier: the store is really used
+    Check 'the binary links the Windows certificate verifier' ($binary.Contains('CertVerifyCertificateChainPolicy')) 'the Windows verifier is not linked'
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {
