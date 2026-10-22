@@ -132,11 +132,12 @@ pub fn load(search_dirs: &[PathBuf]) -> Vec<Installed> {
                         continue; // a pack in an earlier search dir wins
                     }
                     info!(
-                        "pack loaded: {} v{} (order {}, {} target(s))",
+                        "pack loaded: {} v{} (order {}, {} target(s), kind {})",
                         pack.name,
                         pack.version,
                         pack.order,
-                        pack.targets.process.len()
+                        pack.targets.process.len(),
+                        pack.kind.name()
                     );
                     seen.push(pack.id.clone());
                     found.push(Installed { pack });

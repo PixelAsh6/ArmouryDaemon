@@ -794,6 +794,65 @@ try {
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     Remove-Item -Recurse -Force $capDir -ErrorAction SilentlyContinue
 
+    # ---- 19c. the pack schema: `kind` and `triggers` ----
+    # A pack may say what it is (`kind`: "pack" or "mode") and what starts it (`triggers`).
+    # Both fields are **additive**: a pack that does not carry them loads and behaves
+    # exactly as it did before, and the three shipped packs do not carry them. The mode
+    # machinery itself is a later phase - today a mode is still a pack the daemon applies
+    # like any other; what this checks is that the schema knows the two fields, that a
+    # pack may carry them, and that a malformed one is refused by name.
+    $kindDir = Join-Path $env:TEMP "armoury-kindpack-$ns"
+    New-Item -ItemType Directory -Force -Path $kindDir | Out-Null
+    $kindPack = @'
+{
+  "spec": 2,
+  "id": "kindtest",
+  "name": "Kind test",
+  "version": "1.0.0",
+  "order": 7,
+  "kind": "mode",
+  "triggers": [ { "kind": "hotkey", "key": "end" } ],
+  "targets": { "process": ["timeout.exe"] },
+  "script": { "apply": "ctx.log(\"kind apply ran\");", "revert": "ctx.log(\"kind revert ran\");" },
+  "apply": { "steps": [] },
+  "revert": { "guard": { "targetRunning": false, "capturedRunning": true }, "steps": [] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $kindDir 'pack.json'), $kindPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($kindDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a pack with a kind and triggers installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    $s = Status
+    Check 'the daemon loaded the pack' (@($s.packs | Where-Object { $_.id -eq 'kindtest' }).Count -eq 1) "packs=$(@($s.packs).Count)"
+    Start-Sleep -Milliseconds 300
+    $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the daemon read the kind of the pack' ($logText -match 'Kind test v.*kind mode') "the log does not name the kind"
+    $op = Send-And-Wait '{"type":"remove_pack","id":"kindtest"}' 'pack_op'
+    Check 'the pack with a kind removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Remove-Item -Recurse -Force $kindDir -ErrorAction SilentlyContinue
+
+    # a malformed kind is a named error, like the other schema errors
+    $badDir = Join-Path $env:TEMP "armoury-badkind-$ns"
+    New-Item -ItemType Directory -Force -Path $badDir | Out-Null
+    $badPack = $kindPack.Replace('"kind": "mode"', '"kind": "widget"')
+    [IO.File]::WriteAllText((Join-Path $badDir 'pack.json'), $badPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($badDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a malformed kind is refused' ($op -and -not $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'the refusal names the kind' ($op -and $op.message -match 'kind') "message=$($op.message)"
+    Check 'the refusal names the bad value' ($op -and $op.message -match 'widget') "message=$($op.message)"
+    Check 'the refusal says what the kind may be' ($op -and $op.message -match "'pack'") "message=$($op.message)"
+    Check 'the refused pack landed nowhere' (-not (Test-Path (Join-Path $buildPacks 'kindtest'))) "the pack was installed anyway"
+    Remove-Item -Recurse -Force $badDir -ErrorAction SilentlyContinue
+
+    # a mode needs at least one trigger
+    $modeDir = Join-Path $env:TEMP "armoury-modepack-$ns"
+    New-Item -ItemType Directory -Force -Path $modeDir | Out-Null
+    $modePack = $kindPack.Replace('"triggers": [ { "kind": "hotkey", "key": "end" } ],', '"triggers": [],')
+    [IO.File]::WriteAllText((Join-Path $modeDir 'pack.json'), $modePack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($modeDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a mode without a trigger is refused' ($op -and -not $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'the refusal names the trigger' ($op -and $op.message -match 'trigger') "message=$($op.message)"
+    Remove-Item -Recurse -Force $modeDir -ErrorAction SilentlyContinue
+
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
     # desktop. They run in a namespace of their own ($cliNs), see the top of this file.

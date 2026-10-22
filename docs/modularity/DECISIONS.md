@@ -538,3 +538,100 @@ cooldown row reads to say that a change is waiting behind the window.
 same decision as row **H21**, with the log excerpt it is based on. That file is the
 private decision log of the earlier sessions; this section is the versioned copy.
 
+---
+
+## 18. `kind` and `triggers` are additive, and the mode machinery comes later
+
+**Settled — implemented in A3.** The pack schema gained two fields: `kind` (`"pack"` or
+`"mode"`) and `triggers` (what starts the pack). Both are **additive**: a pack that does
+not carry them loads and behaves exactly as it did before, the three shipped packs carry
+neither, the catalogue needs no change, and `spec` stays 1 or 2.
+
+**The defaults.** `kind` defaults to `"pack"`; `triggers` defaults to
+`[ { "kind": "tracked_app" } ]` — today's behaviour, a pack applies while a tracked app
+runs. **The default is the same for every kind**: a mode that does not say what starts it
+inherits the tracked app, like any other pack. The rule "a mode needs at least one
+trigger" therefore bites on an **explicitly empty** trigger list, not on an absent one.
+
+**Why.** `DESIGN.md` §1 gives the field one default, and that default is the behaviour a
+pack had before the field existed. A default that depended on the kind would need the
+schema to know whether the field was *present* — `serde(default = …)` cannot see the
+other fields — and the pack's own default is the one that keeps today's packs working.
+
+**A malformed `kind` is a named error.** The kind is a closed set, and a value outside it
+is refused when the pack is parsed: `unknown kind 'widget' (expected 'pack' or 'mode')` —
+the same shape as the capability list's `unknown capability 'teleport'`, and it names what
+the kind may be, because there are only two of them and the author would otherwise have
+to guess. It is never a panic and never a silent default to `"pack"`.
+
+**The shape of a trigger.** A trigger is `{ "kind": … }` and, for a `hotkey`, the key it
+listens for. Two rules the folder did not state, settled here:
+
+- **A `hotkey` trigger needs a key.** Without one it names no key, and nothing would ever
+  start the pack.
+- **A `tracked_app` trigger takes no key.** A key there would be ignored in silence —
+  the same failure the other schema errors guard against ("a `when` that names something
+  the pack does not have would never match, and the step would vanish silently while the
+  pack reports success").
+
+**The key name is not checked against the daemon's hotkey table.** The schema does not
+carry the list of keys (`crates/armoury/src/hotkey.rs` knows End and Home), and a second
+list would drift from the first — the same reason the capability table lives in one
+place. A key the daemon does not know is a trigger that never fires; the daemon-side
+resolution belongs to the phase that dispatches a trigger (A4/A5).
+
+**The daemon does not act on the fields yet — and that is why the phase is additive.**
+Before the schema knew them, a pack that carried `"kind": "mode"` loaded as an ordinary
+pack: serde drops the fields it does not know. After it, the daemon still applies a mode
+pack the way it applies any other pack, because the mode machinery — a worker of its own,
+a hotkey that dispatches to it — is Phase A4 and A5. **The daemon's behaviour did not
+change; the schema learned to say what it always meant.** The kind is in the log line
+that names the loaded pack, so an operator can see it.
+
+**Rejected:**
+
+- **A `spec: 3`.** `spec` is the *script* axis and stays 1 or 2 (§13). `kind` and
+  `triggers` are new, separate axes.
+- **Refusing a mode pack until the mode machinery exists.** It would change what the
+  daemon does with a pack it already accepts, and it would make the field meaningless in
+  the phase that introduces it. The gates belong to the phase that implements them.
+- **Validating the hotkey key against the daemon's table inside the schema.** Two lists,
+  and the schema would have to know about the daemon's hotkeys.
+- **A default that depends on the kind.** It needs the schema to tell an absent field
+  from an empty one, and it would make the mode rule fire on packs that never mentioned
+  triggers.
+
+---
+
+## 19. The schema phase adds 12,288 bytes — the size rule bends here, once more
+
+**Settled — measured in A3.** The release build of the tree goes from **12,865,024 bytes**
+(the v1.1.5 release asset — the baseline for the size rule on the released tree) to
+**12,877,312 bytes**: **+12,288 bytes, +0.10 %**.
+
+**Where the bytes are.** The PE section table of the two builds says it in a minute: the
+growth is **code** — **+10,752 bytes of `.text`** — plus **+1,024 bytes of `.rdata`** (the
+format strings of the new error messages) and **+512 bytes of `.pdata`** (the unwind
+tables of that code). The other sections did not move: `.data`, `.rsrc` and `.reloc` are
+byte-identical.
+
+**The split was not measured per crate.** That needs a build on this machine, and the
+build happens in CI. With `lto = "fat"` and `codegen-units = 1` a change of this size
+re-optimises the whole program, so the 12 KB is the program's new layout and not
+necessarily the two enums alone.
+
+**Why the rule bends.** The rule exists to catch *gratuitous* growth — a module system, a
+WASM runtime — and not to freeze a phase that delivers what the work is for. This phase
+delivers the schema the whole module system rests on: two discriminants, their
+(de)serializers and the validation that refuses a malformed pack by name. The bytes buy
+a pack format that can say what a pack is.
+
+**Rejected:**
+
+- **A `String` for the kind instead of an enum.** It would have saved the two
+  (de)serializers — the bytes were not measured against that alternative — and it would
+  have cost the typed discriminant that the Modules window (B4) and the manifest (B1)
+  both need. A schema that cannot say what a pack is is worth more than a kilobyte.
+- **Dropping the named error to save the format strings.** A malformed `kind` has to be
+  a named error (`WORK-ORDER.md` A3), and a silent default to `"pack"` is exactly what
+  the phase exists to prevent.

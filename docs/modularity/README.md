@@ -37,6 +37,11 @@ background.
 
 ## Current state
 
+- **Phase A3 is done on `feature/a3-kind-triggers`** — the pack schema's `kind` and
+  `triggers`, both **additive**, a malformed `kind` refused by name. The branch is cut
+  from `main` (`79ad905`) and is **not merged**: the merge is the user's call. The daemon
+  does not act on the fields yet — the mode machinery is A4/A5 — so the phase changes no
+  runtime path and the three shipped packs cannot notice it.
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The phase is
   integrated on **`main`** — A2, with the lockout re-timing and the art fetch through the
   Windows certificate store merged into it — at the merge commit `4712b44`, and it is the
@@ -48,9 +53,11 @@ background.
   certificate store** for the catalogue **and the cover art**, and the **cooldown
   re-timing** — a change of the cooldown re-times the window that is running. It carries
   the executable (12,865,024 bytes) and its 85-byte sidecar, and nothing else. It is
-  **published but not installed** — the machine still runs the older build.
-- **The next action is Phase A3** — `triggers` and `kind` in the pack schema
-  (`WORK-ORDER.md` A3). It is not started.
+  **published and installed** — the copy in `C:\Apps\ArmouryDaemon` hashes to
+  `947ef3dc…24a4`, the published asset's hash.
+- **The next action is Phase A4** — a separate worker queue for modes. The pack worker is
+  a single serial thread (`packs.rs:168`), so a slow mode must never block a pack
+  apply/revert: modes get their own thread and channel. `WORK-ORDER.md` A4.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -85,17 +92,17 @@ background.
 
 ## The next action
 
-**Phase A3 — `triggers` + `kind` in the pack schema.** The pack gains a `kind`
-(`"pack"` or `"mode"`) and a `triggers` list, both **additive**: the three shipped
-packs must keep working unchanged, and a malformed `kind` has to be a named error like
-the other schema errors. `WORK-ORDER.md` A3.
+**Phase A4 — a separate worker queue for modes.** The pack worker is a **single serial
+thread** (`packs.rs:168`, `while let Ok(job) = jobs.recv()`), so a slow mode would block
+every later apply and revert. Modes get their own thread and their own channel.
+`WORK-ORDER.md` A4.
 
-A2 is the phase before it, and it is done: the capability-scoped host API. A pack declares
-the capabilities it needs and the daemon grants only those — **one engine per capability
-set** (`DESIGN.md` §3), because the sandbox keeps an engine per thread since 1.1.3, so
-"register less" is no longer free. The full phase list is in `WORK-ORDER.md`. Phases run
-in order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and
-settled.
+A3 is the phase before it, and it is done: the pack schema carries `kind` (`"pack"` or
+`"mode"`) and `triggers`, both **additive**, and a malformed `kind` is refused by name.
+The daemon does not act on the fields yet — that is A4 and A5 — so the phase could not
+change what the daemon does with a pack. The full phase list is in `WORK-ORDER.md`.
+Phases run in order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has
+shipped and settled.
 
 ---
 
