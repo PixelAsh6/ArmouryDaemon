@@ -839,6 +839,7 @@ try {
     Check 'a malformed kind is refused' ($op -and -not $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Check 'the refusal names the kind' ($op -and $op.message -match 'kind') "message=$($op.message)"
     Check 'the refusal names the bad value' ($op -and $op.message -match 'widget') "message=$($op.message)"
+    Check 'the refusal says what the kind may be' ($op -and $op.message -match "'pack'") "message=$($op.message)"
     Check 'the refused pack landed nowhere' (-not (Test-Path (Join-Path $buildPacks 'kindtest'))) "the pack was installed anyway"
     Remove-Item -Recurse -Force $badDir -ErrorAction SilentlyContinue
 

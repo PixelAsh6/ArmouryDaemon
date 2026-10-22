@@ -370,7 +370,9 @@ impl<'de> Deserialize<'de> for PackKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<PackKind, D::Error> {
         let name = String::deserialize(deserializer)?;
         PackKind::from_name(&name).ok_or_else(|| {
-            <D::Error as serde::de::Error>::custom(format!("unknown kind '{name}'"))
+            <D::Error as serde::de::Error>::custom(format!(
+                "unknown kind '{name}' (expected 'pack' or 'mode')"
+            ))
         })
     }
 }
@@ -415,7 +417,9 @@ impl<'de> Deserialize<'de> for TriggerKind {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<TriggerKind, D::Error> {
         let name = String::deserialize(deserializer)?;
         TriggerKind::from_name(&name).ok_or_else(|| {
-            <D::Error as serde::de::Error>::custom(format!("unknown trigger kind '{name}'"))
+            <D::Error as serde::de::Error>::custom(format!(
+                "unknown trigger kind '{name}' (expected 'tracked_app' or 'hotkey')"
+            ))
         })
     }
 }
@@ -2001,12 +2005,15 @@ mod tests {
         let err = Pack::parse(&text).expect_err("an unknown kind must be refused");
         assert!(err.contains("kind"), "{err}");
         assert!(err.contains("widget"), "{err}");
+        // the error says what the kind may be, so the author does not have to guess
+        assert!(err.contains("'pack'") && err.contains("'mode'"), "{err}");
 
         // and so is a trigger kind the daemon does not know
         let text = KIND_PACK.replace("\"kind\": \"hotkey\"", "\"kind\": \"teleport\"");
         let err = Pack::parse(&text).expect_err("an unknown trigger kind must be refused");
         assert!(err.contains("trigger"), "{err}");
         assert!(err.contains("teleport"), "{err}");
+        assert!(err.contains("'hotkey'"), "{err}");
     }
 
     #[test]
