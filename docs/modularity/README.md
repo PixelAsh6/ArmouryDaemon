@@ -38,10 +38,10 @@ background.
 ## Current state
 
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The A2 work is
-  delivered on **`feature/a2-capabilities`** (tip `9acd3b6`), on top of `0ecacd3` and
-  the art fetch through the Windows certificate store (another agent's work). An
-  **A2-only** copy of the phase is on `feature/a2-capabilities-clean`; the two trees
-  have **different numbers** — a number without its tree is not a number.
+  delivered on **`feature/a2-capabilities`**, on top of `0ecacd3` and the art fetch
+  through the Windows certificate store (another agent's work). An **A2-only** copy of
+  the phase is on `feature/a2-capabilities-clean`; the two trees have **different
+  numbers** — a number without its tree is not a number.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).

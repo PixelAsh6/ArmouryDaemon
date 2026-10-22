@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A — **A1 and A2 done** (the TLS root store, the capability-scoped host API), A3 next |
 | **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) |
-| **Branch** | `main` is at `0ecacd3` (version **1.1.4**). The A2 work is delivered on **`feature/a2-capabilities`** (tip `9acd3b6`) — on top of `0ecacd3` **and** the art fetch through the Windows certificate store, which is another agent's work. The **A2-only** copy of the phase is on `feature/a2-capabilities-clean`; it does **not** carry the fixes of the entry below, so the two branches have different numbers |
+| **Branch** | `main` is at `0ecacd3` (version **1.1.4**). The A2 work is delivered on **`feature/a2-capabilities`** — on top of `0ecacd3` **and** the art fetch through the Windows certificate store, which is another agent's work. The **A2-only** copy of the phase is on `feature/a2-capabilities-clean`; it does **not** carry the fixes of the entry below, so the two branches have different numbers |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |
@@ -400,8 +400,10 @@ tree. **The baseline for the size rule on the delivered branch is 12,862,976 byt
 *The CI run:* **39731173747** (the workflow dispatch on the commit that carries the
 phase's code), the job **green** in **6 min 22 s**: the debug build, **359 unit tests**
 (268 + 91), and the self-test harness with **101 checks, all passed** — plus the
-release build and the artefact the size was measured from. A later run on the branch's
-tip was green as well (**39733574798**): the same 359 tests and the same 101 checks.
+release build and the artefact the size was measured from. The branch's tip was
+confirmed green afterwards in **39733574798** (**6 min 41 s**) and again in
+**39734338552** (**6 min 34 s**): the same 359 tests and the same 101 checks, every
+time.
 
 **Decisions.** `DECISIONS.md` §16: `audio_mute` returns the previous mute state **per
 session**, not per process and not as a count — a process can own several sessions and
