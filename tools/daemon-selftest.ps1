@@ -943,7 +943,7 @@ try {
         $probe = Invoke-CliProbe @('--version')
         $r = $probe.Run
         Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
-        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.5')) "output=$(Get-FirstLine $r.Text)"
+        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.6')) "output=$(Get-FirstLine $r.Text)"
 
         # --help: the usage, exit 0, with every flag the parser accepts
         $probe = Invoke-CliProbe @('--help')
