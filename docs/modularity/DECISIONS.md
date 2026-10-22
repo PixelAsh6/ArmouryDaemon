@@ -433,3 +433,54 @@ the phase that brings the killswitch and idle modules (B/C), and A2 then ships t
 gate alone. That is a decision about the *order* of the phases, not about the design —
 and it should be taken by the user, not by the phase that happens to be running.
 
+**The size rule bends on a tree that carries another branch's work.** The number above
+is the A2-only tree (`0ecacd3` + A2). The branch this phase is delivered on also
+carries the art fetch through the Windows certificate store, and that work takes
+Mozilla's bundled roots **out** of the binary — so the same phase costs
+**+60,928 bytes** there, measured against that tree's own baseline of 12,796,416
+bytes. Both numbers are true; they are measured against different parents. See
+`PROGRESS.md` for which tree carries which number.
+
+---
+
+## 16. `audio_mute` returns the previous mute state, per session
+
+**Settled — implemented in A2.** `DESIGN.md` §2 requires the host function to return
+the previous mute state. The first implementation returned only counts
+(`2 session(s) muted, 1 left alone, 0 could not be changed`), which says *how much*
+happened but not *what the state was*. A pack's revert needs the state.
+
+So the report names **every session of the process and the state it was in before the
+call**:
+
+```
+muted {session} (was playing), left alone {session} (was muted)
+```
+
+with `unmuted {session} (was muted)` for a session this call had muted before, and
+`could not be changed {session} (was playing)` when Windows refused. A process without
+an audio session gets `no audio session for pid {pid}`.
+
+**Why per session and not per process.** A process can own several audio sessions, and
+they do not have to be in the same state — a game may have one session the user muted
+by hand and another that was playing. One word for the whole process would either lose
+that distinction or be a guess ("mixed").
+
+**Why the state is named and not just counted.** The counts alone cannot answer "was
+that the user's own mute or ours?" — and that is the difference between a revert that
+restores the machine and one that unmutes something the user silenced.
+
+**Rejected:**
+
+- **The counts alone** (what the first implementation did). It does not carry the
+  previous state, which is the one thing the design asks for.
+- **A separate host function that only reports the state** (`audio_state(pid)`). The
+  report already carries it, and a second function would be a second thing to gate.
+- **A boolean "was muted" per process.** Lossy, as above — and it cannot say which of
+  the sessions was the user's own.
+
+**The second half of the same rule — never unmute a session the user muted — is
+enforced by the ledger, not by the report.** The sessions this call muted are
+remembered by their session id, so the unmute touches exactly those. The report says
+so out loud (`left alone {session} (was muted)`), and a unit test proves both halves.
+

@@ -77,14 +77,22 @@ where it is:
 |---|---|---|
 | `windows_of(pid)` | `killswitch::windows_of` — `killswitch.rs:202` | the visible, unowned, non-tool windows of a process |
 | `window_hide(hwnd)` / `window_show(hwnd)` | `ShowWindow`, as in `killswitch.rs:137` | must report the *previous* visibility so a revert is exact |
-| `audio_mute(pid, on)` | the session sweep — `killswitch.rs:236`, `killswitch.rs:323` | must return the previous mute state, and must not unmute a session the user muted |
+| `audio_mute(pid, on)` | the session sweep — `killswitch.rs:236`, `killswitch.rs:339` | must return the previous mute state, and must not unmute a session the user muted |
 | `audio_mute_all(on)` | `overlay::mute_all` — `overlay.rs:499` | for idle mode |
 | `overlay_show()` / `overlay_hide()` | `overlay::show` / `overlay::hide` — `overlay.rs:248`, `overlay.rs:347` | the daemon keeps owning the crash-recovery ledger and the keypress dismissal |
 
+**`audio_mute` returns the previous mute state, per session.** The report names every
+session of the process and the state it was in *before* the call:
+`muted {session} (was playing)`, `unmuted {session} (was muted)`,
+`left alone {session} (was muted)`, `could not be changed {session} (was playing)`.
+That is what a revert needs, and it says plainly which sessions were the user's own
+mutes and were therefore left alone. A process without an audio session gets
+`no audio session for pid {pid}`.
+
 **`overlay_show` is a request, not a call.** The black windows belong to the thread that
 pumps their messages, and that is the daemon's main loop — the pack worker cannot show
-them itself. The host function therefore hands the request over (`packs.rs:1253`), and
-the daemon's main loop carries it out (`daemon.rs`), which keeps owning the
+them itself. The host function therefore hands the request over (`packs.rs:1268`), and
+the daemon's main loop carries it out (`daemon.rs:461`), which keeps owning the
 crash-recovery ledger, the keypress dismissal and the idle-mode policy.
 
 **The killswitch and idle modes are then almost trivial packs**, because the ledger
@@ -104,9 +112,10 @@ while implementing; the taxonomy above is the shape, not a fixed list.
 
 ## 3. How the capability gate is enforced
 
-**One engine per capability set.** The sandbox keeps **one engine per thread** since
-1.1.3 (`script.rs:90`, `ENGINES`), and the host API is registered on it once. So
-"register fewer functions per run" is no longer free.
+**One engine per capability set.** Before this phase the sandbox kept **one engine per
+thread** (since 1.1.3) and registered the host API on it once, so "register fewer
+functions per run" was no longer free. That engine is now a **map** of engines, one per
+capability set (`script.rs:90`, `ENGINES`).
 
 A second thread-local map, built lazily, capped like the AST cache (32 entries):
 
@@ -116,7 +125,7 @@ thread_local! {
 }
 ```
 
-The pack worker is a **single serial thread** (`packs.rs:160`), so no locking is
+The pack worker is a **single serial thread** (`packs.rs:168`), so no locking is
 needed. A pack then gets an engine on which **only the granted functions are
 registered** (`script.rs:298`, `new_sandbox`), so an ungranted call fails as an
 *unknown function* — a structural denial, not a runtime check a call site could forget.
@@ -256,7 +265,7 @@ module needs.
 | The console helper | `daemon.rs:2008` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
 | The killswitch | `daemon.rs:1778` (`toggle_killswitch`) | it has **no config key and no IPC request** today; add both |
 
-The pack worker is a **single serial thread** (`packs.rs:160`,
+The pack worker is a **single serial thread** (`packs.rs:168`,
 `while let Ok(job) = jobs.recv()`) — that is the reason for the second worker.
 
 ---

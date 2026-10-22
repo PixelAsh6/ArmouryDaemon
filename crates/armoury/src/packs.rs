@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use crate::script;
 
 use windows::Win32::Foundation::{GetLastError, HWND};
-use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW};
+use windows::Win32::UI::WindowsAndMessaging::{
+    IsWindow, IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW,
+};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -1182,6 +1184,10 @@ static HIDDEN_WINDOWS: Mutex<Vec<(isize, bool)>> = Mutex::new(Vec::new());
 /// `ctx.window_hide(hwnd)` — hide a window and report whether it was visible before.
 pub(crate) fn script_window_hide(hwnd: isize) -> bool {
     let mut hidden = HIDDEN_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    // A handle that no longer names a window is stale: the window was closed, and the
+    // handle may belong to another window now. The state we recorded is then about a
+    // window that is not there any more, so it must not be reported.
+    hidden.retain(|(w, _)| *w != hwnd || window_exists(*w));
     if let Some((_, was)) = hidden.iter().find(|(w, _)| *w == hwnd) {
         return *was; // already hidden by us: the state we found is the one that counts
     }
@@ -1212,6 +1218,15 @@ fn window_visible(hwnd: isize) -> bool {
         return false;
     }
     unsafe { IsWindowVisible(HWND(hwnd as *mut _)).as_bool() }
+}
+
+/// Does this handle still name a window? A window that was closed leaves the handle
+/// behind, and Windows may hand the same handle to another window later.
+fn window_exists(hwnd: isize) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    unsafe { IsWindow(HWND(hwnd as *mut _)).as_bool() }
 }
 
 /// `ctx.audio_sessions()` — the audio sessions of the machine, as "pid:state" strings.

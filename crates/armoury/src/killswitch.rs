@@ -327,63 +327,87 @@ fn muted_by_host() -> MutexGuard<'static, HashMap<u32, HashSet<String>>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Mute (or unmute) the audio sessions of one process, and report what changed.
+/// Mute (or unmute) the audio sessions of one process, and report what happened.
 ///
-/// The sessions this call muted are remembered, so the unmute puts back exactly what was
-/// changed: a session the user had muted already is never unmuted again.
+/// The report names every session of the process and the state it was in **before**
+/// the call — the previous mute state — because that is what a revert needs to put
+/// back exactly what was changed.
+///
+/// A session the user had muted already is left alone: it was not ours to change, and
+/// it must never be unmuted again. The sessions this call muted are remembered, so the
+/// unmute touches exactly those.
 pub fn mute_pid(pid: u32, muted: bool) -> String {
-    let sessions = sessions();
-    let mut changed = 0usize;
-    let mut left_alone = 0usize;
-    let mut failed = 0usize;
-    {
-        let mut ledger = muted_by_host();
-        for session in sessions.iter().filter(|s| s.pid() == pid) {
-            let Some(was) = session.is_muted() else {
-                left_alone += 1; // the state cannot be read: the session is left alone
+    let all = sessions();
+    let mut ledger = muted_by_host();
+    mute_sessions(pid, muted, &all, &mut ledger)
+}
+
+/// The mute pass itself, with the sessions and the ledger handed in — so the tests can
+/// see what was changed without touching the machine.
+fn mute_sessions(
+    pid: u32,
+    muted: bool,
+    all: &[Arc<dyn Session>],
+    ledger: &mut HashMap<u32, HashSet<String>>,
+) -> String {
+    let mut report: Vec<String> = Vec::new();
+    for session in all.iter().filter(|s| s.pid() == pid) {
+        let Some(was) = session.is_muted() else {
+            // the state cannot be read: the session is left alone
+            report.push(format!("left alone {} (state unknown)", session.id()));
+            continue;
+        };
+        let state = if was { "muted" } else { "playing" };
+        if muted {
+            if was {
+                // the user muted it: it is not ours to change
+                report.push(format!("left alone {} (was {state})", session.id()));
                 continue;
-            };
-            if muted {
-                if was {
-                    left_alone += 1; // the user muted it: it is not ours to change
-                    continue;
+            }
+            match session.set_muted(true) {
+                Ok(()) => {
+                    ledger.entry(pid).or_default().insert(session.id());
+                    report.push(format!("muted {} (was {state})", session.id()));
                 }
-                match session.set_muted(true) {
-                    Ok(()) => {
-                        changed += 1;
-                        ledger.entry(pid).or_default().insert(session.id());
-                    }
-                    Err(e) => {
-                        failed += 1;
-                        warn!("SetMute failed for pid {pid}: {e}");
-                    }
+                Err(e) => {
+                    warn!("SetMute failed for pid {pid}: {e}");
+                    report.push(format!("could not be changed {} (was {state})", session.id()));
                 }
-            } else {
-                let ours = ledger
-                    .get(&pid)
-                    .map(|ids| ids.contains(&session.id()))
-                    .unwrap_or(false);
-                if !ours {
-                    left_alone += 1; // not a session we muted: the user's own mute stays
-                    continue;
-                }
-                match session.set_muted(false) {
-                    Ok(()) => changed += 1,
-                    Err(e) => {
-                        failed += 1;
-                        warn!("SetMute failed for pid {pid}: {e}");
+            }
+        } else {
+            let ours = ledger
+                .get(&pid)
+                .map(|ids| ids.contains(&session.id()))
+                .unwrap_or(false);
+            if !ours {
+                // not a session we muted: the user's own mute stays
+                report.push(format!("left alone {} (was {state})", session.id()));
+                continue;
+            }
+            match session.set_muted(false) {
+                Ok(()) => {
+                    // it is back in the state it was in: the ledger forgets it
+                    if let Some(ids) = ledger.get_mut(&pid) {
+                        ids.remove(&session.id());
                     }
+                    report.push(format!("unmuted {} (was {state})", session.id()));
+                }
+                Err(e) => {
+                    // the session stays in the ledger: the next call tries again
+                    warn!("SetMute failed for pid {pid}: {e}");
+                    report.push(format!("could not be changed {} (was {state})", session.id()));
                 }
             }
         }
-        if !muted {
-            ledger.remove(&pid);
-        }
     }
-    format!(
-        "{changed} session(s) {}, {left_alone} left alone, {failed} could not be changed",
-        if muted { "muted" } else { "unmuted" }
-    )
+    // the pid is forgotten once it has no sessions of its own left in the ledger
+    if ledger.get(&pid).is_some_and(|ids| ids.is_empty()) {
+        ledger.remove(&pid);
+    }
+    if report.is_empty() {
+        return format!("no audio session for pid {pid}");
+    }
+    report.join(", ")
 }
 
 /// The sessions, indexed by the process that owns them: one sweep answers for every
@@ -567,6 +591,73 @@ mod tests {
         assert!(
             muted_by_the_user.get(),
             "the session the user had muted must stay muted"
+        );
+    }
+
+    #[test]
+    fn a_host_mute_leaves_the_users_own_mute_alone_and_reports_the_previous_state() {
+        // The host call of the `audio` capability: it mutes the audio sessions of a
+        // process. A session the user had muted already is not ours to change, and the
+        // report says what the state was *before* — that is the previous mute state, and
+        // it is what a revert needs.
+        let playing = Rc::new(Cell::new(false));
+        let muted_by_the_user = Rc::new(Cell::new(true));
+        let sessions: Vec<Arc<dyn Session>> = vec![
+            Arc::new(Fake {
+                pid: 42,
+                id: "fake-playing".into(),
+                muted: Rc::clone(&playing),
+            }) as Arc<dyn Session>,
+            Arc::new(Fake {
+                pid: 42,
+                id: "fake-muted".into(),
+                muted: Rc::clone(&muted_by_the_user),
+            }) as Arc<dyn Session>,
+        ];
+        let mut ledger = HashMap::new();
+
+        let report = mute_sessions(42, true, &sessions, &mut ledger);
+        assert!(playing.get(), "the session that was playing must be muted");
+        assert!(
+            muted_by_the_user.get(),
+            "the session the user had muted must not be touched"
+        );
+        assert!(
+            report.contains("muted fake-playing (was playing)"),
+            "the report names what changed and the state it was in: {report}"
+        );
+        assert!(
+            report.contains("left alone fake-muted (was muted)"),
+            "the report names the session that was left alone: {report}"
+        );
+
+        // and the unmute puts back exactly what was changed
+        let report = mute_sessions(42, false, &sessions, &mut ledger);
+        assert!(
+            !playing.get(),
+            "the session we muted must be unmuted again"
+        );
+        assert!(
+            muted_by_the_user.get(),
+            "the session the user had muted must stay muted"
+        );
+        assert!(
+            report.contains("unmuted fake-playing (was muted)"),
+            "the report names the previous state of the session it unmuted: {report}"
+        );
+        assert!(
+            report.contains("left alone fake-muted (was muted)"),
+            "the user's own mute is never unmuteed by us: {report}"
+        );
+    }
+
+    #[test]
+    fn a_host_mute_of_a_process_without_audio_says_so() {
+        let mut ledger = HashMap::new();
+        let report = mute_sessions(42, true, &[], &mut ledger);
+        assert!(
+            report.contains("no audio session for pid 42"),
+            "the report says that there was nothing to mute: {report}"
         );
     }
 }

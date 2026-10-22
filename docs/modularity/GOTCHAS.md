@@ -82,6 +82,15 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 > **After A1 (2026-10-22): 12,868,608 bytes** — **+60,416 bytes (+0.47 %)** for the platform
 > verifier, the WinINet proxy reader and the gzip decoder. `DECISIONS.md` §12 says why that
 > is accepted, and what would pay it back.
+>
+> **After A2, on the A2-only tree (`0ecacd3` + A2): 12,925,440 bytes** — **+56,832 bytes
+> (+0.44 %)** for the eight new host functions. `DECISIONS.md` §15 has the measurement.
+> **After A2, on the branch this phase is delivered on** (the same A2 work on a tree that
+> also carries the art fetch through the Windows certificate store): **12,857,344 bytes**,
+> which is **+60,928 bytes (+0.48 %)** over *that* tree's baseline of 12,796,416 — the art
+> fetch takes Mozilla's bundled roots out of the binary, so that tree starts lower.
+> **The baseline for the size rule on the delivered branch is 12,857,344 bytes.** A number
+> without its tree is not a number (trap 35).
 
 ### Runtime
 
@@ -124,9 +133,11 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 2. **The pack worker is a single serial thread** (`packs.rs:160`,
    `while let Ok(job) = jobs.recv()`). A slow mode would block every later apply and
    revert. Modes need their own worker.
-3. **The engine is cached per thread** since 1.1.3 (`script.rs:86`, `SANDBOX`). This
-   **changes how capability scoping must be built** — it is no longer "build an engine
-   per run and register less". See `DESIGN.md` §3.
+3. **The engine is cached, and the cache is keyed by the capability set** (A2). Since
+   1.1.3 the sandbox kept one engine per thread; since A2 it keeps **one engine per
+   capability set** (`script.rs:90`, `ENGINES`), built lazily and capped at 32 like
+   the AST cache. This **changed how capability scoping had to be built** — it was no
+   longer "build an engine per run and register less". See `DESIGN.md` §3.
 4. **The killswitch no longer re-sweeps audio per pid** (1.1.3). One sweep per press;
    the release restores from the ledger without enumerating at all.
 5. **The daemon still walks the whole process table every second when something IS
@@ -267,6 +278,29 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     file; reading the section headers (`.text`, `.rdata`, `.pdata`, …) of two builds
     says in one minute whether a change grew *code* or *data*. That is how the
     registration cost above was found.
+35. **The numbers in this folder are per tree, and a shared tree is not the A2 tree.**
+    The branch this work is delivered on carries another agent's commits (the art
+    fetch through the Windows certificate store), so it has **four more unit tests**,
+    **five more harness checks** and a **different executable size** than the A2-only
+    copy of the same phase. Quote the numbers of the tree you actually measured, and
+    say which tree that is. A number without its tree is not a number.
+36. **The size baseline moves when another branch lands — and it can move *down*.**
+    The art fetch took Mozilla's bundled roots out of the binary, so the release exe
+    went from 12,868,608 bytes (A1) to **12,796,416** without anybody touching the
+    size rule. Re-measure the baseline on the tree you are on; never carry a baseline
+    over from another branch.
+37. **`HashMap::new` is not a `const fn` because the map is randomly seeded.** The
+    seed is the HashDoS protection, and a seed cannot be made at compile time — so
+    `static M: Mutex<HashMap<..>> = Mutex::new(HashMap::new())` does not compile.
+    `HashMap::with_hasher(BuildHasherDefault::new())` *is* const (since 1.85), but it
+    has a **fixed** hash: do not "fix" the ledger with it. Use a `OnceLock` (or
+    `LazyLock`) and build the map in `get_or_init`. (`Mutex::new` and `Vec::new` are
+    const, so a `Vec` in a static is fine.)
+38. **A window handle outlives its window.** `ShowWindow` on a handle whose window was
+    closed does nothing, and Windows may hand the same handle to another window later.
+    A ledger of "the visibility this handle had before we hid it" is therefore wrong
+    after the window is gone: check `IsWindow` before you report the old state, or a
+    revert shows a window it should not.
 
 ---
 
@@ -296,7 +330,7 @@ Required defences:
    `["windows","audio"]` gets those and nothing else; an ungranted call must fail.
 5. **A pack script may not write outside** `%APPDATA%`, `%LOCALAPPDATA%`,
    `%PROGRAMDATA%` and the target app's own folder — the existing guard
-   (`script.rs:471-533`, `script.rs:610`) compares path *components*, not string
+   (`script.rs:668`, `write_allowed`) compares path *components*, not string
    prefixes, and refuses symlinks. Do not weaken it. Note that
    `%APPDATA%\ArmouryDaemon` is inside `%APPDATA%`, so a pack script can already
    write `config.json` and `journal.json` — decide deliberately whether that stays

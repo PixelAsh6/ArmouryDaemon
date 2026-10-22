@@ -995,6 +995,21 @@ mod tests {
         run_with_capabilities(r#"let s = ctx.audio_sessions();"#, &mut ctx, audio)
             .expect("the audio capability must be there");
 
+        // and the mute reports the previous state of the sessions it touched. The pid
+        // cannot exist, so nothing on this machine is really muted.
+        let report = run_with_capabilities(
+            r#"let r = ctx.audio_mute(4294967295, true);"#,
+            &mut ctx,
+            audio,
+        )
+        .expect("the mute must run");
+        assert!(
+            report
+                .iter()
+                .any(|line| line.contains("no audio session for pid 4294967295")),
+            "{report:?}"
+        );
+
         let overlay = CapSet::default().with(Capability::Overlay);
         run_with_capabilities(r#"ctx.overlay_show();"#, &mut ctx, overlay)
             .expect("the overlay capability must be there");

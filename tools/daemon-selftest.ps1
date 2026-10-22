@@ -727,8 +727,8 @@ try {
   "targets": { "process": ["timeout.exe"] },
   "capabilities": ["files"],
   "script": {
-    "apply":  "ctx.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]);",
-    "revert": "ctx.log(\"the revert must not run\");"
+    "apply":  "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\"); ctx.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]);",
+    "revert": "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\");"
   },
   "apply": { "steps": [] },
   "revert": { "guard": { "targetRunning": false, "capturedRunning": true }, "steps": [] }
@@ -744,6 +744,7 @@ try {
     $s = Wait-State 'triggered' 25
     Start-Sleep -Milliseconds 800
     $logText = Get-Content (Join-Path $configDir 'logs\daemon.log') -Raw
+    Check 'the granted call still ran' ($logText -match 'read_file C:/armoury-capability-probe-does-not-exist.txt') "the granted function of the pack did not run"
     Check 'the ungranted call is in the pack log' ($logText -match 'captest: script apply failed') "no failure line for the pack"
     Check 'the denial names the missing capability' ($logText -match "run_cli REFUSED: it needs the 'exec' capability") "no capability in the denial"
     Check 'the denial names what the pack asked for' ($logText -match 'the pack asked for: files') "no grant set in the denial"
