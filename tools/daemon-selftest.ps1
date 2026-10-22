@@ -827,15 +827,91 @@ try {
             Check 'a pack from the catalogue installs and verifies' ($run.Exit -eq 0) "output=$(Get-FirstLine $run.Text)"
         }
 
+        # -- 20c. one client, not one per request --
+        #
+        # The manifest and the pack file are two requests to the same host, and they travel
+        # over **one** connection. A client of its own for every request would open a
+        # connection for each - and would rebuild the rustls config and the platform verifier
+        # every time.
+        #
+        # The pack is the shipped G-Helper pack under a name of its own, so the probe installs
+        # nothing that is really there: the folder it leaves behind is removed again below.
+        $localPack = (Resolve-Path (Join-Path $PSScriptRoot '..\packs\g-helper\pack.json')).Path
+        $packText = ([IO.File]::ReadAllText($localPack)).Replace('"id": "g-helper"', '"id": "harness-test"')
+        $packBytes = [Text.Encoding]::UTF8.GetBytes($packText)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $packSha = ([System.BitConverter]::ToString($sha.ComputeHash($packBytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+        $manifest = '{"schema":1,"updated":"2026-10-22","packs":[{"id":"harness-test","name":"Harness test","version":"9.9.9","description":"served by the harness","file":"packs/harness-test/pack.json","sha256":"' + $packSha + '","size":' + $packBytes.Length + '}]}'
+        $manifestBytes = [Text.Encoding]::UTF8.GetBytes($manifest)
+        $server = Start-LoopbackListener
+        $script:requests = @()
+        $script:connections = 0
+        $probe = Invoke-CatalogProbe @('--catalog-install', 'harness-test', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
+            # the server answers until the daemon has both files, or until it runs out of time
+            $deadline = (Get-Date).AddSeconds(20)
+            while ((Get-Date) -lt $deadline -and $script:requests.Count -lt 2) {
+                $accept = $server.Listener.AcceptTcpClientAsync()
+                if (-not $accept.Wait(2000)) { break }   # no further connection
+                $client = $accept.GetAwaiter().GetResult()
+                $script:connections++
+                $client.ReceiveTimeout = 5000
+                try {
+                    while ($true) {
+                        try { $request = Read-Request $client } catch { break }
+                        if (-not $request) { break }
+                        $script:requests += $request
+                        $body = if (($request -split "`r`n")[0] -like '*pack.json*') { $packBytes } else { $manifestBytes }
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($body.Length)`r`n`r`n"
+                        $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
+                        $stream = $client.GetStream()
+                        $stream.Write($headBytes, 0, $headBytes.Length)
+                        $stream.Write($body, 0, $body.Length)
+                        $stream.Flush()
+                        if ($script:requests.Count -ge 2) { break }
+                    }
+                }
+                finally { $client.Close() }
+            }
+        }
+        $server.Listener.Stop()
+        # the pack the probe installed is not one of ours: it goes away again, from wherever
+        # the daemon put it (the build folder if it is there, the repository's own folder if
+        # the daemon resolved that one)
+        Remove-Item -LiteralPath (Join-Path $buildPacks 'harness-test') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $repoRoot 'packs\harness-test') -Recurse -Force -ErrorAction SilentlyContinue
+        Check 'the pack installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit)"
+        Check 'the manifest and the pack file travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 2)) "connections=$($script:connections) requests=$($script:requests.Count)"
+
         $env:ARMOURY_TEST_NS = $ns
     }
     else {
         "SKIP  the command-line probes (--version, --help, an unknown argument, a flag without"
-        "      its value) and the two catalogue probes (a gzip manifest, the real catalogue):"
+        "      its value) and the catalogue probes (a gzip manifest, the real catalogue, the local"
+        "      one):"
         "      the executable asks Windows for administrator rights, and this harness is not"
         "      elevated - every probe would raise a UAC prompt and the harness would wait for"
         "      the answer. Run the harness from an elevated shell to run them."
     }
+
+    # ---- 21. the root store the binary carries ----
+    #
+    # The build has exactly **one** root store: the Windows certificate store. The Mozilla
+    # bundle is not in the binary, and the HTTP client refuses the bundled roots instead of
+    # using them - so the catalogue, the cover art and the band's thumbnails can only be
+    # validated against the Windows store. The unit tests in catalog.rs, art.rs and
+    # console_ui.rs say that they use that client; these checks say that there is no other
+    # one to use.
+    #
+    # These checks read the binary, so they need no elevation and they run either way.
+    $binary = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($Exe))
+    # the subject of one of Mozilla's bundled roots: it is in the binary as long as the
+    # bundle is
+    Check 'the binary carries no bundled root certificates' (-not $binary.Contains('DigiCert TLS ECC P384 Root G5')) 'the Mozilla root bundle is in the binary'
+    # ureq's own refusal, compiled in when the bundled roots are not linked: the client
+    # cannot fall back to them
+    Check 'the client refuses the bundled roots instead of using them' ($binary.Contains('WebPki is disabled')) 'the refusal is not in the binary'
+    # the Windows verifier, called by the platform verifier: the store is really used
+    Check 'the binary links the Windows certificate verifier' ($binary.Contains('CertVerifyCertificateChainPolicy')) 'the Windows verifier is not linked'
 }
 finally {
     if ($daemon -and -not $daemon.HasExited) {

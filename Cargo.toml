@@ -25,9 +25,17 @@ eframe = { version = "0.37.0", default-features = false, features = ["glow"] }
 # Phase 8: the pack catalog is fetched over HTTPS and its files are verified before install.
 # The root store is the Windows certificate store (`platform-verifier`), not Mozilla's bundled
 # roots: a machine with a corporate CA or a TLS-intercepting proxy has to be able to fetch the
-# catalogue. `win-system-proxy` reads the user's WinINet proxy settings (this is a per-user
-# desktop app, not a Windows service), and `gzip` compresses the manifest and the pack files.
-ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "win-system-proxy", "gzip"] }
+# catalogue and the cover art. `win-system-proxy` reads the user's WinINet proxy settings (this
+# is a per-user desktop app, not a Windows service), and `gzip` compresses the manifest and the
+# pack files.
+#
+# The rustls features are spelled out instead of using `rustls`: `rustls` is
+# `rustls-no-provider` + `_ring` + `rustls-webpki-roots`, and the last one is Mozilla's bundled
+# root certificates - 146 kB of certificates the build has no use for, because the Windows
+# store is the only root store it can validate against. Without the feature the client refuses
+# the bundled roots instead of using them (`RootCerts::WebPki` panics), so a fetch that went
+# anywhere but the shared client could not be validated at all.
+ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "_ring", "platform-verifier", "win-system-proxy", "gzip"] }
 sha2 = "0.10"
 
 [profile.release]

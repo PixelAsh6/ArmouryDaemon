@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use armoury_core::protocol::{ArtListing, ArtPhoto, ArtSlot};
 
+use crate::catalog;
+
 /// An empty marker older than this is re-tried (covers art uploaded later).
 const MISS_RETRY: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -986,18 +988,21 @@ fn sgdb_hero_url(key: &str, game: u32, dim: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no {dim} hero"))
 }
 
-/// GET with the `catalog.rs` HTTP shape: explicit timeout, body as bytes.
+/// The client the cover art is fetched with: the process-wide one (see `catalog::agent`).
+///
+/// The art travels over the same client as the catalogue, so it is validated against the same
+/// root store — the Windows certificate store — and it reuses the same connections.
+fn client() -> &'static ureq::Agent {
+    catalog::agent()
+}
+
+/// GET with the `catalog.rs` HTTP shape: the shared client, body as bytes.
 fn http_get(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, String> {
-    let mut req = ureq::get(url);
+    let mut req = client().get(url);
     if let Some(key) = bearer {
         req = req.header("Authorization", &format!("Bearer {key}"));
     }
-    let mut resp = req
-        .config()
-        .timeout_global(Some(Duration::from_secs(15)))
-        .build()
-        .call()
-        .map_err(|e| format!("GET {url} ({e})"))?;
+    let mut resp = req.call().map_err(|e| format!("GET {url} ({e})"))?;
     resp.body_mut()
         .read_to_vec()
         .map_err(|e| format!("read {url} ({e})"))
@@ -1020,6 +1025,7 @@ fn urlencode(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::testutil::Scratch;
+    use ureq::tls::RootCerts;
 
     #[test]
     fn key_is_stable_and_case_folded() {
@@ -1391,5 +1397,27 @@ mod tests {
         let exe = game_dir.join("RainbowSix.exe");
         assert_eq!(steam_appid(&exe), Some(359550));
         assert_eq!(steam_appid(&root.join("elsewhere/game.exe")), None);
+    }
+
+    #[test]
+    fn the_art_is_fetched_through_the_windows_certificate_store() {
+        // The bug this guards: the cover art had a client of its own, validated against
+        // Mozilla's bundled roots, so a machine with a corporate CA could fetch the catalogue
+        // but not the art.
+        let roots = client().config().tls_config().root_certs();
+        assert!(
+            matches!(roots, RootCerts::PlatformVerifier),
+            "the art must be validated against the Windows certificate store, not {roots:?}"
+        );
+    }
+
+    #[test]
+    fn the_art_shares_the_client_with_the_catalogue() {
+        // One client, one connection pool: a client of its own would rebuild the rustls config
+        // and the platform verifier for every single fetch.
+        assert!(
+            std::ptr::eq::<ureq::Agent>(client(), catalog::agent()),
+            "the art fetch must share the client's connection pool with the catalogue"
+        );
     }
 }
