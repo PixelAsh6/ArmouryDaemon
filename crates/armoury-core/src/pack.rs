@@ -117,6 +117,9 @@ pub enum Capability {
     Files,
     /// Write a file — only inside the folders a pack may write in.
     FilesWrite,
+    /// Write a value under HKCU/HKLM. Only reachable as a declarative step (`registry_set`),
+    /// never from a script: the registry is where Windows looks a start-up entry up.
+    Registry,
     /// Look at, kill and start processes.
     Process,
     /// Run a program.
@@ -136,11 +139,12 @@ pub enum Capability {
 }
 
 /// Every capability, in the order of the table.
-pub const ALL_CAPABILITIES: [Capability; 12] = [
+pub const ALL_CAPABILITIES: [Capability; 13] = [
     Capability::Context,
     Capability::Journal,
     Capability::Files,
     Capability::FilesWrite,
+    Capability::Registry,
     Capability::Process,
     Capability::Exec,
     Capability::Input,
@@ -159,6 +163,7 @@ impl Capability {
             Capability::Journal => "journal",
             Capability::Files => "files",
             Capability::FilesWrite => "files-write",
+            Capability::Registry => "registry",
             Capability::Process => "process",
             Capability::Exec => "exec",
             Capability::Input => "input",
@@ -183,6 +188,9 @@ impl Capability {
             Capability::Journal => &["capture", "log"],
             Capability::Files => &["read_file", "read_json", "read_ini"],
             Capability::FilesWrite => &["write_file"],
+            // No host function: the only way to write the registry is a declarative
+            // `registry_set` step, gated by `of_mechanism`.
+            Capability::Registry => &[],
             Capability::Process => &["process_running", "process_kill", "process_start"],
             Capability::Exec => &["run_cli"],
             Capability::Input => &["hotkey"],
@@ -202,6 +210,7 @@ impl Capability {
             Capability::Journal => "Write to its own journal",
             Capability::Files => "Read files",
             Capability::FilesWrite => "Write files",
+            Capability::Registry => "Write registry values",
             Capability::Process => "Look at, kill and start processes",
             Capability::Exec => "Run external programs",
             Capability::Input => "Send keystrokes",
@@ -227,6 +236,26 @@ impl Capability {
             .find(|c| c.functions().contains(&function))
     }
 
+    /// The capability a declarative step needs.
+    ///
+    /// A step is a host call written as data, so it is gated like one: `cli` runs a program
+    /// (`exec`), `process_start` and `process_kill` reach into other processes (`process`),
+    /// `hotkey` injects keystrokes (`input`), and `registry_set` writes the machine's own
+    /// settings store (`registry`). Without this table the script was gated and the steps
+    /// were not: a pack that declared `["files"]` could still start programs (23 Oct review).
+    ///
+    /// `None` for a mechanism the schema does not know — `Pack::validate` refuses that by
+    /// name, and `run_step` refuses it as well.
+    pub fn of_mechanism(mechanism: &str) -> Option<Capability> {
+        match mechanism {
+            "cli" => Some(Capability::Exec),
+            "process_kill" | "process_start" => Some(Capability::Process),
+            "hotkey" => Some(Capability::Input),
+            "registry_set" => Some(Capability::Registry),
+            _ => None,
+        }
+    }
+
     /// The bit this capability occupies in a [`CapSet`].
     const fn bit(self) -> u32 {
         1u32 << (self as u8)
@@ -235,7 +264,7 @@ impl Capability {
 
 /// The capabilities a pack was granted.
 ///
-/// A bitmask: twelve capabilities fit in a u32, and "was this granted" is a bit test.
+/// A bitmask: thirteen capabilities fit in a u32, and "was this granted" is a bit test.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct CapSet(u32);
 
@@ -246,6 +275,7 @@ impl CapSet {
             | Capability::Journal.bit()
             | Capability::Files.bit()
             | Capability::FilesWrite.bit()
+            | Capability::Registry.bit()
             | Capability::Process.bit()
             | Capability::Exec.bit()
             | Capability::Input.bit()
@@ -300,6 +330,17 @@ impl CapSet {
     /// The names of the granted capabilities: what a denial message lists.
     pub fn names(self) -> Vec<&'static str> {
         self.iter().map(|c| c.name()).collect()
+    }
+
+    /// What the pack asked for, in the words of a denial: the capability names in the order
+    /// of the table, or "nothing" when it asked for none. One wording for the script denials
+    /// and the step denials, so a pack author reads the same sentence in both.
+    pub fn asked_for(self) -> String {
+        let names = self.names();
+        if names.is_empty() {
+            return "nothing".to_string();
+        }
+        names.join(", ")
     }
 }
 
@@ -800,6 +841,21 @@ impl Pack {
                     errs.push(format!(
                         "{block} step {i}: unsupported mechanism '{}'",
                         step.mechanism
+                    ));
+                }
+                // A step is a host call written as data, so the capability gate covers it
+                // too: the script is gated by what is on its engine, the steps by this. A
+                // pack that declares `["files"]` may not start a program, send a keystroke,
+                // kill a process or write the registry.
+                if let Some(capability) = Capability::of_mechanism(&step.mechanism)
+                    && !self.capabilities.grants(capability)
+                {
+                    errs.push(format!(
+                        "{block} step {i}: '{}' needs the '{}' capability, which this pack was \
+                         not granted (the pack asked for: {})",
+                        step.mechanism,
+                        capability.name(),
+                        self.capabilities.asked_for()
                     ));
                 }
                 if step.mechanism == "cli"
@@ -1921,7 +1977,15 @@ mod tests {
         // two could be denied by one and granted by the other.
         let mut seen: Vec<&str> = Vec::new();
         for capability in ALL_CAPABILITIES {
-            assert!(!capability.functions().is_empty(), "{capability:?} has no functions");
+            // `registry` is the one capability without a host function: the only way to
+            // write the registry is a declarative `registry_set` step, gated by
+            // `Capability::of_mechanism`.
+            if capability != Capability::Registry {
+                assert!(
+                    !capability.functions().is_empty(),
+                    "{capability:?} has no functions"
+                );
+            }
             for function in capability.functions() {
                 assert!(
                     !seen.contains(function),
@@ -1952,6 +2016,105 @@ mod tests {
         assert!(CapSet::default().is_empty());
         assert!(!CapSet::ALL.is_empty());
         assert_eq!(CapSet::ALL.len(), ALL_CAPABILITIES.len());
+    }
+
+    /// A pack that declares `capabilities` and uses only the declarative step of `mechanism`.
+    fn step_pack(capabilities: &str, mechanism: &str) -> String {
+        let step = match mechanism {
+            "cli" => r#"{ "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe" }"#,
+            "process_start" => r#"{ "mechanism": "process_start", "exe": "stepped.exe" }"#,
+            "process_kill" => r#"{ "mechanism": "process_kill", "exe": "stepped.exe" }"#,
+            "registry_set" => {
+                r#"{ "mechanism": "registry_set",
+                     "registry": { "path": "HKEY_CURRENT_USER\\Software\\Numeric",
+                                   "name": "flag", "dword": 1 } }"#
+            }
+            other => panic!("no step for {other}"),
+        };
+        format!(
+            r#"{{
+                "spec": 1, "id": "stepped", "name": "Stepped", "version": "1.0.0",
+                "targets": {{ "process": ["stepped.exe"] }},
+                "capabilities": {capabilities},
+                "apply": {{ "steps": [ {step} ] }},
+                "revert": {{ "steps": [ {step} ] }}
+            }}"#
+        )
+    }
+
+    #[test]
+    fn every_mechanism_a_step_may_name_has_a_capability() {
+        // The table the gate uses, next to the list of mechanisms the schema accepts.
+        for mechanism in ALLOWED_MECHANISMS {
+            assert!(
+                Capability::of_mechanism(mechanism).is_some(),
+                "'{mechanism}' is an allowed mechanism with no capability"
+            );
+        }
+        assert_eq!(Capability::of_mechanism("cli"), Some(Capability::Exec));
+        assert_eq!(
+            Capability::of_mechanism("process_start"),
+            Some(Capability::Process)
+        );
+        assert_eq!(
+            Capability::of_mechanism("process_kill"),
+            Some(Capability::Process)
+        );
+        assert_eq!(Capability::of_mechanism("hotkey"), Some(Capability::Input));
+        assert_eq!(
+            Capability::of_mechanism("registry_set"),
+            Some(Capability::Registry)
+        );
+        assert_eq!(Capability::of_mechanism("teleport"), None);
+    }
+
+    #[test]
+    fn a_step_of_a_capability_the_pack_did_not_ask_for_is_refused() {
+        // The script was gated and the steps were not (23 Oct review). A pack that declares
+        // `files` may not run a program through a step either, and the refusal is the same
+        // sentence the script denial uses.
+        let err = Pack::parse(&step_pack(r#"["files"]"#, "cli"))
+            .expect_err("a step of an ungranted capability must be refused");
+        assert!(err.contains("'cli' needs the 'exec' capability"), "{err}");
+        assert!(err.contains("the pack asked for: files"), "{err}");
+
+        // an empty list is not a way around it
+        let err = Pack::parse(&step_pack("[]", "cli")).expect_err("nothing was asked for");
+        assert!(err.contains("the pack asked for: nothing"), "{err}");
+
+        // the process steps are one capability, and a keystroke is another
+        let err = Pack::parse(&step_pack(r#"["files", "exec"]"#, "process_kill"))
+            .expect_err("killing a process needs 'process'");
+        assert!(err.contains("the 'process' capability"), "{err}");
+
+        // with the capability declared, the step is fine
+        Pack::parse(&step_pack(r#"["exec"]"#, "cli")).expect("the grant covers the step");
+        Pack::parse(&step_pack(r#"["process"]"#, "process_start"))
+            .expect("the grant covers the step");
+    }
+
+    #[test]
+    fn a_registry_step_needs_the_registry_capability() {
+        // `registry_set` had no capability at all. It is a write to the machine's own
+        // settings store, not one of `files-write`'s four folders, so it has a capability of
+        // its own: a pack that may write files may not write HKCU.
+        let err = Pack::parse(&step_pack(r#"["files", "files-write"]"#, "registry_set"))
+            .expect_err("writing the registry needs 'registry'");
+        assert!(
+            err.contains("'registry_set' needs the 'registry' capability"),
+            "{err}"
+        );
+        Pack::parse(&step_pack(r#"["registry"]"#, "registry_set")).expect("the grant covers it");
+    }
+
+    #[test]
+    fn the_shipped_packs_still_pass_the_step_gate() {
+        // They declare no capabilities, so they get every one of them, `registry` included:
+        // a pack that predates the field keeps working.
+        for text in [WE, GH, RM] {
+            let pack = Pack::parse(text).expect("the shipped pack must stay valid");
+            assert!(pack.capabilities.grants(Capability::Registry));
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -149,10 +149,21 @@ pub fn run(start: Start) {
     }
 
     // ---- config ----
-    let cfg = armoury_core::config::load_or_create().unwrap_or_else(|e| {
+    let mut cfg = armoury_core::config::load_or_create().unwrap_or_else(|e| {
         error!("config load failed ({e}); using in-memory defaults");
         AppConfig::default()
     });
+    // A hand-edited config may carry any number, and the engine turns the cooldown into a
+    // deadline: `Instant + Duration` panics on the overflow. The window the UI writes is
+    // 5 to 3600 s, so the startup path holds the same range.
+    if !(5..=3600).contains(&cfg.cooldown_seconds) {
+        let clamped = cfg.cooldown_seconds.clamp(5, 3600);
+        warn!(
+            "config: cooldown {}s is outside 5 to 3600 - using {clamped}s",
+            cfg.cooldown_seconds
+        );
+        cfg.cooldown_seconds = clamped;
+    }
     info!(
         "config: cooldown {}s, {} tracked app(s)",
         cfg.cooldown_seconds,
@@ -207,7 +218,7 @@ pub fn run(start: Start) {
     let (launch_tx, launch_rx) = crossbeam_channel::unbounded::<LaunchEvent>();
     console::start(pad_tx, wake_handle);
     let engine = {
-        let mut e = Engine::new(Duration::from_secs(cfg.cooldown_seconds.max(1)));
+        let mut e = Engine::new(Duration::from_secs(cfg.cooldown_seconds));
         if cfg.paused {
             // start frozen, exactly as the user left it
             e.set_paused(true, Instant::now());
@@ -457,17 +468,20 @@ pub fn run(start: Start) {
         // A pack may ask for the idle overlay. The pack worker cannot show it itself: the
         // black windows belong to the thread that pumps their messages, and that is this
         // one - so the daemon keeps owning the crash-recovery ledger and the keypress
-        // dismissal.
-        for request in packs::take_overlay_requests() {
+        // dismissal. Only the newest request is waiting (it replaces the one before it), and
+        // a request for the state the daemon is already in costs nothing.
+        if let Some(request) = packs::take_overlay_request() {
+            let active = app.overlay.is_active();
             match request {
-                packs::OverlayRequest::Show => {
+                packs::OverlayRequest::Show if !active => {
                     info!("a pack asked for the idle overlay");
                     app.enter_idle();
                 }
-                packs::OverlayRequest::Hide => {
+                packs::OverlayRequest::Hide if active => {
                     info!("a pack asked for the idle overlay to go away");
                     app.exit_idle();
                 }
+                _ => {}
             }
         }
         if app.quit_requested.asked() {
@@ -2552,7 +2566,7 @@ impl App {
                 Request::SetCooldown { seconds } => {
                     self.cfg.cooldown_seconds = seconds.clamp(5, 3600);
                     self.engine
-                        .set_cooldown(Duration::from_secs(self.cfg.cooldown_seconds));
+                        .set_cooldown(Duration::from_secs(self.cfg.cooldown_seconds), Instant::now());
                     if let Err(e) = armoury_core::config::save(&self.cfg) {
                         warn!("failed to save config: {e}");
                     }

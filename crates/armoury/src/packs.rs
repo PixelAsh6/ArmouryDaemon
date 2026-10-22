@@ -5,7 +5,9 @@
 //! CLI calls block for tens to hundreds of milliseconds.
 //! Nothing here ever goes through a shell, and packs can only use whitelisted mechanisms.
 
-use armoury_core::pack::{Pack, Step, StepBlock, TemplateCtx, substitute, version_at_least};
+use armoury_core::pack::{
+    CapSet, Capability, Pack, Step, StepBlock, TemplateCtx, substitute, version_at_least,
+};
 use crossbeam_channel::Receiver;
 use log::{info, warn};
 use std::collections::HashMap;
@@ -294,7 +296,14 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
 
         let setting_key = pack.settings.first().map(|s| s.key.as_str());
         let block_name = if job.apply { "apply" } else { "revert" };
-        let mut result = run_block(block, &ctx, setting_key, &pack.id, block_name);
+        let mut result = run_block(
+            block,
+            &ctx,
+            setting_key,
+            &pack.id,
+            block_name,
+            pack.capabilities,
+        );
 
         // Spec 2: the block's script runs after its steps, in the same context. A script may
         // capture values; they are journalled below together with the step captures.
@@ -389,11 +398,12 @@ fn run_block(
     setting_key: Option<&str>,
     pack_id: &str,
     block_name: &str,
+    caps: CapSet,
 ) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
     for (index, step) in block.steps.iter().enumerate() {
         let label = format!("{block_name} step {index}");
-        if let Some(line) = run_step(step, ctx, setting_key, pack_id, &label)? {
+        if let Some(line) = run_step(step, ctx, setting_key, pack_id, &label, caps)? {
             done.push(line);
         }
     }
@@ -450,7 +460,23 @@ fn run_step(
     setting_key: Option<&str>,
     pack_id: &str,
     label: &str,
+    caps: CapSet,
 ) -> Result<Option<String>, String> {
+    // A step is a host call written as data, so it is gated like one. `Pack::validate`
+    // refuses such a pack when it is parsed; this is the same check where the mechanism is
+    // actually run, so a pack that reached the worker by another path cannot reach the
+    // machine either.
+    if let Some(capability) = Capability::of_mechanism(&step.mechanism)
+        && !caps.grants(capability)
+    {
+        return Err(format!(
+            "{label}: {} REFUSED: it needs the '{}' capability, which this pack was not \
+             granted (the pack asked for: {})",
+            step.mechanism,
+            capability.name(),
+            caps.asked_for()
+        ));
+    }
     if let Some(cond) = &step.when
         && !cond.matches(ctx, setting_key)
     {
@@ -1257,24 +1283,31 @@ pub enum OverlayRequest {
     Hide,
 }
 
-/// The overlay requests the pack worker made, waiting for the daemon's main loop.
+/// The overlay request the pack worker made, waiting for the daemon's main loop.
 ///
 /// The pack worker cannot show the overlay itself: the black windows belong to the thread
 /// that pumps their messages, and that is the daemon's main loop. The request is carried
 /// over to that loop, which does the work and keeps owning the crash-recovery ledger and
 /// the keypress dismissal.
-static OVERLAY_REQUESTS: Mutex<Vec<OverlayRequest>> = Mutex::new(Vec::new());
+///
+/// **One pending request, not a queue.** Every request the daemon carries out costs a black
+/// window per monitor, a write and a delete of `idle.marker`, and a pack job; a script with a
+/// thousand `overlay_show`/`overlay_hide` pairs in it would keep the daemon thrashing for
+/// minutes. Only the last request is still worth carrying out — the ones before it are
+/// asking for a state the machine is about to leave anyway.
+static OVERLAY_REQUESTS: Mutex<Option<OverlayRequest>> = Mutex::new(None);
 
-/// Ask the daemon to show or take away the idle overlay.
+/// Ask the daemon to show or take away the idle overlay. The request replaces the one that
+/// was still waiting: the daemon acts on the newest wish, never on a backlog of them.
 pub fn request_overlay(request: OverlayRequest) {
-    let mut requests = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-    requests.push(request);
+    let mut pending = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    *pending = Some(request);
 }
 
-/// The overlay requests that are waiting, taken away so the daemon does them once.
-pub fn take_overlay_requests() -> Vec<OverlayRequest> {
-    let mut requests = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::take(&mut *requests)
+/// The overlay request that is waiting, taken away so the daemon does it once.
+pub fn take_overlay_request() -> Option<OverlayRequest> {
+    let mut pending = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    pending.take()
 }
 
 /// Reject a pack whose scripts do not compile, before it is loaded or installed.
@@ -1937,8 +1970,15 @@ mod tests {
         .unwrap();
         let mut ctx = TemplateCtx::default();
         ctx.settings.insert("mode".into(), "Silent".into());
-        let err = run_step(&step, &ctx, Some("mode"), "g-helper", "revert step 0")
-            .expect_err("an unmapped value must fail the step");
+        let err = run_step(
+            &step,
+            &ctx,
+            Some("mode"),
+            "g-helper",
+            "revert step 0",
+            CapSet::ALL,
+        )
+        .expect_err("an unmapped value must fail the step");
         assert!(err.contains("g-helper"), "{err}");
         assert!(err.contains("revert step 0"), "{err}");
         assert!(err.contains("Silent"), "{err}");
@@ -1953,12 +1993,37 @@ mod tests {
         .unwrap();
         let mut ctx = TemplateCtx::default();
         ctx.captured.insert("prev_mode".into(), "3".into());
-        let err = run_step(&step, &ctx, None, "g-helper", "revert step 0")
-            .expect_err("an unmapped captured value must fail the step");
+        let err = run_step(
+            &step,
+            &ctx,
+            None,
+            "g-helper",
+            "revert step 0",
+            CapSet::ALL,
+        )
+        .expect_err("an unmapped captured value must fail the step");
         assert!(err.contains("g-helper"), "{err}");
         assert!(err.contains("revert step 0"), "{err}");
         assert!(err.contains("prev_mode"), "{err}");
         assert!(err.contains("3"), "{err}");
+    }
+
+    #[test]
+    fn a_step_of_an_ungranted_capability_is_refused_before_it_runs() {
+        // The load gate refuses such a pack (`Pack::validate`); this is the same check where
+        // the mechanism would run, so the worker cannot be reached around it. Nothing of the
+        // step may happen: the refusal comes before the exe is even resolved.
+        let step: Step =
+            serde_json::from_str(r#"{"mechanism":"cli","exe":"C:\\Windows\\System32\\cmd.exe"}"#)
+                .unwrap();
+        let ctx = TemplateCtx::default();
+        let files = CapSet::default().with(Capability::Files);
+        let err = run_step(&step, &ctx, None, "caps", "apply step 0", files)
+            .expect_err("a cli step needs 'exec'");
+        assert!(err.contains("apply step 0"), "{err}");
+        assert!(err.contains("cli REFUSED"), "{err}");
+        assert!(err.contains("it needs the 'exec' capability"), "{err}");
+        assert!(err.contains("the pack asked for: files"), "{err}");
     }
 
     #[test]

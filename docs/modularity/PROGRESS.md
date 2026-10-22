@@ -10,13 +10,13 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A — **A1 and A2 done and released** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API), **A3 done on its branch** (the pack schema's `kind` and `triggers`), A4 next |
-| **Next action** | **A4** — a separate worker queue for modes (`WORK-ORDER.md` A4). A3 is on `feature/a3-kind-triggers` and is **not merged** |
-| **Branch** | A3 is on **`feature/a3-kind-triggers`**, cut from `main` at `79ad905` (the v1.1.5 release). `main` still carries the integration (`4712b44`) and the v1.1.5 release; the branch A2 was built on, `feature/phase-a`, carries the same tree (`0791c0e`) |
+| **Phase** | A - **A1, A2 and A3 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`), **and the review of 1.1.5 closed**. A4 next |
+| **Next action** | **A4** - a separate worker queue for modes (`WORK-ORDER.md` A4). A3 is merged into `main` (`21935ff`); the review's fixes are on **`fix/1.1.5-review`** and are **not merged** - that merge is the user's call |
+| **Branch** | `main` carries A3 at the merge commit **`21935ff`** (its CI, `39803275300`, is green after 3m53s). `fix/1.1.5-review` is cut from that merge and carries the five defects the review found |
 | **Tree** | clean |
 | **Blocking** | nothing |
-| **Open questions** | none — the design is settled in `DECISIONS.md` |
-| **Not measured** | the **idle cost** — the phase adds two fields to the schema and changes no runtime path, and the idle cost of the 1.1.5 tree is itself not measured (the user declined the sampling). The number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to this tree |
+| **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
+| **Not measured** | the **idle cost** - no phase since 1.1.5 has touched the idle path, and the 1.1.5 tree's idle cost is itself not measured (the user declined the sampling). The number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to this tree |
 
 ---
 
@@ -634,6 +634,112 @@ serial thread (`packs.rs:168`), so a slow mode must never block a pack apply/rev
 modes get their own thread and their own channel. `WORK-ORDER.md` A4. The daemon-side
 half of what A3 put in the schema — a trigger that starts something, a mode the hotkey
 dispatches to — comes with it.
+
+---
+
+### 2026-10-23 - A3 merged, and the review of 1.1.5 closed
+
+**What I did.** Two jobs, in this order.
+
+**A3 is on `main`.** `feature/a3-kind-triggers` (tip `fbb1ef9`, cut from `79ad905`) was
+merged with a normal, non-forced merge into `21935ff` and pushed; the `main` CI run
+**`39803275300`** is green after **3m53s**. The tree it lands is the one A3's own runs
+proved: 370 unit tests and 119 harness checks.
+
+**The review of 1.1.5 found five defects, and all five were real.** The work is on
+**`fix/1.1.5-review`**, cut from the merge, and is **not merged** - that is the user's
+call. Each one was verified against the code before it was fixed:
+
+- **The capability gate did not cover the declarative steps** (the severe one). The script
+  is gated structurally - only the granted functions are on its engine - and the **steps**
+  were not gated at all, because a step is data and no engine ever sees it. A pack that
+  declared `["files"]`, or `[]`, could still run programs through `cli`, send keystrokes,
+  kill processes and write the registry. Every mechanism now names a capability
+  (`Capability::of_mechanism`), `Pack::validate` refuses the pack **when it is parsed** so
+  it never loads, and `run_step` refuses it again where it runs.
+- **`set_cooldown` resurrected a window that had ended.** The engine keeps an expired
+  window until a tick reaps it, and the daemon drains the pipe **before** the 1 Hz
+  housekeeping that ticks - the race the review described. `set_cooldown` takes `now` and
+  drops a window whose `end` is past.
+- **The overlay request queue was unbounded.** One pending request now, and the daemon
+  skips a request for the state it is already in.
+- **The denial was lost inside a script-defined function.** Rhai wraps it in
+  `ErrorInFunctionCall`; `denial()` reads `unwrap_inner()` now.
+- **`audio_mute_all` left no crash-recovery record.** Its ids go into `idle.ledger`, the
+  file idle mode already uses, so `recover_if_needed` unmutes them on the next start.
+
+Also from the same review: the startup path **clamps `cooldown_seconds` to 5-3600 s**, so
+a hand-edited config cannot panic the daemon in `Window::end()`.
+
+**Files touched.** `crates/armoury-core/src/pack.rs` (the mechanism table, the `registry`
+capability, the step gate in `validate`, five tests), `crates/armoury-core/src/engine.rs`
+(`set_cooldown` takes `now`, one test), `crates/armoury/src/packs.rs` (`run_block`/`run_step`
+take the `CapSet`, one test; the overlay request is one `Option`), `crates/armoury/src/
+daemon.rs` (the drain, `set_cooldown`, the clamp), `crates/armoury/src/script.rs`
+(`unwrap_inner`, one test), `crates/armoury/src/overlay.rs` (`ledger_add`/`ledger_remove`,
+one test), `tools/daemon-selftest.ps1` (fourteen checks), `CHANGELOG.md`, `compact.md` and
+this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The unit tests | 370 (270 in `armoury`, 100 in `armoury-core`) | **378 (273 in `armoury`, 105 in `armoury-core`)** - **+8** |
+| The harness checks | 119 `Check` calls | **133** - **+14** |
+| The release exe | 12,877,312 bytes (the A3 tree) | **12,879,360 bytes** - **+2,048 (+0.016 %)**, sha256 `611dcb98…b2ab` |
+
+*The exe size:* the release build of the branch, taken from the CI artefact of the
+dispatch (`ArmouryDaemon.exe`, sha256 `611dcb98…b2ab`), measured against the A3 tree's
+12,877,312. No size-bearing decision is made here - the fix is small and the rule is not
+bent (`DECISIONS.md` §12 and §19 bend it; this one does not).
+
+*The CI runs:*
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `39806787130` | CI on the fix branch (dispatch) - **red**: `'go' is a reserved keyword` in the new denial test | failed | 1m26s |
+| `39807213693` | CI on the code commit `41ba47e` (dispatch) | **green** - 378 tests, 133 harness checks, and the release profile | 8m49s |
+| `39809146891` | CI on the branch's tip `ada6f9c` (dispatch) - the same tree, with the folder on it | **green** - the same 378 tests and 133 checks; the artefact is the 12,879,360 bytes above | 7m46s |
+| `39810878555` | CI on `d750efe` - **cancelled by the next dispatch** (`cancel-in-progress` on the branch's concurrency group), not a failure | cancelled | 1m24s |
+| `39811080550` | CI on the branch's tip `18a7c28` (dispatch) - the anchors re-read, docs only | **green** - 378 tests, 133 checks, `ALL CHECKS PASSED` | 10m24s |
+
+**Decisions.** `DECISIONS.md` **20**: the gate covers the declarative steps, and
+`registry_set` gets a capability of its own (`registry`) instead of being folded into
+`files-write`. **21**: **the game wins** - a start inside the window cancels the pending
+revert, the machine stays in Turbo and the window keeps running. That is the user's
+decision of 2026-10-23, the code already behaved that way (H20, rule (4)), and nothing in
+the engine was changed for it: it is pinned by a harness check (9b) and recorded.
+**17** gains the amendment for the window that has ended.
+
+**Surprises.**
+
+- **The gate was structural in exactly one place and absent in the other.** The whole
+  point of §14's "the denial is structural, not a check a call site could forget" is that
+  the *engine* is the gate - and a declarative step never reaches an engine. The question
+  that finds this class of hole: **what are the other paths to the same effect?**
+  (`GOTCHAS.md` trap 43).
+- **The daemon's loop order is a security-relevant detail.** Pipe, watchers and the other
+  channels are drained at the top of the iteration; housekeeping - and so `engine.tick()` -
+  runs after them. Anything the loop reads before that tick must be safe on a state the
+  tick has not reached yet: the engine's accessors already took `now`, the *mutator* did
+  not (`GOTCHAS.md` trap 44).
+- **`go` is a reserved keyword in Rhai 1.26.1.** The first CI run of the branch was red on
+  a script that never parsed - `'go' is a reserved keyword (line 1, position 4)` - so the
+  test failed before it could fail for the reason it was written. The function is
+  `send_bang` now. A Rhai `fn` also does **not** capture the caller's scope: the context
+  has to be passed in as a parameter (`GOTCHAS.md` trap 45).
+- **`idle.ledger` now has two writers**, and it is a read-modify-write. Writing it whole
+  from either side loses the other side's record - and a lost record is a machine left
+  muted after a crash - so it is written through `ledger_add`/`ledger_remove` under one
+  lock (`GOTCHAS.md` trap 46).
+- **The harness can only catch the phantom lockout sometimes.** The gap it lives in is up
+  to one second wide (the 1 Hz tick), and the fixed build passes whichever way the race
+  goes: check 12c fails only on a build that has the defect and only when it lands in the
+  gap. That is the right direction for a flake - it can be a false *pass* on the old code,
+  never a false failure on the new one.
+
+**Next.** A4 - a separate worker queue for modes (`WORK-ORDER.md` A4). The merge of
+`fix/1.1.5-review` into `main` and the next release are the user's calls.
 
 ---
 

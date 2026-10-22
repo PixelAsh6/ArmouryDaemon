@@ -151,7 +151,7 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
    That fix is **another agent's work** (`fix/art-fetch-windows-root-store`); a tree
    without it still has the bug in the art fetches, and the binary still carries
    Mozilla's bundled roots because of it.
-2. **The pack worker is a single serial thread** (`packs.rs:168`,
+2. **The pack worker is a single serial thread** (`packs.rs:171`,
    `while let Ok(job) = jobs.recv()`). A slow mode would block every later apply and
    revert. Modes need their own worker.
 3. **The engine is cached, and the cache is keyed by the capability set** (A2). Since
@@ -360,6 +360,45 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     'widget' (expected 'pack' or 'mode')"* — the field is named by the walk back
     over the text, and it works for a custom error exactly as it works for a type
     error.
+43. **A gate over one way in is not a gate.** The capability gate covered the pack
+    **script** — structurally, by registering only the granted functions on the engine
+    — and said nothing about the **declarative steps**, which are the same powers
+    written as data. A pack that declared `[]` could run `cmd.exe` through a `cli`
+    step. Data and code that reach the same machine need the same check, and it has to
+    sit where the data is **read** (`Pack::validate`), not only where it runs. The
+    review of 1.1.5 found this; `DECISIONS.md` §20 is the record. **The question to ask
+    of any new gate: what are the other paths to the same effect?**
+44. **A pipe request is drained before the tick that would have cleaned up after it.**
+    The main loop handles the pipe and the other channels at the top of an iteration
+    (`daemon.rs`), and only then runs the 1 Hz housekeeping that calls
+    `engine.tick()`. So a window that has **ended** can still be in the engine when a
+    `set_cooldown` arrives in that sub-second gap — and re-timing it made a dead window
+    run again: the dashboard showed a countdown and the next launch was **held** for it.
+    The fix passes `now` and drops an expired window (`set_cooldown`). **Anything the
+    loop reads before housekeeping must be safe on a state that housekeeping has not
+    reached yet** — the engine's own accessors were already `now`-aware, the mutators
+    were not.
+45. **Rhai wraps an error raised inside a script-defined function, and the wrapper is
+    not the error.** A call to an ungranted host function from inside `fn go(host)`
+    comes back as `ErrorInFunctionCall`, with `ErrorFunctionNotFound` inside it — so
+    matching only the top-level variant missed **every** denial in a script that had a
+    function of its own, and the pack's log got Rhai's raw `Function not found` instead
+    of the line that names the missing capability (`script.rs`, `denial`, now
+    `error.unwrap_inner()` — `rhai` 1.26.1 `types/error.rs:471`). The same trap is
+    waiting for every other match on `EvalAltResult`. Note also that a Rhai `fn` does
+    **not** capture the caller's scope: the context has to be passed in as a parameter
+    (`fn send_bang(host)`), which is why the harness check writes it that way — and the
+    first name tried for that function, `go`, is a **reserved keyword** in Rhai 1.26.1
+    (`'go' is a reserved keyword (line 1, position 4)`), so the test failed to parse
+    before it could fail for the reason it was written.
+46. **`idle.ledger` has two writers, and it is a read-modify-write.** Idle mode writes
+    the devices its overlay muted (`overlay.rs`, `show`/`hide`), and `audio_mute_all`
+    writes the ones a pack muted (`mute_all_host`). It used to be overwritten by each
+    writer, which loses the other side's record — and a lost record is a machine left
+    muted after a crash, because `recover_if_needed` only restores what is in the file.
+    There is one writer at a time now (`LEDGER_LOCK`) and the two operations are
+    `ledger_add` / `ledger_remove`: add what you change, remove what you put back, never
+    write the file whole.
 
 ---
 
@@ -386,7 +425,15 @@ Required defences:
 3. **The helper runs non-elevated where possible.** A child of the elevated daemon
    inherits elevation; a linked-token `CreateProcessWithTokenW` is the way to drop it.
 4. **The capability gate is the real boundary** for data modules. A pack that declares
-   `["windows","audio"]` gets those and nothing else; an ungranted call must fail.
+   `["windows","audio"]` gets those and nothing else; an ungranted call must fail — **and
+   that includes the declarative steps, not only the script.** Until 2026-10-23 it did
+   not: the script was gated structurally, and a `cli` / `hotkey` / `process_kill` /
+   `process_start` / `registry_set` step ran whatever the pack had declared. Every
+   mechanism now names a capability (`Capability::of_mechanism`, `pack.rs`), the pack is
+   refused at `validate()` if it uses one it did not ask for, and `run_step` refuses it
+   again where it runs. The table is in `DESIGN.md` §2. **When a new mechanism is added,
+   it needs a row in that table in the same commit** — a test
+   (`every_mechanism_a_step_may_name_has_a_capability`) fails if it does not.
 5. **A pack script may not write outside** `%APPDATA%`, `%LOCALAPPDATA%`,
    `%PROGRAMDATA%` and the target app's own folder — the existing guard
    (`script.rs:668`, `write_allowed`) compares path *components*, not string
