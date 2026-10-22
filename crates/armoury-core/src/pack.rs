@@ -30,6 +30,17 @@ fn default_capabilities() -> CapSet {
     CapSet::ALL
 }
 
+/// The default for a pack that does not declare its triggers: the tracked app.
+///
+/// This is today's behaviour — a pack applies while a tracked app runs — so a pack that
+/// does not carry the field keeps working exactly as it did before it existed.
+fn default_triggers() -> Vec<Trigger> {
+    vec![Trigger {
+        kind: TriggerKind::TrackedApp,
+        key: None,
+    }]
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pack {
     #[serde(default = "default_spec")]
@@ -59,6 +70,13 @@ pub struct Pack {
     /// none gets the whole host API (see [`default_capabilities`]).
     #[serde(default = "default_capabilities")]
     pub capabilities: CapSet,
+    /// What this pack is: a pack that follows a tracked app, or a mode — a global on/off
+    /// thing with a trigger of its own. A pack that does not say is a pack.
+    #[serde(default)]
+    pub kind: PackKind,
+    /// What starts this pack. A pack that does not say follows the tracked app.
+    #[serde(default = "default_triggers")]
+    pub triggers: Vec<Trigger>,
     pub apply: StepBlock,
     pub revert: StepBlock,
 }
@@ -303,6 +321,114 @@ impl<'de> Deserialize<'de> for CapSet {
         }
         Ok(set)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The kind and the triggers
+//
+// A pack is either a pack — it follows a tracked app — or a mode: a global on/off thing
+// with a trigger of its own. Both fields are **additive**: a pack that does not carry
+// them loads and behaves exactly as it did before they existed.
+
+/// What a pack is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PackKind {
+    /// A pack: it applies when a tracked app runs. The default.
+    #[default]
+    Pack,
+    /// A mode: a global on/off thing, started by a trigger of its own.
+    Mode,
+}
+
+impl PackKind {
+    /// The name a pack writes in its `kind` field.
+    pub fn name(self) -> &'static str {
+        match self {
+            PackKind::Pack => "pack",
+            PackKind::Mode => "mode",
+        }
+    }
+
+    /// The kind with this name, if the daemon knows one.
+    pub fn from_name(name: &str) -> Option<PackKind> {
+        let name = name.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "pack" => Some(PackKind::Pack),
+            "mode" => Some(PackKind::Mode),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for PackKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for PackKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<PackKind, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        PackKind::from_name(&name).ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(format!("unknown kind '{name}'"))
+        })
+    }
+}
+
+/// What starts a pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TriggerKind {
+    /// A tracked app: the pack applies while one runs. The default.
+    #[default]
+    TrackedApp,
+    /// A hotkey: the pack starts when the key is pressed.
+    Hotkey,
+}
+
+impl TriggerKind {
+    /// The name a pack writes in a trigger's `kind` field.
+    pub fn name(self) -> &'static str {
+        match self {
+            TriggerKind::TrackedApp => "tracked_app",
+            TriggerKind::Hotkey => "hotkey",
+        }
+    }
+
+    /// The trigger kind with this name, if the daemon knows one.
+    pub fn from_name(name: &str) -> Option<TriggerKind> {
+        let name = name.trim().to_ascii_lowercase();
+        match name.as_str() {
+            "tracked_app" => Some(TriggerKind::TrackedApp),
+            "hotkey" => Some(TriggerKind::Hotkey),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for TriggerKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for TriggerKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<TriggerKind, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        TriggerKind::from_name(&name).ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(format!("unknown trigger kind '{name}'"))
+        })
+    }
+}
+
+/// One trigger: what starts the pack.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Trigger {
+    /// What starts the pack.
+    pub kind: TriggerKind,
+    /// The key a hotkey trigger listens for ("end", "home"). The daemon's hotkey table
+    /// knows the keys; the schema does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,6 +720,29 @@ impl Pack {
             errs.push(format!(
                 "min_engine '{min}' is not a version like \"1.0.0\" (digits and dots only)"
             ));
+        }
+        // A mode is started by a trigger of its own: a mode without one could never be
+        // engaged, and it would sit in the catalogue looking like something that works.
+        if self.kind == PackKind::Mode && self.triggers.is_empty() {
+            errs.push("a mode pack needs at least one trigger".into());
+        }
+        for trigger in &self.triggers {
+            match trigger.kind {
+                // A hotkey trigger without a key names no key, so nothing would start it.
+                TriggerKind::Hotkey => {
+                    if trigger.key.as_deref().map_or(true, |k| k.trim().is_empty()) {
+                        errs.push("trigger 'hotkey': needs a key".into());
+                    }
+                }
+                // A key on a tracked-app trigger is a typo waiting to happen: the trigger
+                // would start the pack on a tracked app anyway, and the key would be
+                // silently ignored.
+                TriggerKind::TrackedApp => {
+                    if trigger.key.is_some() {
+                        errs.push("trigger 'tracked_app': does not take a key".into());
+                    }
+                }
+            }
         }
         if self.targets.process.is_empty() {
             errs.push("targets.process must list at least one exe file name".into());
@@ -1456,6 +1605,45 @@ mod tests {
             "settings",
             true
         );
+        // a kind the daemon does not know
+        mutation!(
+            "the kind is one the daemon does not know",
+            mutated(RM, |t| set(t, &["kind"], serde_json::json!("widget"))),
+            "kind",
+            true
+        );
+        // a trigger kind the daemon does not know
+        mutation!(
+            "the trigger kind is one the daemon does not know",
+            mutated(RM, |t| set(
+                t,
+                &["triggers"],
+                serde_json::json!([{ "kind": "teleport" }])
+            )),
+            "trigger",
+            true
+        );
+        // a mode that names no trigger at all
+        mutation!(
+            "a mode pack without a trigger",
+            mutated(RM, |t| {
+                set(t, &["kind"], serde_json::json!("mode"));
+                set(t, &["triggers"], serde_json::json!([]));
+            }),
+            "trigger",
+            true
+        );
+        // a hotkey trigger that names no key
+        mutation!(
+            "a hotkey trigger without a key",
+            mutated(RM, |t| set(
+                t,
+                &["triggers"],
+                serde_json::json!([{ "kind": "hotkey" }])
+            )),
+            "trigger",
+            true
+        );
 
         // the numbers the shipped packs do not have
         mutation!(
@@ -1760,5 +1948,102 @@ mod tests {
         assert!(CapSet::default().is_empty());
         assert!(!CapSet::ALL.is_empty());
         assert_eq!(CapSet::ALL.len(), ALL_CAPABILITIES.len());
+    }
+
+    // -----------------------------------------------------------------------
+    // The kind and the triggers
+
+    /// A pack that says what it is and what starts it.
+    const KIND_PACK: &str = r#"{
+        "spec": 2, "id": "kinded", "name": "Kinded", "version": "1.0.0",
+        "kind": "mode",
+        "triggers": [ { "kind": "hotkey", "key": "end" } ],
+        "targets": { "process": ["kinded.exe"] },
+        "script": { "apply": "ctx.log(\"hi\");", "revert": "ctx.log(\"bye\");" },
+        "apply": { "steps": [] }, "revert": { "steps": [] }
+    }"#;
+
+    #[test]
+    fn a_pack_that_says_nothing_follows_the_tracked_app() {
+        // The three shipped packs predate the fields: they must keep working unchanged.
+        for text in [WE, GH, RM] {
+            let pack = Pack::parse(text).expect("the shipped pack must be valid");
+            assert_eq!(pack.kind, PackKind::Pack);
+            assert_eq!(pack.triggers.len(), 1);
+            assert_eq!(pack.triggers[0].kind, TriggerKind::TrackedApp);
+            assert!(pack.triggers[0].key.is_none());
+            assert!(pack.validate().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_pack_may_say_what_it_is_and_what_starts_it() {
+        let pack = Pack::parse(KIND_PACK).expect("a pack with a kind is valid");
+        assert_eq!(pack.kind, PackKind::Mode);
+        assert_eq!(pack.triggers.len(), 1);
+        assert_eq!(pack.triggers[0].kind, TriggerKind::Hotkey);
+        assert_eq!(pack.triggers[0].key.as_deref(), Some("end"));
+        assert!(pack.validate().is_empty());
+
+        // a mode that does not say what starts it inherits the tracked app, like any pack
+        let text = KIND_PACK.replace(
+            "\"triggers\": [ { \"kind\": \"hotkey\", \"key\": \"end\" } ],",
+            "",
+        );
+        let pack = Pack::parse(&text).expect("a mode without a trigger list is valid");
+        assert_eq!(pack.triggers.len(), 1);
+        assert_eq!(pack.triggers[0].kind, TriggerKind::TrackedApp);
+    }
+
+    #[test]
+    fn a_malformed_kind_is_a_named_error() {
+        let text = KIND_PACK.replace("\"kind\": \"mode\"", "\"kind\": \"widget\"");
+        let err = Pack::parse(&text).expect_err("an unknown kind must be refused");
+        assert!(err.contains("kind"), "{err}");
+        assert!(err.contains("widget"), "{err}");
+
+        // and so is a trigger kind the daemon does not know
+        let text = KIND_PACK.replace("\"kind\": \"hotkey\"", "\"kind\": \"teleport\"");
+        let err = Pack::parse(&text).expect_err("an unknown trigger kind must be refused");
+        assert!(err.contains("trigger"), "{err}");
+        assert!(err.contains("teleport"), "{err}");
+    }
+
+    #[test]
+    fn a_mode_needs_a_trigger() {
+        let text = KIND_PACK.replace(
+            "\"triggers\": [ { \"kind\": \"hotkey\", \"key\": \"end\" } ],",
+            "\"triggers\": [],",
+        );
+        let err = Pack::parse(&text).expect_err("a mode without a trigger must be refused");
+        assert!(err.contains("trigger"), "{err}");
+    }
+
+    #[test]
+    fn a_trigger_says_what_it_needs() {
+        // a hotkey trigger without a key names no key: nothing would start the pack
+        let text = KIND_PACK.replace("\"key\": \"end\"", "\"key\": \"\"");
+        let err = Pack::parse(&text).expect_err("a hotkey trigger needs a key");
+        assert!(err.contains("hotkey"), "{err}");
+
+        // a key on a tracked-app trigger would be ignored in silence
+        let text = KIND_PACK.replace(
+            "\"triggers\": [ { \"kind\": \"hotkey\", \"key\": \"end\" } ],",
+            "\"triggers\": [ { \"kind\": \"tracked_app\", \"key\": \"end\" } ],",
+        );
+        let err = Pack::parse(&text).expect_err("a tracked_app trigger takes no key");
+        assert!(err.contains("tracked_app"), "{err}");
+    }
+
+    #[test]
+    fn the_kind_and_the_triggers_survive_a_json_round_trip() {
+        let pack = Pack::parse(KIND_PACK).unwrap();
+        let json = serde_json::to_string(&pack).expect("a pack serialises");
+        assert!(json.contains("\"kind\":\"mode\""), "{json}");
+        assert!(json.contains("\"kind\":\"hotkey\""), "{json}");
+        let again: Pack = serde_json::from_str(&json).expect("the pack parses again");
+        assert_eq!(again.kind, PackKind::Mode);
+        assert_eq!(again.triggers[0].kind, TriggerKind::Hotkey);
+        assert_eq!(again.triggers[0].key.as_deref(), Some("end"));
     }
 }
