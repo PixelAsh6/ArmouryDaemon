@@ -814,7 +814,7 @@ try {
   "targets": { "process": ["timeout.exe"] },
   "capabilities": ["files"],
   "script": {
-    "apply":  "fn go(host) { host.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]); } ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\"); go(ctx);",
+    "apply":  "fn send_bang(host) { host.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]); } ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\"); send_bang(ctx);",
     "revert": "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\");"
   },
   "apply": { "steps": [] },

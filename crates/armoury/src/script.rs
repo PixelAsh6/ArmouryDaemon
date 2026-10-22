@@ -918,8 +918,8 @@ mod tests {
         // not shown the raw "Function not found" of the wrapper (23 Oct review).
         let mut ctx = ctx();
         let err = run_with_capabilities(
-            r#"fn go(host) { host.run_cli("C:\\Windows\\System32\\cmd.exe", ["/c", "echo hi"]); }
-               go(ctx);"#,
+            r#"fn send_bang(host) { host.run_cli("C:\\Windows\\System32\\cmd.exe", ["/c", "echo hi"]); }
+               send_bang(ctx);"#,
             &mut ctx,
             files_only(),
         )
