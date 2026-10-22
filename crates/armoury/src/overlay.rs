@@ -320,18 +320,10 @@ pub fn show(overlay: &mut Overlay) {
     };
 
     // The ledger is the authoritative record of what we changed: the daemon's marker
-    // only says "a run ended while idle".
-    let entries: Vec<LedgerEntry> = outcome
-        .muted
-        .iter()
-        .map(|muted| LedgerEntry {
-            id: muted.id.clone(),
-            was_muted: false,
-        })
-        .collect();
-    if let Err(e) = write_ledger(&ledger_path(), &entries) {
-        error!("idle overlay: the mute ledger could not be written ({e}) - a crash would not be recoverable");
-    }
+    // only says "a run ended while idle". It is *added to*, not overwritten: a pack may have
+    // muted devices of its own through `audio_mute_all`, and that record has to survive.
+    let ids: Vec<String> = outcome.muted.iter().map(|muted| muted.id.clone()).collect();
+    ledger_add(&ledger_path(), &ids);
 
     overlay.muted = outcome.muted;
     overlay.active = true;
@@ -354,6 +346,7 @@ pub fn hide(overlay: &mut Overlay) {
         }
     }
     let mut failed: Vec<LedgerEntry> = Vec::new();
+    let mut restored: Vec<String> = Vec::new();
     for muted in overlay.muted.drain(..) {
         if let Err(e) = set_device_mute(&muted.device, false) {
             warn!("idle: {} could not be unmuted: {e}", muted.id);
@@ -361,18 +354,21 @@ pub fn hide(overlay: &mut Overlay) {
                 id: muted.id,
                 was_muted: false,
             });
+        } else {
+            restored.push(muted.id);
         }
     }
     overlay.active = false;
     let ledger_file = ledger_path();
+    // Our devices are back: forget them in the ledger. A pack's mutes are not ours to forget,
+    // and a device that could not be unmuted stays in it.
+    ledger_remove(&ledger_file, &restored);
     if failed.is_empty() {
-        let _ = fs::remove_file(&ledger_file);
         info!("idle overlay off: screens restored, audio restored");
     } else {
         // What is still muted stays in the ledger: the next start retries it.
-        if let Err(e) = write_ledger(&ledger_file, &failed) {
-            error!("idle: the leftover ledger could not be written: {e}");
-        }
+        let ids: Vec<String> = failed.iter().map(|entry| entry.id.clone()).collect();
+        ledger_add(&ledger_file, &ids);
         error!(
             "idle overlay off: screens restored, {} device(s) could not be unmuted - the ledger \
              was kept for the next start",
@@ -553,7 +549,8 @@ fn restore_device(entry: &LedgerEntry) -> Result<(), String> {
 
 /// The output devices a host call muted, by endpoint id: exactly the ones it has to
 /// unmute again. A device the user had muted already is not in here — it was not
-/// changed, and it must never be unmuted again.
+/// changed, and it must never be unmuted again. This is the in-memory half of the record;
+/// the half a crash can read is `idle.ledger`, written by [`ledger_add`].
 static MUTED_BY_HOST: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Mute every active output device, or unmute the ones this call muted.
@@ -561,15 +558,23 @@ static MUTED_BY_HOST: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// This is the `audio_mute_all` of the host API. The devices it muted are remembered by
 /// their endpoint id, so the unmute puts back exactly what was changed: a device the
 /// user had muted already stays muted.
+///
+/// The record is also written to the crash-recovery ledger (`idle.ledger`), the same file
+/// idle mode uses, so a pack that mutes the machine and then loses its daemon does not leave
+/// it silent: `recover_if_needed` puts those devices back on the next start.
 pub fn mute_all_host(muted: bool) -> Result<String, String> {
     if muted {
         let outcome = mute_all()?;
-        let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
-        for device in &outcome.muted {
-            if !ledger.contains(&device.id) {
-                ledger.push(device.id.clone());
+        let ids: Vec<String> = outcome.muted.iter().map(|device| device.id.clone()).collect();
+        {
+            let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
+            for id in &ids {
+                if !ledger.contains(id) {
+                    ledger.push(id.clone());
+                }
             }
         }
+        ledger_add(&ledger_path(), &ids);
         return Ok(format!(
             "{} device(s) muted, {} left alone",
             outcome.changed,
@@ -581,17 +586,17 @@ pub fn mute_all_host(muted: bool) -> Result<String, String> {
         let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::take(&mut *ledger)
     };
-    let mut restored = 0usize;
+    let mut restored: Vec<String> = Vec::new();
     let mut failed = 0usize;
     for id in ids {
         match restore_device(&LedgerEntry {
             id: id.clone(),
             was_muted: false,
         }) {
-            Ok(()) => restored += 1,
+            Ok(()) => restored.push(id),
             Err(e) => {
                 failed += 1;
-                // the device stays in the ledger: the next call tries again
+                // the device stays in the record: the next call tries again
                 MUTED_BY_HOST
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -600,8 +605,12 @@ pub fn mute_all_host(muted: bool) -> Result<String, String> {
             }
         }
     }
+    // The devices that are back leave the ledger too. One that could not be unmuted stays in
+    // it, so the next start retries it.
+    ledger_remove(&ledger_path(), &restored);
     Ok(format!(
-        "{restored} device(s) unmuted, {failed} could not be unmuted"
+        "{} device(s) unmuted, {failed} could not be unmuted",
+        restored.len()
     ))
 }
 
@@ -729,6 +738,59 @@ pub fn recover_if_needed() {
     }
 }
 
+/// One writer at a time. The ledger is a read-modify-write and two threads use it: the pack
+/// worker (`audio_mute_all`) and the daemon loop (idle mode). Two writers at once would each
+/// write the file they read, and one side's record would be lost.
+static LEDGER_LOCK: Mutex<()> = Mutex::new(());
+
+/// Add these devices to the crash-recovery ledger, keeping what is already in it.
+///
+/// The ledger is shared: idle mode records the devices its overlay muted, and `audio_mute_all`
+/// records the ones it muted. Overwriting it would lose the other writer's record, and a crash
+/// would then leave that set muted with nothing to put it back.
+fn ledger_add(path: &Path, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let _guard = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries = read_ledger(path).map(|ledger| ledger.devices).unwrap_or_default();
+    for id in ids {
+        if !entries.iter().any(|entry| &entry.id == id) {
+            entries.push(LedgerEntry {
+                id: id.clone(),
+                was_muted: false,
+            });
+        }
+    }
+    if let Err(e) = write_ledger(path, &entries) {
+        error!(
+            "idle: the mute ledger could not be written ({e}) - a crash would not be recoverable"
+        );
+    }
+}
+
+/// Forget these devices in the ledger: they were put back. The file goes away with the last
+/// entry, and a device that could not be restored is simply not in `ids`.
+fn ledger_remove(path: &Path, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let _guard = LEDGER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(ledger) = read_ledger(path) else {
+        return;
+    };
+    let left: Vec<LedgerEntry> = ledger
+        .devices
+        .into_iter()
+        .filter(|entry| !ids.contains(&entry.id))
+        .collect();
+    if left.is_empty() {
+        let _ = fs::remove_file(path);
+    } else if let Err(e) = write_ledger(path, &left) {
+        error!("idle: the leftover ledger could not be written: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,6 +879,35 @@ mod tests {
         assert_eq!(failed, 0);
         assert!(!ledger_file.exists());
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn a_host_mute_joins_the_ledger_and_leaves_the_idle_record_alone() {
+        // `audio_mute_all` shares `idle.ledger` with idle mode. Its devices have to go in
+        // (a crash must not leave the machine silent) without erasing the record idle mode
+        // wrote, and its unmute must forget only its own devices.
+        let dir = temp_dir("host-mute");
+        let file = dir.join("idle.ledger");
+        write_ledger(&file, &[entry("idle-device", false)]).unwrap();
+
+        let ours = vec!["host-device".to_string()];
+        ledger_add(&file, &ours);
+        ledger_add(&file, &ours); // the same device twice is the same record
+        assert_eq!(
+            read_ledger(&file).unwrap().devices,
+            vec![entry("idle-device", false), entry("host-device", false)]
+        );
+
+        // the host's unmute puts its device back: the entry goes, idle's stays
+        ledger_remove(&file, &ours);
+        assert_eq!(
+            read_ledger(&file).unwrap().devices,
+            vec![entry("idle-device", false)]
+        );
+
+        // the last entry takes the file with it
+        ledger_remove(&file, &["idle-device".to_string()]);
+        assert!(!file.exists(), "an empty ledger is not a ledger");
     }
 
     #[test]
