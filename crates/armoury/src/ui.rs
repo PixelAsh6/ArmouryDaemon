@@ -335,6 +335,65 @@ pub fn run() {
     );
 }
 
+/// The status line: the state the daemon reports, in the user's words.
+///
+/// The cooldown names the app the window belongs to, so the user can see which app is
+/// running while the packs are still where they were.
+fn status_line(st: Option<&StatusSnapshot>) -> (String, Color32) {
+    match st {
+        Some(st) => match st.state {
+            RunState::Idle => ("Idle".to_string(), Color32::from_rgb(52, 211, 153)),
+            RunState::Triggered => (
+                match &st.trigger_source {
+                    Some(src) => format!("Triggered — {src}"),
+                    None => "Triggered".to_string(),
+                },
+                Color32::from_rgb(251, 191, 36),
+            ),
+            RunState::Cooldown => (
+                {
+                    // The cooldown is the settling window after a change, not a pending
+                    // revert: the number is what is left to settle.
+                    let mut text = match st.cooldown_remaining_ms {
+                        Some(ms) => format!("Cooling down — {}s", ms / 1000),
+                        None => "Cooling down".to_string(),
+                    };
+                    if let Some(src) = &st.trigger_source {
+                        text.push_str(" · ");
+                        text.push_str(src);
+                    }
+                    text
+                },
+                Color32::from_rgb(96, 165, 250),
+            ),
+        },
+        None => ("Waiting for daemon…".to_string(), Color32::GRAY),
+    }
+}
+
+/// The value of the cooldown row: what is left to settle, and the change that is waiting
+/// behind the window, if there is one.
+///
+/// The daemon says which change waits (`"apply"` or `"revert"`), so the row can say that
+/// something is queued: the packs are not where the app wants them yet.
+fn cooldown_row(st: Option<&StatusSnapshot>) -> String {
+    let st = match st {
+        Some(st) => st,
+        None => return "—".to_string(),
+    };
+    let mut text = match st.cooldown_remaining_ms {
+        Some(ms) => format!("{}s left", ms / 1000),
+        None => format!("{}s", st.cooldown_seconds),
+    };
+    match st.cooldown_action.as_deref() {
+        Some("apply") => text.push_str(" · waiting to apply"),
+        Some("revert") => text.push_str(" · waiting to revert"),
+        Some(_) => text.push_str(" · change waiting"),
+        None => {}
+    }
+    text
+}
+
 struct App {
     rx: Receiver<UiEvent>,
     shared: Arc<Mutex<Shared>>,
@@ -628,28 +687,7 @@ impl eframe::App for App {
             console_open,
         ) = {
             let s = self.shared.lock().unwrap();
-            let (text, color) = match &s.status {
-                Some(st) => match st.state {
-                    RunState::Idle => ("Idle".to_string(), Color32::from_rgb(52, 211, 153)),
-                    RunState::Triggered => (
-                        match &st.trigger_source {
-                            Some(src) => format!("Triggered — {src}"),
-                            None => "Triggered".to_string(),
-                        },
-                        Color32::from_rgb(251, 191, 36),
-                    ),
-                    RunState::Cooldown => (
-                        // The cooldown is the settling window after a change, not a pending
-                        // revert: the number is what is left to settle.
-                        match st.cooldown_remaining_ms {
-                            Some(ms) => format!("Cooling down — {}s", ms / 1000),
-                            None => "Cooling down".to_string(),
-                        },
-                        Color32::from_rgb(96, 165, 250),
-                    ),
-                },
-                None => ("Waiting for daemon…".to_string(), Color32::GRAY),
-            };
+            let (text, color) = status_line(s.status.as_ref());
             let version_text = if s.connected {
                 format!("v{}", s.daemon_version)
             } else {
@@ -668,13 +706,7 @@ impl eframe::App for App {
                 ),
                 (
                     "cooldown".to_string(),
-                    match &s.status {
-                        Some(st) => match st.cooldown_remaining_ms {
-                            Some(ms) => format!("{}s left", ms / 1000),
-                            None => format!("{}s", st.cooldown_seconds),
-                        },
-                        None => "—".to_string(),
-                    },
+                    cooldown_row(s.status.as_ref()),
                 ),
                 ("packs".to_string(), {
                     let list: Vec<PackStatus> = s
@@ -3685,6 +3717,41 @@ mod tests {
             sgdb_api_key: key.to_string(),
             last_error: None,
         }
+    }
+
+    #[test]
+    fn the_cooldown_band_names_the_app_the_window_belongs_to() {
+        // The user reported on 22 Oct that the dashboard said "Cooling down — 2s" and gave
+        // no hint which app was running: the app is named now.
+        let mut st = status_with_key(false, "");
+        st.state = RunState::Cooldown;
+        st.cooldown_remaining_ms = Some(2_000);
+        st.trigger_source = Some("Warframe.x64.exe".to_string());
+        let (text, _) = status_line(Some(&st));
+        assert_eq!(text, "Cooling down — 2s · Warframe.x64.exe");
+
+        // no app is running: the band names none
+        st.trigger_source = None;
+        let (text, _) = status_line(Some(&st));
+        assert_eq!(text, "Cooling down — 2s");
+    }
+
+    #[test]
+    fn the_cooldown_row_says_that_a_change_is_waiting() {
+        // The row said "42s left" and nothing else, so the user could not tell that a
+        // change was queued behind the window. The daemon says which one waits.
+        let mut st = status_with_key(false, "");
+        st.cooldown_remaining_ms = Some(42_000);
+        assert_eq!(cooldown_row(Some(&st)), "42s left");
+
+        st.cooldown_action = Some("apply".to_string());
+        assert_eq!(cooldown_row(Some(&st)), "42s left · waiting to apply");
+
+        st.cooldown_action = Some("revert".to_string());
+        assert_eq!(cooldown_row(Some(&st)), "42s left · waiting to revert");
+
+        // no daemon answer yet: the row says what is left and nothing more
+        assert_eq!(cooldown_row(None), "—");
     }
 
     /// A window in the chain, sitting in the slot the chain gave it (physical pixels).
