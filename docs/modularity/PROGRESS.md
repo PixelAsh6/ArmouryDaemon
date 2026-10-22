@@ -596,6 +596,7 @@ asset** (12,865,024 bytes, sha256 `947ef3dc…24a4` — the copy installed on th
 | `39777594088` | CI on the code commit `0f0b104` (dispatch) | green — 370 tests, 118 harness checks, and the release profile | 9m54s |
 | `39780061907` | CI on the folder commit `55aed31` (dispatch) | green — the same 370 tests and 118 checks | 9m40s |
 | `39781519178` | CI on the branch's tip `8341452` (dispatch) | green — **370 tests, 119 harness checks**, and the release profile | 10m40s |
+| `39783613729` | CI on the folder commit `bb2f234` (dispatch) | green — the same 370 tests and 119 checks; the artefact is the same 12,877,312 bytes | 10m45s |
 
 **Decisions.** `DECISIONS.md` §18: the defaults (`"pack"`, and the tracked app for every
 kind), the named error, the two trigger rules the folder did not state (a `hotkey` trigger
