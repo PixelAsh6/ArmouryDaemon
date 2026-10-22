@@ -254,8 +254,10 @@ bytes.** `DECISIONS.md` §15 says where the bytes are (a Rhai registration costs
 shapes) and what was rejected. **The size rule bends here, once** — and the baseline
 for the next phase is now 12,925,440 bytes.
 
-*The CI run:* **__RUNID__**, the job **__CONCLUSION__** in **__WALL__**: the debug build,
-**353 unit tests**, and the self-test harness with **95 checks, all passed**.
+*The CI run:* **39707130123** (the workflow dispatch on the measurement branch), the job
+**green** in **9 min 31 s**: the debug build, **353 unit tests**, and the self-test
+harness with **95 checks, all passed** — plus the release build and the artefact the
+size was measured from.
 
 **Decisions.** `DECISIONS.md` §14: the taxonomy, one engine per capability set, the
 **`time` capability for `sleep`**, the default of the `capabilities` field, and the
