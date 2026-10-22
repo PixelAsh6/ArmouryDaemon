@@ -1226,7 +1226,7 @@ fn window_exists(hwnd: isize) -> bool {
     if hwnd == 0 {
         return false;
     }
-    unsafe { IsWindow(HWND(hwnd as *mut _)).as_bool() }
+    unsafe { IsWindow(Some(HWND(hwnd as *mut _))).as_bool() }
 }
 
 /// `ctx.audio_sessions()` — the audio sessions of the machine, as "pid:state" strings.
