@@ -38,10 +38,12 @@ background.
 ## Current state
 
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The phase is
-  integrated on **`feature/phase-a`** — A2, with the lockout re-timing and the art fetch
-  through the Windows certificate store merged into it — and it is the **1.1.5** release.
-  An **A2-only** copy of the phase is still on `feature/a2-capabilities-clean`; the trees
-  have **different numbers** — a number without its tree is not a number.
+  integrated on **`main`** — A2, with the lockout re-timing and the art fetch through the
+  Windows certificate store merged into it — at the merge commit `4712b44`, and it is the
+  **1.1.5** release. The branch it was built on, `feature/phase-a`, carries the **same
+  tree** (`0791c0e`). An **A2-only** copy of the phase is still on
+  `feature/a2-capabilities-clean`; the trees have **different numbers** — a number
+  without its tree is not a number.
 - The **1.1.5** release is out: the **capability-scoped host API**, the **Windows
   certificate store** for the catalogue **and the cover art**, and the **cooldown
   re-timing** — a change of the cooldown re-times the window that is running.

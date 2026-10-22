@@ -12,10 +12,11 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A — **A1 and A2 done and released** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API), A3 next |
 | **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) — the next phase, and it is not started |
-| **Branch** | The phase is integrated on **`feature/phase-a`** — A2, with the lockout re-timing and the art fetch merged into it — and it is the **v1.1.5** release. `main` was at `0ecacd3` (version 1.1.4) when the integration started |
+| **Branch** | The phase is integrated on **`main`** — A2, with the lockout re-timing and the art fetch merged into it — at the merge commit `4712b44`, and it is the **v1.1.5** release. The branch it was built on, `feature/phase-a`, carries the **same tree** (`0791c0e`); `main` was at `0ecacd3` (version 1.1.4) when the integration started |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |
+| **Not measured** | the **idle cost** of this tree — it needs minutes of quiet sampling on the user's machine, and the user was testing. The number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to this tree |
 
 ---
 
