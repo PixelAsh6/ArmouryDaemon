@@ -46,7 +46,11 @@ background.
   without its tree is not a number.
 - The **1.1.5** release is out: the **capability-scoped host API**, the **Windows
   certificate store** for the catalogue **and the cover art**, and the **cooldown
-  re-timing** — a change of the cooldown re-times the window that is running.
+  re-timing** — a change of the cooldown re-times the window that is running. It carries
+  the executable (12,865,024 bytes) and its 85-byte sidecar, and nothing else. It is
+  **published but not installed** — the machine still runs the older build.
+- **The next action is Phase A3** — `triggers` and `kind` in the pack schema
+  (`WORK-ORDER.md` A3). It is not started.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).

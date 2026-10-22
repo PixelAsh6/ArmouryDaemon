@@ -497,6 +497,27 @@ section, seven checks), `Cargo.toml` and `Cargo.lock` (the version), `README.md`
 |---|---|---|
 | The unit tests | 359 (268 in `armoury`, 91 in `armoury-core`) | **364** (270 / 94) — the lockout branch's five |
 | The harness checks | 101 `Check` calls | **108** — **+7** (the re-timing section) |
+| The release exe | 12,796,416 (the A2+art tree) | **12,865,024** — **+68,608 (+0.54 %)**; **+2,048 (+0.016 %)** over 12,862,976 (the delivered branch) |
+
+**The release.** The integration was merged into `main` (`4712b44`, a normal merge, the
+same tree as `feature/phase-a` — `0791c0e`) and the tag **`v1.1.5`** is on it. The
+release is published: `https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.5`,
+carrying **two assets and nothing else** — `ArmouryDaemon.exe` (12,865,024 bytes, sha256
+`947ef3dc…24a4`) and its 85-byte sidecar. The published body is **2,270 bytes, byte for
+byte** the committed `release-notes/v1.1.5.md`.
+
+**The CI runs.**
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `39738969438` | CI on `feature/phase-a` (dispatch) | green — 364 tests, 108 harness checks, and the release profile | 8m42s |
+| `39741535492` | CI on `main` (push) | green | 5m57s |
+| `39742290289` | CI on the tag `v1.1.5` | green | 9m57s |
+| `39742290367` | **Release** on `v1.1.5` | green — published and re-verified its own assets | 5m20s |
+
+**Not measured.** The **idle cost** of this tree: it needs minutes of quiet sampling on
+the user's machine, and the user was testing. The number in `GOTCHAS.md` is the
+pre-1.1.5 one and does not belong to this tree.
 
 **Decisions.** `DECISIONS.md` §17: a change of the cooldown **re-times the window that is
 running** — the window keeps its start and takes the new length, so it ends at

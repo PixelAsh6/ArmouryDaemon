@@ -89,8 +89,16 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 > also carries the art fetch through the Windows certificate store): **12,857,344 bytes**,
 > which is **+60,928 bytes (+0.48 %)** over *that* tree's baseline of 12,796,416 — the art
 > fetch takes Mozilla's bundled roots out of the binary, so that tree starts lower.
-> **The baseline for the size rule on the delivered branch is 12,857,344 bytes.** A number
-> without its tree is not a number (trap 35).
+> A number without its tree is not a number (trap 35).
+>
+> **The v1.1.5 release asset: 12,865,024 bytes** (2026-10-22, the published exe of the
+> merged tree `4712b44`, byte for byte, sha256
+> `947ef3dc622959491f0d2125801501b5203fa352d72f1faa7f8556df8a2424a4`) — **+2,048 bytes
+> (+0.016 %)** over the 12,862,976 the delivered branch measured before the dashboard,
+> the `cooldown_action` line and the version bump, and **+68,608 (+0.54 %)** over
+> 12,796,416. **The baseline for the size rule on the released tree is 12,865,024
+> bytes.** The idle cost of this tree is **not measured** — that needs minutes of quiet
+> sampling on the user's machine, and the number below is the pre-1.1.5 one.
 
 ### Runtime
 
