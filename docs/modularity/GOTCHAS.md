@@ -109,6 +109,16 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 > branch is 12,877,312 bytes.** The idle cost of this tree is **not measured** either:
 > the phase changes no runtime path, and the 1.1.5 tree's own number was never taken
 > (the user declined the sampling).
+>
+> **The v1.1.6 release asset: 12,879,360 bytes** (2026-10-22, the published exe of
+> `a61740f`, sha256
+> `0bc14524aa20c3f424ef8aa224845ec13f34d0115222fe3e6affe784904556d4`) — **+14,336 bytes
+> (+0.11 %)** over the v1.1.5 asset, the review's fixes. It is **the same size** as the
+> fix branch's CI artefact and **not the same bytes** (`611dcb98…` there): the link stamps
+> a PE timestamp and a per-link constant, so the size is a property of the source and the
+> bytes are not. **The baseline for the size rule on the released tree is
+> 12,879,360 bytes.** The idle cost of this tree is **not measured** — the user declined
+> the sampling.
 
 ### Runtime
 

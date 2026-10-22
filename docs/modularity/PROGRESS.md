@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2 and A3 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`), **and the review of 1.1.5 closed**. A4 next |
-| **Next action** | **A4** - a separate worker queue for modes (`WORK-ORDER.md` A4). A3 is merged into `main` (`21935ff`); the review's fixes are on **`fix/1.1.5-review`** and are **not merged** - that merge is the user's call |
-| **Branch** | `main` carries A3 at the merge commit **`21935ff`** (its CI, `39803275300`, is green after 3m53s). `fix/1.1.5-review` is cut from that merge and carries the five defects the review found |
+| **Phase** | A - **A1, A2 and A3 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`), the review of 1.1.5 **merged and shipped as 1.1.6**. A4 next |
+| **Next action** | **A4** - a separate worker queue for modes (`WORK-ORDER.md` A4). 1.1.6 is published and installed; the next release is the user's call |
+| **Branch** | `main` - the merge **`95b0797`** and the release content **`a61740f`**, which carries the annotated tag **`v1.1.6`**. Both runs green (`39816227849`, `39818292103`) |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -740,6 +740,88 @@ the engine was changed for it: it is pinned by a harness check (9b) and recorded
 
 **Next.** A4 - a separate worker queue for modes (`WORK-ORDER.md` A4). The merge of
 `fix/1.1.5-review` into `main` and the next release are the user's calls.
+
+---
+
+### 2026-10-22 - 1.1.6: the review's fixes merged, released and installed
+
+**What I did.** The review of 1.1.5 was merged into `main` as `95b0797` - its CI,
+`39816227849`, is green after 7m24s - and the tree became **1.1.6**: the workspace
+version moved, the release notes and the changelog section were written, the tag
+`v1.1.6` was cut on `a61740f`, the Release workflow published, and the published
+binary was installed on this machine.
+
+**Files touched.** `Cargo.toml` (1.1.5 -> 1.1.6), `Cargo.lock` (the two workspace
+packages, by `cargo fetch`), `tools/daemon-selftest.ps1` (the `--version` check names
+the version), `README.md` (the badge, the version in the examples, the release link,
+and the test counts, which were stale at 364/108), `deploy/README.md`,
+`release-notes/v1.1.6.md`, `CHANGELOG.md`, this folder, `compact.md`.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The release exe | 12,865,024 bytes (v1.1.5, the published asset) | **12,879,360 bytes** - **+14,336 (+0.11 %)**, sha256 `0bc14524.56d4` |
+| The branch tree's artefact | 12,879,360 bytes (the fix branch's CI artefact) | **12,879,360 bytes** - the release build reproduces the size exactly |
+| The unit tests | 378 | **378** - the fixes and the version carry no new test |
+| The harness checks | 133 | **133** |
+
+*The size:* the release is **+2,048 (+0.016 %)** over the A3 tree's 12,877,312 and
+**+14,336 (+0.11 %)** over the v1.1.5 asset. No size-bearing decision - the growth is
+the review's fixes, and `DECISIONS.md` §19 already records the schema phase's bend.
+
+*The runs:*
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `39816227849` | CI on `main` at `95b0797` (the merge of the review) | green - 378 tests, 133 harness checks | 7m24s |
+| `39818292103` | CI on `main` at `a61740f` (the version, the notes, the changelog) | green - 378 tests, 133 checks, `ALL CHECKS PASSED` | 6m53s |
+| `39819468547` | CI on the tag `v1.1.6` | green - 378 tests, 133 checks | 9m58s |
+| `39819468439` | **Release** on `v1.1.6` | green - built, wrote the sidecar, published, re-downloaded and verified its own assets | 7m27s |
+
+**The published release.** `https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.6`,
+published 2026-10-22 17:11:47Z, two assets and nothing else:
+
+- `ArmouryDaemon.exe` - **12,879,360 bytes**, sha256
+  `0bc14524aa20c3f424ef8aa224845ec13f34d0115222fe3e6affe784904556d4`
+- `ArmouryDaemon.exe.sha256` - **85 bytes**, sha256
+  `7a65af45fd38d1b7699dafeb5aee2ab26103b32a681af6cad0bdab472b6165c0`; the hash
+  field in it is the exe's.
+
+Downloaded back and checked: the exe's hash is the API digest and the sidecar's field,
+the sidecar is exactly 85 bytes, and the body is **2,987 bytes**, byte for byte the
+committed `release-notes/v1.1.6.md`.
+
+**The install.** The backup `C:\Apps\ArmouryDaemon_backup_2026-10-22-2005` (8 files,
+12,907,474 bytes - the same totals as the live folder) was made first and **deleted**
+once the install verified. The daemon was asked to quit over `\\.\armoury-daemon.pipe`
+and left in **1.292 s**; nothing was killed. The published exe was copied in and
+`setup.ps1` ran elevated (exit 0). Verified: the task `ArmouryDaemon` is **Running**,
+last result **267009**, action `C:\Apps\ArmouryDaemon\ArmouryDaemon.exe --autostart`,
+`RunLevel Highest`, and its description carries `0bc14524...56d4`; the sidecar is 85
+bytes and matches; the folder's ACL is applied with `AreAccessRulesProtected = True`
+and no inherited entries; the daemon's token is **High (0x3000)**; and
+`%APPDATA%\ArmouryDaemon\logs\daemon.log` reads `daemon starting (v1.1.6)` then
+`daemon ready`.
+
+**Decisions.** None new. The two the release ships - §20 (the gate over the
+declarative steps and the `registry` capability) and §21 (the game wins) - were settled
+in the review session and are recorded there.
+
+**Surprises.**
+
+- **The version lives in the harness as well.** `tools/daemon-selftest.ps1` checks
+  `--version` against the literal `ArmouryDaemon 1.1.5`, and the CI runner is elevated,
+  so that check really runs: a version bump that skips that line turns `main`'s CI red
+  on the first push. The bump touches `Cargo.toml`, `Cargo.lock` and the harness, and
+  the README's badge, examples and release link, or the tree contradicts itself.
+- **The release build reproduces the branch artefact's size but not its bytes.**
+  Both are 12,879,360, and their hashes differ (`611dcb98` on the branch, `0bc14524`
+  on the release) - the link stamps a PE timestamp and a per-link constant, as
+  `GOTCHAS.md` says. The size is a property of the source; the bytes are not.
+
+**Next.** A4 - a separate worker queue for modes (`WORK-ORDER.md` A4). 1.1.6 is out
+and installed; the next release is the user's call.
 
 ---
 

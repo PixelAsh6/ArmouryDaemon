@@ -37,32 +37,37 @@ background.
 
 ## Current state
 
-- **Phase A3 is merged into `main`** — the merge commit `21935ff`, and its CI run
-  (`39803275300`) is green after 3m53s. The pack schema's `kind` and `triggers`, both
-  **additive**, a malformed `kind` refused by name. The daemon does not act on the fields
-  yet — the mode machinery is A4/A5 — so the phase changes no runtime path and the three
-  shipped packs cannot notice it.
-- **The review of 1.1.5 is closed on `fix/1.1.5-review`**, cut from that merge: the
-  capability gate now covers the **declarative steps** (a pack that declared `["files"]`
-  could run programs through a `cli` step), a cooldown change no longer resurrects a window
-  that has ended, the overlay requests are coalesced, a denial inside a script-defined
-  function is reported as a denial, and `audio_mute_all` leaves a crash-recovery record.
-  **Not merged** — that merge is the user's call. CI: `39807213693` and `39809146891`,
-  both green (378 unit tests, 133 harness checks). `DECISIONS.md` §20 (the step gate and the
-  `registry` capability) and §21 (the game wins).
+- **Phase A3 is merged into `main` and released in 1.1.6** — the merge commit `21935ff`,
+  and its CI run (`39803275300`) is green after 3m53s. The pack schema's `kind` and
+  `triggers`, both **additive**, a malformed `kind` refused by name. The daemon does not
+  act on the fields yet — the mode machinery is A4/A5 — so the phase changes no runtime
+  path and the three shipped packs cannot notice it.
+- **The review of 1.1.5 is merged into `main`** (`95b0797`, CI `39816227849`, green after
+  7m24s) and **shipped as 1.1.6**: the capability gate now covers the **declarative steps**
+  (a pack that declared `["files"]` could run programs through a `cli` step), a cooldown
+  change no longer resurrects a window that has ended, the overlay requests are coalesced,
+  a denial inside a script-defined function is reported as a denial, and `audio_mute_all`
+  leaves a crash-recovery record. `DECISIONS.md` §20 (the step gate and the `registry`
+  capability) and §21 (the game wins).
+- **1.1.6 is published and installed.** The tag `v1.1.6` is an annotated tag on `main` at
+  `a61740f`; the release is
+  `https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.6` (published
+  2026-10-22 17:11:47Z). It carries **two assets and nothing else**: the executable
+  (**12,879,360 bytes**, sha256 `0bc14524…56d4`) and its **85-byte** sidecar. Both were
+  downloaded back and checked, and the published body is **2,987 bytes**, byte for byte
+  the committed `release-notes/v1.1.6.md`. The copy in `C:\Apps\ArmouryDaemon` is that
+  binary, the task is `Running` (last result 267009) with the new hash in its description,
+  and the log reads `daemon starting (v1.1.6)` then `daemon ready`.
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The phase is
   integrated on **`main`** — A2, with the lockout re-timing and the art fetch through the
-  Windows certificate store merged into it — at the merge commit `4712b44`, and it is the
-  **1.1.5** release. The branch it was built on, `feature/phase-a`, carries the **same
-  tree** (`0791c0e`). An **A2-only** copy of the phase is still on
-  `feature/a2-capabilities-clean`; the trees have **different numbers** — a number
-  without its tree is not a number.
-- The **1.1.5** release is out: the **capability-scoped host API**, the **Windows
-  certificate store** for the catalogue **and the cover art**, and the **cooldown
-  re-timing** — a change of the cooldown re-times the window that is running. It carries
-  the executable (12,865,024 bytes) and its 85-byte sidecar, and nothing else. It is
-  **published and installed** — the copy in `C:\Apps\ArmouryDaemon` hashes to
-  `947ef3dc…24a4`, the published asset's hash.
+  Windows certificate store merged into it — at the merge commit `4712b44` (1.1.5), and
+  the review's fixes at `95b0797` (1.1.6). The branch it was built on,
+  `feature/phase-a`, carries the **same tree** (`0791c0e`). An **A2-only** copy of the
+  phase is still on `feature/a2-capabilities-clean`; the trees have **different
+  numbers** — a number without its tree is not a number.
+- The **1.1.5** release is out (the executable, 12,865,024 bytes, sha256
+  `947ef3dc…24a4`, and its 85-byte sidecar) and **1.1.6 ships on top of it**: everything
+  1.1.5 carried, plus Phase A3 and the review's fixes.
 - **The next action is Phase A4** — a separate worker queue for modes. The pack worker is
   a single serial thread (`packs.rs:171`), so a slow mode must never block a pack
   apply/revert: modes get their own thread and channel. `WORK-ORDER.md` A4.
@@ -105,12 +110,11 @@ thread** (`packs.rs:171`, `while let Ok(job) = jobs.recv()`), so a slow mode wou
 every later apply and revert. Modes get their own thread and their own channel.
 `WORK-ORDER.md` A4.
 
-A3 is merged (`21935ff`), and the review of 1.1.5 is closed on `fix/1.1.5-review`; that
-branch waits for the user's merge, and A4 starts from whichever tree the user wants. A3
-put `kind` (`"pack"` or `"mode"`) and `triggers` in the schema; the daemon does not act on
-them yet — that is A4 and A5. The full phase list is in `WORK-ORDER.md`. Phases run in
-order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and
-settled.
+A3 and the review of 1.1.5 are merged into `main` and shipped as **1.1.6**, so A4 starts
+from the released tree. A3 put `kind` (`"pack"` or `"mode"`) and `triggers` in the
+schema; the daemon does not act on them yet — that is A4 and A5. The full phase list is in
+`WORK-ORDER.md`. Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
+until the rest has shipped and settled.
 
 ---
 
