@@ -894,7 +894,10 @@ try {
             # the server answers until the daemon has both files, or until it runs out of time
             $deadline = (Get-Date).AddSeconds(20)
             while ((Get-Date) -lt $deadline -and $script:requests.Count -lt 2) {
-                $accept = $server.Listener.AcceptTcpClientAsync()
+                # the helper already started the first accept: a second one would compete with
+                # it for the connection, and the daemon would wait for an answer that never
+                # comes
+                if ($script:connections -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
                 if (-not $accept.Wait(2000)) { break }   # no further connection
                 $client = $accept.GetAwaiter().GetResult()
                 $script:connections++
@@ -923,7 +926,7 @@ try {
         # the daemon resolved that one)
         Remove-Item -LiteralPath (Join-Path $buildPacks 'harness-test') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'packs\harness-test') -Recurse -Force -ErrorAction SilentlyContinue
-        Check 'the pack installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit)"
+        Check 'the pack installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit) $(Get-FirstLine $probe.Text)"
         Check 'the manifest and the pack file travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 2)) "connections=$($script:connections) requests=$($script:requests.Count)"
 
         $env:ARMOURY_TEST_NS = $ns
