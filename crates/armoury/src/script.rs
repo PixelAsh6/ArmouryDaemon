@@ -87,10 +87,7 @@ thread_local! {
     /// The engines are built lazily and kept: building one and registering its host
     /// functions costs about half a millisecond, and the pack worker is a single serial
     /// thread, so no locking is needed. The map is capped like the AST cache.
-    ///
-    /// The engines are boxed: a `Sandbox` carries a whole Rhai engine, and a map of them
-    /// moves that around.
-    static ENGINES: RefCell<HashMap<CapSet, Box<Sandbox>>> = RefCell::new(HashMap::new());
+    static ENGINES: RefCell<HashMap<CapSet, Sandbox>> = RefCell::new(HashMap::new());
 }
 
 /// How many engines this thread keeps. The AST cache has the same cap: a pack that was
@@ -160,7 +157,7 @@ fn with_engine<T>(caps: CapSet, f: impl FnOnce(&mut Sandbox) -> T) -> T {
             if cache.len() >= MAX_ENGINES {
                 cache.clear(); // a pack was replaced or removed: start over
             }
-            cache.insert(caps, Box::new(new_sandbox(caps)));
+            cache.insert(caps, new_sandbox(caps));
         }
         let sandbox = cache
             .get_mut(&caps)
@@ -298,11 +295,6 @@ fn asked_for(caps: CapSet) -> String {
 /// granted is simply **not there**, so a call to it fails as an unknown function. That is
 /// the whole point of the gate: the denial cannot be forgotten at a call site, because
 /// there is no call site to forget it at.
-///
-/// The function is never inlined: it carries the whole host API, and there are two places
-/// that build an engine (compiling a script and running one). Inlined twice, the whole
-/// registration block would be in the binary twice.
-#[inline(never)]
 fn new_sandbox(caps: CapSet) -> Sandbox {
     #[cfg(test)]
     BUILDS.with(|c| c.set(c.get() + 1));
