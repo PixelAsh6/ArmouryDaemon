@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A — **A1 and A2 done** (the TLS root store, the capability-scoped host API), A3 next |
-| **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) |
-| **Branch** | `main` is at `0ecacd3` (version **1.1.4**). The A2 work is delivered on **`feature/a2-capabilities`** — on top of `0ecacd3` **and** the art fetch through the Windows certificate store, which is another agent's work. The **A2-only** copy of the phase is on `feature/a2-capabilities-clean`; it does **not** carry the fixes of the entry below, so the two branches have different numbers |
+| **Phase** | A — **A1 and A2 done and released** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API), A3 next |
+| **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) — the next phase, and it is not started |
+| **Branch** | The phase is integrated on **`feature/phase-a`** — A2, with the lockout re-timing and the art fetch merged into it — and it is the **v1.1.5** release. `main` was at `0ecacd3` (version 1.1.4) when the integration started |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |
@@ -458,6 +458,79 @@ schema errors. `WORK-ORDER.md` A3. The `Capability`/`CapSet` types and the addit
 `capabilities` field are already in `armoury_core::pack` — A3 adds the sibling fields
 to the same struct and validates them the same way, and it should reuse the same
 `#[serde(default = ...)]` pattern the capability field uses.
+
+---
+
+### 2026-10-22 — the three branches integrated, and the re-timing released
+
+**What I did.** The three green branches were integrated into one, `feature/phase-a`, and
+the result is the **1.1.5** release.
+
+| Branch | Tip | What it carried |
+|---|---|---|
+| `feature/a2-capabilities` | `ac404ec` | **Phase A2** — the capability-scoped host API |
+| `fix/lockout-retime` | `494aa1b` | the cooldown re-timing, and the dashboard that names the app and says a change is waiting |
+| `fix/art-fetch-windows-root-store` | `79ad7be` | the cover art through the Windows certificate store, `rustls-webpki-roots` dropped |
+
+The branch was cut from A2 and the other two were merged into it. **Both merges were
+clean**, and the reason is worth writing down: the art fetch was **already an ancestor**
+of A2 (`2b119c6`), so that merge brought nothing new in content, and the harness's accept
+fix is the same change twice (`aca3414` on A2, `79ad7be` on the art branch), which git
+resolves on its own. The merged harness therefore carries **both** sets of checks — A2's
+capability checks and the art branch's five root-store checks — and nothing was dropped.
+
+The one line that was still missing: the snapshot's `cooldown_action` was hard-coded to
+`None`, although the wire format has carried the field since the first release. The
+daemon publishes it now, from the engine's own `pending_change`, so the dashboard's
+cooldown row can say that a change is waiting behind the window — and the harness checks
+that it does.
+
+**Files touched.** `crates/armoury/src/daemon.rs` (the one line), `crates/armoury-core/
+src/status.rs` (the field's doc comment), `tools/daemon-selftest.ps1` (the re-timing
+section, seven checks), `Cargo.toml` and `Cargo.lock` (the version), `README.md`,
+`CHANGELOG.md`, `release-notes/v1.1.5.md`, and this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The unit tests | 359 (268 in `armoury`, 91 in `armoury-core`) | **364** (270 / 94) — the lockout branch's five |
+| The harness checks | 101 `Check` calls | **108** — **+7** (the re-timing section) |
+
+**Decisions.** `DECISIONS.md` §17: a change of the cooldown **re-times the window that is
+running** — the window keeps its start and takes the new length, so it ends at
+`start + cooldown`, and the change it holds lands at the new expiry. The row **H21** of
+the local-only `DECISIONS-2026-10-17.md` records the same decision, with the log excerpt
+it is based on.
+
+**Surprises.**
+
+- **The merge that was supposed to conflict did not.** The folder's plan and the session
+  notes expected the art branch's harness changes and A2's to collide. They do not: the
+  art branch's work is **in** A2 (it is the ancestor `2b119c6`), and the one commit that
+  was not — the accept fix — is byte-for-byte the same change as A2's `aca3414`. Git
+  resolved it on its own, and the merged harness has both sets of checks. **A merge that
+  resolves itself is not a merge that was checked**: the harness still had to be read to
+  be sure that nothing was dropped.
+- **The lockout branch touches no harness at all.** It changed `engine.rs` and `ui.rs`
+  and nothing else, so the defect it fixed had **no harness check** — the harness set the
+  cooldown only *before* each scenario, never while a window was running. That gap is
+  the defect's real home, and the harness now closes it: a scenario that changes the
+  cooldown while a window runs, and asserts that the window takes the new length and that
+  the change it holds lands at the new expiry.
+- **`cooldown_action` was `None` in the snapshot while the field was live in the wire
+  format and in the dashboard's row.** The UI that reads it was written first and the
+  daemon that fills it was not — one line in `App::status`, the last thing missing
+  between the lockout model and what the user sees.
+
+**Next.** Phase A3 — `triggers` + `kind` in the pack schema (`crates/armoury-core/src/
+pack.rs`). The pack gains a `kind` (`"pack"` or `"mode"`) and a `triggers` list, both
+**additive**: the three shipped packs must keep loading, installing, applying, reverting
+and removing unchanged, and a malformed `kind` has to be a named error like the other
+schema errors. `WORK-ORDER.md` A3. The `Capability`/`CapSet` types and the additive
+`capabilities` field are already in `armoury_core::pack` — A3 adds the sibling fields to
+the same struct and validates them the same way, with the same `#[serde(default = ...)]`
+pattern.
 
 ---
 

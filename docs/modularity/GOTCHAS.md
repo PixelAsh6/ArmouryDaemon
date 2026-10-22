@@ -172,14 +172,19 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     **exactly once**; a close is **always held** (it starts a window if none is
     running and keeps the running one rather than restarting it); a **restart inside
     the window cancels the hold**; a **manual action bypasses** the window. Read
-    `engine.rs:291` (`tick`), `:314` (`try_change`), `:366` (`lock_running`), `:145`
-    (`set_paused`), `:183` (`set_idle`) before touching it.
+    `engine.rs:344` (`tick`), `:367` (`try_change`), `:419` (`lock_running`), `:198`
+    (`set_paused`), `:236` (`set_idle`) before touching it — and, for the re-timing,
+    `:65` (`Window`), `:126` (`set_cooldown`), `:178` (`pending_change`).
     The 2026-10-21 model — *"the apply is never deferred, the lockout holds the
     revert"* — is **rejected**: it was an over-correction, it was not needed for the
     21 Oct flip-flop, and the user rejected it on 2026-10-22. The older model —
     "the lockout is a minimum spacing between two changes" — is gone for good.
     **The trap:** a start inside a window means the packs are *late*. That is the
     intended behaviour, not a bug — do not "fix" it by applying at once.
+    **And the rule added on 2026-10-22 (1.1.5):** a change of the cooldown
+    **re-times the window that is running** — it keeps its start and takes the new
+    length, so it ends at `start + cooldown`. A window is never a mix of the old and
+    the new length, and the change it holds lands at the new expiry.
 14. **`/docs/plans/` and `/docs/research/` are gitignored**, along with `HANDOVER.md`,
     `PLAN.md`, `RESEARCH.md`, `PACK-SPEC-PROPOSAL.md`, `SPEC3-SCRIPTING.md`,
     `DECISIONS-2026-10-17.md` and **`/docs/scope.md`** — the private scope note for
@@ -267,6 +272,8 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     The same goes for the harness's `Check` calls (`^[ \t]*Check[ \t]`). The honest
     numbers for the A1 tree are **341 unit tests** (256 in `armoury`, 85 in
     `armoury-core`) and **90 harness checks** — the ones the folder already carries.
+    The delivered tree (A2 + the art fetch + the lockout re-timing) carries **364 unit
+    tests** (270 / 94) and **108 harness checks**.
 32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
     built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
     `HashMap` is not) — use a `OnceLock` and build the map in `get_or_init`.
@@ -309,6 +316,15 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     core) on this machine, with the user's own desktop running. Measure **three
     samples of each binary, alternating**, and compare the medians. A single sample
     can make a change look like a 0.2 % swing that is really the noise.
+40. **A harness that only sets a setting *before* a scenario cannot catch a setting
+    that changes *during* one.** The lockout re-timing defect lived in exactly that
+    gap: the harness set the cooldown before every scenario, so a window that was
+    already running was never re-timed and the change it was holding landed at the
+    old expiry — and no check failed, because no check ever changed the setting
+    while a window ran. The harness now does that (`12b`), and it asserts both the
+    remaining time **and** the moment the held change lands. **When a defect is
+    "the setting did not take effect *now*", the harness has to change the setting
+    *now*.**
 
 ---
 

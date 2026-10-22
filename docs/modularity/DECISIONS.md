@@ -493,3 +493,48 @@ enforced by the ledger, not by the report.** The sessions this call muted are
 remembered by their session id, so the unmute touches exactly those. The report says
 so out loud (`left alone {session} (was muted)`), and a unit test proves both halves.
 
+---
+
+## 17. A change of the cooldown re-times the window that is running
+
+**Settled — implemented in 1.1.5.** The lockout model is unchanged (§10): the window
+still holds a change in **both** directions. What is settled here is what a new cooldown
+does to a window that is **already running**.
+
+When the cooldown is changed while a window is running, the window **keeps its start and
+takes the new length**: it ends at `start + cooldown`. The setting is in force at once, and
+a window is never a mix of the old and the new length.
+
+**Why.** The daemon log of 22 Oct 08:46 shows the defect. The apply at 08:46:26 armed a
+**10 s** window (the old value); the setting landed a second later (10 s → 60 s) and
+changed only the length of *future* windows, so that window expired at 08:46:36 — three
+seconds before the game came back at 08:46:39. The revert landed in that gap (the packs
+went to Silent), and the game's return then sat **held** inside the new 60 s window with
+the packs off: they only came back at 08:47:37. With the re-timing the window ends at
+08:47:26, the game comes back at 08:46:39 — inside the window — so the held revert is
+**cancelled** and the packs stay applied.
+
+**How it is built.** The window is kept as its **start** and its **length**, not as a
+deadline (`Window` in `engine.rs`), so it can be re-timed at all; `set_cooldown` sets the
+length of the window in flight. The engine also names the change the window is holding
+(`pending_change`), and the daemon publishes it in the snapshot's `cooldown_action` — the
+field the wire format has carried since the first release, and which the dashboard's
+cooldown row reads to say that a change is waiting behind the window.
+
+**Rejected:**
+
+- **Letting the change apply only to future windows.** The old behaviour, and the defect
+  itself: the window in flight ends at the old expiry and the change it holds lands in
+  that gap.
+- **Re-arming the window from *now*.** The window would then run the full new length from
+  the moment of the change, so it could outlast the setting and the change it holds would
+  be delayed — the setting would be longer than the user asked for.
+- **Extending a window that would end earlier than now.** A new length that is **shorter**
+  than the time the window has already run ends the window **at once** instead, because a
+  window cannot end before it began: the user asked for a short window, and more than that
+  has passed. The change the window was holding lands with the next tick.
+
+**The local-only record.** `DECISIONS-2026-10-17.md` (on disk, not published) carries the
+same decision as row **H21**, with the log excerpt it is based on. That file is the
+private decision log of the earlier sessions; this section is the versioned copy.
+
