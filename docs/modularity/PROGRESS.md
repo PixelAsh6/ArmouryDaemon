@@ -234,8 +234,8 @@ checks) and this folder.
 
 | | before | after |
 |---|---|---|
-| The release exe | **12,868,608 bytes** (A1, `0ecacd3`) | **__EXE__ bytes** — **__DELTA__** |
-| The daemon's idle cost | **1.016 CPU s in 60 s = 1.692 % of one core** (A1, the same tree) | **__IDLE__** |
+| The release exe | **12,868,608 bytes** (A1, `0ecacd3`) | **12,925,440 bytes** — **+56,832 (+0.44 %)** |
+| The daemon's idle cost | **1.016 CPU s in 60 s = 1.692 % of one core** (A1, the same tree) | **0.984 CPU s in 60 s = 1.641 %** — no regression |
 | The unit tests | 341 (256 in `armoury`, 85 in `armoury-core`) | **353** (262 / 91) — **+12** |
 | The harness checks | 90 `Check` calls | **95** `Check` calls — **+5** |
 
@@ -248,7 +248,11 @@ none of the four tracked apps was running, so no pack ran and nothing on the mac
 moved.
 
 *Exe size:* the release build of the tree, taken from the CI artefact.
-`cargo build --release` is never run on this machine.
+`cargo build --release` is never run on this machine. **The executable grew by 56,832
+bytes.** `DECISIONS.md` §15 says where the bytes are (a Rhai registration costs about
+5 KB of machine code per *shape*, and the phase adds eight host functions over six new
+shapes) and what was rejected. **The size rule bends here, once** — and the baseline
+for the next phase is now 12,925,440 bytes.
 
 *The CI run:* **__RUNID__**, the job **__CONCLUSION__** in **__WALL__**: the debug build,
 **353 unit tests**, and the self-test harness with **95 checks, all passed**.
@@ -294,6 +298,14 @@ overlay as a request to the daemon rather than a call from the pack.
 - **The host API has 26 functions, not 25**: the table's three new groups carry
   **eight** functions (3 + 3 + 2), not seven. A unit test counts them, and it caught
   the miscount in the first CI run.
+- **The executable grew by 56,832 bytes** (+0.44 %) and the size rule says only Phase E
+  may add bytes. The bytes are the eight new host functions: a Rhai registration costs
+  about 5 KB of machine code per *shape*, and the phase adds six new shapes.
+  `DECISIONS.md` §15 has the measurement, the reason and the alternative (the eight
+  functions can move to the killswitch/idle phase, B/C, if the user wants the size
+  flat).
+- **A Rhai "unknown function" is also what a wrong argument type produces** — see the
+  trap above; the gate has to check the grant before it calls the call a denial.
 - **Two agents share this working tree.** The A2 branch picked up the other agent's
   commits, so the deliverable is a separate branch, `feature/a2-capabilities-clean`,
   built from `0ecacd3` with only the A2 commits on it.
