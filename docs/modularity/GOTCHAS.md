@@ -99,6 +99,16 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 > 12,796,416. **The baseline for the size rule on the released tree is 12,865,024
 > bytes.** The idle cost of this tree is **not measured** — that needs minutes of quiet
 > sampling on the user's machine, and the number below is the pre-1.1.5 one.
+>
+> **After A3 (2026-10-22, `feature/a3-kind-triggers`): 12,877,312 bytes** — **+12,288
+> bytes (+0.10 %)** over the v1.1.5 asset, for the two new discriminants in the pack
+> schema and their (de)serializers. The PE section table of the two builds says where
+> the bytes are: **+10,752 of `.text`** (code), **+1,024 of `.rdata`** (the format
+> strings of the new error messages) and **+512 of `.pdata`** (their unwind tables);
+> `.data`, `.rsrc` and `.reloc` did not move. **The baseline for the size rule on the A3
+> branch is 12,877,312 bytes.** The idle cost of this tree is **not measured** either:
+> the phase changes no runtime path, and the 1.1.5 tree's own number was never taken
+> (the user declined the sampling).
 
 ### Runtime
 
@@ -281,7 +291,9 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     numbers for the A1 tree are **341 unit tests** (256 in `armoury`, 85 in
     `armoury-core`) and **90 harness checks** — the ones the folder already carries.
     The delivered tree (A2 + the art fetch + the lockout re-timing) carries **364 unit
-    tests** (270 / 94) and **108 harness checks**.
+    tests** (270 / 94) and **108 harness checks**. The **A3 tree**
+    (`feature/a3-kind-triggers`) carries **370 unit tests** (270 / 100) and **118 harness
+    checks** — and CI says the same numbers, which is the point of the anchored scan.
 32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
     built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
     `HashMap` is not) — use a `OnceLock` and build the map in `get_or_init`.
@@ -333,6 +345,20 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     remaining time **and** the moment the held change lands. **When a defect is
     "the setting did not take effect *now*", the harness has to change the setting
     *now*.**
+41. **serde drops the fields the schema does not know.** A pack that carried
+    `"kind": "mode"` before A3 loaded as an ordinary pack — the field was read and
+    thrown away, not refused. So a new schema field is **not** a behaviour change
+    until something acts on it: the daemon still applies a mode pack the way it
+    applies any other pack, because the mode machinery is A4/A5. A field the
+    daemon does not know is not an error either — the packs-repo README says so
+    ("unknown fields are not part of the schema").
+42. **A custom serde error carries no position of its own, and serde_json gives it
+    one.** `serde::de::Error::custom` builds the error at line 0, column 0, but
+    serde_json's `fix_position` replaces that with the position it was reading when
+    the error came back (`de.rs`, `Error::fix_position`). That is why the named
+    errors of the schema read *"invalid JSON: the field 'kind': unknown kind
+    'widget'"* — the field is named by the walk back over the text, and it works
+    for a custom error exactly as it works for a type error.
 
 ---
 

@@ -84,13 +84,18 @@ granted fails as an *unknown function*.
 naming the missing capability; the denial is in the pack's log. The 1.1.3 per-run
 budget re-arming still holds — a run cannot inherit the previous run's allowance.
 
-### A3. `triggers` + `kind` in the pack schema
+### A3. `triggers` + `kind` in the pack schema — **done (2026-10-22)**
 
 `crates/armoury-core/src/pack.rs`. Validate `kind` ∈ {pack, mode}; validate that a
 mode pack has at least one trigger; keep `spec` 1 and 2 as they are.
 
 **Accept:** the three shipped packs still load, install, apply, revert and remove
 unchanged. A malformed `kind` is a named error, like the other schema errors.
+
+**Done.** The schema carries `kind` (`"pack"` | `"mode"`) and `triggers`, both
+additive; a malformed kind is refused by name (`unknown kind 'widget'`). The daemon
+does not act on the fields yet — that is A4 and A5. `DECISIONS.md` §18 has the
+defaults and the two trigger rules the folder did not state.
 
 ### A4. A separate worker queue for modes
 

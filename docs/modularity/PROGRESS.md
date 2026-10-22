@@ -10,13 +10,13 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A — **A1 and A2 done and released** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API), A3 next |
-| **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) — the next phase, and it is not started |
-| **Branch** | The phase is integrated on **`main`** — A2, with the lockout re-timing and the art fetch merged into it — at the merge commit `4712b44`, and it is the **v1.1.5** release. The branch it was built on, `feature/phase-a`, carries the **same tree** (`0791c0e`); `main` was at `0ecacd3` (version 1.1.4) when the integration started |
+| **Phase** | A — **A1 and A2 done and released** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API), **A3 done on its branch** (the pack schema's `kind` and `triggers`), A4 next |
+| **Next action** | **A4** — a separate worker queue for modes (`WORK-ORDER.md` A4). A3 is on `feature/a3-kind-triggers` and is **not merged** |
+| **Branch** | A3 is on **`feature/a3-kind-triggers`**, cut from `main` at `79ad905` (the v1.1.5 release). `main` still carries the integration (`4712b44`) and the v1.1.5 release; the branch A2 was built on, `feature/phase-a`, carries the same tree (`0791c0e`) |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |
-| **Not measured** | the **idle cost** of this tree — it needs minutes of quiet sampling on the user's machine, and the user was testing. The number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to this tree |
+| **Not measured** | the **idle cost** — the phase adds two fields to the schema and changes no runtime path, and the idle cost of the 1.1.5 tree is itself not measured (the user declined the sampling). The number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to this tree |
 
 ---
 
@@ -553,6 +553,82 @@ schema errors. `WORK-ORDER.md` A3. The `Capability`/`CapSet` types and the addit
 `capabilities` field are already in `armoury_core::pack` — A3 adds the sibling fields to
 the same struct and validates them the same way, with the same `#[serde(default = ...)]`
 pattern.
+
+---
+
+### 2026-10-22 — Phase A3: the pack says what it is and what starts it
+
+**What I did.** The pack schema gained two **additive** fields: `kind` (`"pack"` or
+`"mode"`) and `triggers` (what starts the pack). A pack that carries neither loads and
+behaves exactly as it did — the three shipped packs carry neither, and the catalogue in
+`D:\ArmouryDaemon_Packs` needs no change. `spec` stays 1 or 2; there is no `spec: 3`. A
+malformed `kind` is a **named error** — `unknown kind 'widget'` — refused when the pack is
+parsed: never a panic, never a silent default to `"pack"`.
+
+The **daemon does not act on the fields yet**, and that is what makes the phase additive:
+the mode machinery — a worker of its own, a hotkey that dispatches to it — is A4 and A5.
+The kind is in the log line that names a loaded pack, so an operator can see it.
+
+**Files touched.** `crates/armoury-core/src/pack.rs` (the two fields, the two enums, the
+trigger, the validation, six tests and four mutations of the hostile-pack battery),
+`crates/armoury/src/packs.rs` (the loaded-pack log line), `tools/daemon-selftest.ps1` (ten
+checks), `CHANGELOG.md`, `compact.md` and this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The unit tests | 364 (270 in `armoury`, 94 in `armoury-core`) | **370** (270 / 100) — **+6**, green in CI |
+| The harness checks | 108 `Check` calls | **118** — **+10**, green in CI |
+| The release exe | 12,865,024 bytes (v1.1.5, the released tree) | **12,877,312 bytes** — **+12,288 (+0.10 %)**; the growth is code (+10,752 of `.text`) and the format strings (+1,024 of `.rdata`). `DECISIONS.md` §19 |
+| The daemon's idle cost | not measured | **not measured** — the phase adds two fields to the schema and changes no runtime path, and the idle cost of the 1.1.5 tree is itself not measured (the user declined the sampling) |
+
+*The exe size:* the release build of the tree, taken from the CI artefact of the dispatch
+(`ArmouryDaemon.exe`, sha256 `0bfde64e…4de`), measured against the **published v1.1.5
+asset** (12,865,024 bytes, sha256 `947ef3dc…24a4` — the copy installed on the machine).
+`cargo build --release` is never run on this machine.
+
+*The CI run:* **39777594088** (the workflow dispatch on the branch), the job **green** in
+**10m 54s**: the debug build, **370 unit tests** (270 + 100), and the self-test harness
+with **118 checks, all passed** — plus the release build and the artefact the size was
+measured from.
+
+**Decisions.** `DECISIONS.md` §18: the defaults (`"pack"`, and the tracked app for every
+kind), the named error, the two trigger rules the folder did not state (a `hotkey` trigger
+needs a key, a `tracked_app` trigger takes none), the key name not being checked against
+the daemon's hotkey table, and the daemon not acting on the fields yet. §19: the size.
+`DESIGN.md` §1 carries the shape of a trigger.
+
+**Surprises.**
+
+- **serde drops the fields the schema does not know.** A pack that carried
+  `"kind": "mode"` loaded as an ordinary pack before this phase — the field was read and
+  thrown away. So the daemon's behaviour could not change, and the phase could not break
+  the shipped packs: the schema only learned to say what it always meant
+  (`GOTCHAS.md` trap 41).
+- **A custom serde error has no position of its own, and serde_json gives it one.**
+  `Error::custom` builds it at line 0, column 0, but serde_json's `fix_position` replaces
+  that with the position it was reading — so the named error reads *"invalid JSON: the
+  field 'kind': unknown kind 'widget'"*, with the field named by the walk back over the
+  text (`GOTCHAS.md` trap 42).
+- **The folder's `triggers` default is one default for every kind.** A mode that does
+  not say what starts it inherits the tracked app; the rule "a mode needs at least one
+  trigger" therefore bites on an **explicitly empty** list, not on an absent one. A
+  default that depended on the kind would need the schema to tell an absent field from
+  an empty one — `serde(default = …)` cannot see the other fields.
+- **The packs-repo README does not document `capabilities` either.** The pack format is
+  documented in `D:\ArmouryDaemon_Packs\README.md`, and A2's `capabilities` field is not
+  in it. The **catalogue** needs no change for A3 — the fields are additive — but the
+  format doc is behind. It was not touched here: it is another repository, and the
+  phase before this one did not touch it either.
+- **The harness count is a static scan, and the scan has to be anchored** — `^[ \t]*Check
+  [ \t]`, or the number counts calls that are not calls (`GOTCHAS.md` trap 31).
+
+**Next.** Phase A4 — a separate worker queue for modes. The pack worker is a single
+serial thread (`packs.rs:168`), so a slow mode must never block a pack apply/revert:
+modes get their own thread and their own channel. `WORK-ORDER.md` A4. The daemon-side
+half of what A3 put in the schema — a trigger that starts something, a mode the hotkey
+dispatches to — comes with it.
 
 ---
 

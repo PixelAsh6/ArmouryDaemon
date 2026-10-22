@@ -41,6 +41,13 @@ permission window) comes later and narrows this down; the field is what the pack
 `hotkey` (a key name that maps to the daemon's existing hotkey table —
 `crates/armoury/src/hotkey.rs` already knows End and Home).
 
+**The shape of a trigger.** A trigger is `{ "kind": … }` and, for a `hotkey`, the key it
+listens for: `{ "kind": "hotkey", "key": "end" }`. A `hotkey` trigger **needs** a key —
+without one it names no key, and nothing would ever start the pack. A `tracked_app`
+trigger **takes no key**: a key there would be ignored in silence. The **key name** is
+resolved by the daemon's hotkey table, not by the schema — the schema does not carry that
+list, so there is one table and not two.
+
 ---
 
 ## 2. The capability taxonomy
