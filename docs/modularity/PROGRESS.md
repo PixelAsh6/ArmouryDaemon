@@ -296,7 +296,7 @@ overlay as a request to the daemon rather than a call from the pack.
 - **`HashMap::new()` is not a `const fn`**: a global map cannot be built in a static's
   own initializer. The ledger is a `OnceLock` and the map is built in `get_or_init`.
 - **`IAudioSessionEnumerator::GetCount` returns an `i32`**, not a `u32` — the index of a
-  session in the sweep is an `i32`. Three CI builds found this; the fourth was green.
+  session in the sweep is an `i32`. Two CI builds found this.
 - **The host API has 26 functions, not 25**: the table's three new groups carry
   **eight** functions (3 + 3 + 2), not seven. A unit test counts them, and it caught
   the miscount in the first CI run.
@@ -306,8 +306,6 @@ overlay as a request to the daemon rather than a call from the pack.
   `DECISIONS.md` §15 has the measurement, the reason and the alternative (the eight
   functions can move to the killswitch/idle phase, B/C, if the user wants the size
   flat).
-- **A Rhai "unknown function" is also what a wrong argument type produces** — see the
-  trap above; the gate has to check the grant before it calls the call a denial.
 - **Two agents share this working tree.** The A2 branch picked up the other agent's
   commits, so the deliverable is a separate branch, `feature/a2-capabilities-clean`,
   built from `0ecacd3` with only the A2 commits on it.
