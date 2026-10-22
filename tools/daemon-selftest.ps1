@@ -727,7 +727,7 @@ try {
   "targets": { "process": ["timeout.exe"] },
   "capabilities": ["files"],
   "script": {
-    "apply":  "ctx.run_cli(\"C:\\Windows\\System32\\cmd.exe\", [\"/c\", \"echo hi\"]);",
+    "apply":  "ctx.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]);",
     "revert": "ctx.log(\"the revert must not run\");"
   },
   "apply": { "steps": [] },
