@@ -585,14 +585,17 @@ trigger, the validation, six tests and four mutations of the hostile-pack batter
 | The daemon's idle cost | not measured | **not measured** — the phase adds two fields to the schema and changes no runtime path, and the idle cost of the 1.1.5 tree is itself not measured (the user declined the sampling) |
 
 *The exe size:* the release build of the tree, taken from the CI artefact of the dispatch
-(`ArmouryDaemon.exe`, sha256 `0bfde64e…4de`), measured against the **published v1.1.5
+(`ArmouryDaemon.exe`, sha256 `cef00526…9ba`), measured against the **published v1.1.5
 asset** (12,865,024 bytes, sha256 `947ef3dc…24a4` — the copy installed on the machine).
 `cargo build --release` is never run on this machine.
 
-*The CI run:* **39777594088** (the workflow dispatch on the branch), the job **green** in
-**10m 54s**: the debug build, **370 unit tests** (270 + 100), and the self-test harness
-with **119 checks, all passed** — plus the release build and the artefact the size was
-measured from.
+*The CI runs:*
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `39777594088` | CI on the code commit `0f0b104` (dispatch) | green — 370 tests, 118 harness checks, and the release profile | 9m54s |
+| `39780061907` | CI on the folder commit `55aed31` (dispatch) | green — the same 370 tests and 118 checks | 9m40s |
+| `39781519178` | CI on the branch's tip `8341452` (dispatch) | green — **370 tests, 119 harness checks**, and the release profile | 10m40s |
 
 **Decisions.** `DECISIONS.md` §18: the defaults (`"pack"`, and the tracked app for every
 kind), the named error, the two trigger rules the folder did not state (a `hotkey` trigger
