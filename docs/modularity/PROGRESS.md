@@ -397,10 +397,11 @@ fetch, which takes Mozilla's bundled roots **out** of the binary), so the whole 
 costs **+66,560 bytes (+0.52 %)** here, against **+56,832 (+0.44 %)** on the A2-only
 tree. **The baseline for the size rule on the delivered branch is 12,862,976 bytes.**
 
-*The CI run:* **39731173747** (the workflow dispatch on the delivered tip), the job
-**green** in **6 min 22 s**: the debug build, **359 unit tests** (268 + 91), and the
-self-test harness with **101 checks, all passed** — plus the release build and the
-artefact the size was measured from.
+*The CI run:* **39731173747** (the workflow dispatch on the commit that carries the
+phase's code), the job **green** in **6 min 22 s**: the debug build, **359 unit tests**
+(268 + 91), and the self-test harness with **101 checks, all passed** — plus the
+release build and the artefact the size was measured from. A later run on the branch's
+tip was green as well (**39733574798**): the same 359 tests and the same 101 checks.
 
 **Decisions.** `DECISIONS.md` §16: `audio_mute` returns the previous mute state **per
 session**, not per process and not as a count — a process can own several sessions and

@@ -316,7 +316,10 @@ pub fn session_states() -> Vec<(u32, String)> {
 /// changed, and it must never be unmuted again.
 ///
 /// A `OnceLock` and not a plain `Mutex`: `HashMap::new` is not a `const fn`, so the map
-/// cannot be built in the static's own initializer.
+/// cannot be built in the static's own initializer. The map is randomly seeded — that
+/// is the HashDoS protection — and a seed cannot be made at compile time. Do not
+/// "fix" this with `HashMap::with_hasher(BuildHasherDefault::new())`: that one has a
+/// fixed hash.
 static MUTED_BY_HOST: OnceLock<Mutex<HashMap<u32, HashSet<String>>>> = OnceLock::new();
 
 /// The ledger of the sessions a host call muted.

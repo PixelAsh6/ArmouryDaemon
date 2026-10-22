@@ -81,6 +81,14 @@ where it is:
 | `audio_mute_all(on)` | `overlay::mute_all` — `overlay.rs:499` | for idle mode |
 | `overlay_show()` / `overlay_hide()` | `overlay::show` / `overlay::hide` — `overlay.rs:248`, `overlay.rs:347` | the daemon keeps owning the crash-recovery ledger and the keypress dismissal |
 
+**The vocabulary of the audio functions.** `audio_sessions()` returns one
+`{pid}:{state}` per session of the machine — the state is `muted`, `playing` or
+`unknown` — so a pack can see what is playing without knowing a session id.
+`audio_mute(pid, on)` works on a **pid** and reports per **session**, because one
+process can own several sessions and they need not be in the same state. The session
+id is a diagnostic detail, not a handle: the two functions answer two different
+questions.
+
 **`audio_mute` returns the previous mute state, per session.** The report names every
 session of the process and the state it was in *before* the call:
 `muted {session} (was playing)`, `unmuted {session} (was muted)`,
