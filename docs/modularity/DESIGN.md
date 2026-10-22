@@ -68,6 +68,7 @@ failed as an unknown function. `sleep` is now a capability of its own — see
 | `journal` | `capture`, `log` | none | |
 | `files` | `read_file`, `read_json`, `read_ini` | low | reads anywhere |
 | `files-write` | `write_file` | low | already sandboxed to four roots |
+| `registry` | *(none)* | medium | the `registry_set` step only — a value under HKCU/HKLM, which is where Windows looks a start-up entry up |
 | `process` | `process_running`, `process_kill`, `process_start` | medium | start/kill restricted to the allowed folders |
 | `exec` | `run_cli` | medium | restricted to the allowed folders |
 | `input` | `hotkey` | **high** | injects keystrokes |
@@ -76,6 +77,24 @@ failed as an unknown function. `sleep` is now a capability of its own — see
 | `audio` *(new)* | `audio_mute`, `audio_mute_all`, `audio_sessions` | **high** | mutes any process or device |
 | `overlay` *(new)* | `overlay_show`, `overlay_hide` | **high** | full-screen takeover |
 | `time` *(new)* | `sleep` | none | a flow-control primitive: it grants nothing |
+
+**`registry` is the one capability with no host function.** The power is only reachable
+through a declarative step (`registry_set`), so the table has no function to list for it —
+the step table below is what gates it. `DECISIONS.md` §20 has the reasoning.
+
+**The declarative steps are gated too, by the same table.** A step is a host call written
+as data, so each mechanism names a capability of its own:
+
+| Mechanism | Capability |
+|---|---|
+| `cli` | `exec` |
+| `process_start`, `process_kill` | `process` |
+| `hotkey` | `input` |
+| `registry_set` | `registry` |
+
+A pack that declares `["files"]` and uses a `cli` step is **refused when it is parsed**
+(`Pack::validate`), with the same sentence the script denial uses. This was a hole until
+2026-10-23: the script was gated and the steps were not.
 
 The new host functions are thin wrappers over code that already exists and must stay
 where it is:
@@ -146,8 +165,17 @@ registered** (`script.rs:298`, `new_sandbox`), so an ungranted call fails as an
 *unknown function* — a structural denial, not a runtime check a call site could forget.
 Each distinct capability set costs ~433 µs to build, once.
 
+That structural denial covers the **script**. The **declarative steps** are data, not
+calls, so they never reach an engine — they are gated by the same capability table in
+`Pack::validate` (`pack.rs`, `Capability::of_mechanism`) and, again, where a step is
+actually run (`packs.rs`, `run_step`). A pack that declares `["files"]` and carries a
+`cli` step is refused when it is parsed, so it never loads; the mechanism table is in
+§2. Until 2026-10-23 only the script was gated, and a pack that declared `["files"]`
+could still start programs, send keystrokes, kill processes or write the registry
+through its steps.
+
 The key of the map is the **capability set** (`armoury_core::pack::CapSet`), a bitmask
-over the twelve capabilities: two packs that ask for the same capabilities share one
+over the thirteen capabilities: two packs that ask for the same capabilities share one
 engine, and a pack that asks for nothing gets an engine with no host function on it at
 all.
 
@@ -178,6 +206,18 @@ run_cli REFUSED: it needs the 'exec' capability, which this pack was not granted
 That line is what the pack's log gets, and it is the whole error the daemon records.
 A function the pack **was** granted but called wrongly (a wrong argument type) comes
 back the same way from Rhai — that is not a denial and is not reported as one.
+
+**The error can be one level down.** Rhai wraps an error raised inside a *script-defined
+function*: the failed call is the pack's own function, and the unknown host function sits
+inside `ErrorInFunctionCall` (or `ErrorInModule`). The daemon reads the denial from
+`unwrap_inner` (`rhai` 1.26.1, `types/error.rs:471`), not from the top-level variant —
+before 2026-10-23 a denial inside a function was missed, and the log got Rhai's raw
+`Function not found` instead of the line above. A **step** refusal reads the same way,
+with the mechanism in place of the function name:
+
+```
+apply step 0: cli REFUSED: it needs the 'exec' capability, which this pack was not granted (the pack asked for: files)
+```
 
 ---
 

@@ -37,11 +37,18 @@ background.
 
 ## Current state
 
-- **Phase A3 is done on `feature/a3-kind-triggers`** — the pack schema's `kind` and
-  `triggers`, both **additive**, a malformed `kind` refused by name. The branch is cut
-  from `main` (`79ad905`) and is **not merged**: the merge is the user's call. The daemon
-  does not act on the fields yet — the mode machinery is A4/A5 — so the phase changes no
-  runtime path and the three shipped packs cannot notice it.
+- **Phase A3 is merged into `main`** — the merge commit `21935ff`, and its CI run
+  (`39803275300`) is green after 3m53s. The pack schema's `kind` and `triggers`, both
+  **additive**, a malformed `kind` refused by name. The daemon does not act on the fields
+  yet — the mode machinery is A4/A5 — so the phase changes no runtime path and the three
+  shipped packs cannot notice it.
+- **The review of 1.1.5 is closed on `fix/1.1.5-review`**, cut from that merge: the
+  capability gate now covers the **declarative steps** (a pack that declared `["files"]`
+  could run programs through a `cli` step), a cooldown change no longer resurrects a window
+  that has ended, the overlay requests are coalesced, a denial inside a script-defined
+  function is reported as a denial, and `audio_mute_all` leaves a crash-recovery record.
+  **Not merged** — that merge is the user's call. `DECISIONS.md` §20 (the step gate and the
+  `registry` capability) and §21 (the game wins).
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The phase is
   integrated on **`main`** — A2, with the lockout re-timing and the art fetch through the
   Windows certificate store merged into it — at the merge commit `4712b44`, and it is the
@@ -84,7 +91,7 @@ background.
 | The killswitch enumerates audio sessions **once per press**; release restores from the ledger without enumerating | ~45 ms off the event loop per press | `crates/armoury/src/killswitch.rs:121`, `:415` |
 | The watcher **skips the process-table walk when nothing is tracked** | ~19.5 ms/s of idle cost gone | `crates/armoury/src/watch.rs:174` |
 | The **lockout model was rewritten** — again on 2026-10-22: it holds a change in **both** directions | the packs no longer flip under a running game, and a start inside a window no longer changes the machine in the middle of a cooldown | `crates/armoury-core/src/engine.rs` (`try_change` `:314`, `tick` `:291`) |
-| A change of the cooldown **re-times the window that is running** (1.1.5) | the window keeps its start and takes the new length, so it ends at `start + cooldown` and the change it holds lands at the new expiry | `crates/armoury-core/src/engine.rs` (`Window`, `set_cooldown`) |
+| A change of the cooldown **re-times the window that is running** (1.1.5) | the window keeps its start and takes the new length, so it ends at `start + cooldown` and the change it holds lands at the new expiry; a window that has **already ended** is dropped instead (2026-10-23) | `crates/armoury-core/src/engine.rs` (`Window`, `set_cooldown`) |
 | The **release carries only the executable and its 85-byte sidecar** — no zip, no scripts | the executable installs itself; the scripted install lives in the repository's `deploy\` folder | `.github/workflows/release.yml` |
 | The **build targets x86-64 v3**, not `native` | the same binary on every machine | `.cargo/config.toml` |
 
@@ -97,12 +104,12 @@ thread** (`packs.rs:168`, `while let Ok(job) = jobs.recv()`), so a slow mode wou
 every later apply and revert. Modes get their own thread and their own channel.
 `WORK-ORDER.md` A4.
 
-A3 is the phase before it, and it is done: the pack schema carries `kind` (`"pack"` or
-`"mode"`) and `triggers`, both **additive**, and a malformed `kind` is refused by name.
-The daemon does not act on the fields yet — that is A4 and A5 — so the phase could not
-change what the daemon does with a pack. The full phase list is in `WORK-ORDER.md`.
-Phases run in order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has
-shipped and settled.
+A3 is merged (`21935ff`), and the review of 1.1.5 is closed on `fix/1.1.5-review`; that
+branch waits for the user's merge, and A4 starts from whichever tree the user wants. A3
+put `kind` (`"pack"` or `"mode"`) and `triggers` in the schema; the daemon does not act on
+them yet — that is A4 and A5. The full phase list is in `WORK-ORDER.md`. Phases run in
+order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and
+settled.
 
 ---
 

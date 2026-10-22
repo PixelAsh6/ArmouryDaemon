@@ -538,6 +538,19 @@ cooldown row reads to say that a change is waiting behind the window.
 same decision as row **H21**, with the log excerpt it is based on. That file is the
 private decision log of the earlier sessions; this section is the versioned copy.
 
+### A window that has ended is dropped, not re-timed
+
+**Amended 2026-10-23.** Only a window that is **still running** is re-timed. A window
+whose `end` is in the past is **dropped** by the same call.
+
+The engine keeps an expired window until a tick reaps it, and the daemon drains the pipe
+requests **before** the 1 Hz housekeeping runs that tick - so a `set_cooldown` that
+arrives in that sub-second gap found a dead window and gave it the new length. A window
+`[t0, t0+5]` that had expired with nothing pending came back as `[t0, t0+60]`: the
+dashboard showed a countdown, `lock_running` was true again, and the next game launch was
+**held** for a cooldown that was never really running - a phantom lockout. The call takes
+`now` for exactly this: `match self.lock { Some(w) if w.end() > now => ..., _ => None }`.
+
 ---
 
 ## 18. `kind` and `triggers` are additive, and the mode machinery comes later
@@ -629,9 +642,103 @@ a pack format that can say what a pack is.
 **Rejected:**
 
 - **A `String` for the kind instead of an enum.** It would have saved the two
-  (de)serializers — the bytes were not measured against that alternative — and it would
+  (de)serializers - the bytes were not measured against that alternative - and it would
   have cost the typed discriminant that the Modules window (B4) and the manifest (B1)
   both need. A schema that cannot say what a pack is is worth more than a kilobyte.
 - **Dropping the named error to save the format strings.** A malformed `kind` has to be
   a named error (`WORK-ORDER.md` A3), and a silent default to `"pack"` is exactly what
   the phase exists to prevent.
+
+---
+
+## 20. The capability gate covers the declarative steps, and `registry_set` gets `registry`
+
+**Settled - 2026-10-23, from the review of 1.1.5.** A pack that declared
+`"capabilities": ["files"]` - or `[]` - could still run programs, inject keystrokes,
+kill processes and write the registry, because those are **declarative steps** and the
+gate only ever saw the **script**. The script is gated structurally (only the granted
+functions are on its engine); a step is data, so nothing looked at it.
+
+**The mechanism table** now sits next to the schema (`Capability::of_mechanism`):
+
+| Mechanism | Capability |
+|---|---|
+| `cli` | `exec` |
+| `process_start`, `process_kill` | `process` |
+| `hotkey` | `input` |
+| `registry_set` | `registry` |
+
+`Pack::validate` refuses a step of a capability the pack did not ask for - so the pack
+**never loads** - with the sentence the script denial uses:
+`apply step 0: 'cli' needs the 'exec' capability, which this pack was not granted (the
+pack asked for: files)`. `run_step` makes the same check where the mechanism is actually
+run, so a pack that reached the worker by another path cannot reach the machine either.
+
+**`registry_set` had no capability at all**, and the table had no row it belonged to.
+It gets one of its own, `registry`, rather than being folded into `files-write`:
+
+- **It is not a file.** `files-write` is documented as *"inside the four roots"*
+  (`%APPDATA%`, `%LOCALAPPDATA%`, `%PROGRAMDATA%`, the target's folder), and the gate
+  enforces that. A registry write is not inside any of them, and it can set a value
+  anywhere under HKCU/HKLM - which is where Windows looks a start-up entry up. Folding it
+  into `files-write` would have handed a pack that asked to write a config file a
+  persistence channel, and §14's rule for `sleep` is exactly this: folding a power into
+  another capability gives it away.
+- **The permission window (B4) has to show it.** The window lists what a module may do in
+  the words of `Capability::effect`, and "Write files" would be a lie for a module that
+  can write `HKCU\...\Run`. Two lists that drift is what §14 rejected; one list that
+  describes the wrong thing is worse.
+- **It costs less than a new host function.** `registry` carries **no function** (the
+  only way to write the registry is a step), so it adds an enum arm, a name, an effect
+  string and a bit in `CapSet::ALL` - no engine, no registration, no budget.
+
+**Rejected:**
+
+- **Leaving `registry_set` ungated.** The hole the review found: `[]` + `registry_set` is
+  a persistence channel for a pack that asked for nothing.
+- **Folding it into `files-write`.** Above: the four roots are the documented and
+  enforced limit, and HKCU is not inside them.
+- **Folding it into `exec`.** Killing a process is `process` and running a program is
+  `exec`; a registry write is neither, and a pack that only sets a value would have had
+  to ask for the power to run programs.
+- **A runtime-only check.** A pack that is refused at apply time has already been
+  installed and looks healthy in the UI; the refusal has to be at `validate()` so it
+  never loads. The `run_step` check is the backstop, not the gate.
+
+**The default still holds.** A pack that declares no `capabilities` gets `CapSet::ALL`,
+so the three shipped packs keep working: none of them carries the field, and none of them
+uses a step the new row would refuse.
+
+---
+
+## 21. The game wins: a start inside the window cancels the revert
+
+**Settled by the user 2026-10-23.** When a tracked game closes and starts again inside
+the same cooldown window, the pending **revert is cancelled** - the machine stays in
+**Turbo**, the packs applied - **and the window keeps running** to its expiry, so it is
+still the guard over whatever the packs try next.
+
+**Why.** The alternative is the machine in **Silent while a game runs**: the revert lands
+in the gap between the close and the start, and the game's launch then sits held behind
+the very window the revert started (the 22 Oct 08:46 log, §17). A game on the desktop
+with the G-Helper Turbo profile off is the one outcome the lockout exists to avoid.
+
+**The code already behaves this way** - it is H20's rule (4) (`DECISIONS-2026-10-17.md`,
+the local-only log; H20 is the block this belongs to). `on_started` sets the intent, the
+engine reaches `desired == applied`, the held change is **cancelled** (`pending = false`)
+and the window is left running; the next tick finds nothing to do and starts no window of
+its own. **Nothing in the engine was changed for this decision**: it was re-verified
+against the code, pinned by a harness check (9b - the window is still running after the
+restart, the change behind it is gone, no revert lands, the packs stay applied) and
+recorded here.
+
+**Rejected:**
+
+- **Letting the revert land and re-applying at the end of the window.** That is the
+  flip-flop of 21 Oct under a running game, one window later.
+- **Dropping the window when the revert is cancelled.** The window would stop guarding the
+  packs: a close right after the restart would revert at once, which is the same defect
+  the other way round.
+- **Restarting the window from the restart.** The user's cooldown would be measured from
+  the game's own start, and a game that restarts twice would hold the packs far longer
+  than the setting says.

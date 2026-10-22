@@ -11,10 +11,41 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   (`"kind": "pack"` or `"mode"`) and what starts it (`"triggers"`). Both fields are
   **additive**: a pack that does not carry them loads and behaves exactly as it did, the
   three shipped packs carry neither, and the catalogue needs no change. A kind outside the
-  set is refused by name — `unknown kind 'widget' (expected 'pack' or 'mode')` — and never
+  set is refused by name - `unknown kind 'widget' (expected 'pack' or 'mode')` - and never
   a silent default to `"pack"`;
   a mode needs at least one trigger, a `hotkey` trigger needs a key, and a `tracked_app`
   trigger takes none. `spec` stays 1 or 2.
+- A **`registry`** capability, for the `registry_set` step. A pack that writes a registry
+  value has to ask for it (`"capabilities": ["registry"]`); a pack that declares no
+  capabilities still gets every one of them.
+
+### Fixed
+
+- The **capability gate did not cover the declarative steps**. A pack that declared
+  `"capabilities": ["files"]` - or `[]` - could still run programs (`cli`), inject
+  keystrokes (`hotkey`), kill processes (`process_kill`) and write the registry
+  (`registry_set`): the script was gated, the steps were not. Every mechanism now names a
+  capability and a step the pack did not ask for is refused **when the pack is parsed**, so
+  it never loads - and refused again where the step would run.
+- A change of the cooldown **brought a window that had ended back to life**. The daemon
+  drains a pipe request before the 1 Hz tick that reaps an expired window, so a
+  `set_cooldown` in that gap re-timed a dead window: the dashboard showed a countdown and
+  the next game launch was held for a cooldown that was never really running. Only a window
+  that is still running is re-timed now; one that has ended is dropped.
+- **`overlay_show`/`overlay_hide` requests queued without a limit.** Every request cost a
+  black window per monitor, a write and a delete of `idle.marker` and a pack job, so a
+  script with a thousand pairs kept the daemon thrashing for minutes. There is one pending
+  request now, and a request for the state the daemon is already in is skipped.
+- The **denial message was lost inside a script-defined function**. Rhai wraps an error
+  raised in a script function, so the daemon's match missed it and the pack's log got
+  Rhai's raw `Function not found` instead of `run_cli REFUSED: it needs the 'exec'
+  capability…`.
+- **`audio_mute_all` left no crash-recovery record.** Its devices lived in an in-memory
+  list only, so a crash or a reboot left the machine muted. They go into `idle.ledger` now,
+  the file idle mode already uses, and the next start puts them back.
+- A **hand-edited `cooldown_seconds` could panic the daemon** at startup: the value became
+  an `Instant + Duration`, and nothing clamped it. It is clamped to 5-3600 s, the range the
+  UI writes.
 
 ## [1.1.5] - 2026-10-22
 
