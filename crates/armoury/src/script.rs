@@ -275,17 +275,8 @@ fn denial(caps: CapSet, error: &EvalAltResult) -> Option<String> {
     Some(format!(
         "{name} REFUSED: it needs the '{}' capability, which this pack was not granted (the pack asked for: {})",
         capability.name(),
-        asked_for(caps)
+        caps.asked_for()
     ))
-}
-
-/// The capabilities a pack asked for, as a sentence: what a denial message lists.
-fn asked_for(caps: CapSet) -> String {
-    let names = caps.names();
-    if names.is_empty() {
-        return "nothing".to_string();
-    }
-    names.join(", ")
 }
 
 /// The sandbox: limits first, then only the host API the pack was granted. It is built
