@@ -517,6 +517,18 @@ try {
     Start-Sleep -Milliseconds 700
     Check 'a close after the lockout ended holds the revert' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
     $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    # The decision of 2026-10-23 ("the game wins"): the start cancels the revert the window was
+    # holding, the machine stays in Turbo (the packs applied), and the window keeps running for
+    # the rest of its time - the guard is still up for whatever the packs try next.
+    $seen = $false
+    for ($i = 0; $i -lt 40 -and -not $seen; $i++) {
+        Start-Sleep -Milliseconds 100
+        $s = Status
+        $seen = ($s -and $s.trigger_source -eq 'timeout.exe')
+    }
+    Check 'the restart inside the window is seen' $seen "source=$(($s).trigger_source)"
+    Check 'the restart leaves the window of the held revert running' (($s.state -eq 'cooldown') -and ($s.cooldown_remaining_ms -gt 0)) "state=$($s.state) remaining=$($s.cooldown_remaining_ms)"
+    Check 'the restart cancels the change behind the window' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
     $s = Wait-State 'triggered' 20
     Check 'a fast restart after the lockout ended leaves the packs applied' ($s.state -eq 'triggered') "state=$($s.state)"
     Check 'a fast restart after the lockout ended never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
@@ -624,6 +636,38 @@ try {
     Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
     $s = Wait-State 'idle' 20
     Check 'the daemon goes idle after the re-timed window' ($s.state -eq 'idle') "state=$($s.state)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+
+    # ---- 12c. a change of the cooldown does not resurrect a window that has ended ----
+    # The daemon drains a pipe request *before* its 1 Hz housekeeping runs `tick`, so a window
+    # that has ended is still in the engine when a new length arrives. Re-timing it made a dead
+    # window alive again: the dashboard showed a fresh countdown and the next game launch was
+    # held for a window that never started (23 Oct review). This check waits for the report to
+    # say the window is over - the engine still holds it - and then changes the cooldown in the
+    # gap before the tick.
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $p9 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'cooldown' 8
+    Check 'the start opens a window' ($s.state -eq 'cooldown') "state=$($s.state)"
+    Start-Sleep -Milliseconds 500
+    $applies = @(Get-ChangeTimes 'apply').Count
+    $ended = $false
+    for ($i = 0; $i -lt 400; $i++) {
+        $s = Status
+        if ($s -and $null -eq $s.cooldown_remaining_ms) { $ended = $true; break }
+        Start-Sleep -Milliseconds 20
+    }
+    Check 'the window ends' $ended "remaining=$(($s).cooldown_remaining_ms)"
+    Send-Pipe '{"type":"set_cooldown","seconds":60}' | Out-Null
+    $s = Status
+    Check 'the new length does not bring the ended window back' ($null -eq $s.cooldown_remaining_ms) "remaining=$($s.cooldown_remaining_ms)"
+    Check 'the change leaves the machine settled' ($s.state -eq 'triggered') "state=$($s.state)"
+    Check 'the change does not touch the packs' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $p9 | Stop-Process -Force
+    $s = Wait-State 'idle' 25
+    Check 'the daemon goes idle after the window that ended' ($s.state -eq 'idle') "state=$($s.state)"
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
 
     # ---- 13. config lives in the throw-away folder, not in %APPDATA% ----
@@ -754,6 +798,10 @@ try {
     # to a function of a capability that was not granted fails as an *unknown function*:
     # the denial is structural, not a check a call site could forget. The denial names the
     # missing capability and what the pack asked for, and it lands in the pack's log.
+    #
+    # The denied call sits inside a function the script defines, because Rhai wraps an error
+    # raised there (ErrorInFunctionCall): matching only the top-level error threw the denial
+    # away and the log got Rhai's raw "Function not found" instead (23 Oct review).
     $capDir = Join-Path $env:TEMP "armoury-cappack-$ns"
     New-Item -ItemType Directory -Force -Path $capDir | Out-Null
     $capPack = @'
@@ -766,7 +814,7 @@ try {
   "targets": { "process": ["timeout.exe"] },
   "capabilities": ["files"],
   "script": {
-    "apply":  "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\"); ctx.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]);",
+    "apply":  "fn go(host) { host.run_cli(\"C:\\\\Windows\\\\System32\\\\cmd.exe\", [\"/c\", \"echo hi\"]); } ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\"); go(ctx);",
     "revert": "ctx.read_file(\"C:/armoury-capability-probe-does-not-exist.txt\");"
   },
   "apply": { "steps": [] },
@@ -787,12 +835,38 @@ try {
     Check 'the ungranted call is in the pack log' ($logText -match 'captest: script apply failed') "no failure line for the pack"
     Check 'the denial names the missing capability' ($logText -match "run_cli REFUSED: it needs the 'exec' capability") "no capability in the denial"
     Check 'the denial names what the pack asked for' ($logText -match 'the pack asked for: files') "no grant set in the denial"
+    Check "the denial survives Rhai's wrapping" (-not ($logText -match 'Function not found')) "the raw Rhai message reached the log"
     $p8 | Stop-Process -Force
     Send-Pipe '{"type":"set_pack_enabled","id":"captest","enabled":false}' | Out-Null
     $op = Send-And-Wait '{"type":"remove_pack","id":"captest"}' 'pack_op'
     Check 'the pack with capabilities removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     Remove-Item -Recurse -Force $capDir -ErrorAction SilentlyContinue
+
+    # the gate covers the declarative steps too: the script was gated and the steps were not,
+    # so a pack that declared ["files"] could still run a program through a step (23 Oct review)
+    $stepDir = Join-Path $env:TEMP "armoury-steppack-$ns"
+    New-Item -ItemType Directory -Force -Path $stepDir | Out-Null
+    $stepPack = @'
+{
+  "spec": 1,
+  "id": "steptest",
+  "name": "Step test",
+  "version": "1.0.0",
+  "order": 8,
+  "targets": { "process": ["timeout.exe"] },
+  "capabilities": ["files"],
+  "apply": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "echo hi"] } ] },
+  "revert": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "echo hi"] } ] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $stepDir 'pack.json'), $stepPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($stepDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'a step of a capability the pack did not ask for is refused' ($op -and -not $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Check 'the step refusal names the mechanism and the capability' ($op -and $op.message -match "'cli' needs the 'exec' capability") "message=$($op.message)"
+    Check 'the step refusal names what the pack asked for' ($op -and $op.message -match 'the pack asked for: files') "message=$($op.message)"
+    Check 'the refused step pack landed nowhere' (-not (Test-Path (Join-Path $buildPacks 'steptest'))) "the pack was installed anyway"
+    Remove-Item -Recurse -Force $stepDir -ErrorAction SilentlyContinue
 
     # ---- 19c. the pack schema: `kind` and `triggers` ----
     # A pack may say what it is (`kind`: "pack" or "mode") and what starts it (`triggers`).
