@@ -47,7 +47,8 @@ background.
   could run programs through a `cli` step), a cooldown change no longer resurrects a window
   that has ended, the overlay requests are coalesced, a denial inside a script-defined
   function is reported as a denial, and `audio_mute_all` leaves a crash-recovery record.
-  **Not merged** — that merge is the user's call. `DECISIONS.md` §20 (the step gate and the
+  **Not merged** — that merge is the user's call. CI: `39807213693` and `39809146891`,
+  both green (378 unit tests, 133 harness checks). `DECISIONS.md` §20 (the step gate and the
   `registry` capability) and §21 (the game wins).
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The phase is
   integrated on **`main`** — A2, with the lockout re-timing and the art fetch through the

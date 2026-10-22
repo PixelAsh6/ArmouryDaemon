@@ -686,14 +686,20 @@ this folder.
 |---|---|---|
 | The unit tests | 370 (270 in `armoury`, 100 in `armoury-core`) | **378 (273 in `armoury`, 105 in `armoury-core`)** - **+8** |
 | The harness checks | 119 `Check` calls | **133** - **+14** |
-| The release exe | 12,877,312 bytes (the A3 tree) | not re-measured - no size-bearing decision here, and `cargo build --release` is never run on this machine |
+| The release exe | 12,877,312 bytes (the A3 tree) | **12,879,360 bytes** - **+2,048 (+0.016 %)**, sha256 `611dcb98…b2ab` |
+
+*The exe size:* the release build of the branch, taken from the CI artefact of the
+dispatch (`ArmouryDaemon.exe`, sha256 `611dcb98…b2ab`), measured against the A3 tree's
+12,877,312. No size-bearing decision is made here - the fix is small and the rule is not
+bent (`DECISIONS.md` §12 and §19 bend it; this one does not).
 
 *The CI runs:*
 
 | Run | What | Conclusion | Wall time |
 |---|---|---|---|
 | `39806787130` | CI on the fix branch (dispatch) - **red**: `'go' is a reserved keyword` in the new denial test | failed | 1m26s |
-| `39807213693` | CI on the branch tip (dispatch) | ****green** - 378 tests, 133 harness checks, and the release profile** | 8m49s |
+| `39807213693` | CI on the code commit `41ba47e` (dispatch) | **green** - 378 tests, 133 harness checks, and the release profile | 8m49s |
+| `39809146891` | CI on the branch's tip `ada6f9c` (dispatch) - the same tree, with the folder on it | **green** - the same 378 tests and 133 checks; the artefact is the 12,879,360 bytes above | 7m46s |
 
 **Decisions.** `DECISIONS.md` **20**: the gate covers the declarative steps, and
 `registry_set` gets a capability of its own (`registry`) instead of being folded into
