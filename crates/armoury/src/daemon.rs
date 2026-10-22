@@ -454,6 +454,22 @@ pub fn run(start: Start) {
                 Err(_) => break,
             }
         }
+        // A pack may ask for the idle overlay. The pack worker cannot show it itself: the
+        // black windows belong to the thread that pumps their messages, and that is this
+        // one - so the daemon keeps owning the crash-recovery ledger and the keypress
+        // dismissal.
+        for request in packs::take_overlay_requests() {
+            match request {
+                packs::OverlayRequest::Show => {
+                    info!("a pack asked for the idle overlay");
+                    app.enter_idle();
+                }
+                packs::OverlayRequest::Hide => {
+                    info!("a pack asked for the idle overlay to go away");
+                    app.exit_idle();
+                }
+            }
+        }
         if app.quit_requested.asked() {
             // "Quit means close everything": the packs go back and the audio comes back before
             // the daemon goes away.

@@ -3,8 +3,8 @@
 //! Everything is recorded in a ledger so the restore is exact and only touches what we
 //! altered (windows we hid, audio sessions we muted and their previous mute state).
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use log::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM};
@@ -14,7 +14,7 @@ use windows::Win32::Media::Audio::{
     IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eRender,
 };
 use windows::Win32::System::Com::{
-    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GW_OWNER, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
@@ -27,6 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 trait Session {
     /// The process that owns the session.
     fn pid(&self) -> u32;
+    /// A stable name of the session: the same session keeps it from sweep to sweep, so
+    /// the host can tell the sessions it muted from the ones the user muted.
+    fn id(&self) -> String;
     /// The mute state, when it can be read.
     fn is_muted(&self) -> Option<bool>;
     /// Set the mute state.
@@ -36,12 +39,17 @@ trait Session {
 /// A session of the Windows audio device.
 struct AudioSession {
     pid: u32,
+    id: String,
     volume: ISimpleAudioVolume,
 }
 
 impl Session for AudioSession {
     fn pid(&self) -> u32 {
         self.pid
+    }
+
+    fn id(&self) -> String {
+        self.id.clone()
     }
 
     fn is_muted(&self) -> Option<bool> {
@@ -191,7 +199,7 @@ pub fn disengage(ledger: &mut Ledger) {
 }
 
 /// Visible, unowned, non-tool top-level windows belonging to a process.
-fn windows_of(pid: u32) -> Vec<isize> {
+pub fn windows_of(pid: u32) -> Vec<isize> {
     struct Ctx {
         pid: u32,
         out: Vec<isize>,
@@ -259,11 +267,112 @@ fn sessions() -> Vec<Arc<dyn Session>> {
                 let Ok(volume) = control.cast::<ISimpleAudioVolume>() else {
                     continue;
                 };
-                out.push(Arc::new(AudioSession { pid, volume }));
+                let id = session_id(&control2, pid, session_index);
+                out.push(Arc::new(AudioSession { pid, id, volume }));
             }
         }
     }
     out
+}
+
+/// The stable name of an audio session. Windows gives every session an identifier; when
+/// it cannot be read, the process and the place of the session in the sweep stand in for
+/// it — that is not as good, but it is still the same session from one sweep to the next.
+fn session_id(control: &IAudioSessionControl2, pid: u32, index: usize) -> String {
+    unsafe {
+        match control.GetSessionIdentifier() {
+            Ok(pointer) => {
+                let text = pointer.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(pointer.0 as *const core::ffi::c_void));
+                if text.is_empty() {
+                    format!("{pid}#{index}")
+                } else {
+                    text
+                }
+            }
+            Err(_) => format!("{pid}#{index}"),
+        }
+    }
+}
+
+/// The audio sessions of the machine, as (process, state): the state is "muted",
+/// "playing" or "unknown" (a session whose mute state cannot be read).
+pub fn session_states() -> Vec<(u32, String)> {
+    sessions()
+        .iter()
+        .map(|session| {
+            let state = match session.is_muted() {
+                Some(true) => "muted",
+                Some(false) => "playing",
+                None => "unknown",
+            };
+            (session.pid(), state.to_string())
+        })
+        .collect()
+}
+
+/// The sessions a host call muted, by process and by session name: exactly the ones it
+/// has to unmute again. A session the user had muted already is not in here — it was not
+/// changed, and it must never be unmuted again.
+static MUTED_BY_HOST: Mutex<HashMap<u32, HashSet<String>>> = Mutex::new(HashMap::new());
+
+/// Mute (or unmute) the audio sessions of one process, and report what changed.
+///
+/// The sessions this call muted are remembered, so the unmute puts back exactly what was
+/// changed: a session the user had muted already is never unmuted again.
+pub fn mute_pid(pid: u32, muted: bool) -> String {
+    let sessions = sessions();
+    let mut changed = 0usize;
+    let mut left_alone = 0usize;
+    let mut failed = 0usize;
+    {
+        let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
+        for session in sessions.iter().filter(|s| s.pid() == pid) {
+            let Some(was) = session.is_muted() else {
+                left_alone += 1; // the state cannot be read: the session is left alone
+                continue;
+            };
+            if muted {
+                if was {
+                    left_alone += 1; // the user muted it: it is not ours to change
+                    continue;
+                }
+                match session.set_muted(true) {
+                    Ok(()) => {
+                        changed += 1;
+                        ledger.entry(pid).or_default().insert(session.id());
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        warn!("SetMute failed for pid {pid}: {e}");
+                    }
+                }
+            } else {
+                let ours = ledger
+                    .get(&pid)
+                    .map(|ids| ids.contains(&session.id()))
+                    .unwrap_or(false);
+                if !ours {
+                    left_alone += 1; // not a session we muted: the user's own mute stays
+                    continue;
+                }
+                match session.set_muted(false) {
+                    Ok(()) => changed += 1,
+                    Err(e) => {
+                        failed += 1;
+                        warn!("SetMute failed for pid {pid}: {e}");
+                    }
+                }
+            }
+        }
+        if !muted {
+            ledger.remove(&pid);
+        }
+    }
+    format!(
+        "{changed} session(s) {}, {left_alone} left alone, {failed} could not be changed",
+        if muted { "muted" } else { "unmuted" }
+    )
 }
 
 /// The sessions, indexed by the process that owns them: one sweep answers for every
@@ -289,12 +398,17 @@ mod tests {
     /// A session that only remembers: nothing on the machine is really muted.
     struct Fake {
         pid: u32,
+        id: String,
         muted: Rc<Cell<bool>>,
     }
 
     impl Session for Fake {
         fn pid(&self) -> u32 {
             self.pid
+        }
+
+        fn id(&self) -> String {
+            self.id.clone()
         }
 
         fn is_muted(&self) -> Option<bool> {
@@ -314,6 +428,7 @@ mod tests {
             was_muted,
             session: Arc::new(Fake {
                 pid,
+                id: format!("fake-{pid}"),
                 muted: Rc::new(Cell::new(was_muted)),
             }),
         }
@@ -414,10 +529,12 @@ mod tests {
             vec![
                 Arc::new(Fake {
                     pid: 42,
+                    id: "fake-playing".into(),
                     muted: Rc::clone(&playing),
                 }) as Arc<dyn Session>,
                 Arc::new(Fake {
                     pid: 42,
+                    id: "fake-muted".into(),
                     muted: Rc::clone(&muted_by_the_user),
                 }) as Arc<dyn Session>,
             ]
