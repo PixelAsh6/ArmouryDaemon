@@ -386,3 +386,50 @@ idle mode", and the pack sees the request accepted, not the overlay on the scree
 the creating thread, so the daemon's pump would never reach those windows, and
 `DestroyWindow` from another thread is not a thing to rely on.
 
+---
+
+## 15. The executable grows by 56,832 bytes — the size rule bends here, once
+
+**Settled — measured in A2.** The release build of the tree goes from **12,868,608
+bytes** (A1) to **12,925,440 bytes**: **+56,832 bytes, +0.44 %**.
+
+**Why.** The phase delivers the design's capability table, and the table has **eight
+host functions that did not exist** (`windows_of`, `window_hide`, `window_show`,
+`audio_sessions`, `audio_mute`, `audio_mute_all`, `overlay_show`, `overlay_hide`). They
+are thin wrappers, but **a Rhai registration is not free**: every *shape* of host
+function gets its own instantiation of the argument-marshalling code (the `Dynamic`
+unboxing of each parameter and the wrapping of the return value), and the eight
+functions add **six new shapes**. That is where the bytes are — the section table of
+the two release builds shows it: **+47,616 bytes of `.text`** (code), +6,656 of
+`.rdata` (the string literals and the vtables of the new registrations), +1,536 of
+`.pdata` (the unwind tables of that code). The **gate itself is nearly free**: a
+bitmask over twelve capabilities, a table, and a lookup.
+
+There is no new dependency, no framework and no new runtime: the growth is the host API
+the phase is about.
+
+**What was rejected:**
+
+- **Dropping the eight functions to keep the size flat.** The design's table would
+  name functions that do not exist, and the killswitch and idle modules — the things
+  that need them — would arrive in a later phase with a host API that cannot do their
+  job. The table is the contract between the schema, the gate and the permission
+  window (B4); a table with holes in it is worse than 56 KB.
+- **Making the registrations cheaper by turning the closures into function pointers.**
+  The marshalling code would then be shared between the functions of the same shape —
+  but that shrinks the *whole tree*, the baseline included, so the **difference** against
+  the A1 build would not close.
+- **`#[inline(never)]` on the engine builder and boxing the engines.** Measured: the
+  executable grew by 512 bytes, not less. The builder was not being inlined twice, and
+  the change was reverted — the shortest working diff is the rule here too.
+
+**Known trade-off, accepted:** the phase adds bytes, and `WORK-ORDER.md` says only
+Phase E may. The reason is the one above, and the number is written down here so the
+next phase starts from the truth: **the baseline for the size rule is now 12,925,440
+bytes, not 12,868,608.**
+
+**The alternative, if the user wants the size flat:** the eight functions can move to
+the phase that brings the killswitch and idle modules (B/C), and A2 then ships the
+gate alone. That is a decision about the *order* of the phases, not about the design —
+and it should be taken by the user, not by the phase that happens to be running.
+

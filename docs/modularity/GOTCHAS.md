@@ -246,13 +246,27 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     cannot hold the audio session objects (the killswitch's own `Ledger` is a plain
     struct on the main thread for that reason). The host's ledger therefore holds the
     **session identifier** — a string — and matches the sessions of a sweep by it.
-31. **The test and harness counts in this folder were low.** The A1 entry says 341
-    unit tests and 90 harness checks; the same scan over the same tree counts **345
-    and 95**. The numbers in this file are the measured ones — count them again
-    before writing them down.
+31. **Count the tests line by line, not with a loose regex.** The scan that counts the
+    tree's tests has to be anchored to the **end of the line**
+    (`(?m)^[ \t]*#\[test\][ \t]*$`): a pattern with a `\s*` that may cross a newline
+    counts **four tests too many**, and the number then disagrees with what CI reports.
+    The same goes for the harness's `Check` calls (`^[ \t]*Check[ \t]`). The honest
+    numbers for the A1 tree are **341 unit tests** (256 in `armoury`, 85 in
+    `armoury-core`) and **90 harness checks** — the ones the folder already carries.
 32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
     built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
     `HashMap` is not) — use a `OnceLock` and build the map in `get_or_init`.
+33. **A Rhai host function is not free: about 5 KB of machine code per *shape*.**
+    Every shape of registered function gets its own instantiation of the
+    argument-marshalling code — the `Dynamic` unboxing of each parameter and the
+    wrapping of the return value. Eight host functions with six shapes cost the
+    executable **47,616 bytes of `.text`** (measured: the section tables of the two
+    release builds). A "thin wrapper" over a Win32 call is therefore not thin in the
+    binary, and the host API's size is worth watching before it grows again.
+34. **The PE section table tells you where the bytes went.** The release build is a PE
+    file; reading the section headers (`.text`, `.rdata`, `.pdata`, …) of two builds
+    says in one minute whether a change grew *code* or *data*. That is how the
+    registration cost above was found.
 
 ---
 
