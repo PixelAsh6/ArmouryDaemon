@@ -38,7 +38,9 @@ background.
 ## Current state
 
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The A2 work is
-  on **`feature/a2-capabilities`**, on top of `0ecacd3` (version **1.1.4**).
+  on **`feature/a2-capabilities-clean`**, on top of `0ecacd3` (version **1.1.4**) and
+  with the A2 commits only. (The shared working tree sits on
+  `feature/a2-capabilities`, which carries another agent's commits as well.)
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).

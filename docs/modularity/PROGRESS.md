@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A — **A1 and A2 done** (the TLS root store, the capability-scoped host API), A3 next |
 | **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) |
-| **Branch** | `main` is at `0ecacd3` (version **1.1.4**); the A2 work is on **`feature/a2-capabilities`** |
+| **Branch** | `main` is at `0ecacd3` (version **1.1.4**); the A2 work is on **`feature/a2-capabilities-clean`** (A2 only, on top of `0ecacd3`). The shared working tree sits on `feature/a2-capabilities`, which carries another agent's commits as well |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |
