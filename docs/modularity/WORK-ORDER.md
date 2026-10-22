@@ -93,7 +93,8 @@ mode pack has at least one trigger; keep `spec` 1 and 2 as they are.
 unchanged. A malformed `kind` is a named error, like the other schema errors.
 
 **Done.** The schema carries `kind` (`"pack"` | `"mode"`) and `triggers`, both
-additive; a malformed kind is refused by name (`unknown kind 'widget'`). The daemon
+additive; a malformed kind is refused by name (`unknown kind 'widget' (expected 'pack'
+or 'mode')`). The daemon
 does not act on the fields yet — that is A4 and A5. `DECISIONS.md` §18 has the
 defaults and the two trigger rules the folder did not state.
 

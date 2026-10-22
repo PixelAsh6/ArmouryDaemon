@@ -11,7 +11,8 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   (`"kind": "pack"` or `"mode"`) and what starts it (`"triggers"`). Both fields are
   **additive**: a pack that does not carry them loads and behaves exactly as it did, the
   three shipped packs carry neither, and the catalogue needs no change. A kind outside the
-  set is refused by name — `unknown kind 'widget'` — and never a silent default to `"pack"`;
+  set is refused by name — `unknown kind 'widget' (expected 'pack' or 'mode')` — and never
+  a silent default to `"pack"`;
   a mode needs at least one trigger, a `hotkey` trigger needs a key, and a `tracked_app`
   trigger takes none. `spec` stays 1 or 2.
 

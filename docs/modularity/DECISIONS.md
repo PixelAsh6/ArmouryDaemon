@@ -559,9 +559,10 @@ schema to know whether the field was *present* — `serde(default = …)` cannot
 other fields — and the pack's own default is the one that keeps today's packs working.
 
 **A malformed `kind` is a named error.** The kind is a closed set, and a value outside it
-is refused when the pack is parsed: `unknown kind 'widget'` — the same shape as the
-capability list's `unknown capability 'teleport'`. It is never a panic and never a silent
-default to `"pack"`.
+is refused when the pack is parsed: `unknown kind 'widget' (expected 'pack' or 'mode')` —
+the same shape as the capability list's `unknown capability 'teleport'`, and it names what
+the kind may be, because there are only two of them and the author would otherwise have
+to guess. It is never a panic and never a silent default to `"pack"`.
 
 **The shape of a trigger.** A trigger is `{ "kind": … }` and, for a `hotkey`, the key it
 listens for. Two rules the folder did not state, settled here:
@@ -627,13 +628,10 @@ a pack format that can say what a pack is.
 
 **Rejected:**
 
-- **A `String` for the kind instead of an enum.** It would have saved the
-  (de)serializers, and it would have cost the typed discriminant that the Modules window
-  (B4) and the manifest (B1) both need. A schema that cannot say what a pack is is
-  worth more than a kilobyte.
+- **A `String` for the kind instead of an enum.** It would have saved the two
+  (de)serializers — the bytes were not measured against that alternative — and it would
+  have cost the typed discriminant that the Modules window (B4) and the manifest (B1)
+  both need. A schema that cannot say what a pack is is worth more than a kilobyte.
 - **Dropping the named error to save the format strings.** A malformed `kind` has to be
   a named error (`WORK-ORDER.md` A3), and a silent default to `"pack"` is exactly what
   the phase exists to prevent.
-
-
-

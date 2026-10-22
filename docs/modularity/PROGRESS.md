@@ -562,7 +562,8 @@ pattern.
 `"mode"`) and `triggers` (what starts the pack). A pack that carries neither loads and
 behaves exactly as it did — the three shipped packs carry neither, and the catalogue in
 `D:\ArmouryDaemon_Packs` needs no change. `spec` stays 1 or 2; there is no `spec: 3`. A
-malformed `kind` is a **named error** — `unknown kind 'widget'` — refused when the pack is
+malformed `kind` is a **named error** — `unknown kind 'widget' (expected 'pack' or 'mode')` —
+refused when the pack is
 parsed: never a panic, never a silent default to `"pack"`.
 
 The **daemon does not act on the fields yet**, and that is what makes the phase additive:
@@ -571,15 +572,15 @@ The kind is in the log line that names a loaded pack, so an operator can see it.
 
 **Files touched.** `crates/armoury-core/src/pack.rs` (the two fields, the two enums, the
 trigger, the validation, six tests and four mutations of the hostile-pack battery),
-`crates/armoury/src/packs.rs` (the loaded-pack log line), `tools/daemon-selftest.ps1` (ten
-checks), `CHANGELOG.md`, `compact.md` and this folder.
+`crates/armoury/src/packs.rs` (the loaded-pack log line), `tools/daemon-selftest.ps1`
+(eleven checks), `CHANGELOG.md`, `compact.md` and this folder.
 
 **Measured.**
 
 | | before | after |
 |---|---|---|
 | The unit tests | 364 (270 in `armoury`, 94 in `armoury-core`) | **370** (270 / 100) — **+6**, green in CI |
-| The harness checks | 108 `Check` calls | **118** — **+10**, green in CI |
+| The harness checks | 108 `Check` calls | **119** — **+11**, green in CI |
 | The release exe | 12,865,024 bytes (v1.1.5, the released tree) | **12,877,312 bytes** — **+12,288 (+0.10 %)**; the growth is code (+10,752 of `.text`) and the format strings (+1,024 of `.rdata`). `DECISIONS.md` §19 |
 | The daemon's idle cost | not measured | **not measured** — the phase adds two fields to the schema and changes no runtime path, and the idle cost of the 1.1.5 tree is itself not measured (the user declined the sampling) |
 
@@ -590,7 +591,7 @@ asset** (12,865,024 bytes, sha256 `947ef3dc…24a4` — the copy installed on th
 
 *The CI run:* **39777594088** (the workflow dispatch on the branch), the job **green** in
 **10m 54s**: the debug build, **370 unit tests** (270 + 100), and the self-test harness
-with **118 checks, all passed** — plus the release build and the artefact the size was
+with **119 checks, all passed** — plus the release build and the artefact the size was
 measured from.
 
 **Decisions.** `DECISIONS.md` §18: the defaults (`"pack"`, and the tracked app for every

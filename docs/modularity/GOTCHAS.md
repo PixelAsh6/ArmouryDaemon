@@ -292,7 +292,7 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     `armoury-core`) and **90 harness checks** — the ones the folder already carries.
     The delivered tree (A2 + the art fetch + the lockout re-timing) carries **364 unit
     tests** (270 / 94) and **108 harness checks**. The **A3 tree**
-    (`feature/a3-kind-triggers`) carries **370 unit tests** (270 / 100) and **118 harness
+    (`feature/a3-kind-triggers`) carries **370 unit tests** (270 / 100) and **119 harness
     checks** — and CI says the same numbers, which is the point of the anchored scan.
 32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
     built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
@@ -347,11 +347,11 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     *now*.**
 41. **serde drops the fields the schema does not know.** A pack that carried
     `"kind": "mode"` before A3 loaded as an ordinary pack — the field was read and
-    thrown away, not refused. So a new schema field is **not** a behaviour change
-    until something acts on it: the daemon still applies a mode pack the way it
-    applies any other pack, because the mode machinery is A4/A5. A field the
-    daemon does not know is not an error either — the packs-repo README says so
-    ("unknown fields are not part of the schema").
+    thrown away, not refused ("unknown fields are not part of the schema: the struct
+    drops them", the comment on the round-trip test in `pack.rs`). So a new schema
+    field is **not** a behaviour change until something acts on it: the daemon still
+    applies a mode pack the way it applies any other pack, because the mode machinery
+    is A4/A5.
 42. **A custom serde error carries no position of its own, and serde_json gives it
     one.** `serde::de::Error::custom` builds the error at line 0, column 0, but
     serde_json's `fix_position` replaces that with the position it was reading when
