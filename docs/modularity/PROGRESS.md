@@ -700,6 +700,8 @@ bent (`DECISIONS.md` §12 and §19 bend it; this one does not).
 | `39806787130` | CI on the fix branch (dispatch) - **red**: `'go' is a reserved keyword` in the new denial test | failed | 1m26s |
 | `39807213693` | CI on the code commit `41ba47e` (dispatch) | **green** - 378 tests, 133 harness checks, and the release profile | 8m49s |
 | `39809146891` | CI on the branch's tip `ada6f9c` (dispatch) - the same tree, with the folder on it | **green** - the same 378 tests and 133 checks; the artefact is the 12,879,360 bytes above | 7m46s |
+| `39810878555` | CI on `d750efe` - **cancelled by the next dispatch** (`cancel-in-progress` on the branch's concurrency group), not a failure | cancelled | 1m24s |
+| `39811080550` | CI on the branch's tip `18a7c28` (dispatch) - the anchors re-read, docs only | **green** - 378 tests, 133 checks, `ALL CHECKS PASSED` | 10m24s |
 
 **Decisions.** `DECISIONS.md` **20**: the gate covers the declarative steps, and
 `registry_set` gets a capability of its own (`registry`) instead of being folded into
