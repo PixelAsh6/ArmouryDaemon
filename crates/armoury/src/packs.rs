@@ -1283,24 +1283,31 @@ pub enum OverlayRequest {
     Hide,
 }
 
-/// The overlay requests the pack worker made, waiting for the daemon's main loop.
+/// The overlay request the pack worker made, waiting for the daemon's main loop.
 ///
 /// The pack worker cannot show the overlay itself: the black windows belong to the thread
 /// that pumps their messages, and that is the daemon's main loop. The request is carried
 /// over to that loop, which does the work and keeps owning the crash-recovery ledger and
 /// the keypress dismissal.
-static OVERLAY_REQUESTS: Mutex<Vec<OverlayRequest>> = Mutex::new(Vec::new());
+///
+/// **One pending request, not a queue.** Every request the daemon carries out costs a black
+/// window per monitor, a write and a delete of `idle.marker`, and a pack job; a script with a
+/// thousand `overlay_show`/`overlay_hide` pairs in it would keep the daemon thrashing for
+/// minutes. Only the last request is still worth carrying out — the ones before it are
+/// asking for a state the machine is about to leave anyway.
+static OVERLAY_REQUESTS: Mutex<Option<OverlayRequest>> = Mutex::new(None);
 
-/// Ask the daemon to show or take away the idle overlay.
+/// Ask the daemon to show or take away the idle overlay. The request replaces the one that
+/// was still waiting: the daemon acts on the newest wish, never on a backlog of them.
 pub fn request_overlay(request: OverlayRequest) {
-    let mut requests = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-    requests.push(request);
+    let mut pending = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    *pending = Some(request);
 }
 
-/// The overlay requests that are waiting, taken away so the daemon does them once.
-pub fn take_overlay_requests() -> Vec<OverlayRequest> {
-    let mut requests = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::take(&mut *requests)
+/// The overlay request that is waiting, taken away so the daemon does it once.
+pub fn take_overlay_request() -> Option<OverlayRequest> {
+    let mut pending = OVERLAY_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    pending.take()
 }
 
 /// Reject a pack whose scripts do not compile, before it is loaded or installed.

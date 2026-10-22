@@ -22,7 +22,8 @@
 //!   window: only a change that actually happened starts one.
 //! - A change of the cooldown **re-times the window that is running**: the window keeps its
 //!   start and takes the new length, so it ends at `start + cooldown`. The setting is in force
-//!   at once, and a window is never a mix of the old and the new length (2026-10-22).
+//!   at once, and a window is never a mix of the old and the new length (2026-10-22). A window
+//!   that has already ended is dropped with it, never re-timed (2026-10-23).
 //! - The capture of the "previous" state therefore always happens on a settled machine: a fast
 //!   app restart can no longer capture the daemon's own value back (the "stuck on Turbo" bug),
 //!   and the carry no longer has to paper over it.
@@ -123,11 +124,17 @@ impl Engine {
     /// A new length that is shorter than the time the window has already run ends the
     /// window at once — a window cannot end before it began — and the change it was
     /// holding lands with the next tick.
-    pub fn set_cooldown(&mut self, cooldown: Duration) {
+    ///
+    /// A window that has **already ended** is dropped, not re-timed: the engine keeps it
+    /// until a tick reaps it, and the daemon drains a pipe request *before* that tick runs,
+    /// so a new length used to bring a dead window back to life — a countdown on the
+    /// dashboard and a held launch for a cooldown that was never really running.
+    pub fn set_cooldown(&mut self, cooldown: Duration, now: Instant) {
         self.cooldown = cooldown;
-        if let Some(w) = self.lock.as_mut() {
-            w.len = cooldown;
-        }
+        self.lock = match self.lock {
+            Some(w) if w.end() > now => Some(Window { len: cooldown, ..w }),
+            _ => None,
+        };
     }
 
     /// What the user should see: the lockout first, then the state of the packs.
@@ -1086,7 +1093,7 @@ mod tests {
         assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(10)));
 
         // the user changes the cooldown to 60 s while that window is running
-        e.set_cooldown(Duration::from_secs(60));
+        e.set_cooldown(Duration::from_secs(60), now);
 
         // the window in flight now runs 60 s from its start, not 10 s
         assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(60)));
@@ -1119,7 +1126,7 @@ mod tests {
         assert_eq!(e.pending_change(), Some(Transition::Reverted));
 
         // the user changes the cooldown to 60 s while the window is running
-        e.set_cooldown(Duration::from_secs(60));
+        e.set_cooldown(Duration::from_secs(60), now + Duration::from_secs(5));
 
         // the old expiry passes: nothing lands — the window now ends 60 s after the start
         let old_expiry = now + Duration::from_secs(10);
@@ -1156,7 +1163,7 @@ mod tests {
         assert!(e.is_applied());
 
         // the user shortens the cooldown to 5 s, but the window has already run 30 s
-        e.set_cooldown(Duration::from_secs(5));
+        e.set_cooldown(Duration::from_secs(5), now + Duration::from_secs(30));
         assert_eq!(
             e.cooldown_remaining(now + Duration::from_secs(30)),
             None,
@@ -1169,5 +1176,42 @@ mod tests {
             Some(Transition::Reverted)
         );
         assert!(!e.is_applied());
+    }
+
+    #[test]
+    fn a_cooldown_changed_while_the_window_is_settled_does_not_resurrect_it() {
+        // The daemon drains a pipe request *before* the 1 Hz housekeeping runs `tick`, so a
+        // window that has ended can still be in the engine when a new length arrives. Re-timing
+        // it made a dead window alive again: the dashboard showed a fresh countdown and the
+        // next launch was held for it (23 Oct review).
+        let now = t0();
+        let mut e = Engine::new(Duration::from_secs(5));
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 1, now),
+            Some(Transition::Applied)
+        );
+        // the game closes inside the window: the revert is held
+        assert_eq!(e.on_stopped("game.exe", 1, now + Duration::from_secs(1)), None);
+        // the window ends: the revert lands and starts a window of its own [5, 10]
+        assert_eq!(e.tick(now + Duration::from_secs(5)), Some(Transition::Reverted));
+        assert!(!e.is_applied());
+
+        // 11 s: that window has ended too, and nothing is waiting. No tick has reaped it.
+        let settled = now + Duration::from_secs(11);
+        assert_eq!(e.state(settled), EngineState::Idle);
+        e.set_cooldown(Duration::from_secs(60), settled);
+
+        assert_eq!(
+            e.cooldown_remaining(settled),
+            None,
+            "a window that has ended is not re-timed"
+        );
+        assert_eq!(e.state(settled), EngineState::Idle);
+        // and the next launch is not held behind a window that never started
+        assert_eq!(
+            e.on_started("game.exe", "game.exe", 2, settled),
+            Some(Transition::Applied),
+            "the dead window must not hold the next launch"
+        );
     }
 }
