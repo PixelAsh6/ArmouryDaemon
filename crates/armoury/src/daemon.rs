@@ -1235,9 +1235,12 @@ impl App {
                 .engine
                 .cooldown_remaining(now)
                 .map(|d| d.as_millis() as u64),
-            // The wire format keeps the field, but the engine no longer plans a switch: it
-            // only knows the lockout, which is reported as the remaining time.
-            cooldown_action: None,
+            // What the window is holding back, if anything: the engine knows the change
+            // that is waiting for the lockout to end, and the dashboard says so.
+            cooldown_action: self.engine.pending_change().map(|t| match t {
+                Transition::Applied => "apply".to_string(),
+                Transition::Reverted => "revert".to_string(),
+            }),
             cooldown_seconds: self.cfg.cooldown_seconds,
             paused: self.cfg.paused,
             killswitch_active: self.killswitch.is_active(),
