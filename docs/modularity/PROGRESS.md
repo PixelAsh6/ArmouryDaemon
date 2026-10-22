@@ -408,9 +408,9 @@ tree. **The baseline for the size rule on the delivered branch is 12,862,976 byt
 phase's code), the job **green** in **6 min 22 s**: the debug build, **359 unit tests**
 (268 + 91), and the self-test harness with **101 checks, all passed** — plus the
 release build and the artefact the size was measured from. The branch's tip was
-confirmed green afterwards in **39733574798** (**6 min 41 s**) and again in
-**39734338552** (**6 min 34 s**): the same 359 tests and the same 101 checks, every
-time.
+confirmed green afterwards, in **39733574798** (**6 min 41 s**), **39734338552**
+(**6 min 34 s**) and **39735476837** (**5 min 29 s**): the same 359 tests and the same
+101 checks every time. **The commits after those touch this folder only.**
 
 **Decisions.** `DECISIONS.md` §16: `audio_mute` returns the previous mute state **per
 session**, not per process and not as a count — a process can own several sessions and
