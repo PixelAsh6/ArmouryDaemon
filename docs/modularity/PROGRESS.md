@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A — **A1 done** (the TLS root store), A2 next |
-| **Next action** | **A2** — the capability-scoped host API (`WORK-ORDER.md` A2) |
-| **Branch** | `main` (the A1 commit is on top of `9276196`, version **1.1.4**, released) |
+| **Phase** | A — **A1 and A2 done** (the TLS root store, the capability-scoped host API), A3 next |
+| **Next action** | **A3** — `triggers` + `kind` in the pack schema (`WORK-ORDER.md` A3) |
+| **Branch** | `main` is at `0ecacd3` (version **1.1.4**); the A2 work is on **`feature/a2-capabilities`** |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none — the design is settled in `DECISIONS.md` |

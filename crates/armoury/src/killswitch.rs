@@ -4,7 +4,7 @@
 //! altered (windows we hid, audio sessions we muted and their previous mute state).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use log::{info, warn};
 use windows::Win32::Foundation::{HWND, LPARAM};
@@ -278,7 +278,7 @@ fn sessions() -> Vec<Arc<dyn Session>> {
 /// The stable name of an audio session. Windows gives every session an identifier; when
 /// it cannot be read, the process and the place of the session in the sweep stand in for
 /// it — that is not as good, but it is still the same session from one sweep to the next.
-fn session_id(control: &IAudioSessionControl2, pid: u32, index: usize) -> String {
+fn session_id(control: &IAudioSessionControl2, pid: u32, index: u32) -> String {
     unsafe {
         match control.GetSessionIdentifier() {
             Ok(pointer) => {
@@ -314,7 +314,18 @@ pub fn session_states() -> Vec<(u32, String)> {
 /// The sessions a host call muted, by process and by session name: exactly the ones it
 /// has to unmute again. A session the user had muted already is not in here — it was not
 /// changed, and it must never be unmuted again.
-static MUTED_BY_HOST: Mutex<HashMap<u32, HashSet<String>>> = Mutex::new(HashMap::new());
+///
+/// A `OnceLock` and not a plain `Mutex`: `HashMap::new` is not a `const fn`, so the map
+/// cannot be built in the static's own initializer.
+static MUTED_BY_HOST: OnceLock<Mutex<HashMap<u32, HashSet<String>>>> = OnceLock::new();
+
+/// The ledger of the sessions a host call muted.
+fn muted_by_host() -> MutexGuard<'static, HashMap<u32, HashSet<String>>> {
+    MUTED_BY_HOST
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 /// Mute (or unmute) the audio sessions of one process, and report what changed.
 ///
@@ -326,7 +337,7 @@ pub fn mute_pid(pid: u32, muted: bool) -> String {
     let mut left_alone = 0usize;
     let mut failed = 0usize;
     {
-        let mut ledger = MUTED_BY_HOST.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ledger = muted_by_host();
         for session in sessions.iter().filter(|s| s.pid() == pid) {
             let Some(was) = session.is_muted() else {
                 left_alone += 1; // the state cannot be read: the session is left alone

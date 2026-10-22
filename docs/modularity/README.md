@@ -37,7 +37,8 @@ background.
 
 ## Current state
 
-- Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`.
+- Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The A2 work is
+  on **`feature/a2-capabilities`**, on top of `0ecacd3` (version **1.1.4**).
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -45,8 +46,11 @@ background.
   store**, not Mozilla's bundled roots, so it works behind a corporate CA. The client is
   one `ureq::Agent`, the user's WinINet proxy settings are read, and the responses are
   compressed. See `PROGRESS.md`.
-- **The tree is clean and everything is committed.** There is no uncommitted work to
-  protect.
+- **Phase A2 is done** — the host API is **scoped by capability**. A pack declares the
+  capabilities it wants; the daemon keeps **one engine per capability set** and
+  registers only the granted functions on it, so a call to a function the pack was not
+  granted fails as an *unknown function*. The denial names the missing capability and
+  what the pack asked for, and it lands in the pack's log. See `PROGRESS.md`.
 - ~60 % of the request is **already shipped**: G-Helper, Rainmeter and Wallpaper
   Engine are data packs that the catalog already downloads, verifies and installs.
 - The gap is the **killswitch**, **idle mode** and the **console launcher**.
@@ -66,14 +70,17 @@ background.
 
 ## The next action
 
-**Phase A2 — the capability-scoped host API.** A pack declares the capabilities it needs
-and the daemon grants only those: a call to a function that was not granted has to fail as
-an **unknown function**, not as a runtime check a call site could forget.
+**Phase A3 — `triggers` + `kind` in the pack schema.** The pack gains a `kind`
+(`"pack"` or `"mode"`) and a `triggers` list, both **additive**: the three shipped
+packs must keep working unchanged, and a malformed `kind` has to be a named error like
+the other schema errors. `WORK-ORDER.md` A3.
 
-`DESIGN.md` §2 has the capability table and §3 the mechanism — **one engine per capability
-set**, because the sandbox keeps one engine per thread since 1.1.3, so "register less" is
-no longer free. The full phase list is in `WORK-ORDER.md`. Phases run in order:
-**A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and settled.
+A2 is the phase before it: the capability-scoped host API. A pack declares the
+capabilities it needs and the daemon grants only those — **one engine per capability
+set** (`DESIGN.md` §3), because the sandbox keeps one engine per thread since 1.1.3, so
+"register less" is no longer free. The full phase list is in `WORK-ORDER.md`. Phases run
+in order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and
+settled.
 
 ---
 

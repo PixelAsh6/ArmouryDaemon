@@ -293,3 +293,96 @@ files this phase was told not to touch.
 - Rewriting the pack format wholesale. `spec: 1` and `spec: 2` stay; `kind` and
   `triggers` are additive.
 - Moving the engine's mode semantics anywhere new (see §2).
+
+---
+
+## 14. The host API is scoped by capability, one engine per capability set
+
+**Settled — implemented in A2.** A pack declares the capabilities it wants
+(`"capabilities": ["files"]`) and the daemon grants only those. A call to a host
+function of a capability that was **not** granted fails as an **unknown function**:
+the function is not on the engine at all, so the denial is structural — there is no
+call site that could forget to check.
+
+The taxonomy lives in the schema (`armoury_core::pack::Capability` and `CapSet`), the
+engine cache in the sandbox (`script.rs`, `ENGINES`).
+
+**Why one engine per capability set.** The sandbox has kept one engine per thread
+since 1.1.3, so "register fewer functions" is no longer free — a second engine costs
+~433 µs to build. The alternatives were both rejected:
+
+- **One shared engine plus a dispatcher** that consults the grant set at call time.
+  Cheaper in memory, but the denial becomes a runtime branch — a call site could
+  forget it, and that is exactly the property the phase is buying.
+- **One engine per pack.** Throws the 1.1.3 caching win away.
+
+Rhai has no `unregister_fn`, and `disable_symbol` only disables keywords and
+operators, so "register less" and "check at call time" are the only two mechanisms
+available. The engines are keyed by the capability set, so packs that ask for the same
+capabilities share one, and the map is capped at 32 like the AST cache.
+
+**Why the taxonomy is in the schema crate.** The permission window (Phase B4) has to
+show what a module may do, and it has to know the same table the gate uses. Two lists
+would drift.
+
+### The `sleep` decision: `time` is a capability of its own
+
+**Settled.** The table as it was written down listed 17 of the 18 existing host
+functions: **`sleep` was in no capability at all**. Under per-capability-set engines a
+pack whose script called `sleep` would have failed as an unknown function — the
+taxonomy had a hole in it.
+
+`time` is the capability for it, and it is a capability of its own because:
+
+- **It grants nothing.** `sleep` is a flow-control primitive: it touches no file, no
+  process and no window. Every other capability is a *power*; `time` is not.
+- **The budgets already bound it.** The operation budget (500 000 operations) and the
+  wall clock (10 s) are re-armed before every run, and `sleep` is clamped to 10 s.
+  A capability that grants nothing needs no second limit of its own.
+- **Folding it in would give it away.** Putting `sleep` in `context` would hand a
+  pack that only reads the context a way to stall the pack worker; putting it in
+  `time` keeps the grant list honest — a pack that wants to wait says so.
+
+**Rejected:**
+
+- **Putting `sleep` in `context`** (the read-only capability). It would have made
+  every pack that reads the context able to block the worker, for no reason.
+- **Putting `sleep` in `journal`** (the pack's own log). Same problem, and it would
+  have made the read-only capability a write.
+- **Leaving it out of the table** and special-casing it in the engine (always
+  registered). That is a hole in the taxonomy: the table would not be the list of what
+  a pack may call, and the permission window could not show it.
+- **A `sleep` with a tighter clamp** (say 1 s). The 10 s clamp is not this phase's
+  business, and the wall clock already stops the run.
+
+### The default of the `capabilities` field is every capability
+
+**Settled.** `DESIGN.md` §1 originally said the default was `[]`. That is wrong for
+the shipped packs: the Rainmeter pack's script uses `window_message`, and a pack that
+asks for nothing would lose it. The field is **additive** and defaults to every
+capability, so the three shipped packs keep working unchanged.
+
+The field is what the pack **asks** for. The user's own grant list (the permission
+window, Phase B4) comes later and narrows it down: the effective grant is the
+intersection of the two. Until the permission window exists, the ask is everything.
+
+**Rejected: refusing a pack that declares no capability.** It is a legal thing to
+write — a pack that only reads its context — and the daemon can serve it.
+
+### The overlay is a request to the daemon, not a call from the pack
+
+**Settled.** `overlay_show()` and `overlay_hide()` do not touch a window. The black
+windows belong to the thread that pumps their messages, and that is the daemon's main
+loop; a window created on the pack worker would never be painted and could not be
+dismissed by a keypress.
+
+So the host function hands a request over (`packs::request_overlay`), the daemon's main
+loop picks it up and carries it out as its own **idle mode** (`enter_idle` /
+`exit_idle`), and the daemon keeps owning the crash-recovery ledger, the keypress
+dismissal and the idle-mode policy. `overlay_show` therefore means "the daemon enters
+idle mode", and the pack sees the request accepted, not the overlay on the screen.
+
+**Rejected: creating the windows on the pack worker.** The message queue belongs to
+the creating thread, so the daemon's pump would never reach those windows, and
+`DestroyWindow` from another thread is not a thing to rely on.
+

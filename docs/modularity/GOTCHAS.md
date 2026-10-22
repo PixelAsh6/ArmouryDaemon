@@ -219,6 +219,40 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     harness probes the public catalogue instead.
 24. **`Cargo.lock` carries two `windows-sys` versions now**: 0.61.2 (the project's) and
     0.52.0 (from `rustls-platform-verifier`). That is normal — do not "fix" it.
+25. **Rhai's "unknown function" is also what a wrong argument type produces.** A call
+    to a function that is on the engine but with the wrong arguments comes back as
+    `ErrorFunctionNotFound` too — exactly like a call to a function that is not on the
+    engine at all. The capability gate reads the function name out of that error
+    (`script.rs:265`, `denial`), so it **must** check that the capability really was
+    not granted before it calls the call a denial. A pack that was granted `exec` and
+    called `ctx.run_cli(42)` must not be told it needs the `exec` capability.
+26. **Rhai names a call by its signature, not by its name**: the error carries
+    `"run_cli (ScriptHost, &str | ImmutableString | String)"`. The name has to be cut
+    off at the first space before it can be looked up in the capability table.
+27. **An AST belongs to no engine.** The compiled script is resolved against the
+    engine when it *runs*, so one AST cache serves every capability set — only the
+    engine is per capability set. A pack's script may therefore be compiled by the
+    daemon's main thread (the install-time check) and run on the pack worker's
+    restricted engine.
+28. **COM is per thread.** The daemon's main thread has an apartment
+    (`killswitch::init_com()`), but the **pack worker is a thread of its own** — a pack
+    that asks for the `audio` capability needs one too, or every audio call fails.
+    `packs::start` sets it up.
+29. **A window belongs to the thread that created it.** The message queue of the
+    overlay's windows lives on the thread that created them, so a pack worker cannot
+    show the idle overlay itself: the daemon's main loop owns it, and the host
+    function hands the request over.
+30. **The COM interfaces of the `windows` crate are not `Send`.** A global ledger
+    cannot hold the audio session objects (the killswitch's own `Ledger` is a plain
+    struct on the main thread for that reason). The host's ledger therefore holds the
+    **session identifier** — a string — and matches the sessions of a sweep by it.
+31. **The test and harness counts in this folder were low.** The A1 entry says 341
+    unit tests and 90 harness checks; the same scan over the same tree counts **345
+    and 95**. The numbers in this file are the measured ones — count them again
+    before writing them down.
+32. **`HashMap::new()` is not a `const fn`.** A global ledger that is a map cannot be
+    built in a static's own initializer (`Mutex::new` and `Vec::new` are const, a
+    `HashMap` is not) — use a `OnceLock` and build the map in `get_or_init`.
 
 ---
 
