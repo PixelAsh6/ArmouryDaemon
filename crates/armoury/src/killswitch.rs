@@ -278,7 +278,7 @@ fn sessions() -> Vec<Arc<dyn Session>> {
 /// The stable name of an audio session. Windows gives every session an identifier; when
 /// it cannot be read, the process and the place of the session in the sweep stand in for
 /// it — that is not as good, but it is still the same session from one sweep to the next.
-fn session_id(control: &IAudioSessionControl2, pid: u32, index: u32) -> String {
+fn session_id(control: &IAudioSessionControl2, pid: u32, index: i32) -> String {
     unsafe {
         match control.GetSessionIdentifier() {
             Ok(pointer) => {
