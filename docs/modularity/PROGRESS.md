@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2 and A3 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`), the review of 1.1.5 **merged and shipped as 1.1.6**. A4 next |
 | **Next action** | **A4** - a separate worker queue for modes (`WORK-ORDER.md` A4). 1.1.6 is published and installed; the next release is the user's call |
-| **Branch** | `main` - the merge **`95b0797`** and the release content **`a61740f`**, which carries the annotated tag **`v1.1.6`**. Both runs green (`39816227849`, `39818292103`) |
+| **Branch** | `main` - the merge **`95b0797`**, the release content **`a61740f`** (which carries the annotated tag **`v1.1.6`**) and the docs **`aeb1c74`**. Every run green: `39816227849`, `39818292103`, `39822071450` |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -778,6 +778,7 @@ the review's fixes, and `DECISIONS.md` §19 already records the schema phase's b
 | `39818292103` | CI on `main` at `a61740f` (the version, the notes, the changelog) | green - 378 tests, 133 checks, `ALL CHECKS PASSED` | 6m53s |
 | `39819468547` | CI on the tag `v1.1.6` | green - 378 tests, 133 checks | 9m58s |
 | `39819468439` | **Release** on `v1.1.6` | green - built, wrote the sidecar, published, re-downloaded and verified its own assets | 7m27s |
+| `39822071450` | CI on `main` at `aeb1c74` (the folder and the README, docs only) | green - 378 tests, 133 checks | 4m08s |
 
 **The published release.** `https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.6`,
 published 2026-10-22 17:11:47Z, two assets and nothing else:
