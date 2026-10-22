@@ -127,10 +127,13 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 1. **The `ureq` root store bug — fixed in A1.** `features = ["rustls"]` only → Mozilla
    roots, not the Windows cert store → the catalog failed behind any corporate CA. The
    fix is the `platform-verifier` feature **and** `RootCerts::PlatformVerifier` together.
-   **The art fetches still have it**: `art.rs:991` and `console_ui.rs:1320` make their own
-   `ureq::get(...)` calls with no TLS config, so the SteamGridDB lookups are still
-   validated against the bundled roots. Same bug, still open.
-2. **The pack worker is a single serial thread** (`packs.rs:160`,
+   **The art fetches had the same bug and had it fixed as well** — they now share the
+   catalogue's client (`art.rs:995` and `console_ui.rs:1324`, both `catalog::agent()`),
+   so the SteamGridDB lookups are validated against the Windows certificate store too.
+   That fix is **another agent's work** (`fix/art-fetch-windows-root-store`); a tree
+   without it still has the bug in the art fetches, and the binary still carries
+   Mozilla's bundled roots because of it.
+2. **The pack worker is a single serial thread** (`packs.rs:168`,
    `while let Ok(job) = jobs.recv()`). A slow mode would block every later apply and
    revert. Modes need their own worker.
 3. **The engine is cached, and the cache is keyed by the capability set** (A2). Since

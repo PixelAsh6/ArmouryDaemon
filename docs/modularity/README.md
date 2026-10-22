@@ -65,7 +65,7 @@ background.
 | Done | Effect | Where |
 |---|---|---|
 | The script sandbox keeps **one engine per capability set** (since A2); budgets re-armed per run | 432.7 µs build cost paid once; a run spends 4.7 µs | `crates/armoury/src/script.rs:90` |
-| The killswitch enumerates audio sessions **once per press**; release restores from the ledger without enumerating | ~45 ms off the event loop per press | `crates/armoury/src/killswitch.rs:108`, `:271` |
+| The killswitch enumerates audio sessions **once per press**; release restores from the ledger without enumerating | ~45 ms off the event loop per press | `crates/armoury/src/killswitch.rs:121`, `:415` |
 | The watcher **skips the process-table walk when nothing is tracked** | ~19.5 ms/s of idle cost gone | `crates/armoury/src/watch.rs:174` |
 | The **lockout model was rewritten** — again on 2026-10-22: it holds a change in **both** directions | the packs no longer flip under a running game, and a start inside a window no longer changes the machine in the middle of a cooldown | `crates/armoury-core/src/engine.rs` (`try_change` `:314`, `tick` `:291`) |
 | The **release carries only the executable and its 85-byte sidecar** — no zip, no scripts | the executable installs itself; the scripted install lives in the repository's `deploy\` folder | `.github/workflows/release.yml` |

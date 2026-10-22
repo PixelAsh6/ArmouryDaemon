@@ -242,7 +242,7 @@ back the same way from Rhai — that is not a denial and is not reported as one.
     ☐ Run external programs        ← separate, explicitly labelled group
   ```
 - **Discovered dropdown values.** The last piece of per-pack hardcoding is
-  `crates/armoury/src/daemon.rs:733` (`if p.pack.id == "rainmeter"`) plus
+  `crates/armoury/src/daemon.rs:749` (`if p.pack.id == "rainmeter"`) plus
   `packs::rainmeter_layouts()` (`packs.rs:795-814`). A pack must be able to declare
   that its dropdown values are *discovered* (e.g. from a directory) rather than
   hardcoded in the daemon.
@@ -266,12 +266,12 @@ module needs.
 | Concern | Where | What changes |
 |---|---|---|
 | Mode worker | `packs.rs:149` (`packs::start`) | a **second** worker thread and channel for modes, so a slow mode never blocks a pack apply/revert |
-| Mode triggers | `daemon.rs:1693` / `:1697` (the hotkey handlers) and the tray menu | a mode's trigger dispatches to its own worker |
-| `suspends_packs` | `daemon.rs:1710` (`enter_idle`) / `:1743` (`exit_idle`) | the mode drives `Engine::set_idle` |
-| `react_to_tracked` | `daemon.rs:1334-1339` | a tracked app starting while the mode is engaged re-engages it |
-| Installing a module | `daemon.rs:2556` (the `InstallPack` handler) | one handler per kind |
-| The console helper | `daemon.rs:2008` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
-| The killswitch | `daemon.rs:1778` (`toggle_killswitch`) | it has **no config key and no IPC request** today; add both |
+| Mode triggers | `daemon.rs:1709` / `:1713` (the hotkey handlers) and the tray menu | a mode's trigger dispatches to its own worker |
+| `suspends_packs` | `daemon.rs:1726` (`enter_idle`) / `:1759` (`exit_idle`) | the mode drives `Engine::set_idle` |
+| `react_to_tracked` | `daemon.rs:1350` | a tracked app starting while the mode is engaged re-engages it |
+| Installing a module | `daemon.rs:2572` (the `InstallPack` handler) | one handler per kind |
+| The console helper | `daemon.rs:2024` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
+| The killswitch | `daemon.rs:1794` (`toggle_killswitch`) | it has **no config key and no IPC request** today; add both |
 
 The pack worker is a **single serial thread** (`packs.rs:168`,
 `while let Ok(job) = jobs.recv()`) — that is the reason for the second worker.
@@ -288,7 +288,7 @@ The pack worker is a **single serial thread** (`packs.rs:168`,
   `Request::ConsoleHello`. **No new protocol is needed.**
 - **Consider moving the SteamGridDB key out of the elevated daemon.** Today
   `cfg.sgdb_api_key` is in the daemon's config and the daemon does the art lookups
-  (`daemon.rs:2456`, `daemon.rs:2507`). If the console owns the art code, the key can
+  (`daemon.rs:2135`, `daemon.rs:2469`). If the console owns the art code, the key can
   live with it — but a child of an elevated daemon inherits elevation, so a
   *non-elevated* helper needs a linked-token `CreateProcessWithTokenW`. **Decide
   explicitly; do not half-do it.**

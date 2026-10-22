@@ -179,6 +179,13 @@ is accepted — the size rule bends for a fix that makes the catalogue reachable
   catalogue — but it is the same bug and it is **still open**. It is also why the binary
   grew: the **Mozilla roots are still in it** (they are only used by those two calls), and
   moving them to the shared client would take them out again.
+  **Superseded on 2026-10-22 (the same day, later):** the art fetches now share the
+  catalogue's client (`art.rs:995`, `console_ui.rs:1324`), so they are validated against
+  the Windows certificate store too, and the bundled roots are out of the binary. That is
+  **another agent's work** (`fix/art-fetch-windows-root-store`), and it is why the size
+  baseline on this branch is *lower* than the A1 one — see the entry at the end of this
+  file and `GOTCHAS.md` trap 36. On a tree without that commit, the bullet above still
+  holds.
 - A **self-signed certificate cannot be used for a local TLS server** on Windows: `SslStream`
   refuses it with *"the platform does not support ephemeral keys"*. A probe that shows the
   daemon **refusing** an untrusted certificate is therefore not possible without a key in the
@@ -429,10 +436,10 @@ next to the size of the A2-only tree, because a number without its tree is not a
   a median of several, alternating between the two binaries.
 - **`windows::Win32::UI::WindowsAndMessaging::IsWindow` takes an `Option<HWND>`,**
   while `IsWindowVisible` next to it takes a plain `HWND`. The first CI run of this
-  session failed on exactly that one line (`packs.rs:1229`) — and because it was the
-  only error, it also proved that the rest of the change type-checked. The vendored
-  source is in `%USERPROFILE%\.cargo\registry\src\…\windows-0.62.2`: read it, do not
-  remember it.
+  session failed on exactly that one line (`packs.rs:1225`, `window_exists`) — and
+  because it was the only error, it also proved that the rest of the change
+  type-checked. The vendored source is in
+  `%USERPROFILE%\.cargo\registry\src\…\windows-0.62.2`: read it, do not remember it.
 - **A pack whose capability list does not include `journal` cannot call `ctx.log`** —
   and the harness's capability pack had exactly that in its revert script. It was
   harmless (the revert is skipped by its guard), but it was one guard away from a
