@@ -257,7 +257,9 @@ for the next phase is now 12,925,440 bytes.
 *The CI run:* **39707130123** (the workflow dispatch on the measurement branch), the job
 **green** in **9 min 31 s**: the debug build, **353 unit tests**, and the self-test
 harness with **95 checks, all passed** — plus the release build and the artefact the
-size was measured from.
+size was measured from. The branch's tip was confirmed green afterwards in
+**39708602555** (**7 min 48 s**): the same 353 tests, the same 95 checks, and the same
+**12,925,440-byte** executable.
 
 **Decisions.** `DECISIONS.md` §14: the taxonomy, one engine per capability set, the
 **`time` capability for `sleep`**, the default of the `capabilities` field, and the
