@@ -3,7 +3,7 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.1.6] - 2026-10-22
 
 ### Added
 
@@ -253,6 +253,7 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 - The spec 2 pack script host: a pack may carry a small Rhai script, and the daemon runs it in a
   sandboxed interpreter.
 
+[1.1.6]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.6
 [1.1.5]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.5
 [1.1.4]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.4
 [1.1.3]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.3
