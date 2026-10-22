@@ -263,7 +263,12 @@ fn run_with_budget(
 /// like every other one, and it says which capability it needs and what the pack asked
 /// for.
 fn denial(caps: CapSet, error: &EvalAltResult) -> Option<String> {
-    let EvalAltResult::ErrorFunctionNotFound(signature, _) = error else {
+    // Rhai wraps an error raised inside a script-defined function: the failed call is the
+    // *function*, and the unknown host function hides one level down in
+    // `ErrorInFunctionCall` (or `ErrorInModule`). Matching the top-level error alone missed
+    // every denial in a script that had a function of its own, and the user was shown the
+    // raw "Function not found" of the wrapper instead of the REFUSED line.
+    let EvalAltResult::ErrorFunctionNotFound(signature, _) = error.unwrap_inner() else {
         return None;
     };
     // Rhai names the call by its signature: "run_cli (ScriptHost, &str | ...)".
@@ -904,6 +909,27 @@ mod tests {
             err.contains("REFUSED"),
             "the denial is written to the pack's log: {err}"
         );
+    }
+
+    #[test]
+    fn a_denial_inside_a_script_defined_function_is_still_a_denial() {
+        // Rhai reports the call to the *script's own* function and hides the unknown host
+        // function inside it (ErrorInFunctionCall). The pack has to be told what it needs,
+        // not shown the raw "Function not found" of the wrapper (23 Oct review).
+        let mut ctx = ctx();
+        let err = run_with_capabilities(
+            r#"fn go(host) { host.run_cli("C:\\Windows\\System32\\cmd.exe", ["/c", "echo hi"]); }
+               go(ctx);"#,
+            &mut ctx,
+            files_only(),
+        )
+        .expect_err("the ungranted call must fail inside the function as well");
+        assert!(err.contains("REFUSED"), "{err}");
+        assert!(
+            err.contains("it needs the 'exec' capability"),
+            "the missing capability: {err}"
+        );
+        assert!(err.contains("the pack asked for: files"), "{err}");
     }
 
     #[test]
