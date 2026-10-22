@@ -1,7 +1,7 @@
 # ArmouryDaemon
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.4-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.1.5-blue.svg)](Cargo.toml)
 
 A resident Windows daemon that watches the applications you track and switches the rest of your
 machine around them. While a tracked app runs, Rainmeter, G-Helper and Wallpaper Engine get out
@@ -56,11 +56,11 @@ A pack may declare the daemon it needs (`"min_engine": "1.2.0"`). A daemon that 
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.4
+pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.5
 ```
 
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
-is `1.1.4`.
+is `1.1.5`.
 
 ### The lockout ("Cooldown")
 
@@ -81,6 +81,9 @@ change in **both** directions: while a window runs, no change may touch the pack
 - When the window is over: the held change lands **only if it is still wanted**, and it lands
   **exactly once**. The change that lands starts a lockout of its own.
 - A lockout that expires while the app still runs changes nothing and starts no new one.
+- A change of the cooldown **re-times the window that is running**: the window keeps its start and
+  takes the new length, so it ends at `start + cooldown`. A window is never a mix of the old and
+  the new length, and the change it holds lands at the new expiry — not at the old one.
 
 Because the "previous state" is always captured on a settled machine, the capture can never read
 the daemon's own value back.
@@ -139,6 +142,10 @@ art that exists — five Steam assets are tried before **SteamGridDB** is asked 
 missing file no longer means a **black** band. Without an API key the band falls back to the exe
 icon and then to a monogram.
 
+The cover art is fetched through the **same client** as the catalogue, so it is validated against
+the **Windows certificate store** too: a machine with a corporate CA — or one whose TLS is
+intercepted by a proxy — can still reach it.
+
 You are not stuck with the automatic pick. The **≡** menu in the band's top-left corner has
 **Choose artwork.**, which opens a picker with an **Icon** and a **Background** tab — the 2:3
 grids for the icon, the wide heroes for the background, each with its size and style under it.
@@ -162,6 +169,8 @@ art** only.
 The fetch is validated against the **Windows certificate store**, so a machine with a
 corporate CA — or one whose TLS is intercepted by a proxy — can still reach the catalogue. It
 goes through the proxy of the desktop session, the way every other app on the machine does.
+The cover art goes through the same client, so it shares the same root store and the same
+connection pool.
 
 ### The command line
 
@@ -173,12 +182,12 @@ ArmouryDaemon.exe --help
 ```
 
 `--catalog-url <url>` lists that catalogue instead of the configured one. `--version` prints
-`ArmouryDaemon 1.1.4`, `--help` prints the flags the binary accepts. An argument the binary
+`ArmouryDaemon 1.1.5`, `--help` prints the flags the binary accepts. An argument the binary
 does not know is an error — the usage on stderr, exit code 2 — so the daemon never starts on
 a typo.
 
 The release build is a **GUI-subsystem binary** (PE subsystem 2), so it prints to the console it
-attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.4` on stdout, once, and
+attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.5` on stdout, once, and
 exits 0. Redirected, the line goes to **both** stdout and stderr, so `2>&1 | Out-String` shows
 it **twice**. `cmd.exe`'s own `>` can misbehave, because the process attaches to the parent
 console (`AttachConsole`) and re-points the standard handles, so the file can come out empty
@@ -215,7 +224,9 @@ small, undecorated windows plus a tray icon:
   purple squircle instead of the default Windows application icon.
 - **The dashboard** opens undecorated in the bottom-right corner, above the system tray. It shows
   the state, the daemon's version, the uptime, the pack count, the tracked apps and the packs,
-  with a status band for *paused* and *cooling down*. Its Packs section also carries the built-in
+  with a status band for *paused* and *cooling down*. The cooling-down band names the app the
+  window belongs to, and the cooldown row says that a change is waiting behind the window while
+  one is. Its Packs section also carries the built-in
   **Console launcher** row.
 - **The Settings window** opens to the left of the dashboard: the **Cooldown** value, the
   idle failsafe, the installed packs (each with a **Remove**), the console launcher's open mode
@@ -243,7 +254,7 @@ AMD Excavator (2015) and later; see [Building from source](#building-from-source
 ### From the executable alone
 
 1. **Download** `ArmouryDaemon.exe` from the
-   [v1.1.4 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.4) and put it
+   [v1.1.5 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.5) and put it
    in a folder you can write to, for example `C:\Apps\ArmouryDaemon`. The release carries this
    executable and its `ArmouryDaemon.exe.sha256` sidecar — the SHA-256 of the file, so a swapped
    binary is detectable — and nothing else.
@@ -320,8 +331,8 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (339: 254 in armoury, 85 in armoury-core)
-powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 84-check integration harness
+cargo test                   # the unit tests (364: 270 in armoury, 94 in armoury-core)
+powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 108-check integration harness
 ```
 
 **The published executable has a fixed target.** `.cargo/config.toml` sets
