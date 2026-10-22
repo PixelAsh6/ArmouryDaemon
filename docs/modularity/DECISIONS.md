@@ -388,10 +388,18 @@ the creating thread, so the daemon's pump would never reach those windows, and
 
 ---
 
-## 15. The executable grows by 56,832 bytes — the size rule bends here, once
+## 15. The executable grows by 56,832 bytes - the size rule bends here, once
 
 **Settled — measured in A2.** The release build of the tree goes from **12,868,608
 bytes** (A1) to **12,925,440 bytes**: **+56,832 bytes, +0.44 %**.
+
+**The same phase on the branch it is delivered on costs a little more.** That branch
+also carries the art fetch through the Windows certificate store, and that work takes
+Mozilla's bundled roots **out** of the binary: its own baseline is **12,796,416
+bytes**, and the A2 work on top of it ends at **12,862,976 bytes** — **+66,560 bytes,
++0.52 %**. Both numbers are true; they are measured against different parents, and a
+number without its tree is not a number (`GOTCHAS.md` trap 35). **The baseline for the
+size rule on the delivered branch is 12,862,976 bytes.**
 
 **Why.** The phase delivers the design's capability table, and the table has **eight
 host functions that did not exist** (`windows_of`, `window_hide`, `window_show`,
@@ -426,7 +434,8 @@ the phase is about.
 **Known trade-off, accepted:** the phase adds bytes, and `WORK-ORDER.md` says only
 Phase E may. The reason is the one above, and the number is written down here so the
 next phase starts from the truth: **the baseline for the size rule is now 12,925,440
-bytes, not 12,868,608.**
+bytes on the A2-only tree and 12,862,976 bytes on the delivered branch, not
+12,868,608.**
 
 **The alternative, if the user wants the size flat:** the eight functions can move to
 the phase that brings the killswitch and idle modules (B/C), and A2 then ships the

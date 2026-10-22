@@ -104,7 +104,7 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
 | Named-pipe JSON round trip | **28.0 µs** (50 sequential: 32.5 µs/trip) |
 | SHA-256 | 1,312 MiB/s (32 MiB in 24.18 ms) |
 | Resident daemon | 2.0 MB private / 12.7 MB WS / 0.078 % of one core (measured pre-1.1.3) |
-| Resident daemon, **four tracked apps** | **1.72 % of one core** — 1.031 CPU seconds in 60 s (2026-10-22, A1). The difference is the 1 Hz process-table walk (trap 5): with nothing tracked it is skipped. **After A1: 1.692 %** (1.016 CPU s in 60 s) — unchanged, as it has to be. |
+| Resident daemon, **four tracked apps** | **1.72 % of one core** — 1.031 CPU seconds in 60 s (2026-10-22, A1). The difference is the 1 Hz process-table walk (trap 5): with nothing tracked it is skipped. **After A1: 1.692 %** (1.016 CPU s in 60 s) — unchanged, as it has to be. **After A2 (the delivered branch): 1.615 %** (0.969 CPU s in 60 s) — the **median of three 60 s samples**, alternating with the binary before it; the medians are the same, so the phase costs nothing at idle. |
 
 ### What the numbers decide
 
@@ -301,6 +301,11 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     A ledger of "the visibility this handle had before we hid it" is therefore wrong
     after the window is gone: check `IsWindow` before you report the old state, or a
     revert shows a window it should not.
+39. **One 60-second idle sample of the daemon proves nothing.** The samples of one and
+    the same binary scattered over **0.812–1.016 CPU s in 60 s** (1.35 %–1.69 % of a
+    core) on this machine, with the user's own desktop running. Measure **three
+    samples of each binary, alternating**, and compare the medians. A single sample
+    can make a change look like a 0.2 % swing that is really the noise.
 
 ---
 

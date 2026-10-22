@@ -38,9 +38,10 @@ background.
 ## Current state
 
 - Branch `main`, remote `https://github.com/PixelAsh6/ArmouryDaemon.git`. The A2 work is
-  on **`feature/a2-capabilities-clean`**, on top of `0ecacd3` (version **1.1.4**) and
-  with the A2 commits only. (The shared working tree sits on
-  `feature/a2-capabilities`, which carries another agent's commits as well.)
+  delivered on **`feature/a2-capabilities`** (tip `9acd3b6`), on top of `0ecacd3` and
+  the art fetch through the Windows certificate store (another agent's work). An
+  **A2-only** copy of the phase is on `feature/a2-capabilities-clean`; the two trees
+  have **different numbers** — a number without its tree is not a number.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -52,7 +53,9 @@ background.
   capabilities it wants; the daemon keeps **one engine per capability set** and
   registers only the granted functions on it, so a call to a function the pack was not
   granted fails as an *unknown function*. The denial names the missing capability and
-  what the pack asked for, and it lands in the pack's log. See `PROGRESS.md`.
+  what the pack asked for, and it lands in the pack's log. The host functions report
+  what they changed: `audio_mute` returns the **previous mute state** of every session
+  it touched and never unmutes a session the user had muted. See `PROGRESS.md`.
 - ~60 % of the request is **already shipped**: G-Helper, Rainmeter and Wallpaper
   Engine are data packs that the catalog already downloads, verifies and installs.
 - The gap is the **killswitch**, **idle mode** and the **console launcher**.
@@ -79,7 +82,7 @@ the other schema errors. `WORK-ORDER.md` A3.
 
 A2 is the phase before it: the capability-scoped host API. A pack declares the
 capabilities it needs and the daemon grants only those — **one engine per capability
-set** (`DESIGN.md` §3), because the sandbox keeps one engine per thread since 1.1.3, so
+set** (`DESIGN.md` §3), because the sandbox keeps an engine per thread since 1.1.3, so
 "register less" is no longer free. The full phase list is in `WORK-ORDER.md`. Phases run
 in order: **A → B → C → D**, and **E (WASM) is deferred** until the rest has shipped and
 settled.
