@@ -424,7 +424,7 @@ try {
     Check 'the apply starts a lockout' ($s.state -eq 'cooldown') "state=$($s.state)"
     Check 'the lockout counts down' ($s.cooldown_remaining_ms -gt 0 -and $s.cooldown_remaining_ms -le 5000) "remaining=$($s.cooldown_remaining_ms)"
     Check 'the applied state names the app' ($s.trigger_source -eq 'timeout.exe') "source=$($s.trigger_source)"
-    Check 'the daemon plans no switch any more' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
+    Check 'no change is waiting behind the window' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
 
     # ---- 5. the lockout ends while the app runs: nothing changes ----
     # A lockout that expires while the intent still holds changes nothing and starts no new one.
@@ -586,6 +586,45 @@ try {
     $s = Status
     Check 'the manual revert leaves no lockout behind' (($s.state -eq 'idle') -and ($null -eq $s.cooldown_remaining_ms)) "state=$($s.state) remaining=$($s.cooldown_remaining_ms)"
     $p6 | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # ---- 12b. a change of the cooldown re-times the window that is running ----
+    # The gap that let the defect through: the harness set the cooldown only *before* a
+    # scenario, so a window that was already running was never re-timed, and the change the
+    # window was holding landed at the old expiry. The window keeps its start and takes the
+    # new length, so the change lands at start + cooldown.
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $startAt = Get-Date
+    $p7 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    $s = Wait-State 'cooldown' 8
+    Check 'the start opens a window' ($s.state -eq 'cooldown') "state=$($s.state)"
+    $left = $s.cooldown_remaining_ms
+    Check 'the window runs with the old cooldown' ($left -gt 2000 -and $left -le 5000) "remaining=$left"
+    # the close is held by the window that is running
+    $reverts = @(Get-ChangeTimes 'revert').Count
+    $p7 | Stop-Process -Force
+    $held = $null
+    for ($i = 0; $i -lt 40 -and $null -eq $held; $i++) {
+        Start-Sleep -Milliseconds 250
+        $t = Status
+        if ($t -and $t.cooldown_action -eq 'revert') { $held = $t }
+    }
+    Check 'the close is held by the running window' ($null -ne $held) "action=$(($held).cooldown_action)"
+    # the user lengthens the cooldown while the window is running
+    Send-Pipe '{"type":"set_cooldown","seconds":20}' | Out-Null
+    Start-Sleep -Milliseconds 300
+    $after = (Status).cooldown_remaining_ms
+    Check 'the window in flight takes the new length' ($after -gt 14000 -and $after -le 20000) "before=$left now=$after"
+    # and the change the window holds lands at the new expiry, not at the old one
+    $times = @(Wait-Change 'revert' $reverts 40)
+    Check 'the held revert lands on the re-timed window' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $revertAt = $times[$times.Count - 1]
+    Check 'the change lands at the new expiry' ((Get-Gap $startAt $revertAt) -ge 12 -and (Get-Gap $startAt $revertAt) -le 32) "start=$startAt revert=$revertAt"
+    # the rest of the run uses the short cooldown again
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    $s = Wait-State 'idle' 20
+    Check 'the daemon goes idle after the re-timed window' ($s.state -eq 'idle') "state=$($s.state)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
 
     # ---- 13. config lives in the throw-away folder, not in %APPDATA% ----
     $tempConfig = Join-Path $configDir 'config.json'
@@ -771,7 +810,7 @@ try {
         $probe = Invoke-CliProbe @('--version')
         $r = $probe.Run
         Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
-        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.4')) "output=$(Get-FirstLine $r.Text)"
+        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.1.5')) "output=$(Get-FirstLine $r.Text)"
 
         # --help: the usage, exit 0, with every flag the parser accepts
         $probe = Invoke-CliProbe @('--help')
