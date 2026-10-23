@@ -853,7 +853,7 @@ fn merge_scoped(
     o: &packs::PackOutcome,
 ) {
     applied.retain(|p| !o.scoped.contains(p));
-    captured.retain(|k| !o.scoped.contains(k));
+    captured.retain(|k, _| !o.scoped.contains(k));
     if o.applied {
         // keep the journal so the matching revert restores the right state
         applied.extend(o.applied_ids.iter().cloned());
