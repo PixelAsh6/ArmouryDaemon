@@ -17,6 +17,7 @@ use armoury_core::config::{
     normalize_console_open,
 };
 use armoury_core::engine::{Engine, EngineState, Transition};
+use armoury_core::pack::PackKind;
 use armoury_core::protocol::{ArtListing, ArtSlot, Request, Response};
 use armoury_core::status::{LastError, PackSettingStatus, PackStatus, RunState, StatusSnapshot};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
@@ -245,8 +246,9 @@ pub fn run(start: Start) {
 
     let pack_catalog: Vec<PackMeta> = build_catalog(&installed);
     let (pack_tx, pack_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
+    let (mode_tx, mode_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
     let (pack_out_tx, pack_out_rx) = crossbeam_channel::unbounded::<packs::PackOutcome>();
-    packs::start(installed, pack_rx, pack_out_tx, wake_handle);
+    packs::start(installed, pack_rx, mode_rx, pack_out_tx, wake_handle);
     info!(
         "watching {} tracked app(s); cooldown {}s",
         cfg.tracked_apps.len(),
@@ -260,7 +262,24 @@ pub fn run(start: Start) {
             "journal: {} pack(s) were applied when the daemon last stopped — reverting now",
             job.enabled.len()
         );
-        let _ = pack_tx.send(job);
+        let packs::PackJob { apply, enabled, values, captured, .. } = job;
+        let (pack_enabled, mode_enabled) = split_enabled(enabled, &pack_catalog);
+        let _ = pack_tx.send(packs::PackJob {
+            apply,
+            tag: None,
+            enabled: pack_enabled,
+            values: values.clone(),
+            captured: captured.clone(),
+        });
+        if mode_enabled.values().any(|v| *v) {
+            let _ = mode_tx.send(packs::PackJob {
+                apply,
+                tag: None,
+                enabled: mode_enabled,
+                values,
+                captured,
+            });
+        }
     }
 
     // ---- tray icon + menu (created on this thread: it owns the message pump) ----
@@ -332,6 +351,7 @@ pub fn run(start: Start) {
         engine,
         search,
         pack_tx,
+        mode_tx,
         pack_out_rx,
         pack_catalog,
         applied_packs: Vec::new(),
@@ -780,6 +800,8 @@ pub struct PackMeta {
     pub id: String,
     pub name: String,
     pub version: String,
+    /// Which worker owns this pack's jobs (A4): a mode runs on the mode worker.
+    pub kind: PackKind,
     pub settings: Vec<armoury_core::pack::Setting>,
 }
 
@@ -790,9 +812,53 @@ fn build_catalog(installed: &[packs::Installed]) -> Vec<PackMeta> {
             id: p.pack.id.clone(),
             name: p.pack.name.clone(),
             version: p.pack.version.clone(),
+            kind: p.pack.kind,
             settings: p.pack.settings.clone(),
         })
         .collect()
+}
+
+/// Is this id a mode (a pack the mode worker owns)?
+fn is_mode(catalog: &[PackMeta], id: &str) -> bool {
+    catalog.iter().any(|m| m.id == id && m.kind == PackKind::Mode)
+}
+
+/// Split a whole-state job's enabled set by kind (A4): each worker only gets the packs of
+/// its own kind, so a slow mode cannot stand in front of a pack job on the pack worker.
+/// An id that is not in the catalogue keeps its old home (the pack worker).
+fn split_enabled(
+    enabled: HashMap<String, bool>,
+    catalog: &[PackMeta],
+) -> (HashMap<String, bool>, HashMap<String, bool>) {
+    let mut pack = HashMap::new();
+    let mut mode = HashMap::new();
+    for (id, on) in enabled {
+        if is_mode(catalog, &id) {
+            mode.insert(id, on);
+        } else {
+            pack.insert(id, on);
+        }
+    }
+    (pack, mode)
+}
+
+/// A4: merge one half's outcome into the applied state and the journal. Everything the
+/// outcome was scoped to belongs to it — apply takes the ids it reports and its
+/// captures, a revert hands the scope back. Two halves therefore merge in either arrival
+/// order, and a whole-state outcome (the single-worker scope) lands exactly where the
+/// old replace/clear put it.
+fn merge_scoped(
+    applied: &mut Vec<String>,
+    captured: &mut HashMap<String, HashMap<String, String>>,
+    o: &packs::PackOutcome,
+) {
+    applied.retain(|p| !o.scoped.contains(p));
+    captured.retain(|k| !o.scoped.contains(k));
+    if o.applied {
+        // keep the journal so the matching revert restores the right state
+        applied.extend(o.applied_ids.iter().cloned());
+        captured.extend(o.captured.clone());
+    }
 }
 
 struct App {
@@ -820,8 +886,13 @@ struct App {
     last_idle_beat: Option<Instant>,
     /// Pack search order (install folder first) — reused when packs are installed/removed.
     search: Vec<std::path::PathBuf>,
-    /// Jobs to the pack worker (apply/revert).
+    /// Jobs to the pack worker (apply/revert). Packs and modes have separate workers (A4);
+    /// the mode's channel carries the same job type, so a half of a transition is
+    /// indistinguishable from a whole job.
     pack_tx: crossbeam_channel::Sender<packs::PackJob>,
+    mode_tx: crossbeam_channel::Sender<packs::PackJob>,
+    /// Both workers report through one channel: an outcome carries the ids it was
+    /// scoped to, and the daemon merges the halves (A4).
     pack_out_rx: crossbeam_channel::Receiver<packs::PackOutcome>,
     pack_catalog: Vec<PackMeta>,
     /// Packs currently in the applied (game-mode) state.
@@ -1404,7 +1475,9 @@ impl App {
             self.broadcast_status();
             return;
         }
-        // Hand the transition to the pack worker (it owns the mechanisms).
+        // Hand the transition to the workers. A4: split the enabled set by kind — the pack
+        // half on the pack worker, the mode half on the mode worker — and pass `values` and
+        // `captured` whole to both (`run_job` looks them up per pack id).
         let job = packs::PackJob {
             apply: t == Transition::Applied,
             tag: None,
@@ -1422,7 +1495,7 @@ impl App {
                 .collect(),
             captured: self.captured_by_pack.clone(),
         };
-        let _ = self.pack_tx.send(job);
+        self.send_by_kind(job);
         match t {
             Transition::Applied => info!(
                 "packs applied (triggered by {})",
@@ -1431,6 +1504,35 @@ impl App {
             Transition::Reverted => info!("packs reverted"),
         }
         self.broadcast_status();
+    }
+
+    /// A4: a whole-state job goes out as two halves, one per worker — the pack half on the
+    /// pack worker, the mode half on the mode worker. `values` and `captured` stay whole
+    /// (`run_job` looks them up per pack id), and each outcome echoes the ids its half was
+    /// scoped to, so the daemon merges both halves order-independently.
+    fn send_by_kind(&self, job: packs::PackJob) {
+        let packs::PackJob { apply, tag, enabled, values, captured } = job;
+        let (pack_enabled, mode_enabled) = split_enabled(enabled, &self.pack_catalog);
+        let _ = self.pack_tx.send(packs::PackJob {
+            apply,
+            tag: tag.clone(),
+            enabled: pack_enabled,
+            values: values.clone(),
+            captured: captured.clone(),
+        });
+        // The mode half is skipped when no mode is part of the job: waking a worker to
+        // report that everything is disabled would only add an empty outcome to merge.
+        if mode_enabled.values().any(|v| *v) {
+            let _ = self
+                .mode_tx
+                .send(packs::PackJob { apply, tag, enabled: mode_enabled, values, captured });
+        }
+    }
+
+    /// The worker that owns this pack's jobs (A4): a tagged, single-pack operation (a
+    /// disable/remove of something currently applied) goes to that pack's own worker.
+    fn worker_for(&self, id: &str) -> &crossbeam_channel::Sender<packs::PackJob> {
+        if is_mode(&self.pack_catalog, id) { &self.mode_tx } else { &self.pack_tx }
     }
 
     fn set_paused(&mut self, paused: bool) {
@@ -1484,14 +1586,11 @@ impl App {
             return;
         }
 
-        if o.applied {
-            self.applied_packs = o.applied_ids.clone();
-            // keep the journal so the matching revert restores the right state
-            self.captured_by_pack = o.captured.clone();
-        } else {
-            self.applied_packs.clear();
-            self.captured_by_pack.clear();
-        }
+        // A4: merges the two halves of a whole-state job order-independently. Each half
+        // echoes the ids its job was scoped to, so one half never touches the other's part
+        // of the applied state or the journal — and for the common single-worker case the
+        // scope is everything, which lands exactly where the old replace/clear put it.
+        merge_scoped(&mut self.applied_packs, &mut self.captured_by_pack, &o);
         for line in &o.succeeded {
             info!("pack {line}");
         }
@@ -1563,16 +1662,18 @@ impl App {
         }
     }
 
-    /// Re-read the packs folders (after an install/remove) and give the worker the new list.
-    /// Dropping the old sender makes the old worker thread exit on its own.
+    /// Re-read the packs folders (after an install/remove) and give the workers the new
+    /// list. Dropping the old senders makes the old worker threads exit on their own.
     fn reload_packs(&mut self) {
         let mut installed = packs::load(&self.search);
         enrich_rainmeter(&mut installed);
         self.pack_catalog = build_catalog(&installed);
         let (tx, rx) = crossbeam_channel::unbounded::<packs::PackJob>();
+        let (modex, modex_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
         let (out_tx, out_rx) = crossbeam_channel::unbounded::<packs::PackOutcome>();
-        packs::start(installed, rx, out_tx, self.wake);
+        packs::start(installed, rx, modex_rx, out_tx, self.wake);
         self.pack_tx = tx;
+        self.mode_tx = modex;
         self.pack_out_rx = out_rx;
         info!("pack list reloaded: {} installed", self.pack_catalog.len());
         self.broadcast_status();
@@ -1618,7 +1719,8 @@ impl App {
                     captured: HashMap::from([(id.clone(), captured)]),
                 };
                 info!("pack {id} is applied — reverting it now that it is disabled");
-                let _ = self.pack_tx.send(job);
+                let sender = self.worker_for(&id);
+                let _ = sender.send(job);
             }
         }
         self.broadcast_status();
@@ -1664,7 +1766,7 @@ impl App {
                 .collect(),
             captured: self.captured_by_pack.clone(),
         };
-        let _ = self.pack_tx.send(job);
+        self.send_by_kind(job);
         info!("packs applied now ({why}, a tracked app is already running)");
     }
 
@@ -1864,16 +1966,17 @@ impl App {
             captured: self.captured_by_pack.clone(),
         };
         info!("quit: reverting the packs before exiting");
-        let _ = self.pack_tx.send(job);
+        self.send_by_kind(job);
 
         // Shutdown is not time-critical; the kill/relaunch paths can take a few seconds.
+        // A4: the two halves of the revert report separately (a slow mode may take seconds
+        // more), so quit waits until the applied set is empty, not just for one outcome.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             match self.pack_out_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(outcome) => {
-                    let reverted = !outcome.applied;
                     self.on_pack_outcome(outcome);
-                    if reverted {
+                    if self.applied_packs.is_empty() {
                         info!("quit: packs reverted, exiting");
                         return;
                     }
@@ -2648,7 +2751,8 @@ impl App {
                         Some(job) => {
                             info!("pack {pack_id} is applied — reverting it before removal");
                             self.pending_removal = Some((pack_id.clone(), id));
-                            let _ = self.pack_tx.send(job);
+                            let sender = self.worker_for(&pack_id);
+                            let _ = sender.send(job);
                         }
                         None => {
                             if applied {
@@ -2899,6 +3003,112 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].1, "C:\\games\\demo.exe"); // the tracked copy wins
         assert_eq!(entries[1].1, "D:\\tools\\pin.exe");
+    }
+
+    #[test]
+    fn the_two_halves_of_a_job_merge_order_independently() {
+        // A4: a whole-state job leaves as two halves. Whichever half arrives first, the
+        // merge lands on the same total: both applied after the applies, nothing left and
+        // an emptied journal after the reverts.
+        let half = |applied: bool, scoped: &[&str], ids: &[&str], captured: &[&str]| {
+            let mut journal = HashMap::new();
+            for id in captured {
+                journal.insert(
+                    id.to_string(),
+                    HashMap::from([("mode".to_string(), "2".to_string())]),
+                );
+            }
+            packs::PackOutcome {
+                applied,
+                tag: None,
+                scoped: scoped.iter().map(|s| s.to_string()).collect(),
+                applied_ids: ids.iter().map(|s| s.to_string()).collect(),
+                values: HashMap::new(),
+                captured: journal,
+                succeeded: vec![],
+                failed: vec![],
+            }
+        };
+        let pack_half = half(true, &["g-pack"], &["g-pack"], &["g-pack"]);
+        let mode_half = half(true, &["m-mode"], &["m-mode"], &["m-mode"]);
+        let pack_back = half(false, &["g-pack"], &[], &[]);
+        let mode_back = half(false, &["m-mode"], &[], &[]);
+
+        for order in [[&pack_half, &mode_half], [&mode_half, &pack_half]] {
+            let mut applied: Vec<String> = Vec::new();
+            let mut captured: HashMap<String, HashMap<String, String>> = HashMap::new();
+            for o in order {
+                merge_scoped(&mut applied, &mut captured, o);
+            }
+            assert!(applied.contains(&"g-pack".to_string()), "{applied:?}");
+            assert!(applied.contains(&"m-mode".to_string()), "{applied:?}");
+            assert_eq!(captured.len(), 2, "both halves journalled their captures");
+            merge_scoped(&mut applied, &mut captured, &pack_back);
+            merge_scoped(&mut applied, &mut captured, &mode_back);
+            assert!(applied.is_empty(), "the reverts took everything back: {applied:?}");
+            assert!(captured.is_empty(), "and emptied the journal: {captured:?}");
+        }
+    }
+
+    #[test]
+    fn a_mode_half_never_touches_the_packs_half_of_the_state() {
+        // The scope is per kind: a mode outcome must leave a pack's applied id alone, and
+        // a pack outcome must leave a mode's alone. That is what makes the merge safe two
+        // workers feeding one channel.
+        let mut applied = vec!["g-pack".to_string(), "m-mode".to_string()];
+        let mut captured: HashMap<String, HashMap<String, String>> = HashMap::from([(
+            "g-pack".to_string(),
+            HashMap::from([("was_running".to_string(), "1".to_string())]),
+        )]);
+        merge_scoped(
+            &mut applied,
+            &mut captured,
+            &packs::PackOutcome {
+                applied: false,
+                tag: None,
+                scoped: vec!["m-mode".to_string()],
+                applied_ids: vec![],
+                values: HashMap::new(),
+                captured: HashMap::new(),
+                succeeded: vec![],
+                failed: vec![],
+            },
+        );
+        assert_eq!(applied, vec!["g-pack"]);
+        assert!(captured.contains_key("g-pack"));
+    }
+
+    #[test]
+    fn split_enabled_routes_by_the_catalogue() {
+        // The same job on the two kind sides; an unknown id stays on the pack side (the
+        // old behaviour — the worker simply ignores ids it does not carry).
+        let catalog = vec![
+            PackMeta {
+                id: "g-pack".into(),
+                name: String::new(),
+                version: String::new(),
+                kind: PackKind::Pack,
+                settings: vec![],
+            },
+            PackMeta {
+                id: "m-mode".into(),
+                name: String::new(),
+                version: String::new(),
+                kind: PackKind::Mode,
+                settings: vec![],
+            },
+        ];
+        let enabled: HashMap<String, bool> = HashMap::from([
+            ("g-pack".to_string(), true),
+            ("m-mode".to_string(), true),
+            ("ghost".to_string(), true),
+        ]);
+        let (pack, mode) = split_enabled(enabled, &catalog);
+        assert!(pack.contains_key("g-pack") && pack.contains_key("ghost"));
+        assert_eq!(mode.keys().cloned().collect::<Vec<_>>(), vec!["m-mode"]);
+        assert!(is_mode(&catalog, "m-mode"));
+        assert!(!is_mode(&catalog, "g-pack"));
+        assert!(!is_mode(&catalog, "m-mode-not-there"));
     }
 
     #[test]

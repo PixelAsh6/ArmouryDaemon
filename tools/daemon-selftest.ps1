@@ -202,6 +202,22 @@ function Get-Gap($from, $to) {
     return ($to - $from).TotalSeconds
 }
 
+# The times at which a named pack logged that it applied ('applied') or reverted ('reverted').
+# The line carries the pack's name, not its id: "Sluggish: reverted (target: n/a)".
+function Get-PackLineTimes([string]$name, [string]$action) {
+    $times = @()
+    if (-not (Test-Path -LiteralPath $logPath)) { return $times }
+    $pattern = '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*' + [regex]::Escape($name) + ': ' + $action + ' \(target'
+    $lines = @()
+    try { $lines = Get-Content -LiteralPath $logPath } catch { return $times }
+    foreach ($line in $lines) {
+        if ($line -match $pattern) {
+            $times += [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+    }
+    return $times
+}
+
 # The content of a file, or '' when it is empty or missing. Get-Content hands back $null for
 # an empty file, which would break every string operation on it.
 function Read-Text([string]$path) {
@@ -871,10 +887,10 @@ try {
     # ---- 19c. the pack schema: `kind` and `triggers` ----
     # A pack may say what it is (`kind`: "pack" or "mode") and what starts it (`triggers`).
     # Both fields are **additive**: a pack that does not carry them loads and behaves
-    # exactly as it did before, and the three shipped packs do not carry them. The mode
-    # machinery itself is a later phase - today a mode is still a pack the daemon applies
-    # like any other; what this checks is that the schema knows the two fields, that a
-    # pack may carry them, and that a malformed one is refused by name.
+    # exactly as it did before, and the three shipped packs do not carry them. The mode's
+    # own trigger machinery is a later phase - today a mode joins the ordinary trigger
+    # path (on its own worker since 19d); what this checks is that the schema knows the
+    # two fields, that a pack may carry them, and that a malformed one is refused by name.
     $kindDir = Join-Path $env:TEMP "armoury-kindpack-$ns"
     New-Item -ItemType Directory -Force -Path $kindDir | Out-Null
     $kindPack = @'
@@ -926,6 +942,93 @@ try {
     Check 'a mode without a trigger is refused' ($op -and -not $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Check 'the refusal names the trigger' ($op -and $op.message -match 'trigger') "message=$($op.message)"
     Remove-Item -Recurse -Force $modeDir -ErrorAction SilentlyContinue
+
+    # ---- 19d. a slow mode does not delay a plain pack: the mode has its own worker ----
+    # Modes run on their own thread and channel (A4). The mode here sleeps five seconds
+    # inside its steps; the plain pack next to it runs at once. A tracked app start applies
+    # every enabled pack through whole-state jobs, so both go out together - each half on
+    # its own worker - and the log's own timestamps show the plain pack finishing while the
+    # mode is still sleeping. The same holds when the app closes: the plain pack goes back
+    # at once, the mode's revert sleeps long after. Both workers feed one outcome channel,
+    # and each outcome carries the ids its job was scoped to, so the daemon merges the
+    # halves order-independently. The log resolves one second, so every bound keeps a
+    # margin of over two seconds.
+    $slowDir = Join-Path $env:TEMP "armoury-slowpack-$ns"
+    $fastDir = Join-Path $env:TEMP "armoury-fastpack-$ns"
+    New-Item -ItemType Directory -Force -Path $slowDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $fastDir | Out-Null
+    $slowPack = @'
+{
+  "spec": 1,
+  "id": "slowmode",
+  "name": "Slow test",
+  "version": "1.0.0",
+  "order": 9,
+  "kind": "mode",
+  "triggers": [ { "kind": "tracked_app" } ],
+  "targets": { "process": ["timeout.exe"] },
+  "apply": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
+  "revert": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
+}
+'@
+    $fastPack = @'
+{
+  "spec": 1,
+  "id": "fastpack",
+  "name": "Fast test",
+  "version": "1.0.0",
+  "order": 10,
+  "targets": { "process": ["timeout.exe"] },
+  "apply": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] },
+  "revert": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] }
+}
+'@
+    [IO.File]::WriteAllText((Join-Path $slowDir 'pack.json'), $slowPack, (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $fastDir 'pack.json'), $fastPack, (New-Object System.Text.UTF8Encoding($false)))
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($slowDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'the slow mode installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($fastDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'the plain pack installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Start-Sleep -Milliseconds 500
+    $logText = Get-Content $logPath -Raw
+    Check 'the mode worker took the mode' ($logText -match 'mode worker started with 1 pack\(s\)') "no mode worker line in the log"
+    Send-Pipe '{"type":"set_pack_enabled","id":"slowmode","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_pack_enabled","id":"fastpack","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
+    Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    $p9 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
+    # the apply starts a lockout, so the state is "cooldown" first and "triggered" after it,
+    # and the mode's five-second sleep runs on its own thread the whole time
+    $s = Wait-State 'triggered' 25
+    Check 'the tracked start applies both' ($s.state -eq 'triggered') "state=$($s.state)"
+    Start-Sleep -Seconds 7   # the mode's sleep plus the log's one-second resolution
+    $send = @(Get-ChangeTimes 'apply')[-1]
+    $fastAt = @(Get-PackLineTimes 'Fast test' 'applied')[-1]
+    $slowAt = @(Get-PackLineTimes 'Slow test' 'applied')[-1]
+    $fastGap = Get-Gap $send $fastAt
+    $slowGap = Get-Gap $send $slowAt
+    Check 'the plain pack applied without waiting' ($fastGap -le 3) "send=$send at=$fastAt gap=${fastGap}s"
+    Check 'the mode applied on its own time' ($slowGap -ge 3.5 -and $slowGap -le 10) "send=$send at=$slowAt gap=${slowGap}s"
+    $p9 | Stop-Process -Force
+    $s = Wait-State 'idle' 25
+    Check 'the close reverts and settles idle' ($s.state -eq 'idle') "state=$($s.state)"
+    Start-Sleep -Seconds 7   # the mode's revert sleep plus the log's one-second resolution
+    $rvSend = @(Get-ChangeTimes 'revert')[-1]
+    $fastRv = @(Get-PackLineTimes 'Fast test' 'reverted')[-1]
+    $slowRv = @(Get-PackLineTimes 'Slow test' 'reverted')[-1]
+    $fastGap = Get-Gap $rvSend $fastRv
+    $slowGap = Get-Gap $rvSend $slowRv
+    Check 'the plain pack reverted without waiting' ($fastGap -le 3) "send=$rvSend at=$fastRv gap=${fastGap}s"
+    Check 'the mode reverted on its own time' ($slowGap -ge 3.5 -and $slowGap -le 12) "send=$rvSend at=$slowRv gap=${slowGap}s"
+    Send-Pipe '{"type":"set_pack_enabled","id":"slowmode","enabled":false}' | Out-Null
+    Send-Pipe '{"type":"set_pack_enabled","id":"fastpack","enabled":false}' | Out-Null
+    $op = Send-And-Wait '{"type":"remove_pack","id":"slowmode"}' 'pack_op'
+    Check 'the slow mode removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    $op = Send-And-Wait '{"type":"remove_pack","id":"fastpack"}' 'pack_op'
+    Check 'the plain pack removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
+    Remove-Item -Recurse -Force $slowDir -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $fastDir -ErrorAction SilentlyContinue
 
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
