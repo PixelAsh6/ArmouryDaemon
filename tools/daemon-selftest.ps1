@@ -957,6 +957,9 @@ try {
     $fastDir = Join-Path $env:TEMP "armoury-fastpack-$ns"
     New-Item -ItemType Directory -Force -Path $slowDir | Out-Null
     New-Item -ItemType Directory -Force -Path $fastDir | Out-Null
+    # The guards are unconditional ("targetRunning": false): a block *without* a guard
+    # skips when its target process is not running, and the revert would be skipped
+    # entirely once the app is dead - the check would watch a sleep that never runs.
     $slowPack = @'
 {
   "spec": 1,
@@ -967,8 +970,8 @@ try {
   "kind": "mode",
   "triggers": [ { "kind": "tracked_app" } ],
   "targets": { "process": ["timeout.exe"] },
-  "apply": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
-  "revert": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
 }
 '@
     $fastPack = @'
@@ -979,8 +982,8 @@ try {
   "version": "1.0.0",
   "order": 10,
   "targets": { "process": ["timeout.exe"] },
-  "apply": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] },
-  "revert": { "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] }
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] }
 }
 '@
     [IO.File]::WriteAllText((Join-Path $slowDir 'pack.json'), $slowPack, (New-Object System.Text.UTF8Encoding($false)))

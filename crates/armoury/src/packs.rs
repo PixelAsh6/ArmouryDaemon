@@ -2352,15 +2352,15 @@ mod tests {
   "kind": "mode",
   "triggers": [ { "kind": "tracked_app" } ],
   "targets": { "process": ["slowmode-test-target.exe"] },
-  "apply": { "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
-  "revert": { "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
 }"#;
         let fast = r#"
 {
   "spec": 1, "id": "fastpack-test", "name": "Fast test", "version": "1.0.0", "order": 2,
   "targets": { "process": ["fastpack-test-target.exe"] },
-  "apply": { "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] },
-  "revert": { "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] }
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] }
 }"#;
         let packs = vec![
             Installed { pack: Pack::parse(slow).expect("the slow mode must be valid") },
