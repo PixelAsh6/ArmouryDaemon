@@ -944,19 +944,26 @@ try {
     Remove-Item -Recurse -Force $modeDir -ErrorAction SilentlyContinue
 
     # ---- 19d. a slow mode does not delay a plain pack: the mode has its own worker ----
-    # Modes run on their own thread and channel (A4). The mode here sleeps five seconds
-    # inside its steps; the plain pack next to it runs at once. A tracked app start applies
-    # every enabled pack through whole-state jobs, so both go out together - each half on
-    # its own worker - and the log's own timestamps show the plain pack finishing while the
-    # mode is still sleeping. The same holds when the app closes: the plain pack goes back
-    # at once, the mode's revert sleeps long after. Both workers feed one outcome channel,
-    # and each outcome carries the ids its job was scoped to, so the daemon merges the
-    # halves order-independently. The log resolves one second, so every bound keeps a
-    # margin of over two seconds.
+    # Modes run on their own thread and channel (A4). Two modes sleep five seconds - one
+    # inside its apply, one inside its revert - and the plain pack between them runs at
+    # once. A tracked app start applies every enabled pack through whole-state jobs, so both
+    # halves go out together, each on its own worker, and the log's own timestamps show the
+    # plain pack finishing while a mode is still sleeping. The same holds when the app
+    # closes: the plain pack goes back at once, the mode that reverts first sleeps five
+    # seconds. `order` is what makes both directions mean something - the apply runs
+    # ascending and the revert descending, so the mode slow in its *apply* sorts below the
+    # pack and the mode slow in its *revert* sorts above it. On the single serial worker
+    # this replaced, one of the two would always be ahead of the pack and the pack's line
+    # would follow five seconds later, which is exactly what the two timing checks below
+    # would report. Both workers feed one outcome channel, and each outcome carries the ids
+    # its job was scoped to, so the daemon merges the halves order-independently. The log
+    # resolves one second, so every bound keeps a margin of over two seconds.
     $slowDir = Join-Path $env:TEMP "armoury-slowpack-$ns"
     $fastDir = Join-Path $env:TEMP "armoury-fastpack-$ns"
+    $slowRvDir = Join-Path $env:TEMP "armoury-slowrevert-$ns"
     New-Item -ItemType Directory -Force -Path $slowDir | Out-Null
     New-Item -ItemType Directory -Force -Path $fastDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $slowRvDir | Out-Null
     # The guards are unconditional ("targetRunning": false): a block *without* a guard
     # skips when its target process is not running, and the revert would be skipped
     # entirely once the app is dead - the check would watch a sleep that never runs.
@@ -971,7 +978,7 @@ try {
   "triggers": [ { "kind": "tracked_app" } ],
   "targets": { "process": ["timeout.exe"] },
   "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
-  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] }
 }
 '@
     $fastPack = @'
@@ -986,8 +993,23 @@ try {
   "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] }
 }
 '@
+    $slowRvPack = @'
+{
+  "spec": 1,
+  "id": "slowrevert",
+  "name": "Slow revert test",
+  "version": "1.0.0",
+  "order": 11,
+  "kind": "mode",
+  "triggers": [ { "kind": "tracked_app" } ],
+  "targets": { "process": ["timeout.exe"] },
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"] } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "C:\\Windows\\System32\\cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
+}
+'@
     [IO.File]::WriteAllText((Join-Path $slowDir 'pack.json'), $slowPack, (New-Object System.Text.UTF8Encoding($false)))
     [IO.File]::WriteAllText((Join-Path $fastDir 'pack.json'), $fastPack, (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $slowRvDir 'pack.json'), $slowRvPack, (New-Object System.Text.UTF8Encoding($false)))
     $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($slowDir.Replace('\','\\'))`"}" 'pack_op'
     Check 'the slow mode installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($fastDir.Replace('\','\\'))`"}" 'pack_op'
@@ -995,15 +1017,20 @@ try {
     Start-Sleep -Milliseconds 500
     $logText = Get-Content $logPath -Raw
     Check 'the mode worker took the mode' ($logText -match 'mode worker started with 1 pack\(s\)') "no mode worker line in the log"
+    # the second mode goes in after that check, so the "1 pack(s)" line above stays the mark
+    # of a reload that saw one mode; this one turns it into two
+    $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($slowRvDir.Replace('\','\\'))`"}" 'pack_op'
+    Check 'the slow revert mode installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Send-Pipe '{"type":"set_pack_enabled","id":"slowmode","enabled":true}' | Out-Null
     Send-Pipe '{"type":"set_pack_enabled","id":"fastpack","enabled":true}' | Out-Null
+    Send-Pipe '{"type":"set_pack_enabled","id":"slowrevert","enabled":true}' | Out-Null
     Send-Pipe '{"type":"set_cooldown","seconds":5}' | Out-Null
     Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     $p9 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
     # the apply starts a lockout, so the state is "cooldown" first and "triggered" after it,
-    # and the mode's five-second sleep runs on its own thread the whole time
+    # and the slow mode's five-second sleep runs on its own thread the whole time
     $s = Wait-State 'triggered' 25
-    Check 'the tracked start applies both' ($s.state -eq 'triggered') "state=$($s.state)"
+    Check 'the tracked start applies all three' ($s.state -eq 'triggered') "state=$($s.state)"
     Start-Sleep -Seconds 7   # the mode's sleep plus the log's one-second resolution
     $send = @(Get-ChangeTimes 'apply')[-1]
     $fastAt = @(Get-PackLineTimes 'Fast test' 'applied')[-1]
@@ -1015,23 +1042,27 @@ try {
     $p9 | Stop-Process -Force
     $s = Wait-State 'idle' 25
     Check 'the close reverts and settles idle' ($s.state -eq 'idle') "state=$($s.state)"
-    Start-Sleep -Seconds 7   # the mode's revert sleep plus the log's one-second resolution
+    Start-Sleep -Seconds 8   # the slow revert's sleep plus the log's one-second resolution
     $rvSend = @(Get-ChangeTimes 'revert')[-1]
     $fastRv = @(Get-PackLineTimes 'Fast test' 'reverted')[-1]
-    $slowRv = @(Get-PackLineTimes 'Slow test' 'reverted')[-1]
+    $slowRv = @(Get-PackLineTimes 'Slow revert test' 'reverted')[-1]
     $fastGap = Get-Gap $rvSend $fastRv
     $slowGap = Get-Gap $rvSend $slowRv
     Check 'the plain pack reverted without waiting' ($fastGap -le 3) "send=$rvSend at=$fastRv gap=${fastGap}s"
-    Check 'the mode reverted on its own time' ($slowGap -ge 3.5 -and $slowGap -le 12) "send=$rvSend at=$slowRv gap=${slowGap}s"
+    Check 'the slow revert mode reverted on its own time' ($slowGap -ge 3.5 -and $slowGap -le 12) "send=$rvSend at=$slowRv gap=${slowGap}s"
     Send-Pipe '{"type":"set_pack_enabled","id":"slowmode","enabled":false}' | Out-Null
     Send-Pipe '{"type":"set_pack_enabled","id":"fastpack","enabled":false}' | Out-Null
+    Send-Pipe '{"type":"set_pack_enabled","id":"slowrevert","enabled":false}' | Out-Null
     $op = Send-And-Wait '{"type":"remove_pack","id":"slowmode"}' 'pack_op'
     Check 'the slow mode removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     $op = Send-And-Wait '{"type":"remove_pack","id":"fastpack"}' 'pack_op'
     Check 'the plain pack removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
+    $op = Send-And-Wait '{"type":"remove_pack","id":"slowrevert"}' 'pack_op'
+    Check 'the slow revert mode removes cleanly' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Send-Pipe '{"type":"remove_tracked_app","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
     Remove-Item -Recurse -Force $slowDir -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $fastDir -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $slowRvDir -ErrorAction SilentlyContinue
 
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
