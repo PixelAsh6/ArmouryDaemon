@@ -742,3 +742,50 @@ recorded here.
 - **Restarting the window from the restart.** The user's cooldown would be measured from
   the game's own start, and a game that restarts twice would hold the packs far longer
   than the setting says.
+
+---
+
+## 22. The modes run on a worker of their own, and the two halves merge on one channel
+
+**Settled 2026-10-23.** `packs::start` (`packs.rs:161`) takes two job receivers and
+spawns two workers: the plain packs keep a serial thread with exactly the old shape,
+and the modes get a second thread built from the same extracted loop
+(`spawn_worker`, `packs.rs:186` — its own COM init, its own carry, the same wake
+`SetEvent`, and the same log words with "mode" in place of "pack"). The daemon splits
+a whole-state job by the catalogue's `pack.kind` (`split_enabled`) — an unknown id
+stays on the pack side, which is the pre-A4 behaviour — and routes a tagged
+single-pack job by the target pack's kind (`worker_for`).
+
+**Why a thread and not a queue on the same thread:** the acceptance is *a mode that
+takes five seconds does not delay a pack revert* (`WORK-ORDER.md` A4). Anything the
+same serial worker still drains in order cannot grant that — a five-second step ahead
+of a revert delays the revert by five seconds whatever lane it sits in. The pack
+worker keeps its thread and its behaviour; the only thing that changed about it is
+how many of it there are.
+
+**One outcome channel, not two.** Both workers send their `PackOutcome` into the
+existing channel, and `on_pack_outcome` keeps draining the way it did — the state
+merge, the journal write and the restart-revert read the same stream as before. What
+makes that safe is `PackOutcome::scoped`: the outcome echoes the enabled ids **its
+own** half carried, and `merge_scoped` folds a half in so the result is the same
+whichever half lands first. Without the echo the second half would overwrite the
+first's ids and one worker would drop the other's applied packs out of the state —
+two producers on one merge means every record carries enough to be merged
+order-independently.
+
+**Rejected:**
+
+- **A priority lane on one thread.** It changes which job is picked up first but not
+  the serialisation: a five-second mode step picked up ahead of a revert still holds
+  the revert for five seconds. Modes are rare; plain applies and reverts are the
+  worker's bread and butter.
+- **Per-worker outcome channels with a split drain.** It would divide the drain loop,
+  the state merge, the journal write and the restart-revert join between two channels
+  — every consumer of outcomes doubled, and the same echo merge still needed to
+  combine the halves. One channel keeps the write side of the pack state
+  single-threaded, which is the property the old design rested on.
+- **Sizing the two workers differently (a pool for packs, one thread for modes).**
+  The workers' lists are disjoint by kind, so nothing can contend; a pool would only
+  make two plain packs run their steps interleaved — a reordering the
+  single-threaded design never promised to survive. A4 does not pay for concurrency
+  the packs have never been tested against.

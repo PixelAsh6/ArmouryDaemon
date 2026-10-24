@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2 and A3 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`), the review of 1.1.5 **merged and shipped as 1.1.6**. A4 next |
-| **Next action** | **A4** - a separate worker queue for modes (`WORK-ORDER.md` A4). 1.1.6 is published and installed; the next release is the user's call |
-| **Branch** | `main` - the release content **`a61740f`**, which carries the annotated tag **`v1.1.6`**, and the docs commits on top of it. Every CI run on it is green |
+| **Phase** | A - **A1, A2, A3 and A4 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel). 1.1.6 is published and installed; A4 sits on the branch `feature/a4-mode-worker`, **not merged** |
+| **Next action** | **A5** - the killswitch gets a config key and an IPC request (`WORK-ORDER.md` A5). The merge of A4 into `main` and the next release are the user's calls |
+| **Branch** | `feature/a4-mode-worker` (cut from `main` `76877ba`) - CI **green** on the tip `26a58f9`: **383 unit tests** (278 in `armoury` + 105 in `armoury-core`), **146 harness checks** |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -824,6 +824,127 @@ in the review session and are recorded there.
 
 **Next.** A4 - a separate worker queue for modes (`WORK-ORDER.md` A4). 1.1.6 is out
 and installed; the next release is the user's call.
+
+---
+
+### 2026-10-23 — Phase A4: the modes have a worker of their own
+
+**What I did.** The pack worker stopped being a single serial thread. `packs::start`
+(`packs.rs:161`) now takes **two** job receivers and spawns **two** workers — the plain
+packs keep their serial thread with the old shape, the modes get a second one
+(`spawn_worker`, `packs.rs:186`, the extracted loop) — so a mode that takes five
+seconds applies and reverts on its own thread while a plain pack's apply or revert
+goes through untouched. The daemon decides which half a job belongs to by reading the
+catalogue: a whole-state job is split by `pack.kind` (`split_enabled`,
+`daemon.rs:829` — an unknown id stays on the pack side, which is the pre-A4
+behaviour), a tagged single-pack job follows the target pack's kind (`worker_for`,
+`daemon.rs:1534`), and a mode half that carries nothing is skipped rather than sent
+empty (`send_by_kind`, `daemon.rs:1513`).
+
+The two halves report on **one** outcome channel as before, and the outcome now
+carries `scoped` — the echo of the enabled ids **its own** half carried
+(`packs.rs:70`) — so `on_pack_outcome` can merge a half order-independently of the
+other (`merge_scoped`, `daemon.rs:850`). The running state, the journal and the wire
+format did not change, and `pack.rs` is untouched — the schema phase (A3) already put
+the `kind` in, and A4 is the first phase that acts on it.
+
+A mode job still arrives only through the ordinary trigger path (`tracked_app` riding
+a whole-state job): A4 is the worker split, **not** the dispatch. `triggers` is read
+by nobody yet — A3 put it in the schema and no phase acts on it — and the folder does
+not schedule the dispatch: the next phase (A5) is the killswitch's config key and IPC
+request, so a `hotkey` trigger stays inert until a phase says otherwise.
+
+**Files touched.** `crates/armoury/src/packs.rs` (the two-worker `start`, the
+extracted `spawn_worker`, `PackOutcome::scoped` and its fill in `run_job` at `packs.rs:410`,
+two tests), `crates/armoury/src/daemon.rs` (the `kind` on `PackMeta` at `:804`, the
+`mode_tx` channel and the kind helpers, the split sends in the four places that emit
+jobs — the startup journal revert, `send_transition`, `apply_now_if_triggered`,
+`revert_before_quit` — and the merge in `on_pack_outcome`, three tests),
+`tools/daemon-selftest.ps1` (the timing helper `Get-PackLineTimes` at `:207` and the
+scenario **19d**, two modes either side of the plain pack), `CHANGELOG.md`,
+`compact.md` and this folder.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The unit tests | 378 (273 in `armoury`, 105 in `armoury-core`) | **383** (278 / 105) — **+5**, green in CI |
+| The harness checks | 133 `Check` calls | **146** — **+13**, green in CI |
+| The release exe | 12,879,360 bytes (v1.1.6, the installed tree) | **12,895,744 bytes** — **+16,384 (+0.13 %)**, sha256 `b504af1c…8a4f` |
+| The daemon's idle cost | not measured | **not measured** — the user declined the sampling; the number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to any tree since |
+
+*The exe size:* the release build of the branch, taken from the CI artefact of the
+tip's dispatch (`ArmouryDaemon.exe`, 12,895,744 bytes, sha256
+`b504af1c4a26df76ace652be024d9c8868d4f232f0ef240e477b20d9a6958a4f`, and the 85-byte
+sidecar beside it), measured against the published v1.1.6 asset (12,879,360 bytes,
+sha256 `0bc14524…56d4` — the copy installed on the machine). The same tree linked
+twice differs in its bytes: the earlier dispatch of the same Rust code produced
+12,895,744 bytes hashing `864e6064…987c`, so the size is the fact and the hash
+identifies one link. `cargo build --release` is never run on this machine.
+
+*The acceptance, in the folder's own words:* **a mode that takes 5 seconds does not
+delay a pack revert** (`WORK-ORDER.md` A4). The harness proves the whole sentence
+with real timing, from log timestamps (19d): **two** modes whose steps sleep 5 s — one
+in its apply, one in its revert — and a plain pack between them in `order`, all three
+enabled, `timeout.exe` tracked. `order` is what makes each direction testable: an
+apply walks the packs ascending and a revert descending, so the mode slow in its
+*apply* (order 9) stands ahead of the plain pack (order 10) in an apply and the mode
+slow in its *revert* (order 11) stands ahead of it in a revert. On the single serial
+worker A4 replaced, one of the two was always ahead of the pack and the pack's own log
+line would have followed five seconds later. As it is: the fast pack's apply line
+lands **≤ 3 s** after the send line and the slow mode's **≥ 3.5 s**, and after the
+tracked app is killed the fast pack's revert is again **≤ 3 s** while the mode that
+reverts first takes **≥ 3.5 s**. The log's timestamp resolution is ~1 s, so the
+margins are wide by design, and every check fails with the numbers behind it.
+
+*The CI runs:*
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `39965300253` | CI on the code commit `a6aa1a9` (dispatch) - **red**: `E0593`, the journal merge's `retain` closure took one argument where `HashMap` wants two | failed | 1m48s |
+| `39965693668` | CI on `6fe01ce` (dispatch) - **red**: the slow-mode harness test applied **nothing** (`applied_ids []` against `["fastpack-test"]`) — the test packs' guardless blocks skip while the target is away | failed | 2m04s |
+| `39966344387` | CI on `9e4fd63` (dispatch) | **green** - 381 tests, 144 harness checks, `ALL CHECKS PASSED`, and the release profile: the 12,895,744-byte exe above | 8m09s |
+| `40121307649` | CI on the branch's tip `26a58f9` (dispatch) — the revert half of 19d now has a mode of its own to fail against | **green** - **383 tests, 146 harness checks**, `ALL CHECKS PASSED` | 8m22s |
+
+**Decisions.** `DECISIONS.md` **22**: the split is by `kind` read from the catalogue,
+the two workers share **one** outcome channel with the echo merge, and a tagged job
+follows the target pack's kind. Rejected there: a priority lane on still-one thread,
+and per-worker outcome channels with a split drain.
+
+**Surprises.**
+
+- **`HashMap::retain` takes a two-argument closure** (`|k, v|`). The journal merge
+  was written with a one-argument predicate and did not compile — `E0593` on the
+  first CI run. Small, but it is the cost of never compiling locally spelled out:
+  `cargo check` would have said it in seconds, CI said it in 1m48s
+  (`GOTCHAS.md` trap 47).
+- **A `guard` you do not write is a guard that says "only while the target runs".**
+  `Guard::default()` defaults to `target_running: true` (`pack.rs:521`), so a
+  `StepBlock` without a `guard` **skips entirely** while the tracked app is closed.
+  That is what made the slow-mode test apply nothing at all and turned the second CI
+  run red. Both the unit-test packs and the harness packs now say
+  `"guard": { "targetRunning": false }` in the apply **and** the revert blocks — and
+  the shipped packs carry explicit revert guards for the same silent reason
+  (`GOTCHAS.md` trap 48).
+- **The revert half of the new check could not fail.** 19d passed on the first green
+  run, and the revert-side checks passed *for the wrong reason*: a revert walks the
+  packs in descending `order`, so the plain pack (order 10) already ran before the
+  slow mode (order 9) on the old single serial worker — the check watched a delay that
+  the defect could not have produced. One mode cannot be both first in an ascending
+  apply and first in a descending revert, so the scenario has two: the mode slow in
+  its apply sorts below the pack, the one slow in its revert sorts above it, and each
+  timing check now has a mode ahead of the pack to fail against
+  (`GOTCHAS.md` trap 50).
+- **In PowerShell, `@($x)[-1]` on an empty array is `$null`, not an error.** The
+  timing helper turns a line it never found into a gap of `9999`, so a missing log
+  line fails as a number in the assertion instead of as a parse error in the
+  plumbing — the right direction for a harness failure.
+
+**Next.** Phase A5 — the killswitch gets a config key and an IPC request
+(`WORK-ORDER.md` A5): it has neither today, and the state has to survive a restart;
+that is also the natural place for the "is the killswitch module installed" flag.
+The merge of `feature/a4-mode-worker` into `main` and the next release are the
+user's calls.
 
 ---
 

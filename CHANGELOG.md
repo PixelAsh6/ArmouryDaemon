@@ -3,6 +3,19 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- The **pack worker is no longer one serial thread**. The plain packs keep their thread; the
+  mode packs get a **second worker and channel of their own**, and the daemon splits a
+  whole-state apply or revert between the two by the pack's `kind` and merges the halves back
+  on one outcome channel, so the running state and the journal read as they always did. A mode
+  whose steps take five seconds no longer delays the apply or the revert of a pack beside it:
+  the self-test harness measures the two against each other, from log timestamps, in both
+  directions. Nothing changes for a pack - `kind` defaults to `"pack"`, and a mode still
+  arrives only through the ordinary tracked-app trigger (`docs/modularity/DECISIONS.md` §22).
+
 ## [1.1.6] - 2026-10-22
 
 ### Added
