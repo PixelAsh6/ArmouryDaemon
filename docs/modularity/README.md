@@ -93,8 +93,9 @@ background.
 - The **1.1.5** release is out (the executable, 12,865,024 bytes, sha256
   `947ef3dc…24a4`, and its 85-byte sidecar) and **1.1.6 ships on top of it**: everything
   1.1.5 carried, plus Phase A3 and the review's fixes.
-- **Phase A6 is done on the branch `feature/a6-crt-static`** (cut from `main`
-  `cf37902`, **not merged** — the merge is the user's call): the exe carries its
+- **Phase A6 is merged into `main`** (`585f8ff`, run `40314663065`; the
+  branch's runs - `40311776397` on `d172567`, `40313595169` on `7cdb0d2` -
+  are green too): the exe carries its
   own C runtime. `.cargo/config.toml`'s MSVC rustflags gain
   `-C target-feature=+crt-static` beside the `target-cpu` pin — the work order's
   shorthand `-C target-crt-static` is not a real rustc flag — so the exe
@@ -107,7 +108,7 @@ background.
   `kernel32.dll` still readable, sha256 `c1373e9e…22f8`.
 - **The next action is Phase B1** — `kind` in the manifest, schema 2
   (`WORK-ORDER.md` B1, `catalog.rs:44`), and the release workflow's catalogue
-  check learning `modules`. A6 sits in `main` at `e45b8be`; the next release
+  check learning `modules`. A6 is in `main` at `585f8ff`; the next release
   is the user's call.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
@@ -147,9 +148,8 @@ background.
 (`catalog.rs:44`) to manifest schema 2 while reading `packs` **and** `modules`
 for one release so an old manifest still works, and teach the release
 workflow's "Check the packs against the catalogue" step (`.github/workflows/release.yml`) the new key — it must keep failing when a release
-ships bytes the catalogue does not publish. A6's branch
-`feature/a6-crt-static` sits unmerged; the merge and the next release are the
-user's calls.
+ships bytes the catalogue does not publish. A6 is in `main` at `585f8ff`;
+only the next release is the user's call.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

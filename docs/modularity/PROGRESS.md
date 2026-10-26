@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**). 1.1.6 is published and installed; A6 sits on the branch `feature/a6-crt-static`, **not merged** |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**). 1.1.6 is published and installed; **A6 is merged into `main`** (`585f8ff`, run `40314663065` green) |
 | **Next action** | **B1** - `kind` in the manifest, schema 2, and the release workflow's catalogue step learning `modules` (`WORK-ORDER.md` B1; `catalog.rs:44`). The next release is the user's call |
-| **Branch** | `feature/a6-crt-static` (cut from `main` `cf37902`) - CI **green** on the tip `d172567` (run `40311776397`): **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**, and the artefact's imports are clean. A5 is merged (`e45b8be`, run `40307649812`) pruned. `feature/a5-killswitch` and the stale `a2`-`a4`, `phase-a` branches are pruned from origin too |
+| **Branch** | `main` at the A6 merge `585f8ff` - the branch's own runs `40311776397` (`d172567`) and `40313595169` (`7cdb0d2`) are green too, the artefact says **13,074,432 bytes** (+192,512), `VCRUNTIME140.dll` **absent** from its imports, and the counts stand at **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**. `feature/a6-crt-static` is pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1035,8 +1035,9 @@ comment.
 
 **Next.** Phase B1 - `kind` in the manifest, schema 2 (`WORK-ORDER.md` B1):
 the release workflow's "Check the packs against the catalogue" step must
-follow the rename to `modules` and keep failing on unpublished bytes. The
-merge of `feature/a6-crt-static` and the next release are the user's calls.
+follow the rename to `modules` and keep failing on unpublished bytes. This
+entry's branch merged into `main` as `585f8ff` (run `40314663065`); the next
+release is the user's call.
 
 ---
 
