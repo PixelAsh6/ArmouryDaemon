@@ -501,6 +501,16 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     copy. When a string you can see refuses to match, dump that line's
     codepoints instead of trusting the console; the same discipline the §
     refs in the house docs already demand.
+58. **A local fixture server must keep the connection alive.** The
+    daemon's fetches (the manifest, then its `.minisig`) ride the same
+    pooled HTTP client, and Python's stock `http.server` answers HTTP/1.0
+    and hangs up between requests. The first fetch succeeds, the very
+    next one dies with `Peer disconnected`, and nothing is wrong with the
+    files - it reads exactly like a missing signature. Serving the
+    fixtures through a ten-line subclass that sets
+    `protocol_version = "HTTP/1.1"` (keep-alive) fixed it. Only a
+    hand-rolled development server hits this; a real catalogue host
+    keep-alives on its own.
 
 ---
 

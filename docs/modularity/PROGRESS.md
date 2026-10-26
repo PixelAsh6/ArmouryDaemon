@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) and **B3** (`c8c0468`) done and merged; **B4 on the branch `feature/b4-modules-window`** (the "Modules" window: the rename, three row shapes, cached permission lines), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
-| **Next action** | Watch the `feature/b4-modules-window` CI runs, then **merge** (`merge: B4 - the Modules window`) and wrap docs. After that: **B5** - the daemon's helper-install request (kind, `entry`, SHA-256) and the armed helper Download button (`WORK-ORDER.md` B5). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b4-modules-window` cut from `main` `5036799` - CI **green** on the tip `e4e4f83` (run `40389239303`; one red run before it - `40388852493` on `6eff4e9`, a paint test that asked its fixture for the wrong shape). Counts printed: **406 unit tests** (300 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip) |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`) and **B4** (`4d7886b`) done and merged: the catalogue window is the **Modules** window - one list renders pack, mode and helper rows, helpers carry their `module.json` state and a size-carrying disabled button, and installed packs show their permission line as effects. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | **B5** - the daemon's helper-install request (kind, `entry`, SHA-256) arms the Modules window's helper Download button (`WORK-ORDER.md` B5). The signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `main` at the B4 merge `4d7886b` - CI **green** on it (run `40392276560`; the runner printed 300 + 106); the branch's runs green on `e4e4f83` (`40389239303`) and `e708eb3` (`40390945457`), and the red `40388852493` on `6eff4e9` is recorded with its lesson. Counts stand: **406 unit tests** (300 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip); the exe is **13,295,104 bytes** (+19,968), sha256 `c6aa61ae…a6bd`, `VCRUNTIME140.dll` still absent. `feature/b4-modules-window` is pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1300,10 +1300,18 @@ pair SKIPs until the flip). Artefact: **13,295,104 bytes** (+19,968
 over the B3 tip's 13,275,136 - the row shapes, the two maps and the
 worker pass), sha256 `c6aa61ae…a6bd`, `VCRUNTIME140.dll` still absent.
 
-**Next.** Watch the branch's CI runs, merge as
-`merge: B4 - the Modules window`, and wrap the docs with the run ids and
-the artefact. Then B5: the daemon's helper-install request (kind, `entry`,
-SHA-256 over the temp file) arms the Download button.
+**On the box.** The rename verified live on the CI build: the settings
+button, the window title, and the log pair (`modules window requested`,
+`modules window shown (78 ms after the request)`). Driven against the
+frozen signed helper fixture served locally, the window goes open -
+fetch - and, before the serving fix, printed its fail-closed refusal for
+an unsigned manifest, naming the URL it tried. The helper row's own
+screenshot is deferred (the paint tests carry the row's geometry) until
+a quiet machine; the deferral's cause is trap 58.
+
+**Next.** Merged into `main` as `4d7886b` (run `40392276560`, green).
+B5: the daemon's helper-install request (kind, `entry`, SHA-256 over the
+temp file) arms the Download button.
 
 ---
 

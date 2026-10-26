@@ -165,9 +165,10 @@ background.
   `e4e4f83` (run `40389239303`; one red before it - a paint test that
   asked its fixture for the wrong shape): **406 unit tests** (300
   `armoury` + 106 `armoury-core`), **160 harness checks**, the exe
-  **13,295,104 bytes** (+19,968), sha256 `c6aa61ae…a6bd`. The branch merges
-  as `merge: B4 - the Modules window`; the packs flip, the signing key
-  and the next release are the user's calls.
+  **13,295,104 bytes** (+19,968), sha256 `c6aa61ae…a6bd`. In `main` at
+  `4d7886b` (the merge's run `40392276560` green); the branch is pruned;
+  the packs flip, the signing key and the next release are the user's
+  calls.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
