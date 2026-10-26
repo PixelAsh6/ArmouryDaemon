@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`) and **B4** (`4d7886b`) done and merged: the catalogue window is the **Modules** window - one list renders pack, mode and helper rows, helpers carry their `module.json` state and a size-carrying disabled button, and installed packs show their permission line as effects. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
-| **Next action** | **B5** - the daemon's helper-install request (kind, `entry`, SHA-256) arms the Modules window's helper Download button (`WORK-ORDER.md` B5). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `main` at the B4 merge `4d7886b` - CI **green** on it (run `40392276560`; the runner printed 300 + 106); the branch's runs green on `e4e4f83` (`40389239303`) and `e708eb3` (`40390945457`), and the red `40388852493` on `6eff4e9` is recorded with its lesson. Counts stand: **406 unit tests** (300 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip); the exe is **13,295,104 bytes** (+19,968), sha256 `c6aa61ae…a6bd`, `VCRUNTIME140.dll` still absent. `feature/b4-modules-window` is pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`) and **B4** (`4d7886b`) done and merged; **B5 on the branch `feature/b5-helper-request`** (the daemon's helper-install request and the armed helper buttons), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | Watch the `feature/b5-helper-request` CI runs, then **merge** (`merge: B5 - the daemon installs helpers to modules/`) and wrap docs. After that: **Phase C** (read `WORK-ORDER.md`'s C section when reached). The signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `feature/b5-helper-request` cut from `main` `7eb83cb` - **CI pending on the tip**. Counts before B5: **406 unit tests** (300 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip); the branch's run prints the fresh numbers (the B5 probe block adds checks) |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1312,6 +1312,51 @@ a quiet machine; the deferral's cause is trap 58.
 **Next.** Merged into `main` as `4d7886b` (run `40392276560`, green).
 B5: the daemon's helper-install request (kind, `entry`, SHA-256 over the
 temp file) arms the Download button.
+
+---
+
+### 2026-10-26 - Phase B5: the daemon installs helpers behind its own request
+
+**What I did.** The protocol learns `InstallHelper` - the entry's `id`,
+`name`, `version`, the executable path, the archive's SHA-256 and its size
+- and the UI is the one driving it: the Modules window's helper rows offer
+the same real Download/Update buttons a pack row offers, the download
+worker lands the verified zip in temp under the archive's own suffix, and
+the drain sends the request the kind asks for (a pack keeps
+`InstallPack { source }`). The daemon is the last to read the file and
+trusts nobody on the way: the request's file must sit in temp with the
+download's name shape (the `.zip` suffix is the helper's, the `.json` one
+stays the pack's), the bytes are re-checked against the SHA-256 they were
+named with, and only then does the helper installer's own machinery run -
+the safe-folder name, the checked entry path, the folder locks, the
+extraction caps. Whatever the answer is, the temp archive is removed; the
+reply rides the usual pack-op, so the row stops saying "installing." and
+the permission-line scan re-runs through the one cache pass. The greyed
+stand-in (B4's disabled button and its "Download (1 KB)" label) is gone -
+`DECISIONS.md` §28 records why: the size label was the disabled button's
+honesty, not the row's promise.
+
+**What I did not do.** No helper removal request (a `RemoveHelper` is
+uncharted: what "uninstall" means for a used helper - running process,
+locks, console band containing it - deserves its own decision before code);
+no CLI change (the in-process `--catalog-install` path already handles
+both kinds); no release.
+
+**Tests.** Two daemon tests: the request path installs the helper with a
+verified archive (and the module.json lands beside the executable, the
+temp file gone) and the refusal rules hold (a file outside temp with the
+right name shape is refused; a right-shape file whose bytes do not hash to
+the given SHA-256 is refused - and is removed either way). The protocol's
+pack-ops roundtrip names the new variant. The UI's greyed-row paint test
+becomes `the_helper_row_acts_like_a_pack_row` (download, update, installed
+- and no size label anywhere), and a helper download test asserts the zip
+suffix and the entry riding along in the queue.
+
+**Next.** Watch the branch's CI runs, merge as
+`merge: B5 - the daemon installs helpers to modules/`, wrap the docs with
+the run ids and the artefact. Then Phase C (the console as a helper
+module; read WORK-ORDER.md's C section when reached). The signing key, the
+packs flip and the release are the user's calls.
 
 ---
 

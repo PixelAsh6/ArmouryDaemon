@@ -31,6 +31,12 @@ pub const DEFAULT_URL: &str =
 /// does not fill up with one file per install. The name is also what tells the daemon
 /// that a file is its own: a pack.json the user picked in the file dialog is not.
 pub const TEMP_PREFIX: &str = "armoury-catalog-";
+/// A pack's temp file holds the pack.json the ordinary installer reads, so `".json"`.
+/// The daemon refuses anything else with the same prefix.
+pub const TEMP_PACK_SUFFIX: &str = ".json";
+/// A helper's temp file holds the archive the daemon extracts itself, so `".zip"`.
+/// The daemon refuses a helper out of anything that does not end with this.
+pub const TEMP_HELPER_SUFFIX: &str = ".zip";
 
 /// The manifest schemas this build understands: 1 is the pre-B1 manifest (entries under
 /// the `packs` key), 2 reads `modules` and names each entry's `kind`.

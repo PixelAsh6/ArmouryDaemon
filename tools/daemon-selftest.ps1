@@ -1422,6 +1422,28 @@ try {
         Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-harness') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-harness') -Recurse -Force -ErrorAction SilentlyContinue
 
+        # -- 20e. a helper installs through the daemon's request (B5) --
+        #
+        # The Modules window downloads the helper archive itself and hands the daemon the
+        # `InstallHelper` request, naming the manifest entry's version, executable path
+        # and the SHA-256 the download was verified against. The daemon re-checks the
+        # bytes before they land anywhere, extracts into modules/<id>/ under its locks,
+        # and the temp file does not survive the answer; a fresh probe process lists what
+        # a restart would find again.
+        $requestZip = Join-Path $env:TEMP 'armoury-catalog-h-request.zip'
+        Copy-Item -LiteralPath (Join-Path $fixtures 'helper-harness-test.zip') -Destination $requestZip -Force
+        $requestHash = (Get-FileHash -LiteralPath $requestZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        $requestSize = (Get-Item -LiteralPath $requestZip).Length
+        $requestJson = '{"type":"install_helper","id":"h-request","name":"Requested helper","version":"0.9.9","entry":"ArmouryConsole.exe","file":"' + ($requestZip -replace '\\', '\\') + '","sha256":"' + $requestHash + '","size":' + $requestSize + '}'
+        $reply = Send-Pipe $requestJson
+        Check 'the daemon answers the helper request' ($reply -match '"ok"\s*:\s*true') "reply=$(Get-FirstLine $reply)"
+        $list = Invoke-Cli @('--module-list') 40
+        Check 'the requested helper is listed by a fresh process' ($list.Text.Contains('h-request')) "output=$(Get-FirstLine $list.Text)"
+        Check 'the requested helper archive left temp after the answer' (-not (Test-Path -LiteralPath $requestZip)) "still there: $requestZip"
+        Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $requestZip -Force -ErrorAction SilentlyContinue
+
         $env:ARMOURY_TEST_NS = $ns
     }
     else {

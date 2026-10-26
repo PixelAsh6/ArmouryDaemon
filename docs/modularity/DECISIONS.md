@@ -999,7 +999,13 @@ three kinds from the same manifest.
   names the daemon: helpers install through the daemon from the next
   phase, which must teach it a new Request variant (kind, `entry`,
   SHA-256) before the button may arm. An enabled button that falls over
-  at the daemon's manifest check would teach the wrong lesson.
+  at the daemon's manifest check would teach the wrong lesson. B5 armed
+  it: the daemon's `InstallHelper` request carries the manifest entry's
+  id, version, entry path, SHA-256 and size, the daemon re-verifies the
+  archive's bytes after it reads them, and the row reads like a pack row
+  again - the size display was the disabled button's honesty, not the
+  row's promise. The reply rides `PackOp`, so the row clears and the
+  permission-line scan re-runs through the one cache pass.
 - **Everything outside the window keeps the packs vocabulary until the
   flip.** The settings one-liner ("Last check: 3 packs - all up to date")
   and the status snapshot still speak of packs - the config and status

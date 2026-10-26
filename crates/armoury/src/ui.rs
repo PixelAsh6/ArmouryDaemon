@@ -137,6 +137,16 @@ enum Picked {
     PackJson(PathBuf),
 }
 
+/// One verified catalogue download waiting for the daemon: where the file sits and the
+/// signed manifest entry it was verified against. A helper's request has to name the
+/// entry's own fields (version, the entry path, the SHA-256), so the pair travels as
+/// one through `Shared`.
+#[derive(Clone)]
+struct PendingInstall {
+    path: PathBuf,
+    entry: CatalogPack,
+}
+
 #[derive(Default)]
 struct Shared {
     status: Option<StatusSnapshot>,
@@ -207,8 +217,9 @@ struct Shared {
     /// in here says "installing…" and offers no button. There is more than one: a second
     /// pack may be asked for while the first one is still coming down.
     catalog_installing: Vec<String>,
-    /// The verified pack files waiting for the daemon's install request.
-    catalog_install_path: Vec<PathBuf>,
+    /// Verified catalogue downloads waiting for the daemon's install request, each with
+    /// the manifest entry it was verified against.
+    pending_installs: Vec<PendingInstall>,
     /// Per-pack windows: ids in open order.
     open_packs: Vec<String>,
     /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
@@ -660,18 +671,40 @@ impl eframe::App for App {
                 request_catalog_repaint(&ctx, &shared);
             });
         }
-        // Verified catalog files waiting for the daemon: installing still goes through the
-        // daemon's normal request (it validates and owns the packs folder). There is more
-        // than one: a second pack may be asked for while the first one is coming down.
-        let ready: Vec<PathBuf> = {
+        // Verified catalog downloads waiting for the daemon: installing still goes
+        // through the daemon's own request (it validates and owns the folders), and a
+        // helper names its manifest entry to the daemon - the daemon re-verifies the
+        // bytes before they land anywhere. There is more than one: a second module may
+        // be asked for while the first one is coming down, and the answers are replied
+        // in the order the requests went out.
+        let ready: Vec<PendingInstall> = {
             let mut s = self.shared.lock().unwrap();
-            std::mem::take(&mut s.catalog_install_path)
+            std::mem::take(&mut s.pending_installs)
         };
-        for path in ready {
-            log::info!("installing catalog pack from {}", path.display());
-            self.request(&Request::InstallPack {
-                source: path.display().to_string(),
-            });
+        for ready in ready {
+            let kind = ready.entry.kind.clone();
+            log::info!(
+                "installing catalog {} {} from {}",
+                kind,
+                ready.entry.id,
+                ready.path.display()
+            );
+            let request = if kind == "helper" {
+                Request::InstallHelper {
+                    id: ready.entry.id.clone(),
+                    name: ready.entry.name.clone(),
+                    version: ready.entry.version.clone(),
+                    entry: ready.entry.entry.clone().unwrap_or_default(),
+                    file: ready.path.display().to_string(),
+                    sha256: ready.entry.sha256.clone(),
+                    size: ready.entry.size,
+                }
+            } else {
+                Request::InstallPack {
+                    source: ready.path.display().to_string(),
+                }
+            };
+            self.request(&request);
         }
 
         // The running-app list is refreshed by the worker, not here: the walk costs
@@ -2699,22 +2732,6 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 /// widen the whole list, and that pushed the state of the rows below it off the screen.
 const CATALOG_DESC_WIDTH: f32 = 240.0;
 
-/// The label on a helper row's disabled button, with the archive's size so the
-/// row says what it would bring down. Under a megabyte the size is shown in
-/// whole KB, above it in MB with one decimal; a catalogue entry without a size
-/// shows none.
-fn helper_button_label(action: &str, size: Option<u64>) -> String {
-    let Some(bytes) = size else {
-        return action.to_string();
-    };
-    let size = if bytes >= 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{} KB", (bytes + 1023) / 1024)
-    };
-    format!("{action} ({size})")
-}
-
 /// One weak, wrapped note under a catalogue row, in the description's column:
 /// the same width cap, so no note can widen the row or push the state of the
 /// rows below it out of the window. `tag` separates the notes of one row.
@@ -2782,50 +2799,26 @@ fn catalog_row(
             }
             match pack_button(&entry.version, installed_version) {
                 PackButton::Download => {
-                    if entry.kind == "helper" {
-                        // The daemon installs helpers: the request it needs is this
-                        // release's next step. Until then the row stays honest - a
-                        // greyed button that shows what it would bring down, and a
-                        // hover that says why it does nothing yet.
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(
-                                RichText::new(helper_button_label("Download", entry.size)).small(),
-                            ),
-                        )
-                        .on_hover_text(
-                            "Helpers install through the daemon, from the next release on",
-                        );
-                    } else if ui
+                    let hover = format!(
+                        "Download, verify and install this {}",
+                        if entry.kind == "helper" { "helper" } else { "pack" }
+                    );
+                    if ui
                         .small_button("Download")
-                        .on_hover_text("Download, verify and install this pack")
+                        .on_hover_text(hover)
                         .clicked()
                     {
                         start_catalog_install(shared, entry, ui.ctx());
                     }
                 }
                 PackButton::Update => {
-                    if entry.kind == "helper" {
-                        // Same story as a fresh helper download: the update needs the
-                        // daemon's request too, so it waits for the next release.
-                        ui.add_enabled(
-                            false,
-                            egui::Button::new(
-                                RichText::new(helper_button_label("Update", entry.size)).small(),
-                            ),
-                        )
-                        .on_hover_text(
-                            "Helpers install through the daemon, from the next release on",
-                        );
-                    } else {
-                        let hover = format!(
-                            "installed v{} → v{}",
-                            installed_version.unwrap_or_default(),
-                            entry.version
-                        );
-                        if ui.small_button("Update").on_hover_text(hover).clicked() {
-                            start_catalog_install(shared, entry, ui.ctx());
-                        }
+                    let hover = format!(
+                        "installed v{} → v{}",
+                        installed_version.unwrap_or_default(),
+                        entry.version
+                    );
+                    if ui.small_button("Update").on_hover_text(hover).clicked() {
+                        start_catalog_install(shared, entry, ui.ctx());
                     }
                 }
                 PackButton::Installed(version) => {
@@ -3184,9 +3177,9 @@ enum Picker {
     PackJson,
 }
 
-/// Download one catalog pack on its own thread, then hand the file to the daemon: the App
-/// drains `catalog_install_path` and sends the normal install request (the daemon still
-/// verifies and owns the packs folder).
+/// Download one catalog entry on its own thread, then hand the file to the daemon: the App
+/// drains `pending_installs` and sends the request the entry's kind asks for (the daemon
+/// still validates and owns the folders).
 ///
 /// The download must not run on the thread that draws the window: this returns at once and
 /// the row says the pack is on its way, so the window keeps drawing while the pack comes
@@ -3222,7 +3215,15 @@ fn download_pack_in_background(
     // The download runs on its own thread: the thread that draws the window returns at
     // once, so the window keeps drawing while the pack comes down.
     thread::spawn(move || {
-        let dest = catalog_temp_path(&entry.id);
+        // A pack's temp file holds the pack.json the daemon's installer reads, a
+        // helper's holds the archive the daemon extracts itself: the suffix says which
+        // is which, and the daemon refuses to read one out of the other's shape.
+        let suffix = if entry.kind == "helper" {
+            catalog::TEMP_HELPER_SUFFIX
+        } else {
+            catalog::TEMP_PACK_SUFFIX
+        };
+        let dest = catalog_temp_path(&entry.id, suffix);
         log::info!("catalog: downloading {}", entry.id);
         let started = Instant::now();
         let result = catalog::download_to(&url, &entry, &dest);
@@ -3235,7 +3236,10 @@ fn download_pack_in_background(
                         entry.id,
                         started.elapsed().as_millis()
                     );
-                    s.catalog_install_path.push(dest);
+                    s.pending_installs.push(PendingInstall {
+                        path: dest,
+                        entry: entry.clone(),
+                    });
                 }
                 Err(e) => {
                     // The pack never lands: the row must not keep saying "installing…".
@@ -3258,12 +3262,13 @@ fn catalogue_url() -> String {
     catalog::url_or_default(configured.as_deref())
 }
 
-/// The file a pack is downloaded into: the temp folder, under a name only the pack's own id
-/// can make.
+/// The file a catalogue download lands in: the temp folder, under a name only the entry's
+/// own id and kind can make.
 ///
 /// The id comes from the network, so it is not trusted with the file system: a name like
-/// `../../x` must not write outside the temp folder.
-fn catalog_temp_path(id: &str) -> PathBuf {
+/// `../../x` must not write outside the temp folder. The kind gives the suffix - a pack's
+/// temp file is its pack.json, a helper's is its archive.
+fn catalog_temp_path(id: &str, suffix: &str) -> PathBuf {
     let safe: String = id
         .chars()
         .map(|c| {
@@ -3274,7 +3279,7 @@ fn catalog_temp_path(id: &str) -> PathBuf {
             }
         })
         .collect();
-    std::env::temp_dir().join(format!("{}{safe}.json", catalog::TEMP_PREFIX))
+    std::env::temp_dir().join(format!("{}{safe}{suffix}", catalog::TEMP_PREFIX))
 }
 
 /// Run the native picker on a worker thread: the dialog runs its own modal loop, and
@@ -5252,11 +5257,12 @@ mod tests {
     }
 
     #[test]
-    fn the_helper_row_names_its_size_and_state() {
-        // A helper row never offers the pack's install flow before the daemon's own
-        // request exists: its button is greyed and shows the archive's size, and a
-        // helper already on disk (its module.json read back) says so in the same
-        // words a pack row uses.
+    fn the_helper_row_acts_like_a_pack_row() {
+        // The daemon's helper request exists, so the row offers what a pack row offers:
+        // the download and the update are real buttons, and a helper already on disk
+        // (its module.json read back) says so in the same words a pack row uses. The
+        // greyed stand-in with the size on it was the not-yet-armed state; its label is
+        // gone with it.
         let ctx = egui::Context::default();
         app_style(&ctx);
         let input = egui::RawInput {
@@ -5268,24 +5274,18 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(Shared::default()));
         // Three helper rows so every state paints once: no record = download,
-        // same version = installed, older record = update (where the MB shows).
+        // same version = installed, older record = update.
         let entries = vec![
-            CatalogPack {
-                kind: "helper".to_string(),
-                size: Some(322),
-                ..catalog_entry("armoury-pick", "Armoury Pick", "0.4.0")
-            },
-            CatalogPack {
-                kind: "helper".to_string(),
-                size: Some(3000),
-                ..catalog_entry("armoury-console", "Armoury Console", "0.2.0")
-            },
-            CatalogPack {
-                kind: "helper".to_string(),
-                size: Some(1024 * 1024 + 512),
-                ..catalog_entry("armoury-alert", "Armoury Alert", "0.7.0")
-            },
-        ];
+            catalog_entry("armoury-pick", "Armoury Pick", "0.4.0"),
+            catalog_entry("armoury-console", "Armoury Console", "0.2.0"),
+            catalog_entry("armoury-alert", "Armoury Alert", "0.7.0"),
+        ]
+        .into_iter()
+        .map(|mut e| {
+            e.kind = "helper".to_string();
+            e
+        })
+        .collect::<Vec<_>>();
         let mut helper_versions = HashMap::new();
         // The console is on disk at the catalogue's version; the alert is older.
         helper_versions.insert("armoury-console".to_string(), "0.2.0".to_string());
@@ -5314,14 +5314,22 @@ mod tests {
                 .map(|(_, rect, _)| *rect)
         };
         output.drop_without_applying_deltas();
-        // The size rides on the greyed button: 322 bytes round up to one KB, and a
-        // size past the megabyte line reads in MB with a decimal.
-        state("Download (1 KB)")
-            .expect("the helper row does not show what its download weighs");
-        state("Update (1.0 MB)").expect("the update does not show its size");
-        // The one installed-only helper says so like a pack row does.
+        // The row owns the three pack-shaped offers, and nothing of the stand-in is
+        // left: no size rides on the button any more.
+        let download = state("Download").expect("the helper row does not offer the download");
+        state("Update").expect("the older helper's row does not offer the update");
         let installed = state("v0.2.0 installed").expect("the installed helper is not shown");
-        // It sits against the right edge, like every row's state.
+        assert!(
+            !text.iter().any(|(t, _, _)| t.contains(" KB")),
+            "the size label was the greyed stand-in's furniture and goes with it"
+        );
+        // Both button and state sit on the row's right half, like every row's widget; the
+        // bare installed label itself touches the right edge (the button's text sits
+        // inside the button's padding, so it is the row position that is asserted).
+        assert!(
+            download.right() > INSTALL_PACKS_WIDTH * 0.8,
+            "the download button is not on the row's right side: {download:?}"
+        );
         assert!(
             (installed.right() - INSTALL_PACKS_WIDTH).abs() < 0.5,
             "the installed label is not at the right edge: {installed:?}"
@@ -5684,7 +5692,7 @@ mod tests {
         while Instant::now() < deadline {
             let done = {
                 let s = shared.lock().unwrap();
-                s.last_pack_op.is_some() || !s.catalog_install_path.is_empty()
+                s.last_pack_op.is_some() || !s.pending_installs.is_empty()
             };
             if done {
                 return shared;
@@ -5694,16 +5702,16 @@ mod tests {
         panic!("the download never ended");
     }
 
-    /// Wait until the queue of verified files holds `count` of them.
-    fn wait_for_files(shared: &Arc<Mutex<Shared>>, count: usize) -> Vec<PathBuf> {
+    /// Wait until the queue of verified downloads holds `count` of them.
+    fn wait_for_files(shared: &Arc<Mutex<Shared>>, count: usize) -> Vec<PendingInstall> {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let landed = {
                 let s = shared.lock().unwrap();
-                s.catalog_install_path.len()
+                s.pending_installs.len()
             };
             if landed >= count {
-                return shared.lock().unwrap().catalog_install_path.clone();
+                return shared.lock().unwrap().pending_installs.clone();
             }
             if Instant::now() >= deadline {
                 panic!("only {landed} of {count} downloads landed");
@@ -5735,11 +5743,44 @@ mod tests {
         // And the download ends on its own, on the worker.
         let paths = wait_for_files(&shared, 1);
         assert_eq!(
-            std::fs::read(&paths[0]).expect("the verified file"),
+            std::fs::read(&paths[0].path).expect("the verified file"),
             body,
             "the file holds the bytes that were served"
         );
-        let _ = std::fs::remove_file(&paths[0]);
+        let _ = std::fs::remove_file(&paths[0].path);
+    }
+
+    #[test]
+    fn a_helper_download_leaves_the_zip_and_its_entry_for_the_daemon() {
+        // A helper is an archive, not a pack.json: the temp file carries the zip's own
+        // suffix (the one the daemon's read refuses to widen), and the manifest entry
+        // rides along in `Shared`, because the daemon's request names its version, its
+        // entry path and its SHA-256.
+        let body = b"archive bytes that the manifest promises".to_vec();
+        let repo = TestRepo::start(body.clone(), Duration::from_millis(0));
+        let id = test_pack_id("helperzip");
+        let mut entry = entry_for(&body, &id);
+        entry.kind = "helper".to_string();
+
+        let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
+        let ctx = egui::Context::default();
+        download_pack_in_background(&shared, &entry, &repo.url, &ctx);
+        let landed = wait_for_files(&shared, 1);
+        assert!(
+            landed[0]
+                .path
+                .to_string_lossy()
+                .ends_with(catalog::TEMP_HELPER_SUFFIX),
+            "the helper's temp file is an archive, not a pack.json: {:?}",
+            landed[0].path
+        );
+        assert_eq!(landed[0].entry.kind, "helper", "the entry rides along");
+        assert_eq!(
+            landed[0].entry.sha256,
+            catalog::hex_sha256(&body),
+            "the entry's hash is the one the download was verified against"
+        );
+        let _ = std::fs::remove_file(&landed[0].path);
     }
 
     #[test]
@@ -5756,13 +5797,16 @@ mod tests {
         let (ok, message) = s.last_pack_op.clone().expect("the failure reaches the user");
         assert!(!ok, "the download failed: {message}");
         assert!(message.contains("size"), "the message says what is wrong: {message}");
-        assert!(s.catalog_install_path.is_empty(), "nothing waits for the daemon");
+        assert!(s.pending_installs.is_empty(), "nothing waits for the daemon");
         assert!(
             s.catalog_installing.is_empty(),
             "the row does not stay on 'installing…'"
         );
         drop(s);
-        assert!(!catalog_temp_path(&id).exists(), "nothing was written");
+        assert!(
+            !catalog_temp_path(&id, catalog::TEMP_PACK_SUFFIX).exists(),
+            "nothing was written"
+        );
     }
 
     #[test]
@@ -5779,13 +5823,16 @@ mod tests {
         let (ok, message) = s.last_pack_op.clone().expect("the failure reaches the user");
         assert!(!ok, "the download failed: {message}");
         assert!(message.contains("sha256"), "the message says what is wrong: {message}");
-        assert!(s.catalog_install_path.is_empty(), "nothing waits for the daemon");
+        assert!(s.pending_installs.is_empty(), "nothing waits for the daemon");
         assert!(
             s.catalog_installing.is_empty(),
             "the row does not stay on 'installing…'"
         );
         drop(s);
-        assert!(!catalog_temp_path(&id).exists(), "nothing was written");
+        assert!(
+            !catalog_temp_path(&id, catalog::TEMP_PACK_SUFFIX).exists(),
+            "nothing was written"
+        );
     }
 
     #[test]
@@ -5809,15 +5856,15 @@ mod tests {
         );
         let paths = wait_for_files(&shared, 2);
         assert_eq!(paths.len(), 2, "both downloads are kept");
-        for path in paths {
-            let _ = std::fs::remove_file(path);
+        for landed in paths {
+            let _ = std::fs::remove_file(&landed.path);
         }
     }
 
     #[test]
     fn the_temp_file_of_a_pack_cannot_leave_the_temp_folder() {
         // The id comes from the network, so it is not trusted with the file system.
-        let path = catalog_temp_path("../../Windows/System32/evil");
+        let path = catalog_temp_path("../../Windows/System32/evil", catalog::TEMP_PACK_SUFFIX);
         assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
         assert!(
             path.file_name()

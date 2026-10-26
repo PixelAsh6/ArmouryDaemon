@@ -4,6 +4,7 @@
 use crate::art;
 use crate::catalog;
 use crate::console;
+use crate::helpers;
 use crate::hotkey;
 use crate::install;
 use crate::ipc;
@@ -728,6 +729,58 @@ fn install_pack_file(
     result
 }
 
+/// Install a helper module from the downloaded archive and clean up after it.
+///
+/// The UI's worker downloads the archive, checks it against the signed catalogue and
+/// leaves it in temp; the request then names the manifest entry and its SHA-256. The
+/// daemon is the last one to read the file, and it trusts nobody along the way: it
+/// re-checks the bytes against the SHA-256 it was told before any of them land
+/// anywhere, and the helper installer's own rules (a safe folder name, a checked entry
+/// path, the folder locks, the extraction caps) run after that. Whether it worked or
+/// not, the archive is removed.
+fn install_helper_file(
+    search: &[std::path::PathBuf],
+    id: &str,
+    name: &str,
+    version: &str,
+    entry: &str,
+    source: &std::path::Path,
+    sha256: &str,
+    size: Option<u64>,
+) -> Result<(String, bool), String> {
+    let result = (|| {
+        let said = "the helper request asks for";
+        if !is_helper_temp(source) {
+            return Err(format!(
+                "{said} {} - that is not the temp archive the catalogue download \
+                 writes, so nothing is extracted",
+                source.display()
+            ));
+        }
+        let archive = std::fs::read(source)
+            .map_err(|e| format!("cannot read the downloaded helper {}: {e}", source.display()))?;
+        catalog::verify(&archive, sha256, size)?;
+        helpers::install_from_bytes(
+            search,
+            &catalog::CatalogPack {
+                id: id.to_string(),
+                name: name.to_string(),
+                version: version.to_string(),
+                description: String::new(),
+                kind: "helper".to_string(),
+                file: String::new(),
+                sha256: sha256.to_string(),
+                size,
+                min_engine: None,
+                entry: Some(entry.to_string()),
+            },
+            &archive,
+        )
+    })();
+    remove_helper_temp(source);
+    result
+}
+
 /// Remove the verified catalogue file the install has just read.
 ///
 /// Only a file that is one of ours goes: it has to sit in the temp folder and to carry
@@ -743,12 +796,29 @@ fn remove_catalog_temp(source: &std::path::Path) {
     }
 }
 
-/// Is this the temp file the catalogue download writes?
-fn is_catalog_temp(path: &std::path::Path) -> bool {
+/// Remove the verified helper archive the install has just read - or refused. The
+/// download is not the user's to keep: whatever the request said, the archive that
+/// bore it is gone when the answer is in.
+fn remove_helper_temp(source: &std::path::Path) {
+    if !is_helper_temp(source) {
+        return;
+    }
+    match std::fs::remove_file(source) {
+        Ok(()) => info!("removed the downloaded helper archive {}", source.display()),
+        Err(e) => warn!("could not remove {} ({e})", source.display()),
+    }
+}
+
+/// Is this the temp file the catalogue download writes with `suffix`?
+///
+/// The name rule and the folder rule are one test: the file carries the download's own
+/// prefix and suffix, and it has to sit in the temp folder - a file with that name
+/// somewhere else is not ours to read or to remove.
+fn is_temp_of(path: &std::path::Path, suffix: &str) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
-    if !name.starts_with(catalog::TEMP_PREFIX) || !name.ends_with(".json") {
+    if !name.starts_with(catalog::TEMP_PREFIX) || !name.ends_with(suffix) {
         return false;
     }
     // It also has to sit in the temp folder: a file with that name somewhere else is not
@@ -759,6 +829,16 @@ fn is_catalog_temp(path: &std::path::Path) -> bool {
         return false;
     };
     same_folder(parent, &std::env::temp_dir())
+}
+
+/// Is this the temp file the catalogue download writes?
+fn is_catalog_temp(path: &std::path::Path) -> bool {
+    is_temp_of(path, catalog::TEMP_PACK_SUFFIX)
+}
+
+/// Is this the temp archive the catalogue download writes for a helper?
+fn is_helper_temp(path: &std::path::Path) -> bool {
+    is_temp_of(path, catalog::TEMP_HELPER_SUFFIX)
 }
 
 /// Are these the same folder? The two paths are canonicalised first, so the short and
@@ -2760,6 +2840,42 @@ impl App {
                         }
                     }
                 }
+                Request::InstallHelper {
+                    id: helper_id,
+                    name,
+                    version,
+                    entry,
+                    file,
+                    sha256,
+                    size,
+                } => {
+                    let result = install_helper_file(
+                        &self.search,
+                        &helper_id,
+                        &name,
+                        &version,
+                        &entry,
+                        std::path::Path::new(&file),
+                        &sha256,
+                        size,
+                    );
+                    match result {
+                        Ok((_, updated)) => {
+                            let message = format!(
+                                "{name} {}",
+                                if updated { "updated" } else { "installed" }
+                            );
+                            info!("pack op: {message}");
+                            forget_error(&mut self.last_error, "catalog");
+                            self.reply_pack_op(id, true, message);
+                        }
+                        Err(e) => {
+                            warn!("helper install failed: {e}");
+                            remember_error(&mut self.last_error, "catalog", &e);
+                            self.reply_pack_op(id, false, e);
+                        }
+                    }
+                }
                 Request::RemovePack { id: pack_id } => {
                     if let Some((pending, _)) = &self.pending_removal {
                         let message = format!(
@@ -3023,6 +3139,110 @@ fn nudge_existing_instance() {
 mod tests {
     use super::*;
     use crate::testutil::Scratch;
+    use std::io::Write as _;
+
+    /// The same shape of helper archive the helpers tests build: one executable at the
+    /// archive root, zipped in-process, deflated. The bytes, their SHA-256 and their
+    /// size are one truth for every expectation of the request path.
+    fn install_zip() -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("Run.exe", options)
+            .expect("a plain name always starts");
+        zip.write_all(b"helper placeholder bytes")
+            .expect("entry bytes");
+        zip.finish().expect("the archive always finishes");
+        buffer.into_inner()
+    }
+
+    #[test]
+    fn a_helper_installs_through_the_daemon_request_path() {
+        // The Modules window downloads the archive and sends the daemon the request with
+        // the manifest entry and its SHA-256. The path here mirrors that request: the
+        // bytes are verified, the helper lands under modules/, its record is beside the
+        // executable, and the temp archive does not survive the answer.
+        let scratch = Scratch::dir("daemon-helper");
+        let dirs = vec![scratch.root().to_path_buf()];
+        let archive = install_zip();
+        let sha = catalog::hex_sha256(&archive);
+        let temp = std::env::temp_dir().join(format!("{}daemon-b5a.zip", catalog::TEMP_PREFIX));
+        std::fs::write(&temp, &archive).expect("the temp archive writes");
+
+        let (id, updated) = install_helper_file(
+            &dirs,
+            "daemon-b5a",
+            "Requested helper",
+            "1.0.0",
+            "Run.exe",
+            &temp,
+            &sha,
+            Some(archive.len() as u64),
+        )
+        .expect("the verified archive installs");
+        assert_eq!(id, "daemon-b5a");
+        assert!(!updated, "the first install is not an update");
+        assert!(
+            !temp.exists(),
+            "the archive is removed once the answer is in"
+        );
+        let record = scratch.root().join("modules").join("daemon-b5a");
+        assert!(
+            record.join("module.json").is_file() && record.join("Run.exe").is_file(),
+            "the folder holds the executable and its record: {}",
+            record.display()
+        );
+    }
+
+    #[test]
+    fn a_helper_request_is_refused_outside_the_temp_folder_and_refused_bad_bytes() {
+        // The daemon reads one file and installs what it names; the rules around that
+        // read are what keep the request from moving bytes anywhere else: the file has
+        // to sit in temp with the download's name shape, and its bytes have to hash to
+        // the SHA-256 the request came with.
+        let scratch = Scratch::dir("daemon-helper-refused");
+        let dirs = vec![scratch.root().to_path_buf()];
+        // right name shape, wrong folder
+        let foreign = scratch
+            .root()
+            .join(format!("{}wrong-place.zip", catalog::TEMP_PREFIX));
+        std::fs::write(&foreign, b"junk").expect("the foreign file writes");
+        let refused = install_helper_file(
+            &dirs,
+            "any",
+            "Any helper",
+            "1.0.0",
+            "Run.exe",
+            &foreign,
+            "00",
+            None,
+        );
+        let why = refused.expect_err("a file outside temp is not ours to extract");
+        assert!(
+            why.contains("not the temp archive"),
+            "the refusal names the rule: {why}"
+        );
+        // right name shape, right folder, bytes that do not hash to the given SHA-256
+        let temp = std::env::temp_dir().join(format!("{}daemon-b5b.zip", catalog::TEMP_PREFIX));
+        std::fs::write(&temp, b"junk that does not hash to 00").expect("the temp file writes");
+        let refused = install_helper_file(
+            &dirs,
+            "any",
+            "Any helper",
+            "1.0.0",
+            "Run.exe",
+            &temp,
+            &"0".repeat(64),
+            None,
+        );
+        let why = refused.expect_err("the hash check runs before anything lands");
+        assert!(why.contains("sha256"), "the refusal names the hash: {why}");
+        assert!(
+            !temp.exists(),
+            "the archive is removed even when the request is refused"
+        );
+    }
 
     #[test]
     fn launcher_entries_drop_hidden_tracked_apps_and_dedupe_pins() {
