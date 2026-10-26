@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) and **B3** (`c8c0468`) done and merged; **B4 on the branch `feature/b4-modules-window`** (the "Modules" window: the rename, three row shapes, cached permission lines), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
 | **Next action** | Watch the `feature/b4-modules-window` CI runs, then **merge** (`merge: B4 - the Modules window`) and wrap docs. After that: **B5** - the daemon's helper-install request (kind, `entry`, SHA-256) and the armed helper Download button (`WORK-ORDER.md` B5). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b4-modules-window` cut from `main` `5036799` - **CI pending on the tip**. Counts before B4: **404 unit tests** (298 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip); the branch's run prints the fresh numbers |
+| **Branch** | `feature/b4-modules-window` cut from `main` `5036799` - CI **green** on the tip `e4e4f83` (run `40389239303`; one red run before it - `40388852493` on `6eff4e9`, a paint test that asked its fixture for the wrong shape). Counts printed: **406 unit tests** (300 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip) |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1285,6 +1285,20 @@ and the daemon answer nothing new - the window reads disk state only.
 helper's "v0.2.0 installed" at the right edge) and the permission line
 under an installed pack (indented, one or two rows). The empty-hint test
 now asserts "Settings → Modules", and its const is `NO_MODULES_HINT`.
+
+**The branch's runs.** One red before the green - `40388852493` on
+`6eff4e9`: the helper paint test mapped the fixtures wrong (the first
+entry was the installed-current one, so `pack_button` handed it
+Installed and no row ever painted the "Download (1 KB)" label the test
+demanded; the runner printed 299 passed and 1 failed, the failing one
+the helper row's test itself). The rewrite gives the test its own
+three helper rows - no record, same version, older record - so each
+state's shape is its own expectation. The green run `40389239303` on `e4e4f83` printed the
+runner's truth: **406 unit tests** (300 `armoury` + 106 `armoury-core`),
+**160 harness checks** with `ALL CHECKS PASSED` (the live-catalogue
+pair SKIPs until the flip). Artefact: **13,295,104 bytes** (+19,968
+over the B3 tip's 13,275,136 - the row shapes, the two maps and the
+worker pass), sha256 `c6aa61ae…a6bd`, `VCRUNTIME140.dll` still absent.
 
 **Next.** Watch the branch's CI runs, merge as
 `merge: B4 - the Modules window`, and wrap the docs with the run ids and
