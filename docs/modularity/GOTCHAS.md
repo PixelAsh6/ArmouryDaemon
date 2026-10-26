@@ -455,6 +455,15 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     `gh run list --branch feature/<branch>` until a run id exists (it takes
     ~15 s), then `gh run watch <id> --exit-status`. `main` pushes trigger on
     their own. All the branch runs in the history carry `workflow_dispatch`.
+53. **A test server that closes with unread data sends an RST, not a FIN.**
+    The schema-2 list probe served its JSON without reading the client's
+    request first, and the fetch died with `io: An established connection was
+    aborted by the software in your host machine` (WSAECONNABORTED 10053):
+    Windows answers a close-with-pending-unread-bytes by aborting the
+    connection. The gzip probe beside it had always called `Read-Request`
+    before answering, which is why its socket behaved. **Read the request
+    before you close** in every loopback-server probe, even when you do not
+    need it.
 
 ---
 

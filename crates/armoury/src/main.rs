@@ -244,7 +244,7 @@ fn catalog_list(url: Option<String>) {
         Ok(list) => {
             let installed = catalog::installed_ids(&dirs);
             println!("catalog: {url} (manifest updated {})", list.updated);
-            for pack in &list.packs {
+            for pack in list.entries() {
                 let state = if installed.iter().any(|id| id == &pack.id) {
                     "installed"
                 } else {

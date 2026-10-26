@@ -373,7 +373,12 @@ jobs:
           try {
               $catalogBytes = $client.GetByteArrayAsync("$base/catalog/index.json").GetAwaiter().GetResult()
               $catalog = [Text.Encoding]::UTF8.GetString($catalogBytes) | ConvertFrom-Json
-              foreach ($pack in $catalog.packs) {
+              if ($catalog.modules -and $catalog.packs) { throw 'the manifest carries both packs and modules - name the entries once' }
+              # schema 1 names the entries under `packs`, schema 2 under `modules`; the
+              # daemon reads both keys for one release, and so does this check.
+              $list = $catalog.modules
+              if (-not $list) { $list = $catalog.packs }
+              foreach ($pack in $list) {
                   $file = [string]$pack.file
                   if (-not $file) { throw "a catalogue entry has no file: $($pack.id)" }
                   $published = $client.GetByteArrayAsync("$base/$file").GetAwaiter().GetResult()

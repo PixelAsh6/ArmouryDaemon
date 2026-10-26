@@ -848,3 +848,31 @@ the work order's 1-2 MB estimate.
   on a stripped image is worse than a megabyte; a `setup.ps1` preflight that
   warns about the missing DLL — it would document the dependency instead of
   removing it.
+
+---
+
+## 25. The manifest says what its packs are: schema 2, `modules` and a `kind`
+
+**Settled 2026-10-26.** B1 moves the catalogue manifest to schema 2 and the
+key with it: the entries live under `modules`, and each entry names its
+`kind` — `"pack"` or `"mode"`, the same vocabulary the pack file's own
+`kind` field uses (`PackKind::from_name` validates it in `parse`, and an
+unknown kind refuses the manifest with the entry's id and the bad name). A
+manifest that names no kind gets `"pack"`, the same default a pre-A3 pack
+file gets; the three shipped packs carry no `pack.json` kind and stay
+`"pack"` — the manifest mirrors what the daemon reads after the download,
+nothing else.
+
+- **One release reads both keys.** The build accepts `packs` (schema 1) and
+  `modules` (schema 2) and refuses a manifest that carries **both**:
+  the publisher writes exactly one, and a silent pick between two lists is
+  the kind of bug that costs an afternoon. The dual read is a courtesy with
+  an expiry — the next build after this one may refuse the old key.
+- **Schema `0` is still not a schema.** The range check is `1..=2`; the old
+  code understood exactly `{1}` and refused `0` the same as `99`. The
+  continuation rule does not change with the extra number.
+- **The release workflow follows.** `release.yml`'s "Check the packs against
+  the catalogue" step reads `modules`, falls back to `packs` for the same
+  window, and throws on both — and keeps failing when a release ships bytes
+  the catalogue does not publish. The manifest is the same key pair, so the
+  check and the daemon see one truth.

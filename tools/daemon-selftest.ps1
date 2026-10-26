@@ -1178,6 +1178,32 @@ try {
         Check 'the catalogue listing names the pack' ($r.Text.Contains('local-test')) "output=$(Get-FirstLine $r.Text)"
         Check 'the client asks for a compressed response' ($script:served -match '(?i)accept-encoding:\s*gzip') "request=$($script:served -replace "`r`n", ' ')"
 
+        # (a2) a schema-2 manifest: the entries under `modules`, naming a kind. The gzip probe
+        # above serves the old `packs` key, which keeps working for one release; this probe
+        # proves the new key lists too - the shape the packs repo will publish at release.
+        $v2Manifest = '{"schema":2,"updated":"2026-10-26","modules":[{"id":"mode-test","name":"Mode test","version":"9.9.9","kind":"mode","description":"served by the harness","file":"packs/mode-test/pack.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":10}]}'
+        $v2Body = [Text.Encoding]::UTF8.GetBytes($v2Manifest)
+        $server = Start-LoopbackListener
+        $probe = Invoke-CatalogProbe @('--catalog-list', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
+            if (-not $server.Accept.Wait(20000)) { throw 'the daemon did not connect' }
+            $client = $server.Accept.GetAwaiter().GetResult()
+            try {
+                # read the request before answering: closing a socket with unread data
+                # turns the close into a reset, and the daemon's fetch dies mid-read
+                $null = Read-Request $client
+                $stream = $client.GetStream()
+                $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($v2Body.Length)`r`nConnection: close`r`n`r`n"
+                $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                $stream.Write($headBytes, 0, $headBytes.Length)
+                $stream.Write($v2Body, 0, $v2Body.Length)
+                $stream.Flush()
+            }
+            finally { $client.Close() }
+        }
+        $server.Listener.Stop()
+        Check 'the schema-2 manifest lists through modules' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit)"
+        Check 'the schema-2 listing names the pack' ($probe.Text.Contains('mode-test')) "output=$(Get-FirstLine $probe.Text)"
+
         # (b) the real catalogue, over HTTPS, with the Windows certificate store
         $run = Invoke-Cli @('--catalog-list') 40
         $failure = Get-FetchFailure $run.Text

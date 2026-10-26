@@ -7,6 +7,12 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ### Added
 
+- The **catalogue manifest reaches schema 2**. The entries move under
+  `modules` and each names its `kind` — `"pack"` or `"mode"`, the same
+  vocabulary a pack file uses; an unknown kind refuses the manifest with the
+  entry's name, an absent kind means `pack`, and the build reads both keys
+  for one release so an old manifest keeps working (a manifest carrying both
+  is refused, `docs/modularity/DECISIONS.md` §25).
 - The **killswitch has a config key and an IPC request**. One field,
   `killswitch_enabled` (default on), is both the switch and the "is the killswitch
   module installed" flag: while it is off, the End key and the tray toggle are
