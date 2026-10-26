@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::helpers;
+
 use armoury_core::pack::version_at_least;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
