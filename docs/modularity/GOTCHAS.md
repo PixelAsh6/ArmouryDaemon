@@ -472,6 +472,15 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     runner sees are the ones the signature covers. The same applies to any
     future frozen artefact - checksums, one-off signatures - treat them like
     the hash sidecar: bytes, not text.
+55. **An accepted accept task answers exactly once.** The loopback helper
+    starts `AcceptTcpClientAsync()` at listener creation, and the task is
+    consumed on the first client. A second fetch over a second connection
+    must wait on a **fresh** `$listener.AcceptTcpClientAsync()` - waiting on
+    the completed task again returns the same (already-served) client, the
+    probe answers a dead socket, and the daemon reports the fetch as cut off
+    (the same `connection aborted` family as trap 53). The 20c install probe
+    has done this right since it served two files; the (a) and (a2) list
+    probes relearned it in B2.
 
 ---
 

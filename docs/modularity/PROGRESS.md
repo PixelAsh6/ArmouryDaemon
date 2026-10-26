@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1 done and merged** (`e56a72a`, run `40320921365` green), **B2 done on the branch** (the manifest arrives minisign-signed; the ring is baked in). 1.1.6 is published and installed; B2 sits on the branch `feature/b2-signed-manifests`, **not merged**; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
 | **Next action** | **B3** - install paths per kind: helper modules extract into `modules/<id>/` with their own ACL (`WORK-ORDER.md` B3). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b2-signed-manifests` (cut from `main` `5ca0033`) - CI **pending on the tip**; counts on the tree: **394 unit tests** (288 in `armoury` + 106 in `armoury-core`), **156 harness checks** |
+| **Branch** | `feature/b2-signed-manifests` (cut from `main` `5ca0033`) - CI **green** on the tip `abf2754` (run `40326319066`, 11m38s, "ALL CHECKS PASSED"; the runner printed **288 passed** + **106 passed**, and the two real-catalogue checks SKIP naming the unsigned live manifest): **394 unit tests**, **156 harness checks**; the exe is **13,156,864 bytes** (+76,800 for the Ed25519 verification), sha256 `0d5b48cf…787b`, `VCRUNTIME140.dll` still absent. B1 is merged (`e56a72a`) and pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1131,20 +1131,42 @@ reason until the flip), `DECISIONS.md` (§26), `GOTCHAS.md` (trap 54), the
 top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`; the packs
 repo gets its own commits (`539773c`, `2cd49ce`).
 
-**Measured.** CI pending on the tip. Unit tests **388 → 394** (288 + 106:
-six trust tests — the baked ring parses, the frozen signature verifies
-against its ring, a tampered manifest refuses, a stranger's key refuses,
-an empty/nonsense signature refuses by name, a broken ring refuses with a
-reason). The harness holds **156** checks but new mechanics: the local probes serve the
-frozen manifest + signature pair (20c now serves three files over one
-connection). The artefact's size lands in the follow-up docs commit.
+**Measured.** Four red runs before the green one, each its own lesson:
+`40324090790` died on `--locked` (the new dependency was not in
+`Cargo.lock`; the lock now carries minisign-verify 0.3.0, and folded two
+windows-sys duplicates 0.52/0.59 into the 0.61.2 already present),
+`40324412546` died on the **0.2-era API by memory** (0.3.0 verifies on the
+key — `key.verify(payload, &sig, false)` — and takes the whole signature
+file in `Signature::decode`, comment lines included), `40325411803` wanted
+a `Debug` impl for `unwrap_err` (the ring's Debug is shape-only: key count
+and source, never keys), and the fourth was the harness again: the second
+accept of the signature fetch must be a **fresh** `AcceptTcpClientAsync` on
+the live listener — the one the helper started answers exactly once
+(trap 55). The green run `40326319066` (`abf2754`, 11m38s, "ALL CHECKS
+PASSED") prints **288 passed** and **106 passed**, the two real-catalogue
+checks SKIP naming the unsigned live manifest, the local probes pass with
+the frozen fixture pairs, and 20c serves manifest + signature + pack over
+one connection. Artefact: **13,156,864 bytes** (+76,800 against the B1
+tip's 13,080,064 — the Ed25519 verification code), sha256
+`0d5b48cf…787b`, `VCRUNTIME140.dll` still absent from its imports. Unit
+tests went **388 → 394** (six trust tests: the baked ring parses, the
+frozen signature verifies against its ring, a tampered manifest refuses, a
+stranger's key refuses, an empty/nonsense signature refuses by name, a
+broken ring refuses with a reason). The packs flip, the signing key and
+the release are the user's calls.
 
 **Decisions.** `DECISIONS.md` §26 — the ring is a crate file that fails
 closed, the keeper's key is custody not repo, the probes trade the ring via
 `ARMOURY_TEST_TRUST` over frozen byte-exact fixtures, the live-catalogue
 checks skip until the flip.
 
-**Surprises.** none yet.
+**Surprises.** Three facts, none fatal: the release workflow is
+**tag-push only** (no `workflow_dispatch`, so the edited catalogue check
+runs on the next release); the 0.3.0 API was **not** what memory said
+(verify on the key, whole-file `Signature::decode`) — CI was the first
+compiler and cost one red run for that; and the accept-task answer-once
+rule resurfaced with two connections per probe (trap 55, same family as
+trap 53).
 
 **Next.** Phase B3 - install paths per kind (`WORK-ORDER.md` B3): helper
 modules extract into `modules/<id>/` with their own ACL. This entry's

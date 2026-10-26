@@ -134,9 +134,12 @@ background.
   `-text`, signed once by a key whose private half died with its temp
   folder), the test ring trades in via `ARMOURY_TEST_TRUST`, and the real
   catalogue checks skip with a reason until the packs flip.
-  `DECISIONS.md` §26. **CI on the tip: pending**; counts on the tree:
-  **394 unit tests** (288 `armoury` + 106 `armoury-core`), **156 harness
-  checks**.
+  `DECISIONS.md` §26. CI green on the tip (`abf2754`, run `40326319066`,
+  11m38s; four red runs before it — the lockfile, the 0.3.0 API, a Debug
+  impl, and the harness's second accept, traps 53-55): **394 unit tests**
+  (288 `armoury` + 106 `armoury-core`), **156 harness checks** (the
+  real-catalogue pair SKIP naming the unsigned live manifest until the
+  flip), the exe **13,156,864 bytes** (+76,800), sha256 `0d5b48cf…787b`.
 - **The next action is Phase B3** — install paths per kind
   (`WORK-ORDER.md` B3): `pack`/`mode` keep the existing path; a `helper`
   extracts into `modules/<id>/` with its own ACL, is recorded and is found
