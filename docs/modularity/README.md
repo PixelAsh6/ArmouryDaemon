@@ -93,12 +93,19 @@ background.
 - The **1.1.5** release is out (the executable, 12,865,024 bytes, sha256
   `947ef3dc…24a4`, and its 85-byte sidecar) and **1.1.6 ships on top of it**: everything
   1.1.5 carried, plus Phase A3 and the review's fixes.
-- **The next action is Phase A6** — the one remaining perf decision: `-C
-  target-crt-static` in the release profile (`WORK-ORDER.md` A6). The shipped exe
-  imports `VCRUNTIME140.dll`, so it is not a truly standalone single file — fine on
-  stock Win10/11, not on a stripped image; the flag costs ~1-2 MB. It is a trade-off
-  to decide explicitly, and the decision is recorded in `DECISIONS.md`. A5 sits in
-  `main` at `e45b8be`; only the next release is the user's call.
+- **Phase A6 is done on the branch `feature/a6-crt-static`** (cut from `main`
+  `cf37902`, **not merged** — the merge is the user's call): the exe carries its
+  own C runtime. `.cargo/config.toml`'s MSVC rustflags gain
+  `-C target-feature=+crt-static` beside the `target-cpu` pin — the work order's
+  shorthand `-C target-crt-static` is not a real rustc flag — so the exe
+  imports no `VCRUNTIME140.dll` and starts even on a stripped image; Cargo has
+  no profile-scoped rustflags, so the debug builds go static with it.
+  `DECISIONS.md` §24. **CI on the tip: pending**; the counts stand: **384 unit
+  tests** (278 `armoury` + 106 `armoury-core`), **154 harness checks**.
+- **The next action is Phase B1** — `kind` in the manifest, schema 2
+  (`WORK-ORDER.md` B1, `catalog.rs:44`), and the release workflow's catalogue
+  check learning `modules`. A6 sits in `main` at `e45b8be`; the next release
+  is the user's call.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -133,12 +140,13 @@ background.
 
 ## The next action
 
-**Phase A6 — the one remaining perf decision** (`WORK-ORDER.md` A6): decide `-C
-target-crt-static` in the release profile and record the decision in
-`DECISIONS.md`. The shipped exe imports `VCRUNTIME140.dll`, so it is not a truly
-standalone single file — fine on stock Win10/11, not on a stripped image; the flag
-costs ~1-2 MB. This is a trade-off, **not a free win**. A5 sits in `main` at
-`e45b8be`; only the next release is the user's call.
+**Phase B1 — `kind` in the manifest** (`WORK-ORDER.md` B1): move `CatalogPack`
+(`catalog.rs:44`) to manifest schema 2 while reading `packs` **and** `modules`
+for one release so an old manifest still works, and teach the release
+workflow's "Check the packs against the catalogue" step (`.github/workflows/release.yml`) the new key — it must keep failing when a release
+ships bytes the catalogue does not publish. A6's branch
+`feature/a6-crt-static` sits unmerged; the merge and the next release are the
+user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

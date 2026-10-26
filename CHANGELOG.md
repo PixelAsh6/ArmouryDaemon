@@ -26,6 +26,12 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ### Changed
 
+- The **exe carries its own C runtime**. The MSVC build now links the CRT
+  statically (`-C target-feature=+crt-static`), so it imports no
+  `VCRUNTIME140.dll`: the lone exe starts even on a stripped image where the VC
+  redistributable was never installed, at the cost of ~1-2 MB
+  (`docs/modularity/DECISIONS.md` §24).
+
 - The **pack worker is no longer one serial thread**. The plain packs keep their thread; the
   mode packs get a **second worker and channel of their own**, and the daemon splits a
   whole-state apply or revert between the two by the pack's `kind` and merges the halves back

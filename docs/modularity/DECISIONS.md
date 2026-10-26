@@ -817,3 +817,33 @@ survives a restart is the key; the engaged state stays in memory exactly as befo
   live on the device — the machine could stay hidden and silent until the next
   start. `release_killswitch_for_exit` now runs between `revert_before_quit` and
   `leave_idle_for_exit`: same guard, same shape.
+
+---
+
+## 24. The C runtime is statically linked
+
+**Settled 2026-10-26.** The owning decision A6 asks for: the exe **carries its
+own C runtime**. Before A6 it imported `VCRUNTIME140.dll` — effectively always
+present on stock Win10/11, but absent on a stripped image (LTSC, thin VMs),
+where the daemon refused to start with nothing the user could fix from inside
+the product. The install ritual is a lone exe and its hash sidecar, with no
+redistributable to install; the runtime was the one hole in the "lone exe"
+story. The accepted cost is weight, not behaviour: measured in the A6 follow-up
+docs commit from the CI artefact (~1-2 MB against the 12.88 MB A5 build).
+
+- **The spelling.** The work order's shorthand `-C target-crt-static` names no
+  real rustc flag; the effective one is `-C target-feature=+crt-static`, appended to the MSVC target's rustflags in `.cargo/config.toml`, next to the
+  already-decided `target-cpu=x86-64-v3` (§5).
+- **Why on the target, not a profile.** Cargo has no profile-scoped rustflags,
+  so the flag rides the target: the debug builds link statically too —
+  deliberate. Every build a developer or the runner makes is the same
+  dependency reality, and the acceptance check never compares a static release
+  artefact against a dynamic debug.
+- **The acceptance is a byte fact, not a size claim.** Import-table strings
+  live verbatim in a PE, so the check is: the artefact contains the byte string
+  `VCRUNTIME140.dll` **nowhere**, while `kernel32.dll` (a real import beside
+  it) is still readable — a check the dynamic build demonstrably fails.
+- **Turned down:** keep the dynamic CRT (smallest exe wins) — a start failure
+  on a stripped image is worse than a megabyte; a `setup.ps1` preflight that
+  warns about the missing DLL — it would document the dependency instead of
+  removing it.

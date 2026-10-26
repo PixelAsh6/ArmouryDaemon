@@ -1,4 +1,7 @@
 # A fixed target, not "native": the build is then the same on every machine, which is what
 # lets the CI runner produce the published artefact; x86-64-v3 is the AVX2 level, not Zen 2.
+# The C runtime is linked statically (DECISIONS.md 24): the exe imports no VCRUNTIME140.dll,
+# so the lone exe starts even on a stripped image without the redistributable. The rustc
+# spelling of the work order's shorthand `-C target-crt-static` is +crt-static.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+crt-static"]
