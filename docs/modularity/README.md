@@ -106,8 +106,9 @@ background.
   harness checks) and the artefact says **13,074,432 bytes** (+192,512, a much
   better price than the 1-2 MB estimate), `VCRUNTIME140.dll` absent,
   `kernel32.dll` still readable, sha256 `c1373e9e…22f8`.
-- **Phase B1 is done on the branch `feature/b1-manifest-kind`** (cut from
-  `main` `dc74394`, **not merged** — the merge is the user's call): the
+- **Phase B1 is merged into `main`** (`e56a72a`, run `40320921365`; the
+  branch's runs — `40318171903` on `5009452` green, `40319627691` on
+  `0d0866d` green, one red on `7b80da3` — are recorded): the
   catalogue manifest reaches schema 2. The entries move under `modules` and
   each names its `kind` (`"pack"`/`"mode"`, validated by `PackKind::from_name`
   in `parse`; absent means `"pack"`), `Catalog::entries()` is the one way
@@ -124,7 +125,7 @@ background.
 - **The next action is Phase B2** — signed manifests (`WORK-ORDER.md` B2):
   `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json`
   via `include_str!`, verify **before** parsing, refuse everything on a bad
-  signature. A6 is in `main` at `585f8ff`; the next release is the user's
+  signature. B1 is in `main` at `e56a72a`; the next release is the user's
   call.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
@@ -165,8 +166,8 @@ background.
 with `include_str!`; the signature is verified **before** the manifest is
 parsed, a bad signature refuses the whole manifest, and nothing installs
 unverified. Acceptance: a manifest with a broken signature installs
-nothing and says why. B1's branch `feature/b1-manifest-kind` sits unmerged;
-the merge and the next release are the user's calls.
+nothing and says why. B1 is in `main` at `e56a72a`; only the next release
+is the user's call.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

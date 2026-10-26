@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (…, killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**); B - **B1 done** (the manifest says what its packs are: schema 2, `modules`, a validated `kind`). 1.1.6 is published and installed; B1 sits on the branch `feature/b1-manifest-kind`, **not merged** |
-| **Next action** | **B2** - signed manifests: `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json` via `include_str!`, verify **before** parsing (`WORK-ORDER.md` B2). The next release is the user's call |
-| **Branch** | `feature/b1-manifest-kind` (cut from `main` `dc74394`) - CI **green** on the tip `5009452` (run `40318171903`, 10m42s, "ALL CHECKS PASSED"; the runner printed **282 passed** and **106 passed**): **388 unit tests**, **156 harness checks**; the artefact is **13,080,064 bytes** (+5,632 against the A6 tip), sha256 `97d436c4…5e66`, `VCRUNTIME140.dll` still absent. A6 is merged (`585f8ff`, run `40314663065`) and pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (…); B - **B1 done and merged** (`e56a72a`, run `40320921365` green): schema 2, `modules`, a validated `kind`, one-release dual-key read. 1.1.6 is published and installed; the packs repo's schema-2 **manifest flip waits for the next release** (prepared as its `539773c`) |
+| **Next action** | **B2** - signed manifests: `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json` via `include_str!`, verify **before** parsing (`WORK-ORDER.md` B2). The signing **key custody** is a user decision; the next release is too |
+| **Branch** | `main` at the B1 merge `e56a72a` - CI **green** on it (run `40320921365`); the branch's own runs `40318171903` (`5009452`, green) and `40319627691` (`0d0866d`, green) are recorded, and the counts stand: **388 unit tests** (282 in `armoury` + 106 in `armoury-core`), **156 harness checks**. `feature/b1-manifest-kind` is pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1101,8 +1101,9 @@ on the next release.
 
 **Next.** Phase B2 - signed manifests (`WORK-ORDER.md` B2): `minisign-verify`
 0.3.0, the keyring embedded with `include_str!`, verify **before** parse,
-and refuse the whole manifest on a bad signature. The merge of
-`feature/b1-manifest-kind` and the next release are the user's calls.
+and refuse the whole manifest on a bad signature. This entry's branch
+merged into `main` as `e56a72a` (run `40320921365`); the packs-repo flip
+and the next release are the user's calls.
 
 ---
 
