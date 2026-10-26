@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) done and merged; **B3 on the branch `feature/b3-helpers`** (helpers extract into `modules/<id>/` with their own lock, `--module-list`), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
-| **Next action** | Watch the `feature/b3-helpers` CI runs, then **merge** (`merge: B3 - helpers install to modules/`) and wrap docs. After that: **B4** - the "Modules" window (`WORK-ORDER.md` B4) - the signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b3-helpers` cut from `main` `a9abddb` - CI **green** on `cc72986` (run `40337739735`, 13m28s, "ALL CHECKS PASSED"; the runner printed **298 passed** + **106 passed**, and the four 20d checks PASS while the real-catalogue pair SKIPs): **404 unit tests**, **160 harness checks**; the exe is **13,275,136 bytes** (+118,272), sha256 `4e591518…64a3`, `VCRUNTIME140.dll` still absent |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) and **B3** (`c8c0468`) done and merged: the catalogue manifest arrives signed, and a `helper` module extracts into `modules/<id>/` behind its own folder lock, records `module.json`, and is found again by disk scan after any restart. 1.1.6 is published and installed; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | **B4** - the "Modules" window: the rows and shapes (pack/mode/helper), the per-module capability display, and the download/verify/install flow behind the daemon (`WORK-ORDER.md` B4). The signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `main` at the B3 merge `c8c0468` - CI **green** on it (run `40341551223`); the branch's runs green on `cc72986` (`40337739735`) and `74f855d` (`40340105409`); counts stand: **404 unit tests** (298 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip). `feature/b3-helpers` is pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1240,9 +1240,10 @@ struct with a new field means **every existing initializer** grows the
 field, so `ui.rs`'s test factory needed it too (E0063 names the missing
 field - the CI compiler was once again the first one to see the mistake).
 
-**Next.** Watch the branch's CI. B4 - the "Modules" window (`WORK-ORDER.md`
-B4): the rows, the shapes and the install flow behind the daemon. This
-entry's branch `feature/b3-helpers` cuts from `main` `a9abddb`.
+**Next.** Phase B4 - the "Modules" window (`WORK-ORDER.md` B4): the rows,
+the shapes and the download/verify/install flow behind the daemon. This
+entry's branch merged into `main` as `c8c0468` (run `40341551223`); the
+packs flip, the signing key and the release are the user's calls.
 
 ---
 

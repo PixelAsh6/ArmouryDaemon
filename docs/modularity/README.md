@@ -140,8 +140,9 @@ background.
   (288 `armoury` + 106 `armoury-core`), **156 harness checks** (the
   real-catalogue pair SKIP naming the unsigned live manifest until the
   flip), the exe **13,156,864 bytes** (+76,800), sha256 `0d5b48cf…787b`.
-- **Phase B3 is on the branch `feature/b3-helpers`** (cut from `main`
-  `a9abddb`, **not merged**): the catalogue's `helper` kind got its install
+- **Phase B3 is merged into `main`** (`c8c0468`, run `40341551223`; the
+  branch's green runs on `cc72986` and `74f855d`, two red runs before the
+  first one): the catalogue's `helper` kind got its install
   path. `catalog::install` dispatches by entry - pack and mode keep the
   existing path, a helper extracts an archive into `modules/<id>/` behind
   its own folder lock (Administrators + SYSTEM full, the user read +
@@ -154,12 +155,13 @@ background.
   13m28s; two red runs before it - the sibling module path and the UI
   test factory's initializer): **404 unit tests** (298 `armoury` + 106
   `armoury-core`), **160 harness checks**, the exe **13,275,136 bytes**
-  (+118,272), sha256 `4e591518…64a3`.
-- **The next action after the B3 merge is Phase B4** - the "Modules"
-  window (`WORK-ORDER.md` B4): the rows, the shapes and the
-  download/verify/install flow behind the daemon. B3 sits on its branch
-  until its runs are green; the packs flip, the signing key and the next
-  release are the user's calls.
+  (+118,272), sha256 `4e591518…64a3`. The branch is in `main` at
+  `c8c0468`, and the next work is B4.
+- **The next action is Phase B4** - the "Modules" window
+  (`WORK-ORDER.md` B4): the rows, the shapes and the
+  download/verify/install flow behind the daemon. B3 is in `main` at
+  `c8c0468`; the packs flip, the signing key and the next release are the
+  user's calls.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
