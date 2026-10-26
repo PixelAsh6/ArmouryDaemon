@@ -303,6 +303,7 @@ mod tests {
                 ref id,
                 ref sha256,
                 size: Some(322),
+                ..
             } if id == "h-harness" && sha256 == "308aeb91"
         ));
         let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
