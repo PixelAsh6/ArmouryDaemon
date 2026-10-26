@@ -32,6 +32,20 @@ pub enum Request {
     SetKillswitch { enabled: bool },
     /// Install a pack from a local `pack.json` (or a folder holding one).
     InstallPack { source: String },
+    /// Install a helper module from an archive the catalogue download verified and left
+    /// in temp. The daemon re-verifies the file's bytes against the signed manifest's
+    /// `sha256` and `size` after it reads them, then extracts into `modules/<id>/`;
+    /// `entry` is the manifest's executable path inside the archive. A pack install and
+    /// a helper install differ in where the bytes go, so they are different requests.
+    InstallHelper {
+        id: String,
+        name: String,
+        version: String,
+        entry: String,
+        file: String,
+        sha256: String,
+        size: Option<u64>,
+    },
     /// Remove an installed pack (its folder under `<install>\packs`).
     RemovePack { id: String },
     /// Console launcher auto-open: `always` (daemon startup), `pad` (controller connect),
@@ -260,6 +274,19 @@ mod tests {
         .unwrap();
         write_msg(
             &mut out,
+            &Request::InstallHelper {
+                id: "h-harness".into(),
+                name: "Harness helper".into(),
+                version: "0.99.0".into(),
+                entry: "ArmouryConsole.exe".into(),
+                file: "C:\\temp\\armoury-catalog-h-harness.zip".into(),
+                sha256: "308aeb91".into(),
+                size: Some(322),
+            },
+        )
+        .unwrap();
+        write_msg(
+            &mut out,
             &Response::PackOp {
                 ok: false,
                 message: "nope".into(),
@@ -269,6 +296,15 @@ mod tests {
         let mut reader = &out[..];
         let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(req, Request::InstallPack { .. }));
+        let req: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(
+            req,
+            Request::InstallHelper {
+                ref id,
+                ref sha256,
+                size: Some(322),
+            } if id == "h-harness" && sha256 == "308aeb91"
+        ));
         let resp: Response = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(resp, Response::PackOp { ok: false, .. }));
     }

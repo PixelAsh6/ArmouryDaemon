@@ -203,12 +203,12 @@ background.
 
 ## The next action
 
-**Phase B5 - the helper-install request** (`WORK-ORDER.md` B5): the
-daemon's new Request variant (kind, `entry`, SHA-256 over the temp file)
-with which a helper installs through the daemon from temp - the thing that
-arms the Modules window's helper Download button. B4 is on its branch
-`feature/b4-modules-window` until its runs are green - then the merge; the
-packs flip, the signing key and the next release are the user's calls.
+**Phase B5 is on its branch** - the daemon's helper-install request: the
+`InstallHelper` variant (the manifest entry's id, version, executable
+path, SHA-256 and size), the daemon's re-verification of the archive's
+bytes, and the Modules window's helper buttons armed to use it. The B4
+work is in `main` at `4d7886b`; the packs flip, the signing key and the
+next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

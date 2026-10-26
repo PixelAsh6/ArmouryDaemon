@@ -27,6 +27,14 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   `--module-list` reads every installed pack, mode and helper back from
   disk. A helper never joins the pack or mode worker
   (`docs/modularity/DECISIONS.md` §27).
+- The **helper Download button is armed**. The Modules window downloads the
+  helper archive on its own worker thread and verifies it against the
+  signed manifest, then hands the daemon the new `InstallHelper` request -
+  the entry's id, version, executable path, SHA-256 and size. The daemon
+  re-verifies the bytes after it reads them, extracts into `modules/<id>/`
+  behind its folder locks, removes the temp archive whatever the answer is,
+  and answers through the usual pack-op reply
+  (`docs/modularity/DECISIONS.md` §28).
 - The **catalogue window is the "Modules" window**. All three kinds render
   in one list - packs and modes keyed off the daemon's pack status,
   helpers off their own `module.json` record on disk, with the archive's
