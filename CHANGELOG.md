@@ -5,6 +5,25 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The **killswitch has a config key and an IPC request**. One field,
+  `killswitch_enabled` (default on), is both the switch and the "is the killswitch
+  module installed" flag: while it is off, the End key and the tray toggle are
+  logged no-ops and the tray item reads "Killswitch off in config";
+  `{"type":"set_killswitch"}` carries the decision over the pipe; the state
+  survives a restart; turning the switch off releases an engaged killswitch first
+  (windows back, audio back, tray icon back); and a status from an older daemon
+  still means on (`docs/modularity/DECISIONS.md` §23).
+
+### Fixed
+
+- **Quitting releases an engaged killswitch.** The quit path reverted the packs and
+  left idle mode, but an engaged killswitch rode past both: its hidden windows die
+  with the process, while its mutes live on the audio devices — the machine could
+  stay hidden and silent until the daemon started again. The killswitch is now
+  released between the revert and the exit.
+
 ### Changed
 
 - The **pack worker is no longer one serial thread**. The plain packs keep their thread; the

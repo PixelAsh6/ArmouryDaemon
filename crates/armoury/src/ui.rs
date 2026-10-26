@@ -3701,6 +3701,7 @@ mod tests {
             paused: false,
             killswitch_active: false,
             killswitch_count: 0,
+            killswitch_enabled: false,
             idle_active: false,
             idle_monitors: 0,
             idle_devices: 0,

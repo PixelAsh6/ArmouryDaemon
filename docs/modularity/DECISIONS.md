@@ -789,3 +789,31 @@ order-independently.
   make two plain packs run their steps interleaved — a reordering the
   single-threaded design never promised to survive. A4 does not pay for concurrency
   the packs have never been tested against.
+
+---
+
+## 23. One key for the killswitch: the config switch and the "installed" flag
+
+**Settled 2026-10-26.** A5 gives the killswitch the config key (`killswitch_enabled`,
+default `true`) and the IPC request (`set_killswitch { enabled }`) it never had —
+and the two live up to the work order's "natural place for the is-the-killswitch-
+module-installed flag" by being **one key**, because the user who turns a killswitch
+off wants a switch that reads off everywhere: the End key and the tray item become
+logged no-ops, the tray item says `Killswitch off in config` instead of promising a
+toggle, and a fresh config (or an old one without the key) means on. The thing that
+survives a restart is the key; the engaged state stays in memory exactly as before.
+
+- **Disabling releases first.** A switch that reads off must not leave windows
+  hidden and audio muted behind it: `set_killswitch_config` disengages an engaged
+  killswitch, resets the tray icon, saves the config and broadcasts the status.
+  While the key is off nothing can re-engage — the toggle's top guard refuses the
+  End key and the tray, and the mid-run engage sits on `is_active()`, which from
+  now on implies enabled.
+- **Older snapshots mean on.** `StatusSnapshot.killswitch_enabled` defaults to
+  `true`: a snapshot from a daemon that has neither key nor request describes a
+  killswitch nothing could have switched off.
+- **The quit path releases it** (the loose end folded into A5): `quit` reverted the
+  packs and left idle, but an engaged killswitch rode into the exit, and its mutes
+  live on the device — the machine could stay hidden and silent until the next
+  start. `release_killswitch_for_exit` now runs between `revert_before_quit` and
+  `leave_idle_for_exit`: same guard, same shape.

@@ -27,6 +27,9 @@ pub enum Request {
     SetIdleFailsafe { enabled: bool, minutes: u64 },
     /// Change the revert cooldown.
     SetCooldown { seconds: u64 },
+    /// Enable or disable the killswitch. `false` is the config-level off: the toggle turns
+    /// into a no-op and, if the killswitch is engaged at that moment, it releases first.
+    SetKillswitch { enabled: bool },
     /// Install a pack from a local `pack.json` (or a folder holding one).
     InstallPack { source: String },
     /// Remove an installed pack (its folder under `<install>\packs`).
@@ -235,11 +238,14 @@ mod tests {
             },
         )
         .unwrap();
+        write_msg(&mut out, &Request::SetKillswitch { enabled: false }).unwrap();
         let mut reader = &out[..];
         let back: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(back, Request::UiHello { pid: 42 }));
         let back: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
         assert!(matches!(back, Request::SetSgdbKey { ref key } if key == "abc123"));
+        let back: Request = read_msg(&mut reader, &mut String::new()).unwrap().unwrap();
+        assert!(matches!(back, Request::SetKillswitch { enabled: false }));
     }
 
     #[test]
@@ -281,6 +287,7 @@ mod tests {
                 paused: false,
                 killswitch_active: false,
                 killswitch_count: 0,
+                killswitch_enabled: false,
                 idle_active: false,
                 idle_monitors: 0,
                 idle_devices: 0,

@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3 and A4 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel). 1.1.6 is published and installed; A4 sits on the branch `feature/a4-mode-worker`, **not merged** |
-| **Next action** | **A5** - the killswitch gets a config key and an IPC request (`WORK-ORDER.md` A5). The merge of A4 into `main` and the next release are the user's calls |
-| **Branch** | `feature/a4-mode-worker` (cut from `main` `76877ba`) - CI **green** on the tip `26a58f9`: **383 unit tests** (278 in `armoury` + 105 in `armoury-core`), **146 harness checks** |
+| **Phase** | A - **A1, A2, A3, A4 and A5 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release). 1.1.6 is published and installed; A5 sits on the branch `feature/a5-killswitch`, **not merged** |
+| **Next action** | **A6** - the one remaining perf decision: `-C target-crt-static` in the release profile, a trade-off (~1-2 MB) to decide explicitly (`WORK-ORDER.md` A6). The merge of A5 into `main` and the next release are the user's calls |
+| **Branch** | `feature/a5-killswitch` (cut from `main` `cd4c3e3`) - CI **pending on the tip**; counts on the tree: **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks** |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -945,6 +945,48 @@ and per-worker outcome channels with a split drain.
 that is also the natural place for the "is the killswitch module installed" flag.
 The merge of `feature/a4-mode-worker` into `main` and the next release are the
 user's calls.
+
+---
+
+### 2026-10-26 — Phase A5: the killswitch has a config key, an IPC request and releases on quit
+
+**What I did.** One config key does the two jobs the work order named:
+`killswitch_enabled` (`config.rs`, default `true`) is both the switch and the "is
+the killswitch module installed" flag. While it is off, `toggle_killswitch`'s top
+guard reduces the End key and the tray item to a log line, the tray item reads
+`Killswitch off in config` (set at startup too), and the configs written before the
+field existed stay meaning on (`#[serde(default)]` on the container). The pipe
+learns `Request::SetKillswitch { enabled }` (`set_killswitch`), handled in
+`set_killswitch_config` like the idle failsafe — mutate, save, broadcast — except
+that turning the switch off while an engaged killswitch exists releases it first:
+windows back, audio back, tray icon back. The snapshot carries
+`killswitch_enabled` with an older-daemon default of `true` (`status.rs`). The
+loose end folded in: `quit` never released an engaged killswitch (its mutes live
+on the device), so `release_killswitch_for_exit` runs between
+`revert_before_quit` and `leave_idle_for_exit`.
+
+**Files touched.** `armoury-core/src/{config,status,protocol}.rs`,
+`armoury/src/{daemon,ui}.rs`, `tools/daemon-selftest.ps1` (scenario 19e, 8
+checks), `DESIGN.md` (the killswitch row of §8), `DECISIONS.md` (§23), `GOTCHAS.md`
+(trap 51), the top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`.
+
+**Measured.** unit tests **383 → 384** (+1 config roundtrip test, 278 in
+`armoury` + 106 in `armoury-core`), harness checks **146 → 154** (scenario 19e:
+the fresh flag is on, the pipe flips it off and back on, the config file carries
+both values, a restart honours the off, and the log names the disable). Exe size:
+filled in from the CI artefact in the follow-up docs commit.
+
+**Decisions.** `DECISIONS.md` §23 — one key for both meanings, disabling releases
+an engaged killswitch first, older snapshots mean on, the quit path releases.
+
+**Surprises.** One, caught before CI: the 19e log check was first written
+`$null -ne (Select-String ... -Quiet)` — always true on a no match, because
+Windows PowerShell 5.1 answers `-Quiet` with `$false` (`GOTCHAS.md` trap 51).
+
+**Next.** Phase A6 — the one remaining perf decision: `-C target-crt-static`
+in the release profile (`WORK-ORDER.md` A6, ~1-2 MB), recorded in
+`DECISIONS.md`. The merge of `feature/a5-killswitch` into `main` and the next
+release are the user's calls.
 
 ---
 

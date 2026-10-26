@@ -22,6 +22,12 @@ pub struct LastError {
     pub message: String,
 }
 
+/// A snapshot that does not carry the field came from an older daemon: its killswitch has
+/// neither a config key nor an IPC request, so nothing can have turned it off.
+fn default_killswitch_enabled() -> bool {
+    true
+}
+
 /// Snapshot of daemon status sent to clients over the pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusSnapshot {
@@ -51,6 +57,9 @@ pub struct StatusSnapshot {
     /// processes it has hidden a window for or muted a session for. 0 when it is off.
     #[serde(default)]
     pub killswitch_count: u32,
+    /// The daemon's config-level killswitch flag (`false`: the toggle is a no-op).
+    #[serde(default = "default_killswitch_enabled")]
+    pub killswitch_enabled: bool,
     /// Idle overlay state.
     #[serde(default)]
     pub idle_active: bool,
@@ -133,6 +142,7 @@ mod tests {
         assert!(s.last_error.is_none());
         assert!(s.tracked_apps.is_empty());
         assert_eq!(s.cooldown_seconds, 0);
+        assert!(s.killswitch_enabled, "an older daemon's killswitch is on");
     }
 
     #[test]

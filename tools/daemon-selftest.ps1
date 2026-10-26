@@ -1064,6 +1064,33 @@ try {
     Remove-Item -Recurse -Force $fastDir -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $slowRvDir -ErrorAction SilentlyContinue
 
+    # ---- 19e. the killswitch has a config key, rides the pipe and survives a restart ----
+    # One key does double duty - the config switch and the "is the killswitch module
+    # installed" flag: set_killswitch over the pipe flips it, the config file carries it,
+    # a restart honours it, and the fresh default is on (an older config has no key at all).
+    $s = Status
+    Check 'a fresh killswitch flag defaults to on' ($s -and $s.killswitch_enabled) "killswitch_enabled=$($s.killswitch_enabled)"
+    Send-Pipe '{"type":"set_killswitch","enabled":false}' | Out-Null
+    $s = $null
+    for ($i = 0; $i -lt 30; $i++) { Start-Sleep -Milliseconds 150; $s = Status; if ($s -and -not $s.killswitch_enabled) { break } }
+    Check 'set_killswitch over the pipe turns the flag off' ($s -and -not $s.killswitch_enabled) "killswitch_enabled=$($s.killswitch_enabled)"
+    $saved = Get-Content $tempConfig -Raw | ConvertFrom-Json
+    Check 'the killswitch off state persisted to the config' ($saved.killswitch_enabled -eq $false) "got $($saved.killswitch_enabled)"
+    $daemon | Stop-Process -Force
+    Start-Sleep -Seconds 1
+    $daemon = Start-Process $Exe -PassThru -WindowStyle Hidden
+    $s = $null
+    for ($i = 0; $i -lt 40 -and -not $s; $i++) { Start-Sleep -Milliseconds 250; $s = Status }
+    Check 'the restarted instance answers' ($null -ne $s)
+    Check 'the killswitch off state survives the restart' ($s -and -not $s.killswitch_enabled) "killswitch_enabled=$($s.killswitch_enabled)"
+    Send-Pipe '{"type":"set_killswitch","enabled":true}' | Out-Null
+    $s = $null
+    for ($i = 0; $i -lt 30; $i++) { Start-Sleep -Milliseconds 150; $s = Status; if ($s -and $s.killswitch_enabled) { break } }
+    Check 'set_killswitch over the pipe turns the flag back on' ($s -and $s.killswitch_enabled) "killswitch_enabled=$($s.killswitch_enabled)"
+    $saved = Get-Content $tempConfig -Raw | ConvertFrom-Json
+    Check 'the killswitch on state persisted to the config' ($saved.killswitch_enabled -eq $true) "got $($saved.killswitch_enabled)"
+    Check 'the log names the disable' ((Test-Path -LiteralPath $logPath) -and [bool](Select-String -LiteralPath $logPath -Pattern 'killswitch.*disable' -Quiet)) "pattern killswitch.*disable against $logPath"
+
     # ---- 20. the command line: the modes that print and exit ----
     # The command line is parsed before anything else happens, so these runs never touch the
     # desktop. They run in a namespace of their own ($cliNs), see the top of this file.
