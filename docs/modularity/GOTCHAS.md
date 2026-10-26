@@ -409,6 +409,36 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     There is one writer at a time now (`LEDGER_LOCK`) and the two operations are
     `ledger_add` / `ledger_remove`: add what you change, remove what you put back, never
     write the file whole.
+47. **`HashMap::retain` takes a two-argument closure** (`|k, v| … `). The A4 journal
+    merge was written with a one-argument predicate and did not compile — `E0593` on
+    the first CI run of `feature/a4-mode-worker` (`39965300253`). Nothing is compiled
+    locally, so the compiler's opinion arrives only from CI; a mistake this small is
+    exactly the class it catches in under two minutes, and the fix is one line — but
+    the run is paid either way.
+48. **A `StepBlock` without a `guard` defaults to `Guard::default()` = `target_running:
+    true`** (`pack.rs:521`). A guardless block **skips entirely while the tracked app
+    is closed** — the A4 slow-mode test applied *nothing* (`applied_ids []`) and
+    the second CI run went red on a scenario that never touched a guard by omission,
+    only by absence. A test or harness pack that must run unconditionally says
+    `"guard": { "targetRunning": false }` in **both** its apply and its revert
+    blocks. The shipped packs carry explicit revert guards for the same silent
+    reason.
+49. **Two workers, one outcome stream — every outcome has to say whose it was.** The
+    pack and mode workers send the halves of a split job over the same channel;
+    without `PackOutcome::scoped` (the echo of the half's own enabled ids) the second
+    half's outcome would overwrite the first's and one worker would drop the other's
+    applied packs out of the running state. When two producers feed a single merge,
+    each record carries enough to be merged order-independently (`merge_scoped`),
+    instead of the merge guessing from the outcome's contents.
+50. **A timing check is only as real as the order it rests on.** An apply walks the
+    packs by `order` **ascending** and a revert **descending** (`run_job`), so a slow
+    pack that sorts *after* the fast one cannot delay it in a revert — the check
+    passes on the broken code too. A4's first 19d had exactly that: the slow mode at
+    order 9 was ahead of the plain pack in the apply and behind it in the revert, so
+    the revert half proved nothing. One mode cannot be first in both directions: to
+    test both, a scenario needs a slow-apply mode **below** the pack and a
+    slow-revert mode **above** it. Before trusting a timing assertion, ask what the
+    order does to it on the code the check is supposed to fail.
 
 ---
 

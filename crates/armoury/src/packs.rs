@@ -1,12 +1,13 @@
 //! Pack execution: loads spec 1 (data only) and spec 2 (data plus a script) packs and
 //! runs their mechanisms and scripts, a script interpreted here against the host API.
 //!
-//! Runs on its own worker thread — the daemon's main loop must stay responsive, and
-//! CLI calls block for tens to hundreds of milliseconds.
+//! Runs on two worker threads of its own — the daemon's main loop must stay responsive, and
+//! CLI calls block for tens to hundreds of milliseconds. Packs and modes each get a thread
+//! and a channel of their own (A4), so a slow mode never delays a pack apply/revert.
 //! Nothing here ever goes through a shell, and packs can only use whitelisted mechanisms.
 
 use armoury_core::pack::{
-    CapSet, Capability, Pack, Step, StepBlock, TemplateCtx, substitute, version_at_least,
+    CapSet, Capability, Pack, PackKind, Step, StepBlock, TemplateCtx, substitute, version_at_least,
 };
 use crossbeam_channel::Receiver;
 use log::{info, warn};
@@ -63,6 +64,10 @@ pub struct PackOutcome {
     pub applied: bool,
     /// Echo of `PackJob::tag`.
     pub tag: Option<String>,
+    /// The enabled ids this job was scoped to (the daemon's split of a whole-state job by
+    /// kind): an outcome speaks only for these, so the two halves of one job merge
+    /// order-independently on the daemon side (A4).
+    pub scoped: Vec<String>,
     /// Packs this job acted on. A pack whose block *started* is in here even if a step
     /// failed halfway: the machine was changed, so it must be journalled and reverted.
     pub applied_ids: Vec<String>,
@@ -156,11 +161,37 @@ pub fn load(search_dirs: &[PathBuf]) -> Vec<Installed> {
 pub fn start(
     packs: Vec<Installed>,
     jobs: Receiver<PackJob>,
+    mode_jobs: Receiver<PackJob>,
+    outcomes: crossbeam_channel::Sender<PackOutcome>,
+    wake: usize,
+) {
+    // Two serial workers instead of one (A4): a slow mode must never delay a pack
+    // apply/revert, so each kind gets its own thread and channel. Outcomes stay on one
+    // channel — the daemon drains it the same way as before, and every outcome carries the
+    // ids its job was scoped to (`PackOutcome::scoped`), so both halves merge.
+    let mut pack_side = Vec::new();
+    let mut mode_side = Vec::new();
+    for installed in packs {
+        if installed.pack.kind == PackKind::Mode {
+            mode_side.push(installed);
+        } else {
+            pack_side.push(installed);
+        }
+    }
+    spawn_worker("pack", pack_side, jobs, outcomes.clone(), wake);
+    spawn_worker("mode", mode_side, mode_jobs, outcomes, wake);
+}
+
+/// One worker: the serial loop `packs::start` used to run on a single thread.
+fn spawn_worker(
+    label: &'static str,
+    packs: Vec<Installed>,
+    jobs: Receiver<PackJob>,
     outcomes: crossbeam_channel::Sender<PackOutcome>,
     wake: usize,
 ) {
     std::thread::spawn(move || {
-        info!("pack worker started with {} pack(s)", packs.len());
+        info!("{} worker started with {} pack(s)", label, packs.len());
         // COM for the audio interfaces: a pack may ask for the 'audio' capability, and
         // the audio sessions are COM objects. COM is per thread, so the apartment has to
         // be set up here and not only on the daemon's main thread.
@@ -175,7 +206,7 @@ pub fn start(
                 unsafe { windows_sys::Win32::System::Threading::SetEvent(wake as _) };
             }
         }
-        info!("pack worker stopped");
+        info!("{} worker stopped", label);
     });
 }
 
@@ -376,6 +407,12 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
     PackOutcome {
         applied: job.apply,
         tag: job.tag.clone(),
+        scoped: job
+            .enabled
+            .iter()
+            .filter(|(_, enabled)| **enabled)
+            .map(|(id, _)| id.clone())
+            .collect(),
         applied_ids,
         values: job.values.clone(),
         captured: captured_out,
@@ -2278,6 +2315,107 @@ mod tests {
                 )])
             },
         }
+    }
+
+    #[test]
+    fn an_outcome_scopes_itself_to_the_enabled_ids_of_the_job() {
+        // A4: the daemon splits a whole-state job into two halves and merges the outcomes
+        // by scope, so the scope must be exactly the ids the job had switched on — a
+        // disabled id is in the map as `false` and must not appear.
+        let scratch = scratch_install("scoped");
+        let dir = scratch.root().to_path_buf();
+        let packs = carry_test_packs(&dir, r#"{"performance_mode": 1}"#);
+        let job = PackJob {
+            apply: true,
+            tag: None,
+            enabled: HashMap::from([
+                ("carry-test".to_string(), true),
+                ("ghost-test".to_string(), false),
+            ]),
+            values: HashMap::new(),
+            captured: HashMap::new(),
+        };
+        let outcome = run_job(&packs, &job, &mut None);
+        assert_eq!(outcome.scoped, vec!["carry-test".to_string()]);
+        // the scratch folder goes away with the guard
+    }
+
+    #[test]
+    fn a_slow_mode_worker_never_delays_the_pack_worker() {
+        // A4 in one picture: the daemon's two halves land on two threads, so the pack
+        // outcome shows up while the mode's job is still sleeping — and each outcome
+        // carries only its own half's scope. The threads are started the way the daemon
+        // starts them, one job per channel.
+        let slow = r#"
+{
+  "spec": 1, "id": "slowmode-test", "name": "Slow test", "version": "1.0.0", "order": 1,
+  "kind": "mode",
+  "triggers": [ { "kind": "tracked_app" } ],
+  "targets": { "process": ["slowmode-test-target.exe"] },
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"], "sleep_ms": 5000 } ] }
+}"#;
+        let fast = r#"
+{
+  "spec": 1, "id": "fastpack-test", "name": "Fast test", "version": "1.0.0", "order": 2,
+  "targets": { "process": ["fastpack-test-target.exe"] },
+  "apply": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] },
+  "revert": { "guard": { "targetRunning": false }, "steps": [ { "mechanism": "cli", "exe": "cmd.exe", "args": ["/c", "exit 0"] } ] }
+}"#;
+        let packs = vec![
+            Installed { pack: Pack::parse(slow).expect("the slow mode must be valid") },
+            Installed { pack: Pack::parse(fast).expect("the fast pack must be valid") },
+        ];
+        let (pack_tx, pack_rx) = crossbeam_channel::unbounded::<PackJob>();
+        let (mode_tx, mode_rx) = crossbeam_channel::unbounded::<PackJob>();
+        let (out_tx, out_rx) = crossbeam_channel::unbounded::<PackOutcome>();
+        start(packs, pack_rx, mode_rx, out_tx, 0);
+
+        // the daemon's split by hand: pack half on the pack channel, mode half on the mode one
+        pack_tx
+            .send(PackJob {
+                apply: true,
+                tag: None,
+                enabled: HashMap::from([("fastpack-test".to_string(), true)]),
+                values: HashMap::new(),
+                captured: HashMap::new(),
+            })
+            .unwrap();
+        mode_tx
+            .send(PackJob {
+                apply: true,
+                tag: None,
+                enabled: HashMap::from([("slowmode-test".to_string(), true)]),
+                values: HashMap::new(),
+                captured: HashMap::new(),
+            })
+            .unwrap();
+
+        // The pack outcome lands while the mode worker is still sleeping: that is the
+        // whole point of A4. Both must still put their own half in the scope.
+        let started = Instant::now();
+        let mut fast_outcome = None;
+        let mut mode_outcome = None;
+        for _ in 0..2 {
+            let outcome = out_rx
+                .recv_timeout(Duration::from_secs(15))
+                .expect("both outcomes arrive");
+            if outcome.scoped.contains(&"fastpack-test".to_string()) {
+                fast_outcome = Some((outcome, started.elapsed()));
+            } else {
+                mode_outcome = Some((outcome, started.elapsed()));
+            }
+        }
+        let (fast, fast_at) = fast_outcome.expect("the pack half answered");
+        let (mode, mode_at) = mode_outcome.expect("the mode half answered");
+        assert_eq!(fast.scoped, vec!["fastpack-test".to_string()]);
+        assert_eq!(mode.scoped, vec!["slowmode-test".to_string()]);
+        assert_eq!(fast.applied_ids, vec!["fastpack-test".to_string()]);
+        assert_eq!(mode.applied_ids, vec!["slowmode-test".to_string()]);
+        assert!(
+            fast_at < Duration::from_secs(3) && mode_at >= Duration::from_secs(4),
+            "the pack half must land while the mode half still sleeps: fast {fast_at:?}, mode {mode_at:?}"
+        );
     }
 
     #[test]

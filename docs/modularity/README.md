@@ -37,11 +37,30 @@ background.
 
 ## Current state
 
+- **Phase A4 is done on the branch `feature/a4-mode-worker`** (cut from `main`
+  `76877ba`, **not merged** - the merge is the user's call): the pack worker is no
+  longer a single serial thread. `packs::start` (`packs.rs:161`) spawns **two**
+  workers - the plain packs keep their serial thread, the modes get a second one - and
+  the daemon splits whole-state jobs by the catalogue's `pack.kind` (`split_enabled`),
+  routes tagged jobs by the target pack's kind (`worker_for`), and merges the two
+  halves of one job order-independently on the **existing** outcome channel through
+  `PackOutcome::scoped`. The acceptance is proven by the harness with real timing
+  (scenario 19d): two modes sleep 5 s - one inside its apply, one inside its revert -
+  and the plain pack between them in `order` applies and reverts without waiting,
+  because the apply walks the packs ascending and the revert descending, so one slow
+  mode is always ahead of the pack on a serial worker and neither is ahead of it on
+  its own. `DECISIONS.md` §22. CI green on the tip (`26a58f9`, run `40121307649`,
+  8m22s): **383 unit tests** (278 in `armoury` + 105 in `armoury-core`), **146
+  harness checks**, the exe **12,895,744 bytes** (+16,384 over v1.1.6, sha256
+  `b504af1c…8a4f`). Two red runs before it: `E0593` (a one-argument `HashMap::retain`
+  closure) and the guardless test packs, which skip while the target is away
+  (`Guard::default()` is `target_running: true`).
 - **Phase A3 is merged into `main` and released in 1.1.6** — the merge commit `21935ff`,
   and its CI run (`39803275300`) is green after 3m53s. The pack schema's `kind` and
-  `triggers`, both **additive**, a malformed `kind` refused by name. The daemon does not
-  act on the fields yet — the mode machinery is A4/A5 — so the phase changes no runtime
-  path and the three shipped packs cannot notice it.
+  `triggers`, both **additive**, a malformed `kind` refused by name. A3 changed no
+  runtime path; `kind` is acted on from A4 on (it picks the worker) and `triggers` is
+  still unread — no phase in the work order dispatches a mode yet, and A5 is the
+  killswitch's config key and request.
 - **The review of 1.1.5 is merged into `main`** (`95b0797`, CI `39816227849`, green after
   7m24s) and **shipped as 1.1.6**: the capability gate now covers the **declarative steps**
   (a pack that declared `["files"]` could run programs through a `cli` step), a cooldown
@@ -68,9 +87,14 @@ background.
 - The **1.1.5** release is out (the executable, 12,865,024 bytes, sha256
   `947ef3dc…24a4`, and its 85-byte sidecar) and **1.1.6 ships on top of it**: everything
   1.1.5 carried, plus Phase A3 and the review's fixes.
-- **The next action is Phase A4** — a separate worker queue for modes. The pack worker is
-  a single serial thread (`packs.rs:171`), so a slow mode must never block a pack
-  apply/revert: modes get their own thread and channel. `WORK-ORDER.md` A4.
+- **The next action is Phase A5** — the killswitch gets a **config key and an IPC
+  request** (`WORK-ORDER.md` A5): it has neither today, so it cannot be disabled at
+  all, the state has to survive a restart, and this is the natural place for the "is
+  the killswitch module installed" flag. Before it, A4's branch
+  `feature/a4-mode-worker` sits unmerged; the merge is the user's call.
+- **A6 after A5** — the one remaining perf decision: `-C target-crt-static` in the
+  release profile, a trade-off (~1-2 MB), to be decided explicitly
+  (`WORK-ORDER.md` A6).
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -105,15 +129,15 @@ background.
 
 ## The next action
 
-**Phase A4 — a separate worker queue for modes.** The pack worker is a **single serial
-thread** (`packs.rs:171`, `while let Ok(job) = jobs.recv()`), so a slow mode would block
-every later apply and revert. Modes get their own thread and their own channel.
-`WORK-ORDER.md` A4.
+**Phase A5 — give the killswitch a config key and an IPC request** (`WORK-ORDER.md`
+A5). It has **neither** today, so it cannot be disabled at all: the acceptance is that
+it can be turned off in config and by IPC, and the state survives a restart. This is
+also the natural place to hang the "is the killswitch module installed" flag. Its
+toggle lives at `daemon.rs:1913` (`toggle_killswitch`).
 
-A3 and the review of 1.1.5 are merged into `main` and shipped as **1.1.6**, so A4 starts
-from the released tree. A3 put `kind` (`"pack"` or `"mode"`) and `triggers` in the
-schema; the daemon does not act on them yet — that is A4 and A5. The full phase list is in
-`WORK-ORDER.md`. Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
+A4's branch `feature/a4-mode-worker` (the modes' own worker, `packs.rs:161`) is
+**green and not merged** — the merge into `main` is the user's call, as is the next
+release. Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.
 
 ---
