@@ -40,9 +40,19 @@ struct KeyEntry {
 /// The loaded ring: what may sign a manifest, with the comments that say why each key
 /// is trusted.
 pub struct TrustKeyring {
-    entries: Vec<(String, PublicKey)>,
+    entries: Vec<(String,PublicKey)>,
     /// Where the ring came from, for messages: the baked file, or the test override.
     source: String,
+}
+
+impl std::fmt::Debug for TrustKeyring {
+    /// Debug without the keys themselves: the ring's shape, not its content.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrustKeyring")
+            .field("keys", &self.entries.len())
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl TrustKeyring {
