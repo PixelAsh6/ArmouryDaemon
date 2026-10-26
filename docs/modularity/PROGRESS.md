@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1 done and merged** (`e56a72a`, run `40320921365` green), **B2 done on the branch** (the manifest arrives minisign-signed; the ring is baked in). 1.1.6 is published and installed; B2 sits on the branch `feature/b2-signed-manifests`, **not merged**; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1 done and merged** (`e56a72a`, run `40320921365` green), **B2 done and merged** (`e94110d`, run `40329394515` green): the catalogue manifest arrives minisign-signed, verified before parse, the ring baked in and the keeper holding the private key. 1.1.6 is published and installed; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
 | **Next action** | **B3** - install paths per kind: helper modules extract into `modules/<id>/` with their own ACL (`WORK-ORDER.md` B3). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b2-signed-manifests` (cut from `main` `5ca0033`) - CI **green** on the tip `abf2754` (run `40326319066`, 11m38s, "ALL CHECKS PASSED"; the runner printed **288 passed** + **106 passed**, and the two real-catalogue checks SKIP naming the unsigned live manifest): **394 unit tests**, **156 harness checks**; the exe is **13,156,864 bytes** (+76,800 for the Ed25519 verification), sha256 `0d5b48cf…787b`, `VCRUNTIME140.dll` still absent. B1 is merged (`e56a72a`) and pruned |
+| **Branch** | `main` at the B2 merge `e94110d` - CI **green** on it (run `40329394515`); the branch's runs green on `abf2754` (`40326319066`) and `f7b4ff1` (`40328131250`); counts stand: **394 unit tests** (288 in `armoury` + 106 in `armoury-core`), **156 harness checks** (the real-catalogue pair SKIPs until the flip). `feature/b2-signed-manifests` is pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1170,8 +1170,8 @@ trap 53).
 
 **Next.** Phase B3 - install paths per kind (`WORK-ORDER.md` B3): helper
 modules extract into `modules/<id>/` with their own ACL. This entry's
-branch merges after its run; the packs flip, the signing key and the
-release are the user's calls.
+branch merged into `main` as `e94110d` (run `40329394515`); the packs
+flip, the signing key and the release are the user's calls.
 
 ---
 

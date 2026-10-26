@@ -122,9 +122,9 @@ background.
   (282 `armoury` + 106 `armoury-core`), **156 harness checks** (the schema-2
   probe lists through `modules`), the exe **13,080,064 bytes** (+5,632), sha256
   `97d436c4…5e66`.
-- **Phase B2 is done on the branch `feature/b2-signed-manifests`** (cut from
-  `main` `5ca0033`, **not merged** — the merge is the user's call): the
-  catalogue manifest arrives minisign-signed. `catalog::fetch` gets the
+- **Phase B2 is merged into `main`** (`e94110d`, run `40329394515`; the
+  branch's green runs on `abf2754` and `f7b4ff1`, four red runs before the
+  first one): the catalogue manifest arrives minisign-signed. `catalog::fetch` gets the
   manifest bytes, then `index.json.minisig`, verifies **before** parsing,
   and an unsigned or refused manifest is refused by name. `trust.rs` +
   `trust/keys.json` bake the keyring (`include_str!`, one trusted key today,
@@ -143,8 +143,8 @@ background.
 - **The next action is Phase B3** — install paths per kind
   (`WORK-ORDER.md` B3): `pack`/`mode` keep the existing path; a `helper`
   extracts into `modules/<id>/` with its own ACL, is recorded and is found
-  after a restart. B2's branch sits unmerged; the packs flip and the next
-  release are the user's calls.
+  after a restart. B2 is in `main` at `e94110d`; the packs flip and the
+  next release are the user's calls.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -184,8 +184,8 @@ background.
 of `helper` gets its own path — download, verify sha256/size, extract into
 `modules/<id>/`, record the resolved path, with the helper directory's own
 ACL. Acceptance: a helper installs, is recorded, and is found again after a
-restart. B2's branch `feature/b2-signed-manifests` sits unmerged; the packs
-flip, the signing key and the next release are the user's calls.
+restart. B2 is in `main` at `e94110d`; the packs flip, the signing key and
+the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.
