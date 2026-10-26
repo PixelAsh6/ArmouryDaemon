@@ -1188,6 +1188,9 @@ try {
             if (-not $server.Accept.Wait(20000)) { throw 'the daemon did not connect' }
             $client = $server.Accept.GetAwaiter().GetResult()
             try {
+                # read the request before answering: closing a socket with unread data
+                # turns the close into a reset, and the daemon's fetch dies mid-read
+                $null = Read-Request $client
                 $stream = $client.GetStream()
                 $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($v2Body.Length)`r`nConnection: close`r`n`r`n"
                 $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)

@@ -1065,29 +1065,35 @@ through `modules`, +2 checks), `D:\ArmouryDaemon_Packs` (`index.json` +
 README, **prepared but not pushed** — see below), `DECISIONS.md` (§25), the
 top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`.
 
-**Measured.** CI pending on the tip. The unit tests go **384 → 388**
-(282 + 106: **four** new tests around the new keys and kinds — the schema-2
-parse with `modules`, absent kind meaning `pack`, an unknown kind refusing
-with a name, both keys refusing — and the modified schema test; the
-schema-1 fixtures stay as the permanent old-manifest proof), the harness
-**154 → 156** (the schema-2 listing names the pack). The release workflow's
-step is validated by parse and review here; it actually runs on the next
-tag push. The packs repo manifest is **not pushed** with this phase: the
-schema-2 flip breaks every installed 1.1.6 daemon's live catalogue fetch
-(it refuses schema 2) until a released daemon ships — the flip is tied to
-the release decision, like the tag.
+**Measured.** The first run was **red** (`40317368025` on `7b80da3`): 2 of
+the harness checks failed, both mine — the new schema-2 probe's server never
+read the client's request before closing, and Windows turned the close into
+a reset that killed the fetch mid-read (`trap 53`; the gzip probe beside it
+had always read first, which is why its socket behaved). The fix is one
+line; the fix's run is the branch's green run. The unit tests went
+**384 → 388** (282 + 106: **four** new tests around the new keys and kinds —
+the schema-2 parse with `modules`, absent kind meaning `pack`, an unknown
+kind refusing with a name, both keys refusing — and the modified schema
+test; the schema-1 fixtures stay as the permanent old-manifest proof), the
+harness **154 → 156** (the schema-2 listing names the pack). The release
+workflow's step is validated by parse and review here; it actually runs on
+the next tag push. The packs repo manifest is **not pushed** with this
+phase: the schema-2 flip breaks every installed 1.1.6 daemon's live
+catalogue fetch (it refuses schema 2) until a released daemon ships — the
+flip is tied to the release decision, like the tag.
 
 **Decisions.** `DECISIONS.md` §25 — the dual key is a courtesy with an
 expiry, the kind mirrors the pack file's vocabulary, and one manifest
 carrying both keys is refused rather than silently merged.
 
-**Surprises.** One, harmless: the release workflow is **tag-push only** —
-there is no `workflow_dispatch`, so the edited catalogue check cannot run on
-the branch at all; its PowerShell parses clean here and becomes live on the
-next release. And one caught before CI: two tests first used helpers
+**Surprises.** Two. One, caught before CI: two tests first used helpers
 (`list_packs`, `list_modules`) that I had never written — the private
 fields are reachable from the same-file test module, so the reads went
-straight to them.
+straight to them. Two, the red run above: the probe's own server was the
+bug, not the parser (`GOTCHAS.md` trap 53). And a discovery alongside: the
+release workflow is **tag-push only** — there is no `workflow_dispatch`, so
+the edited catalogue check cannot run on the branch at all; it becomes live
+on the next release.
 
 **Next.** Phase B2 - signed manifests (`WORK-ORDER.md` B2): `minisign-verify`
 0.3.0, the keyring embedded with `include_str!`, verify **before** parse,
