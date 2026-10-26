@@ -157,11 +157,17 @@ background.
   `armoury-core`), **160 harness checks**, the exe **13,275,136 bytes**
   (+118,272), sha256 `4e591518…64a3`. The branch is in `main` at
   `c8c0468`, and the next work is B4.
-- **The next action is Phase B4** - the "Modules" window
-  (`WORK-ORDER.md` B4): the rows, the shapes and the
-  download/verify/install flow behind the daemon. B3 is in `main` at
-  `c8c0468`; the packs flip, the signing key and the next release are the
-  user's calls.
+- **Phase B4 is done on its branch** - the "Modules" window: the rename,
+  one list rendering all three kinds (packs and modes off the daemon's
+  pack status, helpers off their own `module.json` record), the helper
+  row's disabled button carrying the archive's size, and installed pack
+  rows showing their permission line (effects, cached off disk). Green on
+  `e4e4f83` (run `40389239303`; one red before it - a paint test that
+  asked its fixture for the wrong shape): **406 unit tests** (300
+  `armoury` + 106 `armoury-core`), **160 harness checks**, the exe
+  **13,295,104 bytes** (+19,968), sha256 `c6aa61ae…a6bd`. The branch merges
+  as `merge: B4 - the Modules window`; the packs flip, the signing key
+  and the next release are the user's calls.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -196,11 +202,12 @@ background.
 
 ## The next action
 
-**Phase B4 - the "Modules" window** (`WORK-ORDER.md` B4): the rows and the
-shapes (pack/mode/helper), the per-module capability display, and the
-download/verify/install flow behind the daemon. B3 is on its branch
-`feature/b3-helpers` until its runs are green - then the merge; the packs
-flip, the signing key and the next release are the user's calls.
+**Phase B5 - the helper-install request** (`WORK-ORDER.md` B5): the
+daemon's new Request variant (kind, `entry`, SHA-256 over the temp file)
+with which a helper installs through the daemon from temp - the thing that
+arms the Modules window's helper Download button. B4 is on its branch
+`feature/b4-modules-window` until its runs are green - then the merge; the
+packs flip, the signing key and the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.
