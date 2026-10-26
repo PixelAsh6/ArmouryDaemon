@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4 and A5 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release). 1.1.6 is published and installed; A5 sits on the branch `feature/a5-killswitch`, **not merged** |
-| **Next action** | **A6** - the one remaining perf decision: `-C target-crt-static` in the release profile, a trade-off (~1-2 MB) to decide explicitly (`WORK-ORDER.md` A6). The merge of A5 into `main` and the next release are the user's calls |
-| **Branch** | `feature/a5-killswitch` (cut from `main` `cd4c3e3` - CI **green** on the tip `441c1b6`: **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**, "ALL CHECKS PASSED" |
+| **Phase** | A - **A1, A2, A3, A4 and A5 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release). 1.1.6 is published and installed; **A5 is merged into `main`** (`e45b8be`, run `40307649812`, 4m40s) |
+| **Next action** | **A6** - the one remaining perf decision: `-C target-crt-static` in the release profile, a trade-off (~1-2 MB) to decide explicitly (`WORK-ORDER.md` A6) and record in `DECISIONS.md`. The next release is the user's call |
+| **Branch** | `main` at the A5 merge `e45b8be` - CI **green** on it (run `40307649812`, 4m40s); on the branch its own runs `40304545072` (`441c1b6`) and `40306251783` (`806dd21`) are green as well, and the counts stand: **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**. `feature/a5-killswitch` is pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -984,13 +984,15 @@ bytes** (13,824 lighter than the A4 tip's 12,895,744, all of it layout), sha256
 an engaged killswitch first, older snapshots mean on, the quit path releases.
 
 **Surprises.** One, caught before CI: the 19e log check was first written
-`$null -ne (Select-String ... -Quiet)` — always true on a no match, because
+`$null -ne (Select-String ... -Quiet)` - always true on a no match, because
 Windows PowerShell 5.1 answers `-Quiet` with `$false` (`GOTCHAS.md` trap 51).
+Two, found by a 404 instead of a run: CI does not fire on a feature-branch
+push at all - the branch runs are dispatched by hand (`GOTCHAS.md` trap 52).
 
-**Next.** Phase A6 — the one remaining perf decision: `-C target-crt-static`
+**Next.** Phase A6 - the one remaining perf decision: `-C target-crt-static`
 in the release profile (`WORK-ORDER.md` A6, ~1-2 MB), recorded in
-`DECISIONS.md`. The merge of `feature/a5-killswitch` into `main` and the next
-release are the user's calls.
+`DECISIONS.md`. This entry's branch merged into `main` as `e45b8be` (run
+`40307649812`, 4m40s); the next release is the user's call.
 
 ---
 

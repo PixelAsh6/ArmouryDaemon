@@ -46,8 +46,9 @@ background.
   harness scenario 19d (two 5 s modes, the plain pack unblocked both ways); the full
   story and the two red runs it took are the A4 entry of `PROGRESS.md`.
   `DECISIONS.md` §22.
-- **Phase A5 is done on the branch `feature/a5-killswitch`** (cut from `main`
-  `cd4c3e3`, **not merged** - the merge is the user's call): the killswitch has a
+- **Phase A5 is merged into `main`** (`e45b8be`, run `40307649812`, 4m40s; the
+  branch's own runs - `40304545072` on `441c1b6`, `40306251783` on `806dd21` -
+  are green too): the killswitch has a
   config key and an IPC request. `killswitch_enabled` (default `true`) is both the
   switch and the "is the killswitch module installed" flag: while it is off the End
   key and the tray toggle are logged no-ops and the tray item reads `Killswitch off
@@ -96,8 +97,8 @@ background.
   target-crt-static` in the release profile (`WORK-ORDER.md` A6). The shipped exe
   imports `VCRUNTIME140.dll`, so it is not a truly standalone single file — fine on
   stock Win10/11, not on a stripped image; the flag costs ~1-2 MB. It is a trade-off
-  to decide explicitly, and the decision is recorded in `DECISIONS.md`. A5's branch
-  `feature/a5-killswitch` sits unmerged; the merge is the user's call.
+  to decide explicitly, and the decision is recorded in `DECISIONS.md`. A5 sits in
+  `main` at `e45b8be`; only the next release is the user's call.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -136,9 +137,8 @@ background.
 target-crt-static` in the release profile and record the decision in
 `DECISIONS.md`. The shipped exe imports `VCRUNTIME140.dll`, so it is not a truly
 standalone single file — fine on stock Win10/11, not on a stripped image; the flag
-costs ~1-2 MB. This is a trade-off, **not a free win**. A5's branch
-`feature/a5-killswitch` sits unmerged; the merge and the next release are the
-user's call.
+costs ~1-2 MB. This is a trade-off, **not a free win**. A5 sits in `main` at
+`e45b8be`; only the next release is the user's call.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

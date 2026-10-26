@@ -447,6 +447,14 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     a check that cannot fail proves nothing. Write
     `([bool](Select-String ... -Quiet))`, and keep a `Test-Path` in front of a log
     read - a missing file is an error record and an empty result, not a red check.
+52. **CI does not fire on a feature-branch push.** The workflow triggers on
+    pushes to `main`, tags, PRs to `main`, and `workflow_dispatch` - pushing a
+    branch by itself is invisible, and `gh run watch` dies with a 404 for a run
+    that will never exist. Drive the branch runs by hand, in this order:
+    `gh workflow run CI --ref feature/<branch>`, poll
+    `gh run list --branch feature/<branch>` until a run id exists (it takes
+    ~15 s), then `gh run watch <id> --exit-status`. `main` pushes trigger on
+    their own. All the branch runs in the history carry `workflow_dispatch`.
 
 ---
 
