@@ -1175,8 +1175,11 @@ try {
         $env:ARMOURY_TEST_TRUST = $testTrust
         $probe = Invoke-CatalogProbe @('--catalog-list', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
             for ($i = 0; $i -lt 2; $i++) {
-                if (-not $server.Accept.Wait(20000)) { throw "the daemon did not connect (request $($i + 1))" }
-                $client = $server.Accept.GetAwaiter().GetResult()
+                # the first accept is the task the helper started; the signature fetch
+                # opens its own connection, so it needs a fresh one
+                if ($i -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
+                if (-not $accept.Wait(20000)) { throw "the daemon did not connect (request $($i + 1))" }
+                $client = $accept.GetAwaiter().GetResult()
                 try {
                     $script:served += Read-Request $client
                     $stream = $client.GetStream()
@@ -1213,8 +1216,9 @@ try {
         $env:ARMOURY_TEST_TRUST = $testTrust
         $probe = Invoke-CatalogProbe @('--catalog-list', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
             for ($i = 0; $i -lt 2; $i++) {
-                if (-not $server.Accept.Wait(20000)) { throw "the daemon did not connect (request $($i + 1))" }
-                $client = $server.Accept.GetAwaiter().GetResult()
+                if ($i -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
+                if (-not $accept.Wait(20000)) { throw "the daemon did not connect (request $($i + 1))" }
+                $client = $accept.GetAwaiter().GetResult()
                 try {
                     Read-Request $client | Out-Null
                     $stream = $client.GetStream()
