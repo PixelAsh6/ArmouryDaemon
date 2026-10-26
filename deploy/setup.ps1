@@ -276,6 +276,45 @@ try {
 
 
 # ---------------------------------------------------------------------------
+# pre-create the modules folder the helper modules install into
+# ---------------------------------------------------------------------------
+
+# A helper module is code the elevated daemon will run (GOTCHAS 7), so neither the
+# folder nor the folder above it may be user-writable: a writeable modules folder
+# could delete a locked module folder and put an unlocked one in its place. Both
+# get their own ACL - Administrators + SYSTEM full, the user read + execute, no
+# Modify - on the modules folder itself, and the daemon (helpers.rs) locks each
+# module folder as it installs. Warn-only, like the install folder's ACL: the
+# daemon re-applies the lock every time a helper lands on disk.
+$modulesDir = Join-Path $installDir 'modules'
+if (-not (Test-Path -LiteralPath $modulesDir -PathType Container)) {
+    try {
+        New-Item -ItemType Directory -Path $modulesDir -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Warning "The modules folder was NOT created: $($_.Exception.Message)"
+        Write-Warning "The daemon creates and locks it the next time it installs a helper."
+    }
+}
+if (Test-Path -LiteralPath $modulesDir -PathType Container) {
+    $moduleGrants = @(
+        'BUILTIN\Administrators:(OI)(CI)F'
+        'NT AUTHORITY\SYSTEM:(OI)(CI)F'
+        "${user}:(OI)(CI)RX"
+    )
+    try {
+        & icacls $modulesDir /inheritance:r | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls could not drop the inherited permissions of $modulesDir (exit code $LASTEXITCODE)" }
+        & icacls $modulesDir /grant:r $moduleGrants | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "icacls could not set the permissions of $modulesDir (exit code $LASTEXITCODE)" }
+        Write-Host "Locked $modulesDir down: Administrators + SYSTEM full, $user read + execute, no modify."
+    } catch {
+        Write-Warning "The ACL of $modulesDir was NOT applied: $($_.Exception.Message)"
+        Write-Warning "The daemon locks this folder itself the next time it installs a helper."
+    }
+}
+
+
+# ---------------------------------------------------------------------------
 # stop the daemon that runs from this folder
 # ---------------------------------------------------------------------------
 

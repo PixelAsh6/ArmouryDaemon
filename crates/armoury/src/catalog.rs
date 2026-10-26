@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use armoury_core::pack::{PackKind, version_at_least};
+use armoury_core::pack::version_at_least;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ureq::config::Config;
@@ -70,9 +70,11 @@ pub struct CatalogPack {
     pub version: String,
     #[serde(default)]
     pub description: String,
-    /// What kind of module this is: `"pack"` or `"mode"`, the same vocabulary the pack
-    /// file's own `kind` uses. Absent means `"pack"` — the same default a pre-A3 pack
-    /// file without the field gets.
+    /// What kind of module this is. The catalogue's own vocabulary: `"pack"` and
+    /// `"mode"` name the packs the pack file itself knows, `"helper"` names a
+    /// downloaded executable the daemon extracts into `modules/<id>/` (it is not a
+    /// pack-file kind, so it does not go near the pack or mode workers). Absent
+    /// means `"pack"` - the same default a pre-A3 pack file without the field gets.
     #[serde(default = "default_kind")]
     pub kind: String,
     /// Repository-relative path to the pack file.
@@ -85,6 +87,10 @@ pub struct CatalogPack {
     /// daemon may run it.
     #[serde(default)]
     pub min_engine: Option<String>,
+    /// The executable inside the archive, for `helper` kinds - e.g. `ArmouryConsole.exe`
+    /// or `console/ArmouryConsole.exe`. A helper without one has nothing to run.
+    #[serde(default)]
+    pub entry: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -168,14 +174,50 @@ pub fn parse(json: &str) -> Result<Catalog, String> {
         if pack.id.is_empty() || pack.file.is_empty() || pack.sha256.is_empty() {
             return Err("catalog: a pack entry is missing id/file/sha256".to_string());
         }
-        if PackKind::from_name(&pack.kind).is_none() {
+        if !catalog_kinds().contains(&pack.kind.as_str()) {
             return Err(format!(
-                "catalog: the entry {} names an unknown kind {:?} (pack or mode)",
+                "catalog: the entry {} names an unknown kind {:?} (pack, mode or helper)",
                 pack.id, pack.kind
+            ));
+        }
+        // a helper without its executable inside the archive is a download that
+        // could never be launched
+        if pack.kind == "helper"
+            && pack
+                .entry
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .is_none()
+        {
+            return Err(format!(
+                "catalog: the helper {} needs an `entry`, the file inside its archive to run",
+                pack.id
+            ));
+        }
+        // an `entry` on a pack is a manifest typo: a pack file has nothing to launch
+        if pack.kind != "helper"
+            && pack
+                .entry
+                .as_deref()
+                .map(str::trim)
+                .filter(|e| !e.is_empty())
+                .is_some()
+        {
+            return Err(format!(
+                "catalog: the {} {} names an `entry`, but only a helper runs one file",
+                pack.kind, pack.id
             ));
         }
     }
     Ok(catalog)
+}
+
+/// The kind names a catalogue entry may carry. The catalogue's vocabulary is wider
+/// than a pack file's: `helper` names a module that is not a pack at all, so it
+/// lives here and not in `PackKind` (which the pack and mode workers route by).
+fn catalog_kinds() -> &'static [&'static str] {
+    &["pack", "mode", "helper"]
 }
 
 /// Fetch the manifest over HTTPS — verified before it is parsed.
@@ -219,7 +261,12 @@ pub fn install(install_dirs: &[PathBuf], catalog_url: &str, id: &str) -> Result<
         .ok_or_else(|| format!("catalog: no pack called {id:?}"))?;
     let bytes = fetch_bytes(&join_url(catalog_url, &entry.file))?;
     verify(&bytes, &entry.sha256, entry.size)?;
-    packs::install_from_bytes(install_dirs, &bytes)
+    match entry.kind.as_str() {
+        // a helper is an archive the daemon lands in modules/<id>/; it is not a pack and
+        // never reaches the pack or mode worker
+        "helper" => helpers::install_from_bytes(install_dirs, entry, &bytes),
+        _ => packs::install_from_bytes(install_dirs, &bytes),
+    }
 }
 
 /// Download one catalog entry to `dest`, verified against the manifest.
@@ -442,6 +489,40 @@ mod tests {
         .expect_err("an unknown kind must refuse the manifest");
         assert!(err.contains("widget"), "the refusal names the kind: {err}");
         assert!(err.contains("x"), "the refusal names the entry: {err}");
+    }
+
+    #[test]
+    fn a_helper_entry_carries_its_executable() {
+        let catalog = parse(
+            r#"{"schema": 2, "modules": [{
+                "id": "console", "kind": "helper", "name": "Console launcher",
+                "version": "1.0.0", "file": "modules/console/console.zip",
+                "sha256": "y", "size": 2400000, "entry": "ArmouryConsole.exe"}]}"#,
+        )
+        .expect("a helper entry parses");
+        assert_eq!(catalog.entries()[0].kind, "helper");
+        assert_eq!(catalog.entries()[0].entry.as_deref(), Some("ArmouryConsole.exe"));
+    }
+
+    #[test]
+    fn a_helper_without_an_entry_refuses_at_the_manifest() {
+        let err = parse(
+            r#"{"schema": 2, "modules": [{"id": "console", "kind": "helper",
+                "file": "modules/console/console.zip", "sha256": "y"}]}"#,
+        )
+        .expect_err("an entry-less helper must refuse the manifest");
+        assert!(err.contains("needs an `entry`"), "{err}");
+        assert!(err.contains("console"), "the refusal names the helper: {err}");
+    }
+
+    #[test]
+    fn a_pack_entry_may_not_name_an_entry() {
+        let err = parse(
+            r#"{"schema": 2, "modules": [{"id": "x", "kind": "pack",
+                "file": "packs/x/pack.json", "sha256": "y", "entry": "evil.exe"}]}"#,
+        )
+        .expect_err("a pack with an `entry` must refuse the manifest");
+        assert!(err.contains("only a helper runs one file"), "{err}");
     }
 
     #[test]

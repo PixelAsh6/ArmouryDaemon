@@ -481,6 +481,19 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     (the same `connection aborted` family as trap 53). The 20c install probe
     has done this right since it served two files; the (a) and (a2) list
     probes relearned it in B2.
+56. **A locked child behind a writeable parent is not locked.** Deleting in
+    Windows takes `DELETE` on the object **or** the delete-children right on
+    the parent - so a user with Modify on `modules/` can remove or rename a
+    `modules/<id>/` folder whose own DACL only reads and executes, then
+    create an unlocked replacement in the same place and wait for the daemon
+    to run from it. Locking the child alone bought nothing; the parent has
+    the same lock (`deploy/setup.ps1` pre-creates it, `helpers.rs` re-applies
+    it on every install). Two adjacent lessons of the same hack: address the
+    well-known groups by SID (`*S-1-5-32-544`, `*S-1-5-18`) so a localized
+    Windows cannot rename the grantees away, and check the lock with a
+    write probe - on a non-elevated build the process's own token fails the
+    probe it itself just set, which is the difference between a production
+    install and a repository build.
 
 ---
 

@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1 done and merged** (`e56a72a`, run `40320921365` green), **B2 done and merged** (`e94110d`, run `40329394515` green): the catalogue manifest arrives minisign-signed, verified before parse, the ring baked in and the keeper holding the private key. 1.1.6 is published and installed; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
-| **Next action** | **B3** - install paths per kind: helper modules extract into `modules/<id>/` with their own ACL (`WORK-ORDER.md` B3). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `main` at the B2 merge `e94110d` - CI **green** on it (run `40329394515`); the branch's runs green on `abf2754` (`40326319066`) and `f7b4ff1` (`40328131250`); counts stand: **394 unit tests** (288 in `armoury` + 106 in `armoury-core`), **156 harness checks** (the real-catalogue pair SKIPs until the flip). `feature/b2-signed-manifests` is pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) done and merged; **B3 on the branch `feature/b3-helpers`** (helpers extract into `modules/<id>/` with their own lock, `--module-list`), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | Watch the `feature/b3-helpers` CI runs, then **merge** (`merge: B3 - helpers install to modules/`) and wrap docs. After that: **B4** - the "Modules" window (`WORK-ORDER.md` B4) - the signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `feature/b3-helpers` cut from `main` `a9abddb` - **CI pending on the tip**. Counts on the tree: **404 unit tests** (298 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip) |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1172,6 +1172,62 @@ trap 53).
 modules extract into `modules/<id>/` with their own ACL. This entry's
 branch merged into `main` as `e94110d` (run `40329394515`); the packs
 flip, the signing key and the release are the user's calls.
+
+---
+
+### 2026-10-26 - Phase B3: helpers extract to `modules/<id>/` and hold their own folder lock
+
+**What I did.** The catalogue's `helper` kind got an install path of its
+own: `catalog::install` dispatches on the entry - pack and mode keep
+`packs::install_from_bytes`, a helper calls `helpers::install_from_bytes`,
+which extracts an archive into `modules/<id>/` behind its own folder lock,
+records a `module.json` beside the executable, and is re-discovered by a
+plain disk scan (`helpers::installed`) from any later process. New module
+`crates/armoury/src/helpers.rs`; `catalog.rs` grows the `entry` field and
+gains the catalogue's own kind vocabulary (`pack | mode | helper` - but a
+pack naming an `entry` refuses as a manifest typo); `main.rs` learns
+`--module-list` (installed packs, modes and helpers, one line each); the
+helpers join no worker, so `packs::load` and the pack/mode split never see
+them. `deploy/setup.ps1` pre-creates the locked `modules/` folder at
+deployment (trap 56: the parent needs the lock at least as much as the
+child does). The harness gets a 20d scenario: manifest + minisign signature
++ helper archive travel over **one** connection, the helper installs, and a
+second process's `--module-list` reads it back off disk - the restart story.
+New dependency: `zip` 2.6 (pure-Rust deflate) plus the frozen fixtures
+`helper-harness-test.zip`, `helper-sneak.zip` (a name-stepping fixture),
+`man-helper.json(.minisig)` (signed by a second throwaway probe pair, its
+private half deleted; the verifying `helper-test.pub` sits in the fixtures
+folder), and the harness keyring carries both probe keys now.
+
+**Files touched.** `crates/armoury/src/helpers.rs` (new), `catalog.rs`,
+`packs.rs` (`is_safe_id` is `pub(crate)`), `main.rs`, `Cargo.toml`,
+`Cargo.lock`, `tools/daemon-selftest.ps1` (20d + flags list + a second
+probe key in the test trust), `tools/fixtures/` (the four new fixtures),
+`deploy/setup.ps1`, `docs/modularity/`, `CHANGELOG.md`.
+
+**Measured.** CI pending on the tip. Unit tests **394 → 404** (298 in
+`armoury` + 106 in `armoury-core`): seven helpers tests - the
+install/record/rediscover round trip including an update, the escape
+refusals (entry paths `../evil.exe`, `sub/../../out.exe`, `C:/evil`,
+`console/..`, `console/`, and the `.hidden` id), the sneaking archive
+fixture refusing with nothing on disk, the entry-less helper, the archive
+missing its entry, and the alphabetical scan - plus three catalogue tests
+(a helper entry read, the entry-less helper refused at the manifest, the
+pack with an `entry` refused). The harness goes **156 → 160** checks with
+the 20d block. The artefact's size lands in the follow-up docs commit.
+
+**Decisions.** `DECISIONS.md` §27 - the `modules/<id>/` layout with a
+`module.json` record instead of a config row, the lock on `modules/` and on
+`modules/<id>/` both, the icacls call (well-known SIDs + the user's
+`USERDOMAIN\USERNAME`, write probe, dev reset), helpers join no worker
+(`PackKind` unchanged), the zip crate pure-Rust deflate, and the strict
+manifest rules (helper needs `entry`, pack refuses it).
+
+**Surprises.** none yet.
+
+**Next.** Watch the branch's CI. B4 - the "Modules" window (`WORK-ORDER.md`
+B4): the rows, the shapes and the install flow behind the daemon. This
+entry's branch `feature/b3-helpers` cuts from `main` `a9abddb`.
 
 ---
 

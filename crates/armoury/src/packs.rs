@@ -1096,10 +1096,11 @@ pub fn remove_id(search_dirs: &[PathBuf], id: &str) -> Result<String, String> {
     Ok(id.to_string())
 }
 
-fn is_safe_id(id: &str) -> bool {
-    // A Windows folder name only: no separators, no drive prefix (`C:evil` escapes the root when
-    // joined), no traversal, no leading/trailing dot (Windows strips those, so they would not round
-    // trip through the file system).
+/// A Windows folder name only: no separators, no drive prefix (`C:evil` escapes the root when
+/// joined), no traversal, no leading/trailing dot (Windows strips those, so they would not round
+/// trip through the file system). Shared with `helpers`, whose module folders take the same
+/// shape.
+pub(crate) fn is_safe_id(id: &str) -> bool {
     let id = id.trim();
     if id.is_empty() || id.len() > 64 || id.starts_with('.') || id.ends_with(['.', ' ']) {
         return false;

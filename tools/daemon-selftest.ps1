@@ -1116,7 +1116,7 @@ try {
         $probe = Invoke-CliProbe @('--help')
         $r = $probe.Run
         Check 'help exits 0' ($r.Exit -eq 0) $probe.Detail
-        $flags = @('--autostart', '--ui', '--console', '--catalog-list', '--catalog-install', '--catalog-url', '--version', '--help')
+        $flags = @('--autostart', '--ui', '--console', '--catalog-list', '--catalog-install', '--catalog-url', '--module-list', '--version', '--help')
         $missing = @($flags | Where-Object { -not $r.Text.Contains($_) })
         Check 'help lists every flag the binary accepts' ($missing.Count -eq 0) "missing: $($missing -join ' ')"
 
@@ -1165,7 +1165,7 @@ try {
         $testTrust = Join-Path $cliDir 'test-keyring.json'
         New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
         @'
-{"schema":1,"keys":[{"comment":"the harness's frozen probe key (private half deleted the day the fixtures were signed)","key":"RWTUa5h/DwHow3IGIQ9hySXFqYn7fQTiXHT6t0m5gwKCTcsY1eCakbOz"}]}
+{"schema":1,"keys":[{"comment":"the harness's frozen probe key (private half deleted the day the fixtures were signed)","key":"RWTUa5h/DwHow3IGIQ9hySXFqYn7fQTiXHT6t0m5gwKCTcsY1eCakbOz"},{"comment":"the B3 helper fixtures' probe key (private half deleted the day the fixtures were signed)","key":"RWQDWVat2lgAnsBkYFGLiecUYzI3PoFbek2aOwBC9dmn2fYA0g/4d4L7"}]}
 '@ | Set-Content -Path $testTrust -Encoding ascii
         $manText = [IO.File]::ReadAllText((Join-Path $fixtures 'man-old-key.json'))
         $gzipBody = Get-GzipBytes $manText
@@ -1350,6 +1350,77 @@ try {
         Remove-Item -LiteralPath (Join-Path $repoRoot 'packs\harness-test') -Recurse -Force -ErrorAction SilentlyContinue
         Check 'the pack installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit) $(Get-FirstLine $probe.Text)"
         Check 'the manifest, its signature and the pack travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 3)) "connections=$($script:connections) requests=$($script:requests.Count)"
+
+        # -- 20d. a helper module installs the whole bundle --
+        #
+        # A helper entry downloads an archive instead of a pack file: manifest, minisign
+        # signature, zip - three files over **one** connection (trap 55: each connection
+        # waits on a fresh accept, the pre-started task answers once). The daemon checks the
+        # archive's SHA-256 and size against the signed manifest, extracts into
+        # modules/<id>/, and records the entry in the folder's module.json. A second probe
+        # process lists what is installed - a fresh process reads only disk again, so what
+        # it finds is what a restart would find.
+        # The manifest and its signature are frozen fixtures signed by a probe key whose
+        # private half died with the throwaway folder it was generated in
+        # (tools/fixtures/helper-test.pub holds the verifying key).
+        $helperZip = [IO.File]::ReadAllBytes((Join-Path $fixtures 'helper-harness-test.zip'))
+        $helperMan = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-helper.json'))
+        $helperSig = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-helper.json.minisig'))
+        $env:ARMOURY_TEST_TRUST = $testTrust
+        $server = Start-LoopbackListener
+        $script:requests = @()
+        $script:connections = 0
+        $probe = Invoke-CatalogProbe @('--catalog-install', 'h-harness', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
+            # the server answers until the daemon has all three files (manifest, signature,
+            # archive), or until it runs out of time
+            $deadline = (Get-Date).AddSeconds(20)
+            while ((Get-Date) -lt $deadline -and $script:requests.Count -lt 3) {
+                # the first accept is the task the helper started; every connection but the
+                # first needs a fresh one
+                if ($script:connections -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
+                if (-not $accept.Wait(2000)) { break }
+                $client = $accept.GetAwaiter().GetResult()
+                $script:connections++
+                $client.ReceiveTimeout = 5000
+                try {
+                    while ($true) {
+                        try { $request = Read-Request $client } catch { break }
+                        if (-not $request) { break }
+                        $script:requests += $request
+                        $route = ($request -split "`r`n")[0]
+                        $body = if ($route -like '*index.json.minisig*') { $helperSig }
+                                elseif ($route -like '*console.zip*') { $helperZip }
+                                else { $helperMan }
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: application/octet-stream`r`nContent-Length: $($body.Length)`r`n`r`n"
+                        $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
+                        $stream = $client.GetStream()
+                        $stream.Write($headBytes, 0, $headBytes.Length)
+                        $stream.Write($body, 0, $body.Length)
+                        $stream.Flush()
+                        if ($script:requests.Count -ge 3) { break }
+                    }
+                }
+                finally { $client.Close() }
+            }
+        }
+        $server.Listener.Stop()
+        $env:ARMOURY_TEST_TRUST = $null
+        # what a fresh process reads back from disk: the install landed, its record is
+        # readable - this is the helper found again after a restart
+        $list = Invoke-Cli @('--module-list') 40
+        $helperDir = $null
+        foreach ($candidate in @((Join-Path $exeDir 'modules\h-harness\ArmouryConsole.exe'), (Join-Path $repoRoot 'modules\h-harness\ArmouryConsole.exe'))) {
+            if (Test-Path -LiteralPath $candidate) { $helperDir = $candidate; break }
+        }
+        Check 'a helper installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit) $(Get-FirstLine $probe.Text)"
+        Check 'the manifest, its signature and the helper archive travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 3)) "connections=$($script:connections) requests=$($script:requests.Count)"
+        Check 'the helper lands with its recorded entry' ($null -ne $helperDir) "none of the candidates holds modules\h-harness\ArmouryConsole.exe"
+        Check 'the helper is listed by a fresh process (found after a restart)' ($list.Text.Contains('h-harness') -and $list.Text.Contains('helper')) "output=$(Get-FirstLine $list.Text)"
+
+        # the helper the probe installed is not one of ours: it goes away again, from
+        # wherever the daemon put it
+        Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-harness') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-harness') -Recurse -Force -ErrorAction SilentlyContinue
 
         $env:ARMOURY_TEST_NS = $ns
     }
