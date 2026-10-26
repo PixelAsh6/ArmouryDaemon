@@ -150,9 +150,11 @@ background.
   `--module-list`, the `zip` 2.6 dependency, the strict manifest rules (a
   helper needs `entry`, a pack refuses it), and a 20d harness scenario
   serving manifest + signature + archive over one connection.
-  `DECISIONS.md` §27. Counts on the tree: **404 unit tests** (298
-  `armoury` + 106 `armoury-core`), **160 harness checks**. CI run id lands
-  in the follow-up docs commit.
+  `DECISIONS.md` §27. CI green on the tip (`cc72986`, run `40337739735`,
+  13m28s; two red runs before it - the sibling module path and the UI
+  test factory's initializer): **404 unit tests** (298 `armoury` + 106
+  `armoury-core`), **160 harness checks**, the exe **13,275,136 bytes**
+  (+118,272), sha256 `4e591518…64a3`.
 - **The next action after the B3 merge is Phase B4** - the "Modules"
   window (`WORK-ORDER.md` B4): the rows, the shapes and the
   download/verify/install flow behind the daemon. B3 sits on its branch

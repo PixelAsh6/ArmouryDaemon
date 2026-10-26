@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) done and merged; **B3 on the branch `feature/b3-helpers`** (helpers extract into `modules/<id>/` with their own lock, `--module-list`), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
 | **Next action** | Watch the `feature/b3-helpers` CI runs, then **merge** (`merge: B3 - helpers install to modules/`) and wrap docs. After that: **B4** - the "Modules" window (`WORK-ORDER.md` B4) - the signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b3-helpers` cut from `main` `a9abddb` - **CI pending on the tip**. Counts on the tree: **404 unit tests** (298 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip) |
+| **Branch** | `feature/b3-helpers` cut from `main` `a9abddb` - CI **green** on `cc72986` (run `40337739735`, 13m28s, "ALL CHECKS PASSED"; the runner printed **298 passed** + **106 passed**, and the four 20d checks PASS while the real-catalogue pair SKIPs): **404 unit tests**, **160 harness checks**; the exe is **13,275,136 bytes** (+118,272), sha256 `4e591518…64a3`, `VCRUNTIME140.dll` still absent |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1205,16 +1205,25 @@ folder), and the harness keyring carries both probe keys now.
 probe key in the test trust), `tools/fixtures/` (the four new fixtures),
 `deploy/setup.ps1`, `docs/modularity/`, `CHANGELOG.md`.
 
-**Measured.** CI pending on the tip. Unit tests **394 → 404** (298 in
-`armoury` + 106 in `armoury-core`): seven helpers tests - the
-install/record/rediscover round trip including an update, the escape
-refusals (entry paths `../evil.exe`, `sub/../../out.exe`, `C:/evil`,
-`console/..`, `console/`, and the `.hidden` id), the sneaking archive
-fixture refusing with nothing on disk, the entry-less helper, the archive
-missing its entry, and the alphabetical scan - plus three catalogue tests
-(a helper entry read, the entry-less helper refused at the manifest, the
-pack with an `entry` refused). The harness goes **156 → 160** checks with
-the 20d block. The artefact's size lands in the follow-up docs commit.
+**Measured.** Two red runs before the green one, both compile-side, both
+mine: `40336488909` died on `cannot find module or crate helpers` (a
+submodule must name the sibling through `crate::`, bare `helpers::` works
+only in `main.rs` itself), `40337041814` died on the UI test factory's
+`CatalogPack` initializer (the new `entry` field left unset - E0063
+demands the stop-gap in `ui.rs`'s test helper). The green run
+`40337739735` (`cc72986`, 13m28s, "ALL CHECKS PASSED") prints **298
+passed** plus **106 passed** - unit tests went **394 → 404** (the seven
+helpers tests print by name in the log: the install/record/rediscover
+round trip, the escape refusals, the sneaking fixture, the absent-entry
+pair, `.hidden` id, the sorted scan - plus the three new catalogue tests)
+- and the harness goes **156 → 160 checks**, the four new 20d ones PASS
+by name (installs from the local catalogue; the three files over one
+connection; the recorded entry on disk; listed by a fresh process while
+the two real-catalogue checks still SKIP naming the unsigned live
+manifest). Artefact: **13,275,136 bytes** (+118,272 over the B2 tip's
+13,156,864 - the zip reader and the lock plumbing), sha256
+`4e591518…64a3`, `VCRUNTIME140.dll` still absent. The packs flip, the
+signing key and the release are the user's calls.
 
 **Decisions.** `DECISIONS.md` §27 - the `modules/<id>/` layout with a
 `module.json` record instead of a config row, the lock on `modules/` and on
@@ -1223,7 +1232,13 @@ the 20d block. The artefact's size lands in the follow-up docs commit.
 (`PackKind` unchanged), the zip crate pure-Rust deflate, and the strict
 manifest rules (helper needs `entry`, pack refuses it).
 
-**Surprises.** none yet.
+**Surprises.** Two compile takes for the price of one push: naming a
+**sibling module** from inside another module needs `crate::helpers`,
+bare `helpers::` resolves only at the crate root (`main.rs`) - my earlier
+red run said "cannot find module or crate `helpers` in this scope"; and a
+struct with a new field means **every existing initializer** grows the
+field, so `ui.rs`'s test factory needed it too (E0063 names the missing
+field - the CI compiler was once again the first one to see the mistake).
 
 **Next.** Watch the branch's CI. B4 - the "Modules" window (`WORK-ORDER.md`
 B4): the rows, the shapes and the install flow behind the daemon. This
