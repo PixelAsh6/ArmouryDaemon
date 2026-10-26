@@ -100,8 +100,11 @@ background.
   shorthand `-C target-crt-static` is not a real rustc flag — so the exe
   imports no `VCRUNTIME140.dll` and starts even on a stripped image; Cargo has
   no profile-scoped rustflags, so the debug builds go static with it.
-  `DECISIONS.md` §24. **CI on the tip: pending**; the counts stand: **384 unit
-  tests** (278 `armoury` + 106 `armoury-core`), **154 harness checks**.
+  `DECISIONS.md` §24. CI green on the tip (`d172567`, run `40311776397`): the
+  counts stand (384 unit tests, 278 `armoury` + 106 `armoury-core`, 154
+  harness checks) and the artefact says **13,074,432 bytes** (+192,512, a much
+  better price than the 1-2 MB estimate), `VCRUNTIME140.dll` absent,
+  `kernel32.dll` still readable, sha256 `c1373e9e…22f8`.
 - **The next action is Phase B1** — `kind` in the manifest, schema 2
   (`WORK-ORDER.md` B1, `catalog.rs:44`), and the release workflow's catalogue
   check learning `modules`. A6 sits in `main` at `e45b8be`; the next release

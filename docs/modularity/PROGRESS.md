@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**). 1.1.6 is published and installed; A6 sits on the branch `feature/a6-crt-static`, **not merged** |
 | **Next action** | **B1** - `kind` in the manifest, schema 2, and the release workflow's catalogue step learning `modules` (`WORK-ORDER.md` B1; `catalog.rs:44`). The next release is the user's call |
-| **Branch** | `feature/a6-crt-static` (cut from `main` `cf37902`) - CI **pending on the tip**; test counts unchanged: **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**. A5 is merged (`e45b8be`, run `40307649812`) pruned. `feature/a5-killswitch` and the stale `a2`-`a4`, `phase-a` branches are pruned from origin too |
+| **Branch** | `feature/a6-crt-static` (cut from `main` `cf37902`) - CI **green** on the tip `d172567` (run `40311776397`): **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**, and the artefact's imports are clean. A5 is merged (`e45b8be`, run `40307649812`) pruned. `feature/a5-killswitch` and the stale `a2`-`a4`, `phase-a` branches are pruned from origin too |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1014,16 +1014,24 @@ static release against a dynamic debug.
 change — nothing about the daemon's behaviour changes; the unit and harness
 counts stand at **384** / **154**.
 
-**Measured.** CI pending on the tip; the follow-up docs commit fills in the
-artefact facts: the size delta against the A5 tip's **12,881,920 bytes**, and
-the byte string `VCRUNTIME140.dll` being **absent** while `kernel32.dll`
-(import-table strings live verbatim in a PE; the dynamic A5 build *has* the
-string, so the check demonstrably fails where it must).
+**Measured.** CI is green on the A6 tip (`d172567`, run `40311776397`):
+**384** unit and **154** harness counts hold, "ALL CHECKS PASSED". The
+dispatch artefact says: exe **13,074,432 bytes** - **+192,512** (188 KiB)
+against the A5 tip's 12,881,920, comfortably under the work order's 1-2 MB
+estimate; sha256 `c1373e9e…22f8`. The byte string `VCRUNTIME140.dll` is
+**absent** from the exe, `api-ms-win-crt`/`ucrtbase` absent too (the static
+CRT pulls none of the UCRT forwarders), and `kernel32.dll` still reads, so
+the import strings are being seen. The A5 baseline demonstrably failed this
+check: the same scanner found `VCRUNTIME140.dll` in its dynamic exe.
 
 **Decisions.** `DECISIONS.md` §24 — statically linked CRT over dynamic or an
 installer preflight; the cost is weight.
 
-**Surprises.** none yet.
+**Surprises.** One good one: the cost estimate was 1-2 MB; the artefact says
+the static CRT is **+188 KiB**. And one that cost a download: the exe
+artefact is published only on a `workflow_dispatch` run - the push- and
+PR-triggered builds upload nothing, which the workflow file states in a
+comment.
 
 **Next.** Phase B1 - `kind` in the manifest, schema 2 (`WORK-ORDER.md` B1):
 the release workflow's "Check the packs against the catalogue" step must

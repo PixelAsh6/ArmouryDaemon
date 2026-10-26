@@ -828,8 +828,9 @@ present on stock Win10/11, but absent on a stripped image (LTSC, thin VMs),
 where the daemon refused to start with nothing the user could fix from inside
 the product. The install ritual is a lone exe and its hash sidecar, with no
 redistributable to install; the runtime was the one hole in the "lone exe"
-story. The accepted cost is weight, not behaviour: measured in the A6 follow-up
-docs commit from the CI artefact (~1-2 MB against the 12.88 MB A5 build).
+story. The accepted cost is weight, not behaviour: the A6 artefact measured
+**+192,512 bytes** (188 KiB) against the 12,881,920-byte A5 build - far under
+the work order's 1-2 MB estimate.
 
 - **The spelling.** The work order's shorthand `-C target-crt-static` names no
   real rustc flag; the effective one is `-C target-feature=+crt-static`, appended to the MSVC target's rustflags in `.cargo/config.toml`, next to the
