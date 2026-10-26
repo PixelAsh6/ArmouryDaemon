@@ -915,3 +915,50 @@ URL that missed its signature.
   `2cd49ce`, unpushed) creates it together with the next release. After the
   flip they re-arm: a signed live manifest verifies per fetch, and a refusal
   is red again.
+
+---
+
+## 27. Helpers install to `modules/<id>/`, lock their folder, and never join a worker
+
+**Settled 2026-10-26.** B3 gives the catalogue's `helper` kind an install
+path of its own. The refuse-early rules stay identical to a pack's (SHA-256
+and size against the manifest, verified before anything writes); what is
+different is where the bytes land, from where they are read back, and who
+may touch the folder afterwards.
+
+- **The folder is `modules/<id>/` beside the install.** A helper is an
+  archive (`zip`; the `zip` crate, pure-Rust deflate only) the daemon
+  extracts into `modules/<id>/`. The entry's `entry` names the executable
+  inside the archive, the folder carries a `module.json` record (schema 1:
+  id, name, version, kind, entry, installed_at), and discovery is a plain
+  disk scan (`helpers::installed`) - what a restart finds again is what a
+  folder scan finds. No config row, no migration, no registry.
+- **The lock is on `modules/` and on `modules/<id>/` both** (trap 56):
+  Administrators + SYSTEM full, the interactive user read + execute, no
+  inheritance either way. A writeable `modules/` parent could delete a
+  locked child and put an unlocked one in its place, so locking only the
+  child was not enough. `deploy/setup.ps1` pre-creates the locked `modules/`
+  folder at deployment, and the daemon re-applies both locks every install.
+- **One `icacls` call, the two well-known accounts by SID**
+  (`*S-1-5-32-544`, `*S-1-5-18`, so no locale renames them away), the user
+  as `USERDOMAIN\USERNAME` right after the grant, then a write probe. A
+  token that fails the probe is a non-elevated build running from the
+  repository: its folder resets to the inherited permissions, loudly in the
+  log, and the install proceeds. A production install keeps the lock and
+  would refuse to install under anything whose folder cannot be locked.
+- **A helper joins no worker.** `PackKind` stays the pack file's own
+  vocabulary (pack and mode drive the workers); the catalogue's kind list -
+  pack, mode, helper - lives in `catalog.rs`'s `catalog_kinds()`. Helpers
+  never reach `packs::load`, `split_enabled` or the pack/mode workers: the
+  folder scan is a parallel list. `entry` on a pack entry is a manifest
+  typo and refuses; on a helper it is required.
+- **Refusals happen before files move.** The entry path is checked
+  component-wise (no empty/dotted/illegal components, no `..`), the id must
+  be a safe folder name, the archive's paths are re-checked at extraction
+  with entry-count and unpacked-byte caps (256 / 256 MiB), the declared
+  entry file must exist after extraction, and the staging folder must
+  accept its lock. A refused install leaves the previous folder in place,
+  or nothing; a successful one swaps staging and target atomically-writes
+  (rename), restoring the old folder if the swap cannot complete.
+
+---

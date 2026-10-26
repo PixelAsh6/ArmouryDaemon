@@ -18,6 +18,7 @@ mod console;
 mod console_ui;
 mod daemon;
 mod hotkey;
+mod helpers;
 mod install;
 mod ipc;
 mod killswitch;
@@ -61,6 +62,7 @@ fn main() {
         Action::CatalogList(ref url) => catalog_list(url.clone()),
         Action::CatalogInstall(ref id, ref url) => catalog_install(id, url.clone()),
         Action::CatalogUrl(ref url) => catalog_list(Some(url.clone())),
+    Action::ModuleList => module_list(),
         Action::Version => print_line(&format!(
             "{} {}",
             env!("CARGO_BIN_NAME"),
@@ -94,6 +96,8 @@ enum Action {
     CatalogInstall(String, Option<String>),
     /// Read the catalog from this manifest URL.
     CatalogUrl(String),
+    /// List what the daemon has installed: packs, modes and helpers, one line each.
+    ModuleList,
     /// Print the version.
     Version,
     /// Print the usage.
@@ -106,6 +110,7 @@ enum Action {
 fn parse_args(args: impl Iterator<Item = String>) -> Action {
     let args: Vec<String> = args.collect();
     let mut list = false;
+    let mut modules = false;
     // The pack id of `--catalog-install`. It is not called `install`: that name belongs to
     // the module above, and a local with the same name is a trap for the next reader.
     let mut install_id: Option<String> = None;
@@ -130,6 +135,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
             "--console" => console = true,
             "--install" => install_task = true,
             "--catalog-list" => list = true,
+            "--module-list" => modules = true,
             "--version" | "-V" => version = true,
             "--help" | "-h" => help = true,
             "--catalog-install" => match args.get(index + 1) {
@@ -166,6 +172,9 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
     if list {
         return Action::CatalogList(url);
     }
+    if modules {
+        return Action::ModuleList;
+    }
     if let Some(url) = url {
         return Action::CatalogUrl(url);
     }
@@ -196,6 +205,7 @@ const FLAGS: &[(&str, &str)] = &[
     ("--catalog-list", "list the packs of the catalog and exit"),
     ("--catalog-install <id>", "install one pack from the catalog and exit"),
     ("--catalog-url <url>", "read the catalog from this manifest URL"),
+    ("--module-list", "print the installed modules and exit"),
     ("--version, -V", "print the version and exit"),
     ("--help, -h", "print this usage and exit"),
 ];
@@ -281,6 +291,38 @@ fn catalog_install(id: &str, url: Option<String>) {
     }
 }
 
+/// Print what the daemon has installed: packs from `packs/` (labeled by kind) and
+/// helpers from `modules/`, one line each, sorted by id. The list the "the helper
+/// is still found after a restart" story is checked against: a fresh process reads
+/// it back from disk, nothing was carried in memory.
+fn module_list() {
+    let dirs = daemon::pack_search_dirs();
+    let mut rows = Vec::new();
+    for installed in packs::load(&dirs) {
+        let kind = if installed.pack.kind == armoury_core::pack::PackKind::Mode {
+            "mode"
+        } else {
+            "pack"
+        };
+        rows.push((
+            installed.pack.id.clone(),
+            kind.to_string(),
+            installed.pack.version.clone(),
+            installed.pack.name.clone(),
+        ));
+    }
+    for helper in helpers::installed(&dirs) {
+        rows.push((helper.id, "helper".to_string(), helper.version, helper.name));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if rows.is_empty() {
+        println!("modules: nothing installed");
+    }
+    for (id, kind, version, name) in rows {
+        println!("  {kind:<7} {id:<20} v{version:<8} {name}");
+    }
+}
+
 /// The manifest URL: the configured one, else the official one.
 fn configured_catalog_url() -> String {
     let cfg = armoury_core::config::load_or_create().unwrap_or_default();
@@ -353,6 +395,7 @@ mod tests {
     #[test]
     fn the_catalog_modes_are_recognised() {
         assert_eq!(parse(&["--catalog-list"]), Action::CatalogList(None));
+        assert_eq!(parse(&["--module-list"]), Action::ModuleList);
         assert_eq!(
             parse(&["--catalog-install", "g-helper"]),
             Action::CatalogInstall("g-helper".to_string(), None)

@@ -4347,6 +4347,7 @@ mod tests {
             sha256: "00".to_string(),
             size: None,
             min_engine: None,
+            entry: None,
         }
     }
 

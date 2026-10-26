@@ -1,0 +1,17 @@
+{
+  "schema": 2,
+  "updated": "2026-10-26",
+  "modules": [
+    {
+      "id": "h-harness",
+      "kind": "helper",
+      "name": "Harness helper",
+      "version": "0.99.0",
+      "description": "The helper module install scenario (B3).",
+      "file": "modules/h-harness/console.zip",
+      "sha256": "308aeb91c007eadee578ff145120bcdbd240d9ec92cb0e14918be88cd71cf9e8",
+      "size": 322,
+      "entry": "ArmouryConsole.exe"
+    }
+  ]
+}

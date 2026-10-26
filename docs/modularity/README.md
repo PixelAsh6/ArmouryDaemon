@@ -140,11 +140,26 @@ background.
   (288 `armoury` + 106 `armoury-core`), **156 harness checks** (the
   real-catalogue pair SKIP naming the unsigned live manifest until the
   flip), the exe **13,156,864 bytes** (+76,800), sha256 `0d5b48cf…787b`.
-- **The next action is Phase B3** — install paths per kind
-  (`WORK-ORDER.md` B3): `pack`/`mode` keep the existing path; a `helper`
-  extracts into `modules/<id>/` with its own ACL, is recorded and is found
-  after a restart. B2 is in `main` at `e94110d`; the packs flip and the
-  next release are the user's calls.
+- **Phase B3 is on the branch `feature/b3-helpers`** (cut from `main`
+  `a9abddb`, **not merged**): the catalogue's `helper` kind got its install
+  path. `catalog::install` dispatches by entry - pack and mode keep the
+  existing path, a helper extracts an archive into `modules/<id>/` behind
+  its own folder lock (Administrators + SYSTEM full, the user read +
+  execute, on `modules/` **and** the module folder - trap 56), records a
+  `module.json`, and is rediscovered by a disk scan. New `helpers.rs`,
+  `--module-list`, the `zip` 2.6 dependency, the strict manifest rules (a
+  helper needs `entry`, a pack refuses it), and a 20d harness scenario
+  serving manifest + signature + archive over one connection.
+  `DECISIONS.md` §27. CI green on the tip (`cc72986`, run `40337739735`,
+  13m28s; two red runs before it - the sibling module path and the UI
+  test factory's initializer): **404 unit tests** (298 `armoury` + 106
+  `armoury-core`), **160 harness checks**, the exe **13,275,136 bytes**
+  (+118,272), sha256 `4e591518…64a3`.
+- **The next action after the B3 merge is Phase B4** - the "Modules"
+  window (`WORK-ORDER.md` B4): the rows, the shapes and the
+  download/verify/install flow behind the daemon. B3 sits on its branch
+  until its runs are green; the packs flip, the signing key and the next
+  release are the user's calls.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -179,13 +194,11 @@ background.
 
 ## The next action
 
-**Phase B3 — install paths per kind** (`WORK-ORDER.md` B3): `pack` and
-`mode` keep the existing `packs::install_text` path untouched; a new `kind`
-of `helper` gets its own path — download, verify sha256/size, extract into
-`modules/<id>/`, record the resolved path, with the helper directory's own
-ACL. Acceptance: a helper installs, is recorded, and is found again after a
-restart. B2 is in `main` at `e94110d`; the packs flip, the signing key and
-the next release are the user's calls.
+**Phase B4 - the "Modules" window** (`WORK-ORDER.md` B4): the rows and the
+shapes (pack/mode/helper), the per-module capability display, and the
+download/verify/install flow behind the daemon. B3 is on its branch
+`feature/b3-helpers` until its runs are green - then the merge; the packs
+flip, the signing key and the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

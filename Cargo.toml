@@ -41,6 +41,9 @@ sha2 = "0.10"
 # signature is verified before the manifest is parsed. Verify-only - signing stays with
 # the keeper's private key, which never enters a repository.
 minisign-verify = "0.3.0"
+# B3: a `helper` module is a downloaded archive the daemon extracts into `modules/<id>/`.
+# Pure-Rust deflate/deflate-decoder, no C toolchain in the build.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 opt-level = 3

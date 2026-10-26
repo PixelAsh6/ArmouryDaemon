@@ -18,6 +18,15 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   entry's name, an absent kind means `pack`, and the build reads both keys
   for one release so an old manifest keeps working (a manifest carrying both
   is refused, `docs/modularity/DECISIONS.md` §25).
+- **Helper modules install like packs, and lock their folder.** A catalogue
+  entry of kind "helper" names an archive plus the executable inside it
+  (`entry`); `--catalog-install` verifies the archive's SHA-256 and size
+  against the manifest, extracts it into `modules/<id>/` - the folder and its
+  parent carry an Administrators + SYSTEM full, user read + execute lock -
+  records the layout in the folder's `module.json`, and a later
+  `--module-list` reads every installed pack, mode and helper back from
+  disk. A helper never joins the pack or mode worker
+  (`docs/modularity/DECISIONS.md` §27).
 - The **killswitch has a config key and an IPC request**. One field,
   `killswitch_enabled` (default on), is both the switch and the "is the killswitch
   module installed" flag: while it is off, the End key and the tray toggle are
