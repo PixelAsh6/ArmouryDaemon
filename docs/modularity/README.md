@@ -116,9 +116,11 @@ background.
   `modules` with the same fallback; the packs repo's own `index.json` goes
   schema 2 in its repo's own commit, **pushed only at release time** — a live
   schema-2 manifest breaks the installed 1.1.6 daemons' fetches. `DECISIONS.md`
-  §25. **CI on the tip: pending**; counts on the tree: **388 unit tests**
+  §25. CI green on the tip (`5009452`, run `40318171903`, 10m42s; one red run
+  before it — the probe's own server sent an RST, trap 53): **388 unit tests**
   (282 `armoury` + 106 `armoury-core`), **156 harness checks** (the schema-2
-  probe lists through `modules`).
+  probe lists through `modules`), the exe **13,080,064 bytes** (+5,632), sha256
+  `97d436c4…5e66`.
 - **The next action is Phase B2** — signed manifests (`WORK-ORDER.md` B2):
   `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json`
   via `include_str!`, verify **before** parsing, refuse everything on a bad

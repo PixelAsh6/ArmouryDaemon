@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (…, killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**); B - **B1 done** (the manifest says what its packs are: schema 2, `modules`, a validated `kind`). 1.1.6 is published and installed; B1 sits on the branch `feature/b1-manifest-kind`, **not merged** |
 | **Next action** | **B2** - signed manifests: `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json` via `include_str!`, verify **before** parsing (`WORK-ORDER.md` B2). The next release is the user's call |
-| **Branch** | `feature/b1-manifest-kind` (cut from `main` `dc74394`) - CI **pending on the tip**; counts on the tree: **388 unit tests** (282 in `armoury` + 106 in `armoury-core`), **156 harness checks**. A6 is merged (`585f8ff`, run `40314663065`) and pruned |
+| **Branch** | `feature/b1-manifest-kind` (cut from `main` `dc74394`) - CI **green** on the tip `5009452` (run `40318171903`, 10m42s, "ALL CHECKS PASSED"; the runner printed **282 passed** and **106 passed**): **388 unit tests**, **156 harness checks**; the artefact is **13,080,064 bytes** (+5,632 against the A6 tip), sha256 `97d436c4…5e66`, `VCRUNTIME140.dll` still absent. A6 is merged (`585f8ff`, run `40314663065`) and pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1069,18 +1069,22 @@ top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`.
 the harness checks failed, both mine — the new schema-2 probe's server never
 read the client's request before closing, and Windows turned the close into
 a reset that killed the fetch mid-read (`trap 53`; the gzip probe beside it
-had always read first, which is why its socket behaved). The fix is one
-line; the fix's run is the branch's green run. The unit tests went
-**384 → 388** (282 + 106: **four** new tests around the new keys and kinds —
+had always read first, which is why its socket behaved). The fix (`5009452`)
+is one line, and its run is green: `40318171903`, 10m42s, "ALL CHECKS
+PASSED", the runner itself printing **282 passed** and **106 passed**.
+Counts: unit **384 → 388** (four new tests around the new keys and kinds —
 the schema-2 parse with `modules`, absent kind meaning `pack`, an unknown
 kind refusing with a name, both keys refusing — and the modified schema
-test; the schema-1 fixtures stay as the permanent old-manifest proof), the
-harness **154 → 156** (the schema-2 listing names the pack). The release
-workflow's step is validated by parse and review here; it actually runs on
-the next tag push. The packs repo manifest is **not pushed** with this
-phase: the schema-2 flip breaks every installed 1.1.6 daemon's live
-catalogue fetch (it refuses schema 2) until a released daemon ships — the
-flip is tied to the release decision, like the tag.
+test; the schema-1 fixtures stay as the permanent old-manifest proof),
+harness **154 → 156** (the schema-2 listing names the pack). The artefact:
+**13,080,064 bytes** (+5,632 against the A6 tip's 13,074,432 — whatever the
+extra validation enum weighting costs), sha256 `97d436c4…5e66`,
+`VCRUNTIME140.dll` still absent from its imports. The release workflow's
+step is validated by parse and review here; it actually runs on the next
+tag push. The packs repo manifest is **not pushed** with this phase: the
+schema-2 flip breaks every installed 1.1.6 daemon's live catalogue fetch
+(it refuses schema 2) until a released daemon ships — the flip is tied to
+the release decision, like the tag.
 
 **Decisions.** `DECISIONS.md` §25 — the dual key is a courtesy with an
 expiry, the kind mirrors the pack file's vocabulary, and one manifest
