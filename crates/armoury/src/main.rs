@@ -26,6 +26,7 @@ mod pad;
 mod packs;
 mod pick;
 mod script;
+mod trust;
 mod ui;
 mod watch;
 

@@ -37,6 +37,10 @@ eframe = { version = "0.37.0", default-features = false, features = ["glow"] }
 # anywhere but the shared client could not be validated at all.
 ureq = { version = "3", default-features = false, features = ["rustls-no-provider", "_ring", "platform-verifier", "win-system-proxy", "gzip"] }
 sha2 = "0.10"
+# B2: the catalogue manifest travels minisign-signed; the keyring is baked in and the
+# signature is verified before the manifest is parsed. Verify-only - signing stays with
+# the keeper's private key, which never enters a repository.
+minisign-verify = "0.3.0"
 
 [profile.release]
 opt-level = 3

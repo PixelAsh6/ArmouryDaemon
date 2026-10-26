@@ -122,11 +122,29 @@ background.
   (282 `armoury` + 106 `armoury-core`), **156 harness checks** (the schema-2
   probe lists through `modules`), the exe **13,080,064 bytes** (+5,632), sha256
   `97d436c4…5e66`.
-- **The next action is Phase B2** — signed manifests (`WORK-ORDER.md` B2):
-  `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json`
-  via `include_str!`, verify **before** parsing, refuse everything on a bad
-  signature. B1 is in `main` at `e56a72a`; the next release is the user's
-  call.
+- **Phase B2 is done on the branch `feature/b2-signed-manifests`** (cut from
+  `main` `5ca0033`, **not merged** — the merge is the user's call): the
+  catalogue manifest arrives minisign-signed. `catalog::fetch` gets the
+  manifest bytes, then `index.json.minisig`, verifies **before** parsing,
+  and an unsigned or refused manifest is refused by name. `trust.rs` +
+  `trust/keys.json` bake the keyring (`include_str!`, one trusted key today,
+  two slots for the 90-day rotation); the keeper holds the matching private
+  key and no repository ever does. The harness's local probes serve frozen
+  byte-exact manifest+signature fixtures under `tools/fixtures/` (marked
+  `-text`, signed once by a key whose private half died with its temp
+  folder), the test ring trades in via `ARMOURY_TEST_TRUST`, and the real
+  catalogue checks skip with a reason until the packs flip.
+  `DECISIONS.md` §26. CI green on the tip (`abf2754`, run `40326319066`,
+  11m38s; four red runs before it — the lockfile, the 0.3.0 API, a Debug
+  impl, and the harness's second accept, traps 53-55): **394 unit tests**
+  (288 `armoury` + 106 `armoury-core`), **156 harness checks** (the
+  real-catalogue pair SKIP naming the unsigned live manifest until the
+  flip), the exe **13,156,864 bytes** (+76,800), sha256 `0d5b48cf…787b`.
+- **The next action is Phase B3** — install paths per kind
+  (`WORK-ORDER.md` B3): `pack`/`mode` keep the existing path; a `helper`
+  extracts into `modules/<id>/` with its own ACL, is recorded and is found
+  after a restart. B2's branch sits unmerged; the packs flip and the next
+  release are the user's calls.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -161,13 +179,13 @@ background.
 
 ## The next action
 
-**Phase B2 — signed manifests** (`WORK-ORDER.md` B2): `minisign-verify`
-0.3.0; the trust keyring is `crates/armoury/src/trust/keys.json`, embedded
-with `include_str!`; the signature is verified **before** the manifest is
-parsed, a bad signature refuses the whole manifest, and nothing installs
-unverified. Acceptance: a manifest with a broken signature installs
-nothing and says why. B1 is in `main` at `e56a72a`; only the next release
-is the user's call.
+**Phase B3 — install paths per kind** (`WORK-ORDER.md` B3): `pack` and
+`mode` keep the existing `packs::install_text` path untouched; a new `kind`
+of `helper` gets its own path — download, verify sha256/size, extract into
+`modules/<id>/`, record the resolved path, with the helper directory's own
+ACL. Acceptance: a helper installs, is recorded, and is found again after a
+restart. B2's branch `feature/b2-signed-manifests` sits unmerged; the packs
+flip, the signing key and the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

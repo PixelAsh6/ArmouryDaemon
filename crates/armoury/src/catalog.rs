@@ -17,6 +17,7 @@ use ureq::config::Config;
 use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::packs;
+use crate::trust;
 
 /// Where the official catalog manifest lives.
 pub const DEFAULT_URL: &str =
@@ -177,9 +178,29 @@ pub fn parse(json: &str) -> Result<Catalog, String> {
     Ok(catalog)
 }
 
-/// Fetch the manifest over HTTPS.
+/// Fetch the manifest over HTTPS — verified before it is parsed.
+///
+/// The manifest travels minisign-signed: the signature sits beside it as
+/// `<manifest>.minisig`, and a manifest whose signature the keyring refuses is not
+/// parsed at all. An unsigned manifest is not a manifest.
 pub fn fetch(url: &str) -> Result<Catalog, String> {
-    let body = fetch_text(url)?;
+    let bytes = fetch_bytes(url)?;
+    let sig_url = format!("{}.minisig", url.trim_end_matches('/'));
+    let sig = fetch_bytes(&sig_url).map_err(|e| {
+        format!(
+            "the manifest's signature could not be fetched from {sig_url} ({e}) — an unsigned \
+             manifest is refused, so the catalogue must arrive with an index.json.minisig beside it"
+        )
+    })?;
+    let sig_text = std::str::from_utf8(&sig)
+        .map_err(|_| format!("the signature at {sig_url} is not text"))?;
+    trust::TrustKeyring::load().verify(&bytes, sig_text).map_err(|e| {
+        format!(
+            "the manifest's signature does not verify (trust: {e}) — nothing is listed or \
+             installed until a signature the keyring accepts arrives"
+        )
+    })?;
+    let body = String::from_utf8(bytes).map_err(|e| format!("the manifest is not UTF-8 ({e})"))?;
     parse(&body)
 }
 
@@ -274,14 +295,6 @@ pub fn join_url(manifest_url: &str, file: &str) -> String {
         .unwrap_or(manifest_dir);
     let root = if one_up.contains("://") { one_up } else { manifest_dir };
     format!("{root}/{}", file.trim_start_matches('/'))
-}
-
-fn fetch_text(url: &str) -> Result<String, String> {
-    let response = get(url)?;
-    response
-        .into_body()
-        .read_to_string()
-        .map_err(|e| format!("catalog: cannot read {url} ({e})"))
 }
 
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {

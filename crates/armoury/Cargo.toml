@@ -24,6 +24,7 @@ eframe.workspace = true
 rhai.workspace = true
 ureq.workspace = true
 sha2.workspace = true
+minisign-verify.workspace = true
 image.workspace = true
 # The pipe's security descriptor is built from an SDDL string.
 widestring = "1"

@@ -390,6 +390,9 @@ function Start-LoopbackListener {
 function Get-FetchFailure([string]$text) {
     if ($text -match '(?i)certificate|unknownissuer|untrusted|rustls') { return 'tls' }
     if ($text -match '(?i)host not found|connection failed|timeout|dns|no such host') { return 'network' }
+    # only the "no .minisig to fetch" case is the transitional one - a published
+    # signature that does not VERIFY is a failure, and must be red
+    if ($text -match '(?i)signature could not be fetched') { return 'signature' }
     return 'other'
 }
 
@@ -1153,58 +1156,98 @@ try {
         #   asserted by the unit test in catalog.rs (the client trusts the platform
         #   verifier).
 
-        # (a) the gzip manifest
-        $localManifest = '{"schema":1,"updated":"2026-10-22","packs":[{"id":"local-test","name":"Local test","version":"9.9.9","description":"served by the harness","file":"packs/local-test/pack.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":10}]}'
-        $gzipBody = Get-GzipBytes $localManifest
+        # (a) the gzip manifest - and its minisign signature: an unsigned manifest is
+        # refused since B2, so the probe serves the manifest and, when the client asks for
+        # it, the .minisig beside it. Both are frozen fixture files (tools/fixtures): been
+        # signed once by a key whose private half died with the throwaway folder it lived
+        # in, so anyone in the repository can serve these exact bytes.
+        $fixtures = Join-Path $PSScriptRoot 'fixtures'
+        $testTrust = Join-Path $cliDir 'test-keyring.json'
+        New-Item -ItemType Directory -Force -Path $cliDir | Out-Null
+        @'
+{"schema":1,"keys":[{"comment":"the harness's frozen probe key (private half deleted the day the fixtures were signed)","key":"RWTUa5h/DwHow3IGIQ9hySXFqYn7fQTiXHT6t0m5gwKCTcsY1eCakbOz"}]}
+'@ | Set-Content -Path $testTrust -Encoding ascii
+        $manText = [IO.File]::ReadAllText((Join-Path $fixtures 'man-old-key.json'))
+        $gzipBody = Get-GzipBytes $manText
+        $sigBytes = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-old-key.json.minisig'))
         $server = Start-LoopbackListener
         $script:served = ''
+        $env:ARMOURY_TEST_TRUST = $testTrust
         $probe = Invoke-CatalogProbe @('--catalog-list', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
-            if (-not $server.Accept.Wait(20000)) { throw 'the daemon did not connect' }
-            $client = $server.Accept.GetAwaiter().GetResult()
-            try {
-                $script:served = Read-Request $client
-                $stream = $client.GetStream()
-                $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Encoding: gzip`r`nContent-Length: $($gzipBody.Length)`r`nConnection: close`r`n`r`n"
-                $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
-                $stream.Write($headBytes, 0, $headBytes.Length)
-                $stream.Write($gzipBody, 0, $gzipBody.Length)
-                $stream.Flush()
+            for ($i = 0; $i -lt 2; $i++) {
+                # the first accept is the task the helper started; the signature fetch
+                # opens its own connection, so it needs a fresh one
+                if ($i -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
+                if (-not $accept.Wait(20000)) { throw "the daemon did not connect (request $($i + 1))" }
+                $client = $accept.GetAwaiter().GetResult()
+                try {
+                    $script:served += Read-Request $client
+                    $stream = $client.GetStream()
+                    if ($i -eq 0) {
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Encoding: gzip`r`nContent-Length: $($gzipBody.Length)`r`nConnection: close`r`n`r`n"
+                        $body = $gzipBody
+                    }
+                    else {
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: $($sigBytes.Length)`r`nConnection: close`r`n`r`n"
+                        $body = $sigBytes
+                    }
+                    $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                    $stream.Write($headBytes, 0, $headBytes.Length)
+                    $stream.Write($body, 0, $body.Length)
+                    $stream.Flush()
+                }
+                finally { $client.Close() }
             }
-            finally { $client.Close() }
         }
+        $env:ARMOURY_TEST_TRUST = $null
         $server.Listener.Stop()
         $r = $probe
         Check 'the catalogue listing succeeds against a local server' ($r.Exited -and $r.Exit -eq 0) "exit=$($r.Exit)"
         Check 'the catalogue listing names the pack' ($r.Text.Contains('local-test')) "output=$(Get-FirstLine $r.Text)"
         Check 'the client asks for a compressed response' ($script:served -match '(?i)accept-encoding:\s*gzip') "request=$($script:served -replace "`r`n", ' ')"
 
-        # (a2) a schema-2 manifest: the entries under `modules`, naming a kind. The gzip probe
-        # above serves the old `packs` key, which keeps working for one release; this probe
-        # proves the new key lists too - the shape the packs repo will publish at release.
-        $v2Manifest = '{"schema":2,"updated":"2026-10-26","modules":[{"id":"mode-test","name":"Mode test","version":"9.9.9","kind":"mode","description":"served by the harness","file":"packs/mode-test/pack.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":10}]}'
-        $v2Body = [Text.Encoding]::UTF8.GetBytes($v2Manifest)
+        # (a2) a schema-2 manifest: the entries under `modules`, naming a kind - and signed.
+        # The gzip probe above serves the old `packs` key, which keeps working for one
+        # release; this probe proves the new key lists too, the shape the packs repo will
+        # publish at the flip.
+        $v2Body = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-schema2.json'))
+        $v2Sig = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-schema2.json.minisig'))
         $server = Start-LoopbackListener
+        $env:ARMOURY_TEST_TRUST = $testTrust
         $probe = Invoke-CatalogProbe @('--catalog-list', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
-            if (-not $server.Accept.Wait(20000)) { throw 'the daemon did not connect' }
-            $client = $server.Accept.GetAwaiter().GetResult()
-            try {
-                # read the request before answering: closing a socket with unread data
-                # turns the close into a reset, and the daemon's fetch dies mid-read
-                $null = Read-Request $client
-                $stream = $client.GetStream()
-                $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($v2Body.Length)`r`nConnection: close`r`n`r`n"
-                $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
-                $stream.Write($headBytes, 0, $headBytes.Length)
-                $stream.Write($v2Body, 0, $v2Body.Length)
-                $stream.Flush()
+            for ($i = 0; $i -lt 2; $i++) {
+                if ($i -eq 0) { $accept = $server.Accept } else { $accept = $server.Listener.AcceptTcpClientAsync() }
+                if (-not $accept.Wait(20000)) { throw "the daemon did not connect (request $($i + 1))" }
+                $client = $accept.GetAwaiter().GetResult()
+                try {
+                    Read-Request $client | Out-Null
+                    $stream = $client.GetStream()
+                    if ($i -eq 0) {
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($v2Body.Length)`r`nConnection: close`r`n`r`n"
+                        $body = $v2Body
+                    }
+                    else {
+                        $head = "HTTP/1.1 200 OK`r`nContent-Type: text/plain`r`nContent-Length: $($v2Sig.Length)`r`nConnection: close`r`n`r`n"
+                        $body = $v2Sig
+                    }
+                    $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                    $stream.Write($headBytes, 0, $headBytes.Length)
+                    $stream.Write($body, 0, $body.Length)
+                    $stream.Flush()
+                }
+                finally { $client.Close() }
             }
-            finally { $client.Close() }
         }
+        $env:ARMOURY_TEST_TRUST = $null
         $server.Listener.Stop()
         Check 'the schema-2 manifest lists through modules' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit)"
         Check 'the schema-2 listing names the pack' ($probe.Text.Contains('mode-test')) "output=$(Get-FirstLine $probe.Text)"
 
         # (b) the real catalogue, over HTTPS, with the Windows certificate store
+        # The catalogue is signed since B2: its manifest's signature fetch must succeed
+        # before the listing happens. While the live index.json has no index.json.minisig
+        # beside it (the prepared-but-unpushed packs change is at 539773c), these two
+        # checks skip and say why; they re-arm the moment the flip lands.
         $run = Invoke-Cli @('--catalog-list') 40
         $failure = Get-FetchFailure $run.Text
         if (($run.Exit -ne 0) -and ($failure -eq 'network')) {
@@ -1212,6 +1255,11 @@ try {
             # the build, so the check is skipped rather than failed.
             "SKIP  the catalogue fetch against the real catalogue: this machine cannot reach"
             "      it right now ($($run.Err.Trim()))"
+        }
+        elseif (($run.Exit -ne 0) -and ($failure -eq 'signature')) {
+            "SKIP  the catalogue fetch against the real catalogue: the live manifest is not"
+            "      signed yet (tools/fixtures carry the probes; the packs flip at 539773c"
+            "      publishes index.json.minisig with the next release). ($($run.Err.Trim()))"
         }
         else {
             # a certificate error here is a failure of the build: the platform verifier is
@@ -1230,6 +1278,11 @@ try {
             "SKIP  the catalogue install against the real catalogue: this machine cannot reach"
             "      it right now ($($run.Err.Trim()))"
         }
+        elseif (($run.Exit -ne 0) -and ($failure -eq 'signature')) {
+            "SKIP  the catalogue install against the real catalogue: the live manifest is not"
+            "      signed yet (the packs flip at 539773c publishes index.json.minisig with the"
+            "      next release). ($($run.Err.Trim()))"
+        }
         else {
             Check 'a pack from the catalogue installs and verifies' ($run.Exit -eq 0) "output=$(Get-FirstLine $run.Text)"
         }
@@ -1243,20 +1296,22 @@ try {
         #
         # The pack is the shipped G-Helper pack under a name of its own, so the probe installs
         # nothing that is really there: the folder it leaves behind is removed again below.
-        $localPack = (Resolve-Path (Join-Path $PSScriptRoot '..\packs\g-helper\pack.json')).Path
-        $packText = ([IO.File]::ReadAllText($localPack)).Replace('"id": "g-helper"', '"id": "harness-test"')
-        $packBytes = [Text.Encoding]::UTF8.GetBytes($packText)
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        try { $packSha = ([System.BitConverter]::ToString($sha.ComputeHash($packBytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
-        $manifest = '{"schema":1,"updated":"2026-10-22","packs":[{"id":"harness-test","name":"Harness test","version":"9.9.9","description":"served by the harness","file":"packs/harness-test/pack.json","sha256":"' + $packSha + '","size":' + $packBytes.Length + '}]}'
-        $manifestBytes = [Text.Encoding]::UTF8.GetBytes($manifest)
+        # B2: the manifest and its signature are frozen fixtures (signed once by the probe
+        # key), and the pack copy is frozen with them - a change to packs/g-helper/pack.json
+        # does not move these bytes, so the signature keeps verifying.
+        $fixtures = Join-Path $PSScriptRoot 'fixtures'
+        $packBytes = [IO.File]::ReadAllBytes((Join-Path $fixtures 'pack-harness-test.json'))
+        $manifestBytes = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-install.json'))
+        $installSig = [IO.File]::ReadAllBytes((Join-Path $fixtures 'man-install.json.minisig'))
+        $env:ARMOURY_TEST_TRUST = $testTrust
         $server = Start-LoopbackListener
         $script:requests = @()
         $script:connections = 0
         $probe = Invoke-CatalogProbe @('--catalog-install', 'harness-test', '--catalog-url', "http://127.0.0.1:$($server.Port)/catalog/index.json") {
-            # the server answers until the daemon has both files, or until it runs out of time
+            # the server answers until the daemon has all three files (manifest, its
+            # signature, the pack), or until it runs out of time
             $deadline = (Get-Date).AddSeconds(20)
-            while ((Get-Date) -lt $deadline -and $script:requests.Count -lt 2) {
+            while ((Get-Date) -lt $deadline -and $script:requests.Count -lt 3) {
                 # the helper already started the first accept: a second one would compete with
                 # it for the connection, and the daemon would wait for an answer that never
                 # comes
@@ -1270,27 +1325,31 @@ try {
                         try { $request = Read-Request $client } catch { break }
                         if (-not $request) { break }
                         $script:requests += $request
-                        $body = if (($request -split "`r`n")[0] -like '*pack.json*') { $packBytes } else { $manifestBytes }
+                        $route = ($request -split "`r`n")[0]
+                        $body = if ($route -like '*index.json.minisig*') { $installSig }
+                                elseif ($route -like '*pack.json*') { $packBytes }
+                                else { $manifestBytes }
                         $head = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($body.Length)`r`n`r`n"
                         $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
                         $stream = $client.GetStream()
                         $stream.Write($headBytes, 0, $headBytes.Length)
                         $stream.Write($body, 0, $body.Length)
                         $stream.Flush()
-                        if ($script:requests.Count -ge 2) { break }
+                        if ($script:requests.Count -ge 3) { break }
                     }
                 }
                 finally { $client.Close() }
             }
         }
         $server.Listener.Stop()
+        $env:ARMOURY_TEST_TRUST = $null
         # the pack the probe installed is not one of ours: it goes away again, from wherever
         # the daemon put it (the build folder if it is there, the repository's own folder if
         # the daemon resolved that one)
         Remove-Item -LiteralPath (Join-Path $buildPacks 'harness-test') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'packs\harness-test') -Recurse -Force -ErrorAction SilentlyContinue
         Check 'the pack installs from the local catalogue' ($probe.Exited -and $probe.Exit -eq 0) "exit=$($probe.Exit) $(Get-FirstLine $probe.Text)"
-        Check 'the manifest and the pack file travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 2)) "connections=$($script:connections) requests=$($script:requests.Count)"
+        Check 'the manifest, its signature and the pack travel over one connection' (($script:connections -eq 1) -and ($script:requests.Count -eq 3)) "connections=$($script:connections) requests=$($script:requests.Count)"
 
         $env:ARMOURY_TEST_NS = $ns
     }

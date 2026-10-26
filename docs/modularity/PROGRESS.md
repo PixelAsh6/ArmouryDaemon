@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (…); B - **B1 done and merged** (`e56a72a`, run `40320921365` green): schema 2, `modules`, a validated `kind`, one-release dual-key read. 1.1.6 is published and installed; the packs repo's schema-2 **manifest flip waits for the next release** (prepared as its `539773c`) |
-| **Next action** | **B2** - signed manifests: `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json` via `include_str!`, verify **before** parsing (`WORK-ORDER.md` B2). The signing **key custody** is a user decision; the next release is too |
-| **Branch** | `main` at the B1 merge `e56a72a` - CI **green** on it (run `40320921365`); the branch's own runs `40318171903` (`5009452`, green) and `40319627691` (`0d0866d`, green) are recorded, and the counts stand: **388 unit tests** (282 in `armoury` + 106 in `armoury-core`), **156 harness checks**. `feature/b1-manifest-kind` is pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1 done and merged** (`e56a72a`, run `40320921365` green), **B2 done on the branch** (the manifest arrives minisign-signed; the ring is baked in). 1.1.6 is published and installed; B2 sits on the branch `feature/b2-signed-manifests`, **not merged**; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | **B3** - install paths per kind: helper modules extract into `modules/<id>/` with their own ACL (`WORK-ORDER.md` B3). The signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `feature/b2-signed-manifests` (cut from `main` `5ca0033`) - CI **green** on the tip `abf2754` (run `40326319066`, 11m38s, "ALL CHECKS PASSED"; the runner printed **288 passed** + **106 passed**, and the two real-catalogue checks SKIP naming the unsigned live manifest): **394 unit tests**, **156 harness checks**; the exe is **13,156,864 bytes** (+76,800 for the Ed25519 verification), sha256 `0d5b48cf…787b`, `VCRUNTIME140.dll` still absent. B1 is merged (`e56a72a`) and pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1104,6 +1104,74 @@ on the next release.
 and refuse the whole manifest on a bad signature. This entry's branch
 merged into `main` as `e56a72a` (run `40320921365`); the packs-repo flip
 and the next release are the user's calls.
+
+---
+
+### 2026-10-26 — Phase B2: the manifest arrives signed
+
+**What I did.** The trust of §4, in code. `crates/armoury/src/trust.rs` +
+`trust/keys.json` hold the keyring (`include_str!`), one trusted key today,
+carrying up to two for the 90-day rotation; a ring that fails to load fails
+**closed** — no key parses and nothing trusts. `catalog::fetch` now gets
+the manifest *bytes*, then `index.json.minisig`, verifies **before**
+parsing, and a missing or refused signature is a by-name refusal naming the
+URL and the reason. The signing key is the keeper's (minisign
+`ArmouryDaemonCatalog.key`, id `65E9927042B22300`, winget-fetched minisign
+0.12); it lives in no repository. The maker's side is prepared in the packs
+repo (`539773c` + `2cd49ce`, unpushed): schema-2 manifest, `index.json.minisig`
+created at the flip, `tools/sign-manifest.ps1`, the README rules that
+manifest + signature travel in one commit.
+
+**Files touched.** `Cargo.toml` (workspace + crate: `minisign-verify` 0.3.0),
+`crates/armoury/src/{trust.rs,trust/keys.json,catalog.rs,main.rs}`,
+`tools/fixtures/` (three probe manifests, their three signatures, the
+frozen pack copy, and a `.gitattributes` that keeps the bytes), `tools/daemon-selftest.ps1`
+(the probes serve the frozen pairs; the real-catalogue checks skip with a
+reason until the flip), `DECISIONS.md` (§26), `GOTCHAS.md` (trap 54), the
+top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`; the packs
+repo gets its own commits (`539773c`, `2cd49ce`).
+
+**Measured.** Four red runs before the green one, each its own lesson:
+`40324090790` died on `--locked` (the new dependency was not in
+`Cargo.lock`; the lock now carries minisign-verify 0.3.0, and folded two
+windows-sys duplicates 0.52/0.59 into the 0.61.2 already present),
+`40324412546` died on the **0.2-era API by memory** (0.3.0 verifies on the
+key — `key.verify(payload, &sig, false)` — and takes the whole signature
+file in `Signature::decode`, comment lines included), `40325411803` wanted
+a `Debug` impl for `unwrap_err` (the ring's Debug is shape-only: key count
+and source, never keys), and the fourth was the harness again: the second
+accept of the signature fetch must be a **fresh** `AcceptTcpClientAsync` on
+the live listener — the one the helper started answers exactly once
+(trap 55). The green run `40326319066` (`abf2754`, 11m38s, "ALL CHECKS
+PASSED") prints **288 passed** and **106 passed**, the two real-catalogue
+checks SKIP naming the unsigned live manifest, the local probes pass with
+the frozen fixture pairs, and 20c serves manifest + signature + pack over
+one connection. Artefact: **13,156,864 bytes** (+76,800 against the B1
+tip's 13,080,064 — the Ed25519 verification code), sha256
+`0d5b48cf…787b`, `VCRUNTIME140.dll` still absent from its imports. Unit
+tests went **388 → 394** (six trust tests: the baked ring parses, the
+frozen signature verifies against its ring, a tampered manifest refuses, a
+stranger's key refuses, an empty/nonsense signature refuses by name, a
+broken ring refuses with a reason). The packs flip, the signing key and
+the release are the user's calls.
+
+**Decisions.** `DECISIONS.md` §26 — the ring is a crate file that fails
+closed, the keeper's key is custody not repo, the probes trade the ring via
+`ARMOURY_TEST_TRUST` over frozen byte-exact fixtures, the live-catalogue
+checks skip until the flip.
+
+**Surprises.** Three facts, none fatal: the release workflow is
+**tag-push only** (no `workflow_dispatch`, so the edited catalogue check
+runs on the next release); the 0.3.0 API was **not** what memory said
+(verify on the key, whole-file `Signature::decode`) — CI was the first
+compiler and cost one red run for that; and the accept-task answer-once
+rule resurfaced with two connections per probe (trap 55, same family as
+trap 53).
+
+**Next.** Phase B3 - install paths per kind (`WORK-ORDER.md` B3): helper
+modules extract into `modules/<id>/` with their own ACL. This entry's
+branch merges after its run; the packs flip, the signing key and the
+release are the user's calls.
 
 ---
 

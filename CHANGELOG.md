@@ -7,6 +7,11 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 
 ### Added
 
+- The **catalogue manifest arrives minisign-signed**. `catalog::fetch` gets
+  `index.json` and `index.json.minisig`, verifies the signature against a
+  keyring baked into the binary **before** parsing anything, and refuses an
+  unsigned or badly signed manifest by name, nothing installed or listed
+  (`docs/modularity/DECISIONS.md` §26).
 - The **catalogue manifest reaches schema 2**. The entries move under
   `modules` and each names its `kind` — `"pack"` or `"mode"`, the same
   vocabulary a pack file uses; an unknown kind refuses the manifest with the
