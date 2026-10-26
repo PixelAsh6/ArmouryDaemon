@@ -87,26 +87,26 @@ impl TrustKeyring {
     }
 
     /// Verify a signature file's text over payload bytes against every key of the ring.
-    /// A minisign signature file is an untrusted comment line and the base64 signature
-    /// below it; only the signature line is the signature.
+    /// The signature text is a minisign file's whole content: untrusted comment, base64
+    /// signature, trusted comment, trusted-comment signature — `Signature::decode` takes
+    /// the file as it is, so no line splitting happens on our side.
     pub fn verify(&self, payload: &[u8], sig_text: &str) -> Result<(), String> {
-        let sig_line = sig_text
-            .lines()
-            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with("untrusted comment:"))
-            .ok_or_else(|| "the signature is empty".to_string())?;
-        let signature = Signature::from_base64(sig_line.trim())
+        // the same file may arrive with Windows line endings from the fetch
+        let text = sig_text.replace("\r\n", "\n");
+        let signature = Signature::decode(&text)
             .map_err(|e| format!("the signature does not parse ({e})"))?;
         let mut reasons = Vec::with_capacity(self.entries.len());
         for (comment, key) in &self.entries {
-            match signature.verify(key, payload) {
+            match key.verify(payload, &signature, false) {
                 Ok(()) => return Ok(()),
                 Err(e) => reasons.push(format!("{} ({e})", quote(comment))),
             }
         }
         Err(format!(
-            "no key of the ring accepts it: checked {} key(s) from {}", 
+            "no key of the ring accepts it: checked {} key(s) from {} ({})",
             self.entries.len(),
-            self.source
+            self.source,
+            reasons.join("; ")
         ))
     }
 
@@ -130,10 +130,13 @@ mod tests {
     /// repository - the frozen probes were signed once, with a key whose bytes died with
     /// the temp folder they were generated in. The ring for a test is built in memory.
     const TEST_KEY: &str = "RWTUa5h/DwHow3IGIQ9hySXFqYn7fQTiXHT6t0m5gwKCTcsY1eCakbOz";
-    /// The frozen signature of `tools/fixtures/man-schema2.json`, made with that key.
+    /// The frozen signature of `tools/fixtures/man-schema2.json`, made with that key —
+    /// the whole file, comment lines included, exactly what `Signature::decode` takes.
     const FROZEN_SIG: &str = concat!(
         "untrusted comment: ArmouryDaemon harness probe signature\n",
-        "RUTUa5h/DwHowwOgZDyCw1SW8zPgOXgZEiate5aw9feBNNQcbQFVpWBpJCMolAKRQYnMz7ocIfFBkSSJxJ8phVPJXyrOUaO7Ugk=\n"
+        "RUTUa5h/DwHowwOgZDyCw1SW8zPgOXgZEiate5aw9feBNNQcbQFVpWBpJCMolAKRQYnMz7ocIfFBkSSJxJ8phVPJXyrOUaO7Ugk=\n",
+        "trusted comment: timestamp:1793017762\tfile:man-schema2.json\thashed\n",
+        "9lASdxKL/v0BgaevnLFpxCU+1FPYyOJZQx6p1NsO4t2bd6u2+qDG5PmpVQtJ91GIaPsHGQcwkMPQTjN5+RTADQ==\n"
     );
     /// The first line changed, so the frozen manifest text must match byte for byte.
     const FROZEN_MANIFEST: &str = concat!(
@@ -189,7 +192,7 @@ mod tests {
             "test",
         )
         .unwrap();
-        assert!(ring.verify(FROZEN_MANIFEST.as_bytes(), "").unwrap_err().contains("empty"));
+        assert!(ring.verify(FROZEN_MANIFEST.as_bytes(), "").unwrap_err().contains("does not parse"));
         assert!(ring
             .verify(FROZEN_MANIFEST.as_bytes(), "untrusted comment: x\nnot base64!!\n")
             .unwrap_err()
