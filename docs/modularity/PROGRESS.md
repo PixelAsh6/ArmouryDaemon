@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`) and **B4** (`4d7886b`) done and merged; **B5 on the branch `feature/b5-helper-request`** (the daemon's helper-install request and the armed helper buttons), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
-| **Next action** | Watch the `feature/b5-helper-request` CI runs, then **merge** (`merge: B5 - the daemon installs helpers to modules/`) and wrap docs. After that: **Phase C** (read `WORK-ORDER.md`'s C section when reached). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `feature/b5-helper-request` cut from `main` `7eb83cb` - **CI pending on the tip**. Counts before B5: **406 unit tests** (300 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip); the branch's run prints the fresh numbers (the B5 probe block adds checks) |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`), **B4** (`4d7886b`) and **B5 done and merged** (`3f3a772`): a helper installs through the daemon's `InstallHelper` request, the Modules window's helper buttons are armed, and the daemon re-verifies the archive's bytes before they land anywhere. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`); the signing key and the next release are the user's calls |
+| **Next action** | **Phase C** (the console as a helper module; read `WORK-ORDER.md`'s C section first), plus the fold-in opportunities: the **failed-helper-download button bug** (below), the dashboard cooldown-gap, audio_mute_all crash-recovery, the harness 12c caveat, the tautological tests, the sleep/resume lockout, and the harness 20a literal version at `tools/daemon-selftest.ps1:1110`. Ask the user before taking any of them in |
+| **Branch** | **Merged; `feature/b5-helper-request` pruned.** Counts stand: **409 unit tests** (303 in `armoury` + 106 in `armoury-core`), **163 harness checks** (the real-catalogue pair SKIPs until the flip); the exe from the branch run `40409208575` is **13,325,312 bytes** (+30,208 over B4), sha256 `7fc9cc9e…5aff`, `VCRUNTIME140.dll` still absent; merge run `40410782706` green on `3f3a772`. Idle cost **did not regress**: the daemon idles at about **15 ms of CPU per 10 s** with windows open (the UI's own redraw cost is separate) - same shape as the B4 measurement |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1352,11 +1352,28 @@ becomes `the_helper_row_acts_like_a_pack_row` (download, update, installed
 - and no size label anywhere), and a helper download test asserts the zip
 suffix and the entry riding along in the queue.
 
-**Next.** Watch the branch's CI runs, merge as
-`merge: B5 - the daemon installs helpers to modules/`, wrap the docs with
-the run ids and the artefact. Then Phase C (the console as a helper
-module; read WORK-ORDER.md's C section when reached). The signing key, the
-packs flip and the release are the user's calls.
+**Next.** Merged into `main` as `3f3a772` (runs green: branch fix `8d5f33f` =
+`40409208575`, merge `3f3a772` = `40410782706`). One red run first:
+`139994f`'s guard in the protocol roundtrip omitted four fields and the
+compiler stopped it (`E0027`) - the one-line rest-pattern fix is
+`8d5f33f`. On the box (namespaced test instance, offline fixture server):
+the armed Download click downloaded and hash-verified the zip, the
+daemon's re-verification and folder lock held, the module landed in
+`modules/h-harness/` (executable, record, subfolder), the temp archive
+was removed, and the row reads **"v0.99.0 installed"** like any pack row;
+the daemon idles at about 15 ms CPU per 10 s (no regression). One
+failure-mode stays open as a fold-in opportunity: after a **failed**
+helper download (a 404 mid-download), the row offered no button again -
+the state survived a fresh check and a window reopen until the process
+restarted (screenshots kept in `%TEMP%\opencode\b5-ui-05..09.png`).
+The repo-wide non-English character audit found nothing outside the
+accepted glyph set introduced by B4/B5; the characters that do appear
+(pre-paint glyph art, minus and comparison signs in the docs' byte
+tables, and test data that exercises non-ASCII names) predate the phase
+and stay, recorded here as the audit's verdict.
+
+**Next.** Phase C. The signing key, the packs flip and the release are
+the user's calls.
 
 ---
 

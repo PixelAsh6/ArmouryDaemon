@@ -203,12 +203,12 @@ background.
 
 ## The next action
 
-**Phase B5 is on its branch** - the daemon's helper-install request: the
-`InstallHelper` variant (the manifest entry's id, version, executable
-path, SHA-256 and size), the daemon's re-verification of the archive's
-bytes, and the Modules window's helper buttons armed to use it. The B4
-work is in `main` at `4d7886b`; the packs flip, the signing key and the
-next release are the user's calls.
+**Phase B is in `main`** - B5 finished it: the daemon's `InstallHelper`
+request (the manifest entry's id, version, executable path, SHA-256 and
+size), the daemon's re-verification of the archive's bytes, and the
+Modules window's helper buttons armed to use it. The merge is `3f3a772`
+and the whole work's runs are green. The packs repo's flip, the signing
+key and the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.
