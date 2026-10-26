@@ -1,0 +1,1 @@
+{"schema":1,"updated":"2026-10-22","packs":[{"id":"local-test","name":"Local test","version":"9.9.9","description":"served by the harness","file":"packs/local-test/pack.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":10}]}

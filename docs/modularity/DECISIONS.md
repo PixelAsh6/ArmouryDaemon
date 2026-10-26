@@ -876,3 +876,42 @@ nothing else.
   window, and throws on both — and keeps failing when a release ships bytes
   the catalogue does not publish. The manifest is the same key pair, so the
   check and the daemon see one truth.
+
+---
+
+## 26. The manifest arrives signed, and the ring is baked in
+
+**Settled 2026-10-26.** B2 puts the catalogue's trust where §4 said it would
+go: the manifest is minisign-signed, the signature is fetched **before** the
+manifest is parsed, and a manifest whose signature the keyring refuses is
+never parsed at all. `fetch` gets the bytes of `index.json` and of
+`index.json.minisig` (the minisign convention, one fetch each), verifies,
+and only then parses. An unsigned manifest is refused by name, with the
+URL that missed its signature.
+
+- **The ring is a file in the crate** (`crates/armoury/src/trust/keys.json`,
+  `include_str!`): schema 1, one entry per trusted key, the format carries
+  two (§4's 90-day overlap — a new public key joins the ring first, the old
+  one drops only later). The first key's private half is the keeper's
+  (`~\.minisign\ArmouryDaemonCatalog.key`, minisign id `65E9927042B22300`,
+  generated 2026-10-26) and lives in no repository, ever.
+- **The ring fails closed.** A key that does not parse, a ring with no keys,
+  a schema this build does not know — every defect at load time means
+  nothing verifies and every fetch reports why, rather than a fallback to
+  trusting.
+- **The probes trade the ring, not the trusting.** After B2 the self-test's
+  local probes cannot serve an unsigned manifest, and the harness has no
+  signing key. The fixtures are frozen instead — `tools/fixtures/`: three
+  probe manifests and their real signatures, signed **once** by a test pair
+  whose private half died with the throwaway folder it was generated in —
+  and `trust.rs` reads `ARMOURY_TEST_TRUST`: when it is set, the ring loads
+  from that file instead of the compiled one, the same test-trade pattern as
+  `ARMOURY_TEST_NS` for the config and the pipe. The fixtures themselves are
+  byte-exact artefacts: `tools/fixtures/.gitattributes` says `* -text`, so a
+  runner checkout cannot rewrite the bytes a frozen signature covers.
+- **The live catalogue skips, not fails.** The two real-catalogue checks in
+  harness scenario 20b skip with a reason while the live `index.json` has no
+  published `.minisig` — the packs repo's flip (commits `539773c` and
+  `2cd49ce`, unpushed) creates it together with the next release. After the
+  flip they re-arm: a signed live manifest verifies per fetch, and a refusal
+  is red again.

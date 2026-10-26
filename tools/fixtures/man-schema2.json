@@ -1,0 +1,1 @@
+{"schema":2,"updated":"2026-10-26","modules":[{"id":"mode-test","name":"Mode test","version":"9.9.9","kind":"mode","description":"served by the harness","file":"packs/mode-test/pack.json","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":10}]}

@@ -464,6 +464,14 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     before answering, which is why its socket behaved. **Read the request
     before you close** in every loopback-server probe, even when you do not
     need it.
+54. **A frozen signature is a byte-exact artefact - mark its file `-text`.**
+    The signed probe fixtures under `tools/fixtures/` carry real minisign
+    signatures over exact bytes; a runner checkout converting LF to CRLF on
+    the fly would make every one of them refuse its own file.
+    `tools/fixtures/.gitattributes` says `* -text`, so the fixture bytes a
+    runner sees are the ones the signature covers. The same applies to any
+    future frozen artefact - checksums, one-off signatures - treat them like
+    the hash sidecar: bytes, not text.
 
 ---
 

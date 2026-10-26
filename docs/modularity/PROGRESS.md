@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (…); B - **B1 done and merged** (`e56a72a`, run `40320921365` green): schema 2, `modules`, a validated `kind`, one-release dual-key read. 1.1.6 is published and installed; the packs repo's schema-2 **manifest flip waits for the next release** (prepared as its `539773c`) |
-| **Next action** | **B2** - signed manifests: `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json` via `include_str!`, verify **before** parsing (`WORK-ORDER.md` B2). The signing **key custody** is a user decision; the next release is too |
-| **Branch** | `main` at the B1 merge `e56a72a` - CI **green** on it (run `40320921365`); the branch's own runs `40318171903` (`5009452`, green) and `40319627691` (`0d0866d`, green) are recorded, and the counts stand: **388 unit tests** (282 in `armoury` + 106 in `armoury-core`), **156 harness checks**. `feature/b1-manifest-kind` is pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1 done and merged** (`e56a72a`, run `40320921365` green), **B2 done on the branch** (the manifest arrives minisign-signed; the ring is baked in). 1.1.6 is published and installed; B2 sits on the branch `feature/b2-signed-manifests`, **not merged**; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | **B3** - install paths per kind: helper modules extract into `modules/<id>/` with their own ACL (`WORK-ORDER.md` B3). The signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `feature/b2-signed-manifests` (cut from `main` `5ca0033`) - CI **pending on the tip**; counts on the tree: **394 unit tests** (288 in `armoury` + 106 in `armoury-core`), **156 harness checks** |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1104,6 +1104,52 @@ on the next release.
 and refuse the whole manifest on a bad signature. This entry's branch
 merged into `main` as `e56a72a` (run `40320921365`); the packs-repo flip
 and the next release are the user's calls.
+
+---
+
+### 2026-10-26 — Phase B2: the manifest arrives signed
+
+**What I did.** The trust of §4, in code. `crates/armoury/src/trust.rs` +
+`trust/keys.json` hold the keyring (`include_str!`), one trusted key today,
+carrying up to two for the 90-day rotation; a ring that fails to load fails
+**closed** — no key parses and nothing trusts. `catalog::fetch` now gets
+the manifest *bytes*, then `index.json.minisig`, verifies **before**
+parsing, and a missing or refused signature is a by-name refusal naming the
+URL and the reason. The signing key is the keeper's (minisign
+`ArmouryDaemonCatalog.key`, id `65E9927042B22300`, winget-fetched minisign
+0.12); it lives in no repository. The maker's side is prepared in the packs
+repo (`539773c` + `2cd49ce`, unpushed): schema-2 manifest, `index.json.minisig`
+created at the flip, `tools/sign-manifest.ps1`, the README rules that
+manifest + signature travel in one commit.
+
+**Files touched.** `Cargo.toml` (workspace + crate: `minisign-verify` 0.3.0),
+`crates/armoury/src/{trust.rs,trust/keys.json,catalog.rs,main.rs}`,
+`tools/fixtures/` (three probe manifests, their three signatures, the
+frozen pack copy, and a `.gitattributes` that keeps the bytes), `tools/daemon-selftest.ps1`
+(the probes serve the frozen pairs; the real-catalogue checks skip with a
+reason until the flip), `DECISIONS.md` (§26), `GOTCHAS.md` (trap 54), the
+top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`; the packs
+repo gets its own commits (`539773c`, `2cd49ce`).
+
+**Measured.** CI pending on the tip. Unit tests **388 → 394** (288 + 106:
+six trust tests — the baked ring parses, the frozen signature verifies
+against its ring, a tampered manifest refuses, a stranger's key refuses,
+an empty/nonsense signature refuses by name, a broken ring refuses with a
+reason). The harness holds **156** checks but new mechanics: the local probes serve the
+frozen manifest + signature pair (20c now serves three files over one
+connection). The artefact's size lands in the follow-up docs commit.
+
+**Decisions.** `DECISIONS.md` §26 — the ring is a crate file that fails
+closed, the keeper's key is custody not repo, the probes trade the ring via
+`ARMOURY_TEST_TRUST` over frozen byte-exact fixtures, the live-catalogue
+checks skip until the flip.
+
+**Surprises.** none yet.
+
+**Next.** Phase B3 - install paths per kind (`WORK-ORDER.md` B3): helper
+modules extract into `modules/<id>/` with their own ACL. This entry's
+branch merges after its run; the packs flip, the signing key and the
+release are the user's calls.
 
 ---
 
