@@ -4,6 +4,7 @@
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
 use crate::catalog::{self, CatalogPack, EngineGate};
+use crate::{daemon, helpers, packs};
 use armoury_core::config::{
     CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, CONSOLE_OPEN_PAD, TrackedApp,
 };
@@ -54,7 +55,7 @@ const UI_MARGIN_PX: f32 = 0.0;
 /// The folder that was looked in is not named here: the path is long and belongs to the
 /// machine, and a path that says nothing is worse than no path at all. The settings
 /// window has an "Open packs folder" button for the ones who want to see it.
-const NO_PACKS_HINT: &str = "No packs installed yet.\nFind them in Settings → Install packs.";
+const NO_MODULES_HINT: &str = "No modules installed yet.\nFind them in Settings → Modules.";
 
 /// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
 /// packs lists as a built-in row with one dropdown.
@@ -182,6 +183,18 @@ struct Shared {
     pick_tx: Option<crossbeam_channel::Sender<Picked>>,
     /// Result of the last pack install/remove, shown in the settings window.
     last_pack_op: Option<(bool, String)>,
+    /// The capabilities of the installed packs, per id, shown under their rows as
+    /// the permission line (the effect, not the API). Filled by a worker thread on
+    /// every catalogue check and again after every pack op - reading every
+    /// pack.json per frame would compile scripts per frame.
+    pack_capabilities: HashMap<String, Vec<String>>,
+    /// The installed helpers' versions, per id, read from their module.json
+    /// records on the same worker pass as the capability line. The helper row
+    /// shows "v1.0 installed" from this, not from the daemon's pack status -
+    /// helpers are no packs and never appear in it.
+    helper_versions: HashMap<String, String>,
+    /// A capabilities re-read is waiting for the app's next tick.
+    pack_capabilities_requested: bool,
     /// Result of the last console-app add/remove, shown in the settings window.
     last_console_op: Option<(bool, String)>,
     /// Catalog (Phase 8) state for the settings window: the last check's result, whether a
@@ -516,6 +529,11 @@ impl eframe::App for App {
                         log::info!("pack op result: {message}");
                         let mut s = self.shared.lock().unwrap();
                         s.last_pack_op = Some((ok, message));
+                        // The installed pack.jsons just changed (it does not matter for
+                        // WHICH op): the permission line the Modules window shows under
+                        // each row and the helper rows' installed state are both re-read
+                        // from disk.
+                        s.pack_capabilities_requested = true;
                         // The daemon has answered for the pack that was on its way, so its
                         // row may offer the button again. The answers come in the order the
                         // requests went out, so the first one is the first pack.
@@ -596,6 +614,49 @@ impl eframe::App for App {
                 }
                 // The rows are here now: the window that shows them has to redraw at
                 // once, not at its next tick.
+                request_catalog_repaint(&ctx, &shared);
+            });
+        }
+
+        // Capabilities re-read: each installed pack's pack.json carries its capability
+        // set, and the Modules window shows it as a permission line under the row
+        // (the effect, not the API). Parsing every pack per frame would compile
+        // scripts per frame, so this is a cached read on a worker thread - one cache
+        // for the whole window, not one read per row.
+        let caps = {
+            let mut s = self.shared.lock().unwrap();
+            std::mem::take(&mut s.pack_capabilities_requested)
+        };
+        if caps {
+            let shared = Arc::clone(&self.shared);
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                let dirs = daemon::pack_search_dirs();
+                let map = packs::load(&dirs)
+                    .into_iter()
+                    .map(|installed| {
+                        (
+                            installed.pack.id.clone(),
+                            installed
+                                .pack
+                                .capabilities
+                                .iter()
+                                .map(|c| c.effect().to_string())
+                                .collect::<Vec<String>>(),
+                        )
+                    })
+                    .collect::<HashMap<String, Vec<String>>>();
+                // The helpers, meanwhile, are read straight off the modules folders:
+                // each folder's module.json is a small record the install wrote there.
+                let helper_versions = helpers::installed(&dirs)
+                    .into_iter()
+                    .map(|module| (module.id, module.version))
+                    .collect::<HashMap<String, String>>();
+                {
+                    let mut s = shared.lock().unwrap();
+                    s.pack_capabilities = map;
+                    s.helper_versions = helper_versions;
+                }
                 request_catalog_repaint(&ctx, &shared);
             });
         }
@@ -1041,7 +1102,7 @@ impl eframe::App for App {
                 self.request(&Request::SetConsoleOpen { mode });
             }
             if packs.is_empty() {
-                ui.small(NO_PACKS_HINT);
+                ui.small(NO_MODULES_HINT);
             }
             let mut set_enabled: Option<(String, bool)> = None;
             let mut set_value: Option<(String, String, String)> = None;
@@ -1206,13 +1267,13 @@ impl eframe::App for App {
                 move |ui, _class| settings_ui(ui, &shared),
             );
         }
-        // ---- install packs viewport (the catalog list, to the left of the settings) ----
+        // ---- modules viewport (the catalogue list, to the left of the settings) ----
         if install_packs_open {
             let shared = self.shared.clone();
             ctx.show_viewport_deferred(
                 install_packs_viewport_id(),
                 egui::ViewportBuilder::default()
-                    .with_title("Install packs")
+                    .with_title("Modules")
                     .with_decorations(false)
                     .with_resizable(false)
                     .with_visible(false)
@@ -1461,7 +1522,7 @@ fn reanchor(ctx: &egui::Context, s: &mut Shared, core: Rect) {
     for item in s.chain.clone() {
         let (size, title) = match &item {
             ChainItem::Settings => (s.settings_size, "Settings".to_string()),
-            ChainItem::InstallPacks => (s.install_packs_size, "Install packs".to_string()),
+            ChainItem::InstallPacks => (s.install_packs_size, "Modules".to_string()),
             ChainItem::Pack(id) => (s.pack_sizes.get(id).copied(), format!("Pack: {id}")),
         };
         let Some(size) = size else {
@@ -1559,7 +1620,7 @@ fn leftmost_edge_px(s: &Shared, skip: &str, core_left_px: f32) -> f32 {
         edges.push(rect.left());
     }
     if s.install_packs_open
-        && let Some(rect) = window_rect_px("Install packs")
+        && let Some(rect) = window_rect_px("Modules")
     {
         edges.push(rect.left());
     }
@@ -2009,8 +2070,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // A tighter gap than the app's default: the two buttons have to share one row.
             ui.spacing_mut().item_spacing.x = 6.0;
             if ui
-                .button("Install packs")
-                .on_hover_text("Open the window that lists the packs from the repo")
+                .button("Modules")
+                .on_hover_text("Open the Modules window: the catalogue of packs and helpers")
                 .clicked()
             {
                 let mut s = shared.lock().unwrap();
@@ -2020,7 +2081,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     s.install_packs_deadline = Some(Instant::now() + Duration::from_secs(6));
                     s.install_packs_requested_at = Some(Instant::now());
                     s.install_packs_asked = false;
-                    log::info!("install packs window requested");
+                    log::info!("modules window requested");
                 }
                 drop(s);
                 // The root viewport owns the window: it creates it and does the fetch.
@@ -2249,7 +2310,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
         // The packs row: two buttons side by side.
         w = w.max(
-            tw(&button_font, "Install packs")
+            tw(&button_font, "Modules")
                 + 24.0
                 + tw(&button_font, "Open packs folder")
                 + 24.0
@@ -2381,7 +2442,15 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 
-    let (catalog_state, catalog_checking, catalog_installing, last_op, packs) = {
+    let (
+        catalog_state,
+        catalog_checking,
+        catalog_installing,
+        last_op,
+        packs,
+        pack_capabilities,
+        helper_versions,
+    ) = {
         let s = shared.lock().unwrap();
         (
             s.catalog.clone(),
@@ -2392,6 +2461,8 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 .as_ref()
                 .map(|st| st.packs.clone())
                 .unwrap_or_default(),
+            s.pack_capabilities.clone(),
+            s.helper_versions.clone(),
         )
     };
 
@@ -2405,7 +2476,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 
         // ---- title bar ----
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Install packs").strong().size(16.0));
+            ui.label(RichText::new("Modules").strong().size(16.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, 20.0, draw_close).clicked() {
                     close = true;
@@ -2453,7 +2524,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 match &catalog_state {
                     None => {
                         if catalog_checking {
-                            ui.small(RichText::new("Fetching the packs from the repo…").weak());
+                            ui.small(RichText::new("Fetching the catalogue from the repo…").weak());
                         } else {
                             ui.small(RichText::new("The catalog has not been fetched yet.").weak());
                         }
@@ -2462,7 +2533,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                         ui.small(RichText::new(message).color(Color32::from_rgb(248, 113, 113)));
                     }
                     Some(Ok(entries)) if entries.is_empty() => {
-                        ui.small(RichText::new("The packs repo has no packs.").weak());
+                        ui.small(RichText::new("The catalogue has no modules yet.").weak());
                     }
                     Some(Ok(entries)) => {
                         // The rows are shown by name: the catalogue's own order is the
@@ -2474,6 +2545,8 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                                 entry,
                                 &packs,
                                 &catalog_installing,
+                                &pack_capabilities,
+                                &helper_versions,
                             );
                         }
                     }
@@ -2502,6 +2575,8 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut s = shared.lock().unwrap();
         s.catalog_check_requested = true;
         s.catalog_checking = true;
+        // a fresh catalogue means fresh rows; the permission line under them follows
+        s.pack_capabilities_requested = true;
         drop(s);
         // The root does the HTTPS round trip on its own thread.
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
@@ -2532,6 +2607,8 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 if !s.catalog_checking {
                     s.catalog_check_requested = true;
                     s.catalog_checking = true;
+                    // and the permission line under the rows is re-read too
+                    s.pack_capabilities_requested = true;
                     // The root picks the request up on its next frame, and its next frame
                     // is a tick away: ask for it now, so the round trip starts now.
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -2568,7 +2645,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         2 => {
             // Same rule as the dashboard: only show once the OS reports the position.
             let ppp = ctx.pixels_per_point().max(0.5);
-            let placed = match (s.install_packs_target, window_topleft_px("Install packs")) {
+            let placed = match (s.install_packs_target, window_topleft_px("Modules")) {
                 (Some(t), Some((x, y))) => {
                     let want = ((t.x * ppp).round() as i32, (t.y * ppp).round() as i32);
                     (x - want.0).abs() <= 2 && (y - want.1).abs() <= 2
@@ -2582,10 +2659,10 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 // for it: this is the number the "it opens slowly" complaint is about.
                 match s.install_packs_requested_at {
                     Some(at) => log::info!(
-                        "install packs window shown ({} ms after the request)",
+                        "modules window shown ({} ms after the request)",
                         at.elapsed().as_millis()
                     ),
-                    None => log::info!("install packs window shown"),
+                    None => log::info!("modules window shown"),
                 }
             } else if let Some(t) = s.install_packs_target {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(t));
@@ -2595,7 +2672,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // The window is up. It keeps its slot in the chain; the user may have dragged
             // it, and then the real position wins over the stored one.
             let target = s.install_packs_target;
-            let pos = window_rect_pts(ctx, "Install packs").map(|r| r.min).or(target);
+            let pos = window_rect_pts(ctx, "Modules").map(|r| r.min).or(target);
             if pos != target {
                 s.install_packs_target = pos;
             }
@@ -2616,23 +2693,67 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ctx.request_repaint_after(Duration::from_secs(1));
 }
 
-/// The width of the description column in the install-packs window. A one-sentence
+/// The width of the description column in the Modules window. A one-sentence
 /// description wraps into two or three rows in it. The column is narrower than the
 /// window on purpose: a description that ran the full width of the window used to
 /// widen the whole list, and that pushed the state of the rows below it off the screen.
 const CATALOG_DESC_WIDTH: f32 = 240.0;
 
-/// One pack of the catalog: its name, its version, its description and the button that
-/// downloads it.
+/// The label on a helper row's disabled button, with the archive's size so the
+/// row says what it would bring down. Under a megabyte the size is shown in
+/// whole KB, above it in MB with one decimal; a catalogue entry without a size
+/// shows none.
+fn helper_button_label(action: &str, size: Option<u64>) -> String {
+    let Some(bytes) = size else {
+        return action.to_string();
+    };
+    let size = if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{} KB", (bytes + 1023) / 1024)
+    };
+    format!("{action} ({size})")
+}
+
+/// One weak, wrapped note under a catalogue row, in the description's column:
+/// the same width cap, so no note can widen the row or push the state of the
+/// rows below it out of the window. `tag` separates the notes of one row.
+fn indented_note(ui: &mut egui::Ui, row_id: &str, tag: &'static str, text: &str) {
+    ui.indent((tag, row_id), |ui| {
+        let width = CATALOG_DESC_WIDTH.min(ui.available_width());
+        let rect = Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(width, ui.available_height().max(60.0)),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.small(RichText::new(text).weak());
+        });
+    });
+}
+
+/// One row of the catalogue list: its name and version, its state against the
+/// right edge, and the notes under it, shaped by the entry's kind.
 fn catalog_row(
     ui: &mut egui::Ui,
     shared: &Arc<Mutex<Shared>>,
     entry: &CatalogPack,
     packs: &[PackStatus],
     installing: &[String],
+    pack_capabilities: &HashMap<String, Vec<String>>,
+    helper_versions: &HashMap<String, String>,
 ) {
-    let installed = packs.iter().find(|p| p.id == entry.id);
-    let installed_version = installed.map(|p| p.version.as_str());
+    // A helper's installed state is its module.json record on disk (read by the
+    // worker pass into `helper_versions`, never per frame); a pack's comes from
+    // the daemon's status. Helpers are no packs and never appear in that list.
+    let installed_version = if entry.kind == "helper" {
+        helper_versions.get(&entry.id).map(String::as_str)
+    } else {
+        packs
+            .iter()
+            .find(|p| p.id == entry.id)
+            .map(|p| p.version.as_str())
+    };
     let name = if entry.name.is_empty() {
         &entry.id
     } else {
@@ -2661,7 +2782,21 @@ fn catalog_row(
             }
             match pack_button(&entry.version, installed_version) {
                 PackButton::Download => {
-                    if ui
+                    if entry.kind == "helper" {
+                        // The daemon installs helpers: the request it needs is this
+                        // release's next step. Until then the row stays honest - a
+                        // greyed button that shows what it would bring down, and a
+                        // hover that says why it does nothing yet.
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                RichText::new(helper_button_label("Download", entry.size)).small(),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Helpers install through the daemon, from the next release on",
+                        );
+                    } else if ui
                         .small_button("Download")
                         .on_hover_text("Download, verify and install this pack")
                         .clicked()
@@ -2670,13 +2805,27 @@ fn catalog_row(
                     }
                 }
                 PackButton::Update => {
-                    let hover = format!(
-                        "installed v{} → v{}",
-                        installed_version.unwrap_or_default(),
-                        entry.version
-                    );
-                    if ui.small_button("Update").on_hover_text(hover).clicked() {
-                        start_catalog_install(shared, entry, ui.ctx());
+                    if entry.kind == "helper" {
+                        // Same story as a fresh helper download: the update needs the
+                        // daemon's request too, so it waits for the next release.
+                        ui.add_enabled(
+                            false,
+                            egui::Button::new(
+                                RichText::new(helper_button_label("Update", entry.size)).small(),
+                            ),
+                        )
+                        .on_hover_text(
+                            "Helpers install through the daemon, from the next release on",
+                        );
+                    } else {
+                        let hover = format!(
+                            "installed v{} → v{}",
+                            installed_version.unwrap_or_default(),
+                            entry.version
+                        );
+                        if ui.small_button("Update").on_hover_text(hover).clicked() {
+                            start_catalog_install(shared, entry, ui.ctx());
+                        }
                     }
                 }
                 PackButton::Installed(version) => {
@@ -2686,21 +2835,24 @@ fn catalog_row(
         });
     });
     if !entry.description.is_empty() {
-        // The description is a column of its own, indented under the name. It wraps
-        // into two or three rows instead of running off the edge of the window, and it
-        // never grows wider than its column, so it cannot push the state of the rows
-        // below it out of the window.
-        ui.indent(("catalog-description", entry.id.as_str()), |ui| {
-            let width = CATALOG_DESC_WIDTH.min(ui.available_width());
-            let rect = Rect::from_min_size(
-                ui.cursor().min,
-                egui::vec2(width, ui.available_height().max(60.0)),
-            );
-            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.small(RichText::new(entry.description.as_str()).weak());
-            });
-        });
+        indented_note(
+            ui,
+            entry.id.as_str(),
+            "catalog-description",
+            entry.description.as_str(),
+        );
+    }
+    // The permission line: what the pack may do, in the words of an effect, not an
+    // API ("Send keystrokes", not "input()"). A helper's own permission line
+    // arrives with its download in the next release; a pack's is read from its
+    // pack.json on disk, so only an installed pack shows one.
+    if entry.kind != "helper" {
+        if let Some(abilities) = pack_capabilities.get(&entry.id) {
+            if !abilities.is_empty() {
+                let list = abilities.join("; ");
+                indented_note(ui, entry.id.as_str(), "catalog-capabilities", &list);
+            }
+        }
     }
     ui.add_space(6.0);
 }
@@ -4401,25 +4553,25 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_packs_message_points_at_the_catalogue() {
+    fn the_empty_modules_message_points_at_the_catalogue() {
         // The message used to carry a placeholder that was never substituted
         // ("looked in <app>/packs"), so a first-time user saw broken templating.
         assert!(
-            !NO_PACKS_HINT.contains('<') && !NO_PACKS_HINT.contains('>'),
-            "the message must have no placeholder: {NO_PACKS_HINT}"
+            !NO_MODULES_HINT.contains('<') && !NO_MODULES_HINT.contains('>'),
+            "the message must have no placeholder: {NO_MODULES_HINT}"
         );
         assert!(
-            NO_PACKS_HINT.contains("No packs installed"),
-            "the message must say that nothing is installed: {NO_PACKS_HINT}"
+            NO_MODULES_HINT.contains("No modules installed"),
+            "the message must say that nothing is installed: {NO_MODULES_HINT}"
         );
         assert!(
-            NO_PACKS_HINT.contains("Settings → Install packs"),
-            "the message must point at the catalogue: {NO_PACKS_HINT}"
+            NO_MODULES_HINT.contains("Settings → Modules"),
+            "the message must point at the catalogue: {NO_MODULES_HINT}"
         );
         // Every line has to fit the dashboard: it is as narrow as its content, and a
-        // line that does not fit is a line that is cut off. The longest line is 38
+        // line that does not fit is a line that is cut off. The longest line is 32
         // characters, and the limit leaves room for it to grow.
-        for line in NO_PACKS_HINT.lines() {
+        for line in NO_MODULES_HINT.lines() {
             assert!(
                 line.chars().count() <= 40,
                 "the line is too long for the dashboard: {line}"
@@ -4780,9 +4932,9 @@ mod tests {
                     ui.horizontal_wrapped(|ui| {
                         // The gap the packs row uses.
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        // The catalogue is checked in the install-packs window, so the
+                        // The catalogue is checked in the Modules window, so the
                         // settings window has two buttons and not three.
-                        for label in ["Install packs", "Open packs folder"] {
+                        for label in ["Modules", "Open packs folder"] {
                             let rect = ui.button(label).rect;
                             rows.push(rect.top());
                             widths.push(rect.width());
@@ -4844,7 +4996,7 @@ mod tests {
         assert!((out[0].1.x - 1555.0).abs() < 1e-3);
         // 1555 - 5 - 538 px: the install-packs window touches the settings.
         assert!((out[1].1.x - 1012.0).abs() < 1e-3);
-        // The order from the right: dashboard, settings, install packs.
+        // The order from the right: dashboard, settings, modules.
         assert!(core_left_px > out[0].1.x && out[0].1.x > out[1].1.x);
         // The whole chain stands on the dashboard's bottom edge.
         assert!((out[1].1.y + 588.0 - core_bottom_px).abs() < 1e-3);
@@ -5043,7 +5195,15 @@ mod tests {
                 .frame(egui::Frame::NONE)
                 .show(ui, |ui| {
                     for entry in &entries {
-                        catalog_row(ui, &shared, entry, &packs, &[]);
+                        catalog_row(
+                            ui,
+                            &shared,
+                            entry,
+                            &packs,
+                            &[],
+                            &HashMap::new(),
+                            &HashMap::new(),
+                        );
                     }
                 });
         });
@@ -5089,6 +5249,132 @@ mod tests {
             "the description is {rows} rows, not two or three"
         );
         assert!(rect.left() > 0.0, "the description is not indented");
+    }
+
+    #[test]
+    fn the_helper_row_names_its_size_and_state() {
+        // A helper row never offers the pack's install flow before the daemon's own
+        // request exists: its button is greyed and shows the archive's size, and a
+        // helper already on disk (its module.json read back) says so in the same
+        // words a pack row uses.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let entries = vec![
+            CatalogPack {
+                kind: "helper".to_string(),
+                size: Some(322),
+                ..catalog_entry("armoury-console", "Armoury Console", "0.2.0")
+            },
+            CatalogPack {
+                kind: "helper".to_string(),
+                size: Some(1024 * 1024 + 512),
+                ..catalog_entry("armoury-pick", "Armoury Pick", "0.3.0")
+            },
+        ];
+        let mut helper_versions = HashMap::new();
+        helper_versions.insert("armoury-console".to_string(), "0.2.0".to_string());
+        // The second helper is on disk but older than the catalogue says: its row
+        // offers the (disabled) update, which is where the MB format shows.
+        helper_versions.insert("armoury-pick".to_string(), "0.2.4".to_string());
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    for entry in &entries {
+                        catalog_row(
+                            ui,
+                            &shared,
+                            entry,
+                            &[],
+                            &[],
+                            &HashMap::new(),
+                            &helper_versions,
+                        );
+                    }
+                });
+        });
+        let text = painted_text(&output);
+        let state = |want: &str| {
+            text.iter()
+                .find(|(t, _, _)| t == want)
+                .map(|(_, rect, _)| *rect)
+        };
+        output.drop_without_applying_deltas();
+        // The size rides on the greyed button: 322 bytes round up to one KB, and a
+        // size past the megabyte line reads in MB with a decimal.
+        state("Download (1 KB)")
+            .expect("the helper row does not show what its download weighs");
+        state("Update (1.0 MB)").expect("the update does not show its size");
+        // The one installed-only helper says so like a pack row does.
+        let installed = state("v0.2.0 installed").expect("the installed helper is not shown");
+        // It sits against the right edge, like every row's state.
+        assert!(
+            (installed.right() - INSTALL_PACKS_WIDTH).abs() < 0.5,
+            "the installed label is not at the right edge: {installed:?}"
+        );
+    }
+
+    #[test]
+    fn the_installed_pack_row_names_its_permissions() {
+        // The permission line under an installed pack row names the effects the
+        // pack may have, joined into one human line in the description's column.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        let entries = vec![catalog_entry("rainmeter", "Rainmeter", "1.4.0")];
+        let packs = vec![installed_pack("rainmeter", "1.4.0")];
+        let mut caps = HashMap::new();
+        caps.insert(
+            "rainmeter".to_string(),
+            vec![
+                "Send keystrokes".to_string(),
+                "Write files".to_string(),
+                "Look at, kill and start processes".to_string(),
+            ],
+        );
+        let output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
+                    for entry in &entries {
+                        catalog_row(
+                            ui,
+                            &shared,
+                            entry,
+                            &packs,
+                            &[],
+                            &caps,
+                            &HashMap::new(),
+                        );
+                    }
+                });
+        });
+        let text = painted_text(&output);
+        output.drop_without_applying_deltas();
+        // The permissions are one line (or a wrapped two) under the description,
+        // and they name the effects, not the API names.
+        let (rect, rows) = text
+            .iter()
+            .find(|(t, _, _)| t.starts_with("Send keystrokes; Write files"))
+            .map(|(_, rect, rows)| (*rect, *rows))
+            .expect("no permission line under the installed pack's row");
+        assert!((1..=2).contains(&rows), "the permissions run {rows} rows long");
+        assert!(rect.left() > 0.0, "the permission line is not indented");
     }
 
     /// The install-packs window as it is drawn, with a catalog of `count` packs.

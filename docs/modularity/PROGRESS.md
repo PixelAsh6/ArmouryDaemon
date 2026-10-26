@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) and **B3** (`c8c0468`) done and merged: the catalogue manifest arrives signed, and a `helper` module extracts into `modules/<id>/` behind its own folder lock, records `module.json`, and is found again by disk scan after any restart. 1.1.6 is published and installed; the packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
-| **Next action** | **B4** - the "Modules" window: the rows and shapes (pack/mode/helper), the per-module capability display, and the download/verify/install flow behind the daemon (`WORK-ORDER.md` B4). The signing key, the packs flip and the next release are the user's calls |
-| **Branch** | `main` at the B3 merge `c8c0468` - CI **green** on it (run `40341551223`); the branch's runs green on `cc72986` (`40337739735`) and `74f855d` (`40340105409`); counts stand: **404 unit tests** (298 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip). `feature/b3-helpers` is pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`) and **B3** (`c8c0468`) done and merged; **B4 on the branch `feature/b4-modules-window`** (the "Modules" window: the rename, three row shapes, cached permission lines), **not merged** - the merge is the next step after the branch's CI runs. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`) |
+| **Next action** | Watch the `feature/b4-modules-window` CI runs, then **merge** (`merge: B4 - the Modules window`) and wrap docs. After that: **B5** - the daemon's helper-install request (kind, `entry`, SHA-256) and the armed helper Download button (`WORK-ORDER.md` B5). The signing key, the packs flip and the next release are the user's calls |
+| **Branch** | `feature/b4-modules-window` cut from `main` `5036799` - **CI pending on the tip**. Counts before B4: **404 unit tests** (298 in `armoury` + 106 in `armoury-core`), **160 harness checks** (the real-catalogue pair SKIPs until the flip); the branch's run prints the fresh numbers |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1244,6 +1244,52 @@ field - the CI compiler was once again the first one to see the mistake).
 the shapes and the download/verify/install flow behind the daemon. This
 entry's branch merged into `main` as `c8c0468` (run `40341551223`); the
 packs flip, the signing key and the release are the user's calls.
+
+---
+
+### 2026-10-26 - Phase B4: the Modules window, and permission lines that cache themselves
+
+**What I did.** The catalogue window is the **Modules** window now - the
+title, the settings button that opens it, the viewport title, the chain
+slot, the placement lookups and the log lines all say Modules, and the
+dashboard's empty hint points at "Settings → Modules". One sorted list
+renders the three kinds: a pack or mode row keeps its installed state from
+the daemon's pack status, a helper row reads its `module.json` record
+(`helpers::installed`) off disk and says "v0.2.0 installed" in the same
+words a pack row uses; the installed-vs-newer decision (`pack_button`)
+stays one function both share. The helper row's buttons ship **disabled on
+purpose** - the label carries the archive's size ("Download (1 KB)",
+"Update (1.0 MB)"; sub-megabyte bytes round up in KB) and the hover names
+the daemon - because installing a helper needs the daemon's own request
+variant with kind, `entry` and SHA-256: Phase B5. The permission display
+is display-only per the decision: under an installed pack's description
+sits one weak line of the pack's granted effects, joined with "; "
+("Send keystrokes; Write files; Look at, kill and start processes") - the
+words from `Capability::effect`, never the function names. Reading every
+pack.json per frame would compile scripts per frame, so the permission
+line and the helper versions fill one `Shared` cache on a worker thread -
+triggered by the window's own catalogue check (open and "Check for
+updates") and by every `PackOp` answer. Everything outside the window
+keeps the packs words until the flip (`DECISIONS.md` §28). The empty hint
+is `NO_MODULES_HINT` now, and the description's indent column became a
+shared `indented_note` helper (the permission line sits in the same
+column, so neither note can widen a row).
+
+**What I did not do.** Helper downloads stay disabled - no fake flow; no
+revocation (needs an engine mechanism plus a config surface, deferred);
+no config `packs` → `modules` rename (it rides the flip); the protocol
+and the daemon answer nothing new - the window reads disk state only.
+
+**Tests.** Two new paints: the helper row's size and state labels
+(disabled labels "Download (1 KB)" and "Update (1.0 MB)", the installed
+helper's "v0.2.0 installed" at the right edge) and the permission line
+under an installed pack (indented, one or two rows). The empty-hint test
+now asserts "Settings → Modules", and its const is `NO_MODULES_HINT`.
+
+**Next.** Watch the branch's CI runs, merge as
+`merge: B4 - the Modules window`, and wrap the docs with the run ids and
+the artefact. Then B5: the daemon's helper-install request (kind, `entry`,
+SHA-256 over the temp file) arms the Download button.
 
 ---
 

@@ -494,6 +494,13 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     write probe - on a non-elevated build the process's own token fails the
     probe it itself just set, which is the difference between a production
     install and a repository build.
+57. **A visible period can be an invisible U+2026.** The catalogue
+    window's fetching line ends in a real ellipsis ("repo…") that the
+    terminal here rendered as a period - so an "obvious string edit" fails
+    exact-match, and a replacement typed with "." would have churned the
+    copy. When a string you can see refuses to match, dump that line's
+    codepoints instead of trusting the console; the same discipline the §
+    refs in the house docs already demand.
 
 ---
 

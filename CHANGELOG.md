@@ -27,6 +27,13 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   `--module-list` reads every installed pack, mode and helper back from
   disk. A helper never joins the pack or mode worker
   (`docs/modularity/DECISIONS.md` §27).
+- The **catalogue window is the "Modules" window**. All three kinds render
+  in one list - packs and modes keyed off the daemon's pack status,
+  helpers off their own `module.json` record on disk, with the archive's
+  size on the helper's (disabled) button: helpers install through the
+  daemon from the next phase. An installed pack's row carries a
+  permission line under its description - the granted capabilities as
+  effects, in one cached line (`docs/modularity/DECISIONS.md` §28).
 - The **killswitch has a config key and an IPC request**. One field,
   `killswitch_enabled` (default on), is both the switch and the "is the killswitch
   module installed" flag: while it is off, the End key and the tray toggle are

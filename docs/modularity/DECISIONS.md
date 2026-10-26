@@ -962,3 +962,46 @@ may touch the folder afterwards.
   (rename), restoring the old folder if the swap cannot complete.
 
 ---
+
+## 28. The Modules window renders per kind, and the display names effects, not APIs
+
+**Settled 2026-10-26.** B4 gives the catalogue window its name and shape:
+"Install packs" is the **Modules** window - the title, the settings button
+that opens it, the viewport and placement lookups, the log lines and the
+dashboard's empty hint all say Modules - and one sorted list renders all
+three kinds from the same manifest.
+
+- **One list, three row shapes.** The catalogue's own order is not for
+  reading (`sorted_catalog` shows it by display name); each row decides
+  from `kind`: a pack or mode row takes its installed state from the
+  daemon's pack status, a helper row reads the installed `module.json`
+  records off disk (`helpers::installed`), and both halves share the same
+  installed-vs-newer decision (`pack_button`).
+- **The capability display is display-only, and it is the truth on disk.**
+  An installed pack's row carries its permission line under the
+  description: its granted capabilities joined into one weak line in the
+  words of an effect - "Send keystrokes", never "input()" (the table is
+  `Capability::effect`). A helper's own line arrives with its download.
+- **The permission line is a cached worker pass, not a per-frame read.**
+  `packs::load` compiles scripts, so the UI must not parse pack manifests
+  every frame. One `Shared` cache is filled on a worker thread - triggered
+  by every catalogue check (the window's open and "Check for updates") and
+  every `PackOp` answer - and it carries the helper versions (off disk)
+  on the same pass. A pack installed by another process does not refresh
+  the line until the next check; accepted, it is display text, not
+  control.
+- **Revocation is deferred.** Naming what a pack may do is half the
+  permission display; taking it away needs an engine mechanism plus a
+  config surface, and is deliberately not B4's work.
+- **The helper row's button is honest furniture, not a fake flow.** It
+  greys with the archive's size in the label ("Download (1 KB)",
+  "Update (1.0 MB)" - sub-megabyte bytes round up in KB) and the hover
+  names the daemon: helpers install through the daemon from the next
+  phase, which must teach it a new Request variant (kind, `entry`,
+  SHA-256) before the button may arm. An enabled button that falls over
+  at the daemon's manifest check would teach the wrong lesson.
+- **Everything outside the window keeps the packs vocabulary until the
+  flip.** The settings one-liner ("Last check: 3 packs - all up to date")
+  and the status snapshot still speak of packs - the config and status
+  rename (DESIGN §7) rides the release that flips the catalogue
+  (§25). Only the Modules window and its own copy say Modules.
