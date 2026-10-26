@@ -439,6 +439,14 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     test both, a scenario needs a slow-apply mode **below** the pack and a
     slow-revert mode **above** it. Before trusting a timing assertion, ask what the
     order does to it on the code the check is supposed to fail.
+51. **`Select-String -Quiet` already is the answer - wrapping it in `$null -ne`
+    turns the check into a lie.** The 19e log check was first written as
+    `$null -ne (Select-String ... -Quiet)`: on Windows PowerShell 5.1 a query with
+    no match returns `$false`, and `$null -ne $false` is `$true` - so the check
+    would pass whether or not the log ever carried the word. Same class as trap 50:
+    a check that cannot fail proves nothing. Write
+    `([bool](Select-String ... -Quiet))`, and keep a `Test-Path` in front of a log
+    read - a missing file is an error record and an empty result, not a red check.
 
 ---
 

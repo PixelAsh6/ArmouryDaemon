@@ -51,6 +51,10 @@ pub struct AppConfig {
     pub packs: HashMap<String, PackUserConfig>,
     /// Pause all pack switching (tray menu / dashboard button).
     pub paused: bool,
+    /// The killswitch: hide and mute every tracked app (End key / tray menu). One key does
+    /// double duty — the config switch and the "is the killswitch module installed" flag:
+    /// `false` makes the toggle a no-op wherever it sits.
+    pub killswitch_enabled: bool,
     /// Console launcher auto-open: `always` (daemon startup), `pad` (controller connect), `never`.
     /// The tray's manual open is never affected.
     #[serde(default = "default_console_open", deserialize_with = "de_console_open")]
@@ -95,6 +99,7 @@ impl Default for AppConfig {
             tracked_apps: Vec::new(),
             packs: HashMap::new(),
             paused: false,
+            killswitch_enabled: true,
             console_open: default_console_open(),
             console_apps: Vec::new(),
             console_hidden: Vec::new(),
@@ -294,6 +299,7 @@ mod tests {
         assert!(cfg.last_played.is_empty());
         assert!(cfg.packs.is_empty());
         assert!(!cfg.paused);
+        assert!(cfg.killswitch_enabled);
         assert!(cfg.idle_failsafe_enabled);
         assert_eq!(cfg.idle_failsafe_minutes, 180);
         assert_eq!(cfg.console_open, "pad");
@@ -480,6 +486,7 @@ mod tests {
         let mut cfg = AppConfig {
             cooldown_seconds: 42,
             paused: true,
+            killswitch_enabled: false,
             idle_failsafe_enabled: false,
             idle_failsafe_minutes: 5,
             catalog_url: Some("https://example.invalid/catalog.json".into()),
@@ -499,6 +506,7 @@ mod tests {
         let back: AppConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back.cooldown_seconds, 42);
         assert!(back.paused);
+        assert!(!back.killswitch_enabled);
         assert!(!back.idle_failsafe_enabled);
         assert_eq!(back.idle_failsafe_minutes, 5);
         assert_eq!(back.catalog_url.as_deref(), Some("https://example.invalid/catalog.json"));
@@ -509,5 +517,18 @@ mod tests {
         assert_eq!(back.tracked_apps[0].exe, "demo.exe");
         assert!(back.packs.contains_key("gh"));
         assert!(back.extra.is_empty());
+    }
+
+    #[test]
+    fn killswitch_round_trips_and_old_configs_get_it_enabled() {
+        let mut cfg = AppConfig::default();
+        cfg.killswitch_enabled = false;
+        let text = serde_json::to_string(&cfg).unwrap();
+        let back: AppConfig = serde_json::from_str(&text).unwrap();
+        assert!(!back.killswitch_enabled);
+
+        // a config written before the field existed: the key is missing, the default is on
+        let old: AppConfig = serde_json::from_str(r#"{"cooldown_seconds":30}"#).unwrap();
+        assert!(old.killswitch_enabled);
     }
 }

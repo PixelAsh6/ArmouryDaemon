@@ -386,6 +386,10 @@ pub fn run(start: Start) {
         app.pause_item.set_text("Resume all packs");
         info!("starting paused (packs will not switch until resumed)");
     }
+    if !app.cfg.killswitch_enabled {
+        // The config switch is off: the tray item says so instead of promising a toggle.
+        app.kill_item.set_text("Killswitch off in config");
+    }
     info!("daemon ready");
     // ---- the first run: the dashboard opens itself ----
     // Every first run lands on the dashboard instead of having to know that there is a
@@ -508,6 +512,7 @@ pub fn run(start: Start) {
             // "Quit means close everything": the packs go back and the audio comes back before
             // the daemon goes away.
             app.revert_before_quit();
+            app.release_killswitch_for_exit();
             app.leave_idle_for_exit();
             break true;
         }
@@ -1333,6 +1338,7 @@ impl App {
             // from the list of running processes: an app that is merely running is not
             // hidden, and a released killswitch hides nothing at all.
             killswitch_count: self.killswitch.affected_apps() as u32,
+            killswitch_enabled: self.cfg.killswitch_enabled,
             idle_active: self.overlay.is_active(),
             idle_monitors: self.overlay.monitor_count() as u32,
             idle_devices: self.overlay.muted_devices() as u32,
@@ -1911,6 +1917,10 @@ impl App {
     }
 
     fn toggle_killswitch(&mut self) {
+        if !self.cfg.killswitch_enabled {
+            info!("killswitch: disabled in the config — the toggle does nothing");
+            return;
+        }
         if self.killswitch.is_active() {
             killswitch::disengage(&mut self.killswitch);
             self.set_tray_icon(false);
@@ -1926,6 +1936,40 @@ impl App {
             self.kill_item.set_text("Release killswitch");
         }
         self.broadcast_status();
+    }
+
+    /// The config-level killswitch switch (`set_killswitch` over the pipe). Turning it off
+    /// releases an engaged killswitch first: a switch that reads "off" everywhere must not
+    /// leave windows hidden and audio muted behind it.
+    fn set_killswitch_config(&mut self, enabled: bool) {
+        self.cfg.killswitch_enabled = enabled;
+        if !enabled && self.killswitch.is_active() {
+            info!("killswitch: the config switch turns off — releasing an engaged killswitch");
+            killswitch::disengage(&mut self.killswitch);
+            self.set_tray_icon(false);
+        }
+        self.kill_item.set_text(if enabled {
+            "Toggle killswitch"
+        } else {
+            "Killswitch off in config"
+        });
+        if let Err(e) = armoury_core::config::save(&self.cfg) {
+            warn!("failed to save config: {e}");
+        }
+        info!("killswitch {} in the config", if enabled { "enabled" } else { "disabled" });
+        self.broadcast_status();
+    }
+
+    /// The killswitch on the way out. Its hidden windows vanish with the process, but the
+    /// mutes live on the device: release here, or the machine stays hidden and silent until
+    /// the daemon starts again.
+    fn release_killswitch_for_exit(&mut self) {
+        if !self.killswitch.is_active() {
+            return;
+        }
+        killswitch::disengage(&mut self.killswitch);
+        self.set_tray_icon(false);
+        info!("killswitch released before the exit: the windows and audio are back");
     }
 
     fn set_tray_icon(&self, active: bool) {
@@ -2689,6 +2733,7 @@ impl App {
                     );
                     self.broadcast_status();
                 }
+                Request::SetKillswitch { enabled } => self.set_killswitch_config(enabled),
                 Request::InstallPack { source } => {
                     let result = install_pack_file(&self.search, std::path::Path::new(&source));
                     match result {
