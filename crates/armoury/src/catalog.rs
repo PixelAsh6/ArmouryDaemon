@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use armoury_core::pack::version_at_least;
+use armoury_core::pack::{PackKind, version_at_least};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use ureq::config::Config;
@@ -29,15 +29,35 @@ pub const DEFAULT_URL: &str =
 /// that a file is its own: a pack.json the user picked in the file dialog is not.
 pub const TEMP_PREFIX: &str = "armoury-catalog-";
 
-const SCHEMA: u32 = 1;
+/// The manifest schemas this build understands: 1 is the pre-B1 manifest (entries under
+/// the `packs` key), 2 reads `modules` and names each entry's `kind`.
+const SCHEMAS: std::ops::RangeInclusive<u32> = 1..=2;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Catalog {
     pub schema: u32,
     #[serde(default)]
     pub updated: String,
+    /// The entries of a schema-1 manifest. A manifest that carries `modules` must not
+    /// carry this key too; see `entries` and `parse`.
     #[serde(default)]
-    pub packs: Vec<CatalogPack>,
+    packs: Vec<CatalogPack>,
+    /// The entries of a schema-2 manifest.
+    #[serde(default)]
+    modules: Vec<CatalogPack>,
+}
+
+impl Catalog {
+    /// The entries, under whichever key the manifest carries. `parse` refuses a manifest
+    /// that carries both, so this can only ever be the manifest's one list; a manifest
+    /// with neither key lists nothing.
+    pub fn entries(&self) -> &[CatalogPack] {
+        if self.modules.is_empty() {
+            &self.packs
+        } else {
+            &self.modules
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,6 +69,11 @@ pub struct CatalogPack {
     pub version: String,
     #[serde(default)]
     pub description: String,
+    /// What kind of module this is: `"pack"` or `"mode"`, the same vocabulary the pack
+    /// file's own `kind` uses. Absent means `"pack"` — the same default a pre-A3 pack
+    /// file without the field gets.
+    #[serde(default = "default_kind")]
+    pub kind: String,
     /// Repository-relative path to the pack file.
     pub file: String,
     /// Lowercase hex SHA-256 of the exact file bytes.
@@ -59,6 +84,10 @@ pub struct CatalogPack {
     /// daemon may run it.
     #[serde(default)]
     pub min_engine: Option<String>,
+}
+
+fn default_kind() -> String {
+    "pack".to_string()
 }
 
 /// What this daemon can do with a catalogue entry.
@@ -103,7 +132,7 @@ impl Catalog {
     /// The packs this daemon may install. The ones it may not are not hidden: they are in
     /// `refused`, with the reason, so the UI can say why.
     pub fn offered(&self) -> Vec<&CatalogPack> {
-        self.packs
+        self.entries()
             .iter()
             .filter(|pack| pack.engine_gate() == EngineGate::Supported)
             .collect()
@@ -111,7 +140,7 @@ impl Catalog {
 
     /// The packs this daemon may not install, with the reason the UI can show.
     pub fn refused(&self) -> Vec<(&CatalogPack, String)> {
-        self.packs
+        self.entries()
             .iter()
             .filter_map(|pack| match pack.engine_gate() {
                 EngineGate::Supported => None,
@@ -125,15 +154,24 @@ impl Catalog {
 pub fn parse(json: &str) -> Result<Catalog, String> {
     let catalog: Catalog = serde_json::from_str(json.trim_start_matches('\u{feff}'))
         .map_err(|e| format!("catalog: invalid JSON ({e})"))?;
-    if catalog.schema != SCHEMA {
+    if !SCHEMAS.contains(&catalog.schema) {
         return Err(format!(
-            "catalog: unsupported schema {} (this build understands {SCHEMA})",
+            "catalog: unsupported schema {} (this build understands 1 or 2)",
             catalog.schema
         ));
     }
-    for pack in &catalog.packs {
+    if !catalog.packs.is_empty() && !catalog.modules.is_empty() {
+        return Err("catalog: the manifest carries both packs and modules - name the entries once".to_string());
+    }
+    for pack in catalog.entries() {
         if pack.id.is_empty() || pack.file.is_empty() || pack.sha256.is_empty() {
             return Err("catalog: a pack entry is missing id/file/sha256".to_string());
+        }
+        if PackKind::from_name(&pack.kind).is_none() {
+            return Err(format!(
+                "catalog: the entry {} names an unknown kind {:?} (pack or mode)",
+                pack.id, pack.kind
+            ));
         }
     }
     Ok(catalog)
@@ -342,11 +380,65 @@ mod tests {
     #[test]
     fn the_manifest_parses_and_rejects_other_schemas() {
         let catalog = parse(MANIFEST).expect("the shipped manifest shape must parse");
-        assert_eq!(catalog.packs.len(), 1);
-        assert_eq!(catalog.packs[0].id, "g-helper");
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(catalog.entries()[0].id, "g-helper");
+        assert_eq!(catalog.packs.len(), 1, "the schema-1 list is under packs");
+        assert!(parse(r#"{"schema": 0, "packs": []}"#).is_err());
         assert!(parse(r#"{"schema": 99, "packs": []}"#).is_err());
         assert!(parse("not json").is_err());
         assert!(parse(r#"{"schema": 1, "packs": [{"id": "", "file": "x", "sha256": "y"}]}"#).is_err());
+    }
+
+    /// A schema-2 manifest: the entries live under `modules` and name a kind.
+    const MANIFEST_V2: &str = r#"{
+        "schema": 2,
+        "updated": "2026-10-26",
+        "modules": [
+            {
+                "id": "killswitch",
+                "name": "Killswitch",
+                "version": "1.0.0",
+                "kind": "mode",
+                "file": "packs/killswitch/pack.json",
+                "sha256": "826f61ce6faf743fd2b2de2780e0a5ade2f5dfb881edfbc6eeaf88f97ba13cdd"
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn a_schema_two_manifest_reads_the_modules_and_their_kinds() {
+        let catalog = parse(MANIFEST_V2).expect("a schema-2 manifest must parse");
+        assert_eq!(catalog.entries().len(), 1);
+        assert_eq!(catalog.entries()[0].id, "killswitch");
+        assert_eq!(catalog.entries()[0].kind, "mode");
+        assert_eq!(catalog.modules.len(), 1, "the schema-2 list is under modules");
+    }
+
+    #[test]
+    fn an_entry_without_a_kind_is_a_pack() {
+        let catalog = parse(MANIFEST).expect("the manifest must parse");
+        assert_eq!(catalog.entries()[0].kind, "pack", "absent kind means pack");
+        assert!(parse(r#"{"schema": 2, "modules": [{"id": "x", "file": "f", "sha256": "y"}]}"#).is_ok());
+    }
+
+    #[test]
+    fn a_kind_outside_the_vocabulary_is_refused_with_a_name() {
+        let err = parse(
+            r#"{"schema": 2, "modules": [{"id": "x", "kind": "widget", "file": "f", "sha256": "y"}]}"#,
+        )
+        .expect_err("an unknown kind must refuse the manifest");
+        assert!(err.contains("widget"), "the refusal names the kind: {err}");
+        assert!(err.contains("x"), "the refusal names the entry: {err}");
+    }
+
+    #[test]
+    fn a_manifest_cannot_carry_both_keys() {
+        let err = parse(
+            r#"{"schema": 2, "packs": [{"id": "a", "file": "f", "sha256": "y"}],
+                "modules": [{"id": "b", "file": "f", "sha256": "y"}]}"#,
+        )
+        .expect_err("both lists must refuse the manifest");
+        assert!(err.contains("both packs and modules"), "{err}");
     }
 
     #[test]
@@ -484,9 +576,9 @@ mod tests {
     #[test]
     fn the_manifest_reads_the_minimum_engine_of_a_pack() {
         let catalog = parse(MANIFEST_WITH_ENGINES).expect("the manifest must parse");
-        assert_eq!(catalog.packs[0].min_engine.as_deref(), Some("99.0.0"));
-        assert!(catalog.packs[1].min_engine.is_none(), "no minimum means none");
-        assert_eq!(catalog.packs[2].min_engine.as_deref(), Some("0.0.1"));
+        assert_eq!(catalog.entries()[0].min_engine.as_deref(), Some("99.0.0"));
+        assert!(catalog.entries()[1].min_engine.is_none(), "no minimum means none");
+        assert_eq!(catalog.entries()[2].min_engine.as_deref(), Some("0.0.1"));
     }
 
     #[test]
@@ -507,13 +599,13 @@ mod tests {
 
         // the entry itself carries the same answer
         assert_eq!(
-            catalog.packs[0].engine_gate(),
+            catalog.entries()[0].engine_gate(),
             EngineGate::Refused {
                 required: "99.0.0".to_string(),
                 reason: reason.clone(),
             }
         );
-        assert_eq!(catalog.packs[1].engine_gate(), EngineGate::Supported);
+        assert_eq!(catalog.entries()[1].engine_gate(), EngineGate::Supported);
     }
 
     #[test]

@@ -583,7 +583,7 @@ impl eframe::App for App {
                 let since_request = {
                     let mut s = shared.lock().unwrap();
                     s.catalog_checking = false;
-                    s.catalog = Some(result.map(|catalog| catalog.packs));
+                    s.catalog = Some(result.map(|catalog| catalog.entries().to_vec()));
                     s.install_packs_requested_at.map(|at| at.elapsed())
                 };
                 match since_request {
@@ -4342,6 +4342,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             description: String::new(),
+            kind: "pack".to_string(),
             file: format!("packs/{id}/pack.json"),
             sha256: "00".to_string(),
             size: None,

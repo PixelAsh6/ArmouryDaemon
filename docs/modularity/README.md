@@ -106,10 +106,24 @@ background.
   harness checks) and the artefact says **13,074,432 bytes** (+192,512, a much
   better price than the 1-2 MB estimate), `VCRUNTIME140.dll` absent,
   `kernel32.dll` still readable, sha256 `c1373e9e…22f8`.
-- **The next action is Phase B1** — `kind` in the manifest, schema 2
-  (`WORK-ORDER.md` B1, `catalog.rs:44`), and the release workflow's catalogue
-  check learning `modules`. A6 is in `main` at `585f8ff`; the next release
-  is the user's call.
+- **Phase B1 is done on the branch `feature/b1-manifest-kind`** (cut from
+  `main` `dc74394`, **not merged** — the merge is the user's call): the
+  catalogue manifest reaches schema 2. The entries move under `modules` and
+  each names its `kind` (`"pack"`/`"mode"`, validated by `PackKind::from_name`
+  in `parse`; absent means `"pack"`), `Catalog::entries()` is the one way
+  through, the old `packs` key keeps working for one release, and a manifest
+  carrying both keys is refused. The release workflow's catalogue check learns
+  `modules` with the same fallback; the packs repo's own `index.json` goes
+  schema 2 in its repo's own commit, **pushed only at release time** — a live
+  schema-2 manifest breaks the installed 1.1.6 daemons' fetches. `DECISIONS.md`
+  §25. **CI on the tip: pending**; counts on the tree: **388 unit tests**
+  (282 `armoury` + 106 `armoury-core`), **156 harness checks** (the schema-2
+  probe lists through `modules`).
+- **The next action is Phase B2** — signed manifests (`WORK-ORDER.md` B2):
+  `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json`
+  via `include_str!`, verify **before** parsing, refuse everything on a bad
+  signature. A6 is in `main` at `585f8ff`; the next release is the user's
+  call.
 - The **1.1.4** release is out: the lockout rewritten to hold a change in both directions,
   the release carrying only the executable and its sidecar, the toolchain pinned. It is
   committed on top of `0350aac` (version **1.1.3**, released).
@@ -144,12 +158,13 @@ background.
 
 ## The next action
 
-**Phase B1 — `kind` in the manifest** (`WORK-ORDER.md` B1): move `CatalogPack`
-(`catalog.rs:44`) to manifest schema 2 while reading `packs` **and** `modules`
-for one release so an old manifest still works, and teach the release
-workflow's "Check the packs against the catalogue" step (`.github/workflows/release.yml`) the new key — it must keep failing when a release
-ships bytes the catalogue does not publish. A6 is in `main` at `585f8ff`;
-only the next release is the user's call.
+**Phase B2 — signed manifests** (`WORK-ORDER.md` B2): `minisign-verify`
+0.3.0; the trust keyring is `crates/armoury/src/trust/keys.json`, embedded
+with `include_str!`; the signature is verified **before** the manifest is
+parsed, a bad signature refuses the whole manifest, and nothing installs
+unverified. Acceptance: a manifest with a broken signature installs
+nothing and says why. B1's branch `feature/b1-manifest-kind` sits unmerged;
+the merge and the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

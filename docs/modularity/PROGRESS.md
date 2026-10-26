@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**). 1.1.6 is published and installed; **A6 is merged into `main`** (`585f8ff`, run `40314663065` green) |
-| **Next action** | **B1** - `kind` in the manifest, schema 2, and the release workflow's catalogue step learning `modules` (`WORK-ORDER.md` B1; `catalog.rs:44`). The next release is the user's call |
-| **Branch** | `main` at the A6 merge `585f8ff` - the branch's own runs `40311776397` (`d172567`) and `40313595169` (`7cdb0d2`) are green too, the artefact says **13,074,432 bytes** (+192,512), `VCRUNTIME140.dll` **absent** from its imports, and the counts stand at **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**. `feature/a6-crt-static` is pruned |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done** (…, killswitch's config key and IPC request + the quit-path release, **the C runtime statically linked**); B - **B1 done** (the manifest says what its packs are: schema 2, `modules`, a validated `kind`). 1.1.6 is published and installed; B1 sits on the branch `feature/b1-manifest-kind`, **not merged** |
+| **Next action** | **B2** - signed manifests: `minisign-verify` 0.3.0, the keyring in `crates/armoury/src/trust/keys.json` via `include_str!`, verify **before** parsing (`WORK-ORDER.md` B2). The next release is the user's call |
+| **Branch** | `feature/b1-manifest-kind` (cut from `main` `dc74394`) - CI **pending on the tip**; counts on the tree: **388 unit tests** (282 in `armoury` + 106 in `armoury-core`), **156 harness checks**. A6 is merged (`585f8ff`, run `40314663065`) and pruned |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1038,6 +1038,61 @@ the release workflow's "Check the packs against the catalogue" step must
 follow the rename to `modules` and keep failing on unpublished bytes. This
 entry's branch merged into `main` as `585f8ff` (run `40314663065`); the next
 release is the user's call.
+
+---
+
+### 2026-10-26 — Phase B1: the manifest says what its packs are
+
+**What I did.** The catalogue manifest moves to schema 2: `CatalogPack`
+carries a `kind` (`"pack"` / `"mode"`, validated in `parse` through
+`PackKind::from_name`; absent means `"pack"`, the same default a pre-A3 pack
+file gets), the entries move under `modules`, and `Catalog::entries()` is
+the one way through - the old `packs` key keeps parsing for one release and
+a manifest that carries both keys is refused by name. Schema acceptance
+widens from "exactly 1" to `1..=2`. The release workflow's catalogue check
+reads `modules` with the same one-release fallback and keeps failing when
+the release ships bytes the catalogue does not publish. The packs repo's
+manifest goes with it in its own commit (schema 2, `modules`, `"kind":
+"pack"` on the three shipped packs, whose `pack.json` files carry no kind);
+its README documents the new shape.
+
+**Files touched.** `catalog.rs` (structs, `entries`, `parse`, four new tests
+plus the widened schema test), `ui.rs` (the catalogue list and the test
+entries), `main.rs` (`--catalog-list` walks `entries()`),
+`.github/workflows/release.yml` (the catalogue check), `tools/daemon-selftest.ps1`
+(scenario 20b gains a probe: a schema-2 manifest served locally lists
+through `modules`, +2 checks), `D:\ArmouryDaemon_Packs` (`index.json` +
+README, **prepared but not pushed** — see below), `DECISIONS.md` (§25), the
+top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`.
+
+**Measured.** CI pending on the tip. The unit tests go **384 → 388**
+(282 + 106: **four** new tests around the new keys and kinds — the schema-2
+parse with `modules`, absent kind meaning `pack`, an unknown kind refusing
+with a name, both keys refusing — and the modified schema test; the
+schema-1 fixtures stay as the permanent old-manifest proof), the harness
+**154 → 156** (the schema-2 listing names the pack). The release workflow's
+step is validated by parse and review here; it actually runs on the next
+tag push. The packs repo manifest is **not pushed** with this phase: the
+schema-2 flip breaks every installed 1.1.6 daemon's live catalogue fetch
+(it refuses schema 2) until a released daemon ships — the flip is tied to
+the release decision, like the tag.
+
+**Decisions.** `DECISIONS.md` §25 — the dual key is a courtesy with an
+expiry, the kind mirrors the pack file's vocabulary, and one manifest
+carrying both keys is refused rather than silently merged.
+
+**Surprises.** One, harmless: the release workflow is **tag-push only** —
+there is no `workflow_dispatch`, so the edited catalogue check cannot run on
+the branch at all; its PowerShell parses clean here and becomes live on the
+next release. And one caught before CI: two tests first used helpers
+(`list_packs`, `list_modules`) that I had never written — the private
+fields are reachable from the same-file test module, so the reads went
+straight to them.
+
+**Next.** Phase B2 - signed manifests (`WORK-ORDER.md` B2): `minisign-verify`
+0.3.0, the keyring embedded with `include_str!`, verify **before** parse,
+and refuse the whole manifest on a bad signature. The merge of
+`feature/b1-manifest-kind` and the next release are the user's calls.
 
 ---
 
