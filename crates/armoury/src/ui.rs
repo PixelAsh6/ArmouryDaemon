@@ -5267,23 +5267,29 @@ mod tests {
             ..Default::default()
         };
         let shared = Arc::new(Mutex::new(Shared::default()));
+        // Three helper rows so every state paints once: no record = download,
+        // same version = installed, older record = update (where the MB shows).
         let entries = vec![
             CatalogPack {
                 kind: "helper".to_string(),
                 size: Some(322),
+                ..catalog_entry("armoury-pick", "Armoury Pick", "0.4.0")
+            },
+            CatalogPack {
+                kind: "helper".to_string(),
+                size: Some(3000),
                 ..catalog_entry("armoury-console", "Armoury Console", "0.2.0")
             },
             CatalogPack {
                 kind: "helper".to_string(),
                 size: Some(1024 * 1024 + 512),
-                ..catalog_entry("armoury-pick", "Armoury Pick", "0.3.0")
+                ..catalog_entry("armoury-alert", "Armoury Alert", "0.7.0")
             },
         ];
         let mut helper_versions = HashMap::new();
+        // The console is on disk at the catalogue's version; the alert is older.
         helper_versions.insert("armoury-console".to_string(), "0.2.0".to_string());
-        // The second helper is on disk but older than the catalogue says: its row
-        // offers the (disabled) update, which is where the MB format shows.
-        helper_versions.insert("armoury-pick".to_string(), "0.2.4".to_string());
+        helper_versions.insert("armoury-alert".to_string(), "0.6.2".to_string());
         let output = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
