@@ -12,7 +12,7 @@ anything surprising you found.**
 |---|---|
 | **Phase** | A - **A1, A2, A3, A4 and A5 done** (the TLS root store for the catalogue **and the cover art**, the capability-scoped host API, the pack schema's `kind` and `triggers`, the modes' own worker thread and channel, the killswitch's config key and IPC request + the quit-path release). 1.1.6 is published and installed; A5 sits on the branch `feature/a5-killswitch`, **not merged** |
 | **Next action** | **A6** - the one remaining perf decision: `-C target-crt-static` in the release profile, a trade-off (~1-2 MB) to decide explicitly (`WORK-ORDER.md` A6). The merge of A5 into `main` and the next release are the user's calls |
-| **Branch** | `feature/a5-killswitch` (cut from `main` `cd4c3e3`) - CI **pending on the tip**; counts on the tree: **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks** |
+| **Branch** | `feature/a5-killswitch` (cut from `main` `cd4c3e3` - CI **green** on the tip `441c1b6`: **384 unit tests** (278 in `armoury` + 106 in `armoury-core`), **154 harness checks**, "ALL CHECKS PASSED" |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -970,11 +970,15 @@ on the device), so `release_killswitch_for_exit` runs between
 checks), `DESIGN.md` (the killswitch row of §8), `DECISIONS.md` (§23), `GOTCHAS.md`
 (trap 51), the top of `PROGRESS.md`, this entry, `README.md`, `CHANGELOG.md`.
 
-**Measured.** unit tests **383 → 384** (+1 config roundtrip test, 278 in
-`armoury` + 106 in `armoury-core`), harness checks **146 → 154** (scenario 19e:
-the fresh flag is on, the pipe flips it off and back on, the config file carries
-both values, a restart honours the off, and the log names the disable). Exe size:
-filled in from the CI artefact in the follow-up docs commit.
+**Measured.** CI is green on the A5 tip (`441c1b6`, run `40304545072`,
+10m18s, "ALL CHECKS PASSED"): unit tests **383 → 384** (the runner itself
+printed **278 passed** in `armoury` and **106 passed** in `armoury-core`, the
++1 being the config roundtrip test), harness checks **146 → 154** (scenario
+19e: the fresh flag is on, the pipe flips it off and back on, the config file
+carries both values, a restart honours the off, and the log names the
+disable). Exe from the `armourydaemon-windows-x64` artefact: **12,881,920
+bytes** (13,824 lighter than the A4 tip's 12,895,744, all of it layout), sha256
+`1005a3c5…091b`.
 
 **Decisions.** `DECISIONS.md` §23 — one key for both meanings, disabling releases
 an engaged killswitch first, older snapshots mean on, the quit path releases.

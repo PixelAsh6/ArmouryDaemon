@@ -318,7 +318,7 @@ module needs.
 | `react_to_tracked` | `daemon.rs:1350` | a tracked app starting while the mode is engaged re-engages it |
 | Installing a module | `daemon.rs:2572` (the `InstallPack` handler) | one handler per kind |
 | The console helper | `daemon.rs:2024` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
-| The killswitch | `daemon.rs:1913` (`toggle_killswitch`) | **done in A5**: `killswitch_enabled` (default `true`, doubles as the "module installed" flag), `set_killswitch` over the pipe, and a release on quit (`DECISIONS.md` §23) |
+| The killswitch | `daemon.rs:1919` (`toggle_killswitch`) | **done in A5**: `killswitch_enabled` (default `true`, doubles as the "module installed" flag), `set_killswitch` over the pipe, and a release on quit (`DECISIONS.md` §23) |
 
 The pack worker **was** a single serial thread (`packs.rs:171`,
 `while let Ok(job) = jobs.recv()`) — that is the reason for the second worker

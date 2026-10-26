@@ -56,9 +56,10 @@ background.
   icon back); and a status from an older daemon means on. The folded bug: `quit` now
   releases an engaged killswitch between the pack revert and the idle exit - the
   mutes live on the device, and before A5 the machine could stay hidden and silent
-  after a quit. Harness scenario 19e pins it (8 checks). `DECISIONS.md` §23. **CI on
-  the tip: pending**; counts on the tree: **384 unit tests** (278 `armoury` + 106
-  `armoury-core`), **154 harness checks**.
+  after a quit. Harness scenario 19e pins it (8 checks). `DECISIONS.md` §23. CI
+  green on the tip (`441c1b6`, run `40304545072`, 10m18s): **384 unit tests**
+  (278 `armoury` + 106 `armoury-core`), **154 harness checks**, the exe
+  **12,881,920 bytes** (sha256 `1005a3c5…091b`).
 - **Phase A3 is merged into `main` and released in 1.1.6** — the merge commit `21935ff`,
   and its CI run (`39803275300`) is green after 3m53s. The pack schema's `kind` and
   `triggers`, both **additive**, a malformed `kind` refused by name. A3 changed no
