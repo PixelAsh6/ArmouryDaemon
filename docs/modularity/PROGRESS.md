@@ -1381,7 +1381,14 @@ and 303 other tests passed); fix commit `cb2b8dd` → green run
 both green runs and at the merge: **410 unit tests** (304 in `armoury`
 + 106 in `armoury-core`, 0 failed) and the harness's **163 checks**
 (160 PASS + 2 SKIP for the real-catalogue pair, **ALL CHECKS PASSED**).
-The repo-wide non-English character audit found nothing outside the
+The wrap has a second arm, found in visual verification on the box's
+released v1.2.0 exe (2026-10-27): with a failed check the window paints
+its message where the rows would be and has no rows beside it, yet the
+line drew extend-wide all the same and the exe cut it at the window edge
+mid-URL, and this commit wraps it the same way behind the first one,
+proven by the headless paint test
+`a_failed_catalogue_check_paints_its_message_wrapped` (red before, green
+after). The repo-wide non-English character audit found nothing outside the
 accepted glyph set introduced by B4/B5; the characters that do appear
 (pre-paint glyph art, minus and comparison signs in the docs' byte
 tables, and test data that exercises non-ASCII names) predate the phase

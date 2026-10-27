@@ -2552,7 +2552,11 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     // their right-aligned buttons sat past the window edge and clipped
                     // away to background where the Download button belonged - until the
                     // process was killed, for a fresh check and a window reopen leave the
-                    // line in place. Wrap the line, like the notes under the rows are.
+                    // line in place. Wrap the line, like the notes under the rows are. The
+                    // wrap has a second arm, further down: a failed check paints its own
+                    // message where the rows would be - no rows there, so nothing to clip
+                    // but the message itself - and the released v1.2.0 build cut that
+                    // message at the window edge mid-URL, so the arm below wraps too.
                     ui.add(
                         egui::Label::new(RichText::new(message).small().color(if ok {
                             Color32::from_rgb(52, 211, 153)
@@ -2572,7 +2576,14 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                         }
                     }
                     Some(Err(message)) => {
-                        ui.small(RichText::new(message).color(Color32::from_rgb(248, 113, 113)));
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(message)
+                                    .small()
+                                    .color(Color32::from_rgb(248, 113, 113)),
+                            )
+                            .wrap(),
+                        );
                     }
                     Some(Ok(entries)) if entries.is_empty() => {
                         ui.small(RichText::new("The catalogue has no modules yet.").weak());
