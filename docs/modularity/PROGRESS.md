@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`), **B4** (`4d7886b`) and **B5 done and merged** (`3f3a772`): a helper installs through the daemon's `InstallHelper` request, the Modules window's helper buttons are armed, and the daemon re-verifies the archive's bytes before they land anywhere. The packs repo's flip waits for the next release (prepared at `539773c` + `2cd49ce`); the signing key and the next release are the user's calls |
-| **Next action** | **Phase C** (the console as a helper module; read `WORK-ORDER.md`'s C section first), plus the fold-in opportunities: the **failed-helper-download button bug** (below), the dashboard cooldown-gap, audio_mute_all crash-recovery, the harness 12c caveat, the tautological tests, the sleep/resume lockout, and the harness 20a literal version at `tools/daemon-selftest.ps1:1110`. Ask the user before taking any of them in |
-| **Branch** | **Merged; `feature/b5-helper-request` pruned.** Counts stand: **409 unit tests** (303 in `armoury` + 106 in `armoury-core`), **163 harness checks** (the real-catalogue pair SKIPs until the flip); the exe from the branch run `40409208575` is **13,325,312 bytes** (+30,208 over B4), sha256 `7fc9cc9e…5aff`, `VCRUNTIME140.dll` still absent; merge run `40410782706` green on `3f3a772`. Idle cost **did not regress**: the daemon idles at about **15 ms of CPU per 10 s** with windows open (the UI's own redraw cost is separate) - same shape as the B4 measurement |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`), **B4** (`4d7886b`) and **B5 done and merged** (`3f3a772`): a helper installs through the daemon's `InstallHelper` request, the Modules window's helper buttons are armed, and the daemon re-verifies the archive's bytes before they land anywhere. **The tree became 1.2.0 and the release is published** (2026-10-27, tag `v1.2.0` on `e9e393a`). The packs repo's flip waits for its own step (prepared at `539773c` + `2cd49ce`); the signing key, the flip and the install are the user's calls |
+| **Next action** | **Phase C** (the console as a helper module; read `WORK-ORDER.md`'s C section first), plus the fold-in opportunities: the dashboard cooldown-gap, audio_mute_all crash-recovery, the harness 12c caveat, the tautological tests, the sleep/resume lockout, and the harness 20a literal version at `tools/daemon-selftest.ps1:1110` (bumped to 1.2.0; the check itself remains literal). Ask the user before taking any of them in |
+| **Branch** | **1.2.0 released; `feature/b5-helper-request` pruned (its tip `8d5f33f` is inside `main`).** Counts stand: **410 unit tests** (304 in `armoury` + 106 in `armoury-core`), **163 harness checks** (160 PASS + the real-catalogue pair as 2 SKIP until the flip); the released exe is **13,325,824 bytes** (+512 over the B5 branch tree's 13,325,312), sha256 `355b7dc1…a561`, `VCRUNTIME140.dll` still absent; the three runs on `e9e393a` are all green (main CI `40465726424` 6m41s, tag CI `40465726735` 9m14s, Release `40465726898` 7m06s). Idle cost **did not regress**: the daemon idles at about **15 ms of CPU per 10 s** with windows open (the UI's own redraw cost is separate) - same shape as the B4 measurement |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1389,6 +1389,66 @@ and stay, recorded here as the audit's verdict.
 
 **Next.** Phase C. The signing key, the packs flip and the release are
 the user's calls.
+
+---
+
+### 2026-10-27 - 1.2.0: released
+
+**What I did.** The tree became **1.2.0** and the Release workflow published it.
+The bump is `f77bae9` (`build: release 1.2.0` - `Cargo.toml`, `Cargo.lock`'s two
+workspace packages, and the harness's `--version` literal at
+`tools/daemon-selftest.ps1:1113`, the same three files the 1.1.6 bump touched),
+the notes and the changelog are `e9e393a`
+(`docs: the 1.2.0 release notes and the changelog`), and the annotated tag
+`v1.2.0` was cut on `e9e393a` - the 1.1.6 pattern (tag on the notes commit) - and
+pushed in one go with `main` (`9d3a526..e9e393a`). The stale local branch
+`feature/b5-helper-request` (its tip `8d5f33f` fully contained in `main`)
+was deleted first.
+
+**The runs.**
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `40465726424` | CI on `main` at `e9e393a` | green - **410 tests** (304 `armoury` + 106 `armoury-core`), **163 checks** (160 PASS + 2 SKIP), `ALL CHECKS PASSED` | 6m41s |
+| `40465726735` | CI on the tag `v1.2.0` | green - the same counts | 9m14s |
+| `40465726898` | **Release** on `v1.2.0` | green - built, wrote the sidecar, checked the packs against the catalogue, published, and re-downloaded and verified its own assets | 7m06s |
+
+**The published release.** `https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.2.0`,
+published 2026-10-27 07:19:21Z, two assets and nothing else:
+
+- `ArmouryDaemon.exe` - **13,325,824 bytes**, sha256
+  `355b7dc10cfa2725ff259b95ffdf85cec279121bfe9b1e18c351e8d6f468a561`
+- `ArmouryDaemon.exe.sha256` - **85 bytes**, sha256
+  `f809ba8ce30bfda8f8b7adf970016083415209f5a9c304948e40c04ead04fac0`; the hash
+  field in it is the exe's.
+
+The body is **3,841 bytes**, byte for byte the committed
+`release-notes/v1.2.0.md` (the workflow compared them). The exe was downloaded
+to `C:\Users\PixelAsh\AppData\Local\Temp\opencode\v12release\` and re-checked:
+its sha256 matches the sidecar's field and the API digest, it is 13,325,824
+bytes - **+512** over the B5 branch tree's 13,325,312 - and it carries no
+`VCRUNTIME140` string (the static CRT) while `requireAdministrator` is inside
+it. The stashed exe is there waiting for the `C:\Apps\ArmouryDaemon` copy step.
+
+**Pre-flip notes.** The Release run's catalogue check passed against the live
+schema-1 manifest: the log names all three shipped pack files as "the
+catalogue's own bytes" (`826f61ce.13cdd` wallpaper-engine, `b6fdaa3b.07e3`
+g-helper, `579fd1ae.f4dc6b` rainmeter). The daemon's own fetch of the live
+catalogue refuses the unsigned manifest by design - the harness's
+real-catalogue pair SKIPs naming exactly that - so the flip at `539773c` +
+`2cd49ce`, like the signing key and the install, remains the user's call.
+
+**Surprises.** The release build ran cold: the bump changes `Cargo.lock`'s
+bytes, so `hashFiles('**/Cargo.lock')` changes the cache key, and the
+workflow's only restore key embeds that very hash - no previous cache matches a
+bumped lock, so every release whose lock just changed builds from scratch (the
+build step ran near 7 minutes here only because three same-commit runs raced
+and this one saved the first cache of the new key; the 7m27s of 1.1.6 was warm
+because a CI run on the same lock had run first).
+
+**Next.** Phase C (the console as a helper module) and the remaining
+fold-ins are the work; the `C:\Apps` install of the stashed exe, the packs
+flip and the signing key are the user's calls.
 
 ---
 
