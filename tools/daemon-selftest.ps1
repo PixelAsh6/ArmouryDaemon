@@ -443,11 +443,12 @@ try {
     Check 'packs disabled + cooldown 5 s' ((@($s.packs | Where-Object enabled).Count -eq 0) -and ($s.cooldown_seconds -eq 5))
 
     # ---- 4. a tracked app start applies the packs and starts a lockout ----
-    # The engine (2026-10-22): the lockout holds a change in *both* directions. This start
-    # finds no window running - the machine is free, the first launch of a session - so the
-    # packs come on at once, and the change starts a window of `cooldown` seconds. A start
-    # *inside* a window waits for it (section 9c). A close waits for a window too, and a fast
-    # restart inside that window cancels the wait. The daemon reports the window as the
+    # The engine (2026-10-27): a change lands when no window is running, and the window - the
+    # cooldown - starts with the change, after the packs were switched. This start finds no
+    # window running (the machine is free, the first launch of a session), so the packs come on
+    # at once and a window of `cooldown` seconds starts. A start *inside* a window waits for it
+    # (section 9c), and a close inside one is applied when that window ends; a close with no
+    # window running reverts at once (section 6). The daemon reports the window as the
     # "cooldown" state plus the time that is left.
     $applies = @(Get-ChangeTimes 'apply').Count
     Send-Pipe '{"type":"add_tracked_app","name":"Timeout","exe":"C:\\Windows\\System32\\timeout.exe"}' | Out-Null
@@ -467,20 +468,19 @@ try {
     Check 'no lockout is left behind' ($null -eq $s.cooldown_remaining_ms) "remaining=$($s.cooldown_remaining_ms)"
     Check 'nothing was reverted' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
 
-    # ---- 6. a close with no lockout running holds the revert ----
-    # The close always waits for a window: it starts one if none is running and keeps the
-    # running one otherwise, and the revert lands when that window is over - so a fast restart
-    # inside the window cancels it and the packs stay applied.
+    # ---- 6. a close with no lockout running reverts at once ----
+    # The cooldown is the settle time after a mode change, and it starts when the packs were
+    # switched. Section 5 waited the lockout of the start out, so nothing is running now and
+    # the close has nothing in the way: the packs go back with it, and the revert starts a
+    # lockout of its own.
     $reverts = @(Get-ChangeTimes 'revert').Count
     $closeAt = Get-Date
     $p1 | Stop-Process -Force
-    Start-Sleep -Milliseconds 700
-    Check 'the close holds the revert' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
-    $times = @(Wait-Change 'revert' $reverts 15)
-    Check 'the held revert lands when the lockout expires' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $times = @(Wait-Change 'revert' $reverts 5)
+    Check 'the close reverts at once' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
     $revertAt = $times[$times.Count - 1]
     $revertSeenAt = Get-Date
-    Check 'the revert waits for the lockout' ((Get-Gap $closeAt $revertAt) -ge 3 -and (Get-Gap $closeAt $revertAt) -le 12) "close=$closeAt revert=$revertAt"
+    Check 'the revert does not wait for a lockout' ((Get-Gap $closeAt $revertAt) -lt 3) "close=$closeAt revert=$revertAt"
     $s = Wait-State 'cooldown' 8
     Check 'the revert starts a lockout of its own' ($s.state -eq 'cooldown') "state=$($s.state)"
 

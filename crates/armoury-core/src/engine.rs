@@ -1,23 +1,23 @@
 //! Trigger engine: pure state machine driven by tracked-app start/stop events.
 //!
-//! Semantics (user-specified, revised 2026-10-22):
+//! Semantics (user-specified, revised 2026-10-27):
 //! - A tracked-app event states the **intent**: the packs belong to the applied state while a
 //!   tracked app runs, and back to their own state once the last one is gone. `desired` is that
 //!   intent, `applied` is what the machine does — the two are allowed to differ, and that gap is
 //!   exactly a deferred change.
-//! - The **lockout holds a change in both directions**. A change that arrives while a window is
-//!   running is **held**, not dropped: it lands when the window is over, if it is still wanted,
-//!   and it lands exactly once.
-//! - The **apply** lands at once when the machine is free — no window is running, which is the
-//!   case for the first launch of a session. The change starts a window of `cooldown` seconds.
-//!   A launch **inside** a running window waits for it: the packs stay where they are until that
-//!   window is over, and they go to the applied state only if the app is still running by then
-//!   (2026-10-22).
-//! - The **revert** always waits for a window: the close starts one if none is running and keeps
-//!   the running one otherwise — it is not restarted — and the revert lands when that window is
-//!   over. A close that lands between two windows therefore does not put the machine back at
-//!   once, and a fast restart inside the window cancels the hold: the packs stay applied
-//!   (2026-10-21).
+//! - A change lands when **no window is running**, and the cooldown **starts when the mode
+//!   changed** — that is, after the packs were switched, not when the app opened or closed.
+//! - While a window runs, nothing is checked and nothing changes: a start or a stop only moves
+//!   the **intent**. When the window ends, the tick compares the intent with the machine and
+//!   lands one change if the two differ.
+//! - The **apply** therefore lands at once when the machine is free — the first launch of a
+//!   session — and a launch inside a running window waits for it: the packs stay where they are
+//!   until that window is over, and go to the applied state only if the app is still running by
+//!   then (2026-10-22).
+//! - The **revert** is just as immediate: a close that arrives after the cooldown has run out
+//!   puts the packs back **at once** and starts a cooldown of its own — it does not wait a
+//!   second cooldown for the privilege of going back (2026-10-27). A close inside a window waits
+//!   for that window, and a fast restart inside it cancels the change: the packs stay applied.
 //! - A window that expires while the intent still holds changes **nothing** and starts **no new**
 //!   window: only a change that actually happened starts one.
 //! - A change of the cooldown **re-times the window that is running**: the window keeps its
@@ -89,12 +89,6 @@ pub struct Engine {
     paused: bool,
     /// The settling window. While it is running, no change may touch the packs.
     lock: Option<Window>,
-    /// A change is waiting for the window to expire. This is the flag the 21 Oct fix brought in
-    /// (it was called `revert_pending` there): it separates *the window this change started*
-    /// from *the leftover window of the previous change*, so a close that lands between two
-    /// windows still waits for one. The model is symmetric now, so the held change can be the
-    /// apply as well.
-    pending: bool,
     /// exe file name (lowercase, the tracked identity) -> (display name, live pids)
     running: BTreeMap<String, (String, Vec<u32>)>,
     last_source: Option<String>,
@@ -109,7 +103,6 @@ impl Engine {
             idle: false,
             paused: false,
             lock: None,
-            pending: false,
             running: BTreeMap::new(),
             last_source: None,
         }
@@ -179,62 +172,56 @@ impl Engine {
     }
 
     /// The change that is waiting for the window, if there is one: the packs are not where
-    /// the intent says they should be, and the window is holding the change back. `None`
-    /// when nothing is waiting — the machine is where the intent says it is, or the window
-    /// is not holding anything.
+    /// the intent says they should be, and a window is holding the change back. `None` when
+    /// nothing is waiting — the machine is where the intent says it is. A difference can only
+    /// be held by a running window: without one, the next tick lands it.
     pub fn pending_change(&self) -> Option<Transition> {
-        if !self.pending {
+        if self.idle || self.paused || self.desired == self.applied {
             return None;
         }
-        if self.desired {
-            Some(Transition::Applied)
+        Some(if self.desired {
+            Transition::Applied
         } else {
-            Some(Transition::Reverted)
-        }
+            Transition::Reverted
+        })
     }
 
     pub fn is_idle_mode(&self) -> bool {
         self.idle
     }
 
-    /// Freeze/thaw *automatic* switching. Pausing drops the lockout (no pack change may happen)
-    /// and makes the intent match the current state, so nothing is pending. Unpausing catches up
-    /// at once: a running tracked app is applied right away, and with nothing running the revert
-    /// is scheduled (the lockout times it). Manual actions never go through here (the daemon
-    /// forces them).
+    /// Freeze/thaw *automatic* switching. Pausing drops the window (no pack change may happen)
+    /// and makes the intent match the current state, so nothing is held back. Unpausing catches
+    /// up at once — the window is gone, so there is nothing to wait for: a running tracked app
+    /// is applied right away, and with nothing running the revert lands right away and starts a
+    /// window of its own. Manual actions never go through here (the daemon forces them).
     pub fn set_paused(&mut self, paused: bool, now: Instant) -> Option<Transition> {
         if self.paused == paused {
             return None;
         }
         self.paused = paused;
         if paused {
-            // Freeze: drop the lockout, and let nothing be pending.
+            // Freeze: drop the window. The intent matches the machine, so nothing is held.
             self.lock = None;
-            self.pending = false;
             self.desired = self.applied;
             return None;
         }
-        // Unpause: catch up with whatever is running.
+        // Unpause: catch up at once, with no window in the way.
         if !self.running.is_empty() {
             self.desired = true;
             self.lock = None;
-            self.pending = false;
-            if !self.applied {
-                self.applied = true;
-                self.last_source = Some(self.source_label());
-                return Some(Transition::Applied);
+            if self.applied {
+                return None;
             }
-            return None;
+            self.applied = true;
+            self.last_source = Some(self.source_label());
+            self.lock = Some(Window::new(now, self.cooldown));
+            return Some(Transition::Applied);
         }
-        // Nothing is running: schedule the revert, the lockout times it.
+        // Nothing is running: the revert lands now and starts a window of its own.
         self.desired = false;
-        self.lock = if self.applied {
-            Some(Window::new(now, self.cooldown))
-        } else {
-            None
-        };
-        self.pending = self.applied;
-        None
+        self.lock = None;
+        self.try_change(now)
     }
 
     /// Enter or leave idle mode (black screens + muted audio). Entering reverts whatever is
@@ -246,7 +233,6 @@ impl Engine {
         }
         self.idle = idle;
         self.lock = None;
-        self.pending = false;
         if idle {
             if self.applied {
                 self.applied = false;
@@ -277,7 +263,6 @@ impl Engine {
             Transition::Reverted => self.applied = true,
         }
         self.lock = None;
-        self.pending = false;
     }
 
     /// A tracked app was removed from the user's list: forget it entirely. This is a manual
@@ -299,7 +284,6 @@ impl Engine {
             self.applied = false;
             self.last_source = None;
             self.lock = None;
-            self.pending = false;
             return Some(Transition::Reverted);
         }
         self.try_change(now)
@@ -354,72 +338,52 @@ impl Engine {
 
     /// Make the packs match the intent.
     ///
-    /// The lockout holds a change in **both** directions: a change that arrives while a window
-    /// is running waits for it, and it lands when the window is over — if it is still wanted.
+    /// One rule, both directions: the change lands when **no window is running**, and it
+    /// starts a window of its own — the cooldown begins the moment the packs are switched.
     ///
-    /// The **apply** lands at once when the machine is free — no window is running, which is
-    /// the case for the first launch of a session. The change starts a window of its own, so
-    /// the next change waits the full window. A launch **inside** a running window waits for
-    /// it: the packs stay where they are until that window is over.
+    /// While a window is running nothing is decided: a start or a stop has already moved the
+    /// intent, and the change waits. It is the end of the window that looks at the intent
+    /// again, so a close that lands in the middle of a cooldown is applied when the cooldown
+    /// ends, and a launch inside one is applied when it ends if the app still runs. A change
+    /// that the intent has taken back in the meantime never happens at all.
     ///
-    /// The **revert** always waits for a window: the close starts one if none is running and
-    /// keeps the running one otherwise — it is not restarted — and the revert lands when that
-    /// window is over. Without that, a close that lands between two windows would put the
-    /// machine back while the app is already running again — and the re-apply would then wait
-    /// for the lockout the revert started, so the packs would flip back late, under the
-    /// running app.
+    /// The revert is immediate for the same reason: once the cooldown of the apply has run
+    /// out, a close has no window in the way, so the packs go back at once — and the revert
+    /// starts a cooldown of its own (2026-10-27). Waiting for a window first made a close cost
+    /// two cooldowns.
     ///
     /// Idle and pause freeze the switching entirely. A change that does not happen starts no
-    /// lockout.
+    /// window.
     fn try_change(&mut self, now: Instant) -> Option<Transition> {
         if self.idle || self.paused {
             return None;
         }
         if self.desired == self.applied {
-            // The intent holds and the machine is where it should be: a held change is
-            // cancelled, and an expired lockout is gone — it starts no new one.
-            self.pending = false;
+            // The intent holds and the machine is where it should be: a change the window was
+            // holding is cancelled, and an expired window is gone — it starts no new one.
             if self.lock.is_some_and(|w| w.end() <= now) {
                 self.lock = None;
             }
             return None;
         }
-        if self.desired {
-            // The intent is "a tracked app is running" and the machine is not applied.
-            if self.lock_running(now) {
-                // A window is running: the apply is held until that window is over.
-                self.pending = true;
-                return None;
-            }
-            // The machine is free: the apply lands at once and starts a window of its own.
-            self.applied = true;
-            self.pending = false;
-            self.lock = Some(Window::new(now, self.cooldown));
-            self.last_source = Some(self.source_label());
-            return Some(Transition::Applied);
-        }
-        // The intent is gone while the packs are applied: the revert is pending.
-        if !self.pending {
-            // The close starts the window that holds the revert. A lockout that is
-            // already running holds it as well — it is not restarted — and without one
-            // the window starts now.
-            let window = match self.lock {
-                Some(w) if w.end() > now => w,
-                _ => Window::new(now, self.cooldown),
-            };
-            self.pending = true;
-            self.lock = Some(window);
+        // The intent and the machine differ, and a window is still running: nothing is done
+        // during the window. The tick at its end looks at the intent again.
+        if self.lock_running(now) {
             return None;
         }
-        if self.lock.is_some_and(|w| w.end() <= now) {
-            // The window is over: the revert lands and starts a lockout of its own.
-            self.applied = false;
-            self.pending = false;
-            self.lock = Some(Window::new(now, self.cooldown));
-            self.last_source = None;
-            return Some(Transition::Reverted);
-        }
-        None // the window still runs: the revert is held
+        // The machine is free: the change lands, and the cooldown starts with it.
+        self.applied = self.desired;
+        self.lock = Some(Window::new(now, self.cooldown));
+        self.last_source = if self.applied {
+            Some(self.source_label())
+        } else {
+            None
+        };
+        Some(if self.applied {
+            Transition::Applied
+        } else {
+            Transition::Reverted
+        })
     }
 
     /// Is the lockout still running?
@@ -478,34 +442,37 @@ mod tests {
     }
 
     #[test]
-    fn closing_after_the_lockout_holds_the_revert() {
+    fn closing_an_hour_later_still_reverts_at_once() {
+        // Nothing about a long session changes the rule: with the cooldown long over, the
+        // close has no window in the way and the packs go back with it.
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("game.exe", "game.exe", 10, now);
         // the lockout ends with the game still running: nothing happens
         assert_eq!(e.tick(now + Duration::from_secs(C)), None);
 
-        // an hour later the game ends: the lockout holds the revert
+        // an hour later the game ends: the revert lands with the close
         let closed = now + Duration::from_secs(3600);
-        assert_eq!(e.on_stopped("game.exe", 10, closed), None);
-        assert!(e.is_applied(), "the packs stay applied while the lockout runs");
+        assert_eq!(
+            e.on_stopped("game.exe", 10, closed),
+            Some(Transition::Reverted)
+        );
+        assert!(!e.is_applied());
         assert_eq!(e.state(closed), EngineState::Cooldown);
         assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
 
-        // the lockout ends: the revert lands now and starts a lockout of its own
-        let expiry = closed + Duration::from_secs(C);
-        assert_eq!(e.tick(expiry), Some(Transition::Reverted));
+        // the window it started runs out quietly: nothing is performed twice
+        assert_eq!(e.tick(closed + Duration::from_secs(C)), None);
         assert!(!e.is_applied());
-        assert_eq!(e.cooldown_remaining(expiry), Some(Duration::from_secs(C)));
+        assert_eq!(e.state(closed + Duration::from_secs(C)), EngineState::Idle);
     }
 
     #[test]
-    fn a_fast_restart_outside_the_lockout_never_reverts() {
-        // The user's scenario (2026-10-21): the game starts, the packs apply, the lockout runs
-        // out while the game is still up, and the game is closed and opened again. The close
-        // lands between two lockouts, so the lockout has to hold the revert: the restart inside
-        // the window cancels it, the packs stay applied, and when the window finally expires the
-        // machine is not put back while the game is running.
+    fn a_fast_restart_after_the_lockout_reverts_and_reapplies_later() {
+        // The trade-off the 2026-10-27 rule accepts, recorded here so nobody re-learns it the
+        // hard way: with the cooldown already over, a close reverts at once, so a restart that
+        // lands in the revert's own window is applied when that window ends. A restart inside
+        // the cooldown of the apply still never reverts — `a_fast_restart_never_reverts`.
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         assert_eq!(
@@ -520,23 +487,25 @@ mod tests {
         assert!(e.is_applied());
         assert_eq!(e.cooldown_remaining(expiry), None);
 
-        // the game is closed: the lockout holds the revert
+        // the game is closed: the revert lands with it, and starts a window
         let closed = now + Duration::from_secs(C + 5);
-        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
-        assert!(e.is_applied(), "the packs stay applied");
-        assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
+        assert_eq!(
+            e.on_stopped("game.exe", 1, closed),
+            Some(Transition::Reverted)
+        );
+        assert!(!e.is_applied());
 
-        // the game is opened again inside the window: the held revert is cancelled
+        // the game is opened again inside that window: the apply waits for it
         let reopened = closed + Duration::from_secs(5);
         assert_eq!(e.on_started("game.exe", "game.exe", 2, reopened), None);
-        assert!(e.is_applied(), "a fast restart never reverts");
+        assert!(!e.is_applied(), "the apply waits for the window");
+        assert_eq!(e.pending_change(), Some(Transition::Applied));
 
-        // the window expires with the game running: the machine is not put back
+        // the window ends with the game running: the packs come back
         let held = closed + Duration::from_secs(C);
-        assert_eq!(e.tick(held), None);
-        assert!(e.is_applied(), "the packs are still applied while the game runs");
-        assert_eq!(e.cooldown_remaining(held), None);
-        assert_eq!(e.state(held), EngineState::Triggered);
+        assert_eq!(e.tick(held), Some(Transition::Applied));
+        assert!(e.is_applied());
+        assert_eq!(e.state(held), EngineState::Cooldown);
     }
 
     #[test]
@@ -691,11 +660,10 @@ mod tests {
     }
 
     #[test]
-    fn a_close_between_two_windows_is_still_held() {
-        // The close lands after a window expired and before the next tick: the machine looks
-        // free, but the close still waits for a window of its own. Otherwise the packs would
-        // go back at once, and the restart that follows would sit in the quiet mode until the
-        // revert's own window was over (the 21 Oct bug).
+    fn a_close_after_the_window_reverts_at_once() {
+        // The cooldown of the apply has run out and the game closes: there is no window in the
+        // way, so the packs go back now — and the revert starts a cooldown of its own
+        // (2026-10-27: a close used to wait a whole cooldown before it was performed).
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         assert_eq!(
@@ -707,74 +675,81 @@ mod tests {
         assert_eq!(e.tick(expiry), None);
         assert_eq!(e.cooldown_remaining(expiry), None);
 
-        // the game closes in the gap: the revert is held, not performed
+        // the game closes after the window: the revert lands at once
         let closed = expiry + Duration::from_secs(1);
-        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
-        assert!(e.is_applied(), "the packs stay applied");
-        assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
-
-        // the window is over: the revert lands
-        let end = closed + Duration::from_secs(C);
-        assert_eq!(e.tick(end), Some(Transition::Reverted));
+        assert_eq!(
+            e.on_stopped("game.exe", 1, closed),
+            Some(Transition::Reverted),
+            "a close with no window running reverts at once"
+        );
         assert!(!e.is_applied());
+        // and it starts a window of its own
+        assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
+        assert_eq!(e.state(closed), EngineState::Cooldown);
     }
 
     #[test]
-    fn a_close_holds_the_revert_and_a_restart_cancels_it() {
-        // The close holds the revert for a window, and a restart inside that window cancels
-        // it: the packs stay applied and the machine is never put back.
+    fn a_restart_after_the_revert_waits_for_the_new_window() {
+        // The close reverts at once and starts a cooldown; a restart inside that cooldown waits
+        // for it, and the packs come back when it ends (2026-10-27).
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("game.exe", "game.exe", 1, now);
         // the machine settles: the lockout of the start runs out
         assert_eq!(e.tick(now + Duration::from_secs(C)), None);
 
-        // the game closes: the revert is held, not performed
+        // the game closes: the revert lands at once, and starts a window
         let closed = now + Duration::from_secs(C + 5);
-        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
-        assert!(e.is_applied(), "the revert is held");
-        assert_eq!(e.state(closed), EngineState::Cooldown);
+        assert_eq!(
+            e.on_stopped("game.exe", 1, closed),
+            Some(Transition::Reverted)
+        );
+        assert!(!e.is_applied());
         assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
 
-        // the game starts again inside the window: the held revert is cancelled
+        // the game starts again inside that window: the apply waits
         let reopened = closed + Duration::from_secs(5);
         assert_eq!(e.on_started("game.exe", "game.exe", 2, reopened), None);
-        assert!(e.is_applied(), "a fast restart never reverts");
+        assert!(!e.is_applied(), "the apply waits for the window");
+        assert_eq!(e.pending_change(), Some(Transition::Applied));
+        assert_eq!(
+            e.cooldown_remaining(reopened),
+            Some(Duration::from_secs(C - 5)),
+            "the window is not restarted"
+        );
 
-        // the window expires with the game running: nothing is put back
+        // the window ends with the game still running: the apply lands and starts one of its own
         let held = closed + Duration::from_secs(C);
-        assert_eq!(e.tick(held), None);
+        assert_eq!(e.tick(held), Some(Transition::Applied));
         assert!(e.is_applied());
-        assert_eq!(e.cooldown_remaining(held), None);
-        assert_eq!(e.state(held), EngineState::Triggered);
+        assert_eq!(e.cooldown_remaining(held), Some(Duration::from_secs(C)));
+        assert_eq!(e.pending_change(), None);
     }
 
     #[test]
-    fn a_held_revert_lands_exactly_once() {
-        // The revert waits for the window, lands when it is over — and only once: a lockout
-        // that expires while the intent is gone changes nothing a second time.
+    fn a_revert_lands_exactly_once() {
+        // The revert lands at once and starts its own window; nothing is performed twice, and
+        // the window it started runs out quietly.
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("game.exe", "game.exe", 1, now);
         assert_eq!(e.tick(now + Duration::from_secs(C)), None);
 
-        // the game closes: the revert is held
+        // the game closes after the window: the revert lands at once
         let closed = now + Duration::from_secs(C + 5);
-        assert_eq!(e.on_stopped("game.exe", 1, closed), None);
-        assert!(e.is_applied());
-
-        // the window is over: the revert lands, and it starts a lockout of its own
-        let expiry = closed + Duration::from_secs(C);
-        assert_eq!(e.tick(expiry), Some(Transition::Reverted));
+        assert_eq!(
+            e.on_stopped("game.exe", 1, closed),
+            Some(Transition::Reverted)
+        );
         assert!(!e.is_applied());
-        assert_eq!(e.cooldown_remaining(expiry), Some(Duration::from_secs(C)));
+        assert_eq!(e.cooldown_remaining(closed), Some(Duration::from_secs(C)));
 
         // nothing more happens: the revert is not performed twice
-        assert_eq!(e.tick(expiry + Duration::from_secs(1)), None);
-        assert_eq!(e.tick(expiry + Duration::from_secs(C + 1)), None);
+        assert_eq!(e.tick(closed + Duration::from_secs(1)), None);
+        assert_eq!(e.tick(closed + Duration::from_secs(C + 1)), None);
         assert!(!e.is_applied());
-        assert_eq!(e.cooldown_remaining(expiry + Duration::from_secs(C + 1)), None);
-        assert_eq!(e.state(expiry + Duration::from_secs(C + 1)), EngineState::Idle);
+        assert_eq!(e.cooldown_remaining(closed + Duration::from_secs(C + 1)), None);
+        assert_eq!(e.state(closed + Duration::from_secs(C + 1)), EngineState::Idle);
     }
 
     #[test]
@@ -1029,19 +1004,21 @@ mod tests {
     }
 
     #[test]
-    fn unpausing_with_nothing_running_schedules_the_revert() {
+    fn unpausing_with_nothing_running_reverts_at_once() {
         let now = t0();
         let mut e = Engine::new(Duration::from_secs(C));
         e.on_started("game.exe", "game.exe", 1, now);
         e.set_paused(true, now);
         e.on_stopped("game.exe", 1, now);
 
-        // nothing runs and the packs are applied: the resume schedules the revert
-        assert_eq!(e.set_paused(false, now), None);
-        assert!(e.is_applied());
-        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
-        assert_eq!(e.tick(now + Duration::from_secs(C)), Some(Transition::Reverted));
+        // nothing runs and the packs are applied: the resume puts them back at once
+        assert_eq!(
+            e.set_paused(false, now),
+            Some(Transition::Reverted),
+            "nothing waits for a window the pause threw away"
+        );
         assert!(!e.is_applied());
+        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
     }
 
     #[test]
