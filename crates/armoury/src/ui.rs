@@ -5602,6 +5602,62 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_catalogue_check_paints_its_message_wrapped() {
+        // The second arm of the failure-line hazard: a failed check leaves no rows,
+        // so the window shows its message alone where the rows would be - and that
+        // message names the URL it could not reach just the same. On the released
+        // v1.2.0 build the window painted that line extend-wide too and clipped it
+        // at the window edge mid-URL; the sibling line above was already wrapped,
+        // and this one wraps like it.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            // The message the console's 404 produced: a fetch error names the URL it
+            // could not reach, so this line is wider than the window.
+            s.catalog = Some(Err(
+                "catalog: cannot fetch \
+                 https://raw.githubusercontent.com/PixelAsh6/ArmouryDaemon_Packs/main/\
+                 catalog/console.zip (HTTP Status 404 Not Found)"
+                    .to_string(),
+            ));
+        }
+        // Two frames, like the sibling above - the wrap must hold a repaint, not
+        // just the first layout. The assertions read the second one.
+        let run = |input: egui::RawInput| {
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| install_packs_ui(ui, &shared));
+            });
+            let text = painted_text(&output);
+            output.drop_without_applying_deltas();
+            text
+        };
+        let _first = run(input.clone());
+        let text = run(input);
+        // The line is painted and it wrapped: no galley of it runs past the window,
+        // the way the fold-in's failure line above is asserted on.
+        let failure = text
+            .iter()
+            .find(|(t, _, _)| t.starts_with("catalog: cannot fetch"))
+            .expect("the catalogue's error line is shown");
+        assert!(
+            failure.1.right() <= INSTALL_PACKS_WIDTH + 0.5,
+            "the catalogue's error line is a wide line: {:?}",
+            failure.1
+        );
+    }
+
+    #[test]
     fn the_picker_says_how_many_matches_it_did_not_show() {
         // A list that reads as complete but is not is a lie: the count is said.
         assert_eq!(more_matches_note(8, APP_MATCH_ROWS), None);
