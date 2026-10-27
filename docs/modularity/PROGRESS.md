@@ -1361,11 +1361,20 @@ the armed Download click downloaded and hash-verified the zip, the
 daemon's re-verification and folder lock held, the module landed in
 `modules/h-harness/` (executable, record, subfolder), the temp archive
 was removed, and the row reads **"v0.99.0 installed"** like any pack row;
-the daemon idles at about 15 ms CPU per 10 s (no regression). One
-failure-mode stays open as a fold-in opportunity: after a **failed**
-helper download (a 404 mid-download), the row offered no button again -
-the state survived a fresh check and a window reopen until the process
-restarted (screenshots kept in `%TEMP%\opencode\b5-ui-05..09.png`).
+the daemon idles at about 15 ms CPU per 10 s (no regression).
+**Fold-in (branch fix/fold-in-blank-row):** the
+failed-helper-download blank row was the failure line. The Modules window
+paints the last op line (a fetch error names its URL: "catalog: cannot
+fetch …/console.zip") with the window's extend-wide mode and no width
+cap inside the scroll list, so the one wide galley widened the list, the
+rows' right-aligned buttons were laid out past the window edge and
+clipped away to background; the line survives a fresh check and a
+window close (nothing clears `last_pack_op` but the settings window
+reopening or process death), so the button came back only on restart.
+The fix wraps that line like the notes under the rows; it is proven by
+the headless paint test `a_failed_download_leaves_the_row_offering_the_button`,
+red before the fix (`eb7ef63`) and green after it; the run ids, the
+merge commit and the totals join this entry once `main` is green.
 The repo-wide non-English character audit found nothing outside the
 accepted glyph set introduced by B4/B5; the characters that do appear
 (pre-paint glyph art, minus and comparison signs in the docs' byte
