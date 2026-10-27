@@ -186,11 +186,12 @@ New `Request` variants in `crates/armoury-core/src/protocol.rs` (the enum runs f
 - **C2.** `show_console()` (`daemon.rs:2008`) currently spawns
   `Command::new(current_exe()).arg("--console")`. Spawn the installed helper when one
   is present; fall back to `current_exe() --console` otherwise. — **done
-  (2026-10-27)**: `show_console` (now `daemon.rs:2268` — the file moved) picks the
+  (2026-10-27)**: `show_console` (now `daemon.rs:2290` — the file moved) picks the
   first `modules/<id>/` whose recorded `entry` runs `ArmouryConsole.exe`, by file
-  name, case-insensitive, lower id first (`console_helper`, `daemon.rs:731`), logs the
-  module's id, version and path, and refuses a module whose exe is gone from disk;
-  without a helper it logs and takes the old `current_exe() --console` fallback. The
+  name, case-insensitive, lower id first (`matches_console_entry` `:723`,
+  `console_helper` `:733`), logs the module's id, version and path, and refuses a
+  module whose exe is gone from disk; without a helper it logs and takes the old
+  `current_exe() --console` fallback. The
   spawn keeps `CREATE_NO_WINDOW` and the child inherits the environment, so the
   `ARMOURY_TEST_NS` pipe namespacing rides along unchanged. Harness 20f installs and
   removes a console helper over the pipe and checks both log lines; the selection is

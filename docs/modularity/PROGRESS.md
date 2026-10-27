@@ -10,13 +10,13 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`), **B4** (`4d7886b`) and **B5 done and merged** (`3f3a772`): a helper installs through the daemon's `InstallHelper` request, the Modules window's helper buttons are armed, and the daemon re-verifies the archive's bytes before they land anywhere. **The tree became 1.2.0 and the release is published** (2026-10-27, tag `v1.2.0` on `e9e393a`). The packs repo's flip is published and signed (the prepared `539773c` + `2cd49ce` pushed to the packs repo's `origin/main`, the signature committed as `f4d1604` behind them); the `C:\Apps` install of the stashed exe is the user's call |
-| **Next action** | **Phase C** (the console as a helper module; read `WORK-ORDER.md`'s C section first), plus the fold-in opportunities: the dashboard cooldown-gap, audio_mute_all crash-recovery, the harness 12c caveat, the tautological tests, the sleep/resume lockout, and the harness 20a literal version at `tools/daemon-selftest.ps1:1110` (bumped to 1.2.0; the check itself remains literal). Ask the user before taking any of them in |
-| **Branch** | **1.2.0 released; `feature/b5-helper-request` pruned (its tip `8d5f33f` is inside `main`).** Counts stand: **410 unit tests** (304 in `armoury` + 106 in `armoury-core`), **163 harness checks** (160 PASS + the real-catalogue pair as 2 SKIP until the flip - the flip is published and signed now, so the next CI run is the pair's first run without its SKIP reason); the released exe is **13,325,824 bytes** (+512 over the B5 branch tree's 13,325,312), sha256 `355b7dc1…a561`, `VCRUNTIME140.dll` still absent; the three runs on `e9e393a` are all green (main CI `40465726424` 6m41s, tag CI `40465726735` 9m14s, Release `40465726898` 7m06s). Idle cost **did not regress**: the daemon idles at about **15 ms of CPU per 10 s** with windows open (the UI's own redraw cost is separate) - same shape as the B4 measurement |
+| **Phase** | C — **C1, C2 and C3 done**; **C4 decided dead** (the SteamGridDB key stays in the elevated daemon). The console launcher is its own exe: **`ArmouryConsole.exe`** (7,036,928 bytes, a second `[[bin]]` of the `armoury` crate with its own crate root declaring the seven shared modules with `#[path]`), `net.rs`/`fonts.rs`/`dpi.rs` were lifted out of `catalog.rs`/`ui.rs`/`main.rs` so both binaries share them, and `show_console` prefers a console helper under `modules/<id>/`, logging id+version+path, with the `current_exe() --console` fallback behind it (`DECISIONS.md` §29) |
+| **Next action** | The pending C1-C3 entry landed here as its own commit — the merge into `main` and its post-merge run complete this session; **Phase D** (distribution: the Inno installer, the build-from-source script, the self-update decision) is the next work-order phase |
+| **Branch** | **`feature/c1-c3-console-split` delivered; pruned after the merge (its tip is inside `main`).** Counts stand: **417 unit tests** (311 in the `armoury` daemon binary + 106 in `armoury-core`; the unit-test total grew by the six C2 selection tests), **169 harness checks** (all PASS; the real-catalogue pair ran signed, 0 SKIP). The artefact's exes: daemon **13,331,456 bytes** (+5,632 over the released v1.2.0 asset — the re-homing + the C2 selection), console **7,036,928 bytes** (the phase's own deliverable), no `VCRUNTIME140.dll` in either, `requireAdministrator` in both (the icon+manifest ride every bin of the crate). Idle cost **did not regress**: 60 s samples on throw-away namespaced instances, median of 3 alternating: v1.2.0 **0.125 CPU s (0.21 % of a core)**, the C tree **0.109 CPU s (0.18 %)** |
 | **Tree** | clean |
 | **Blocking** | nothing |
-| **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
-| **Not measured** | the **idle cost** - no phase since 1.1.5 has touched the idle path, and the 1.1.5 tree's idle cost is itself not measured (the user declined the sampling). The number in `GOTCHAS.md` is the pre-1.1.5 one and does not belong to this tree |
+| **Open questions** | none — C4 is settled dead, the helper-preference rule is settled in §29 |
+| **Not measured** | the idle cost of the *installed* daemon shape (the four tracked apps) — the throw-away instances carry the three shipped packs but no tracked apps, as since 1.1.5 |
 
 ---
 
@@ -1501,6 +1501,113 @@ after the flip tells what it sees.
 
 **Next.** Phase C and the fold-ins, unchanged from the entry above. The
 `C:\Apps` install of the stashed exe is still the user's call.
+
+---
+
+### 2026-10-27 — Phase C1-C3: the console is its own exe, and the daemon prefers it
+
+**What I did.** The console launcher became its own binary
+(**`ArmouryConsole.exe`**, a second `[[bin]]` of the `armoury` crate with the
+crate root `src/console_bin.rs`, which declares the seven modules the band
+carries with `#[path]` — `art`, `console_ui`, `dpi`, `fonts`, `net`, `pad`,
+`pick`), and `show_console` learned an order of who to run: the first
+`modules/<id>/` whose recorded `entry` **ends with** `ArmouryConsole.exe`
+(case-insensitive, lower id first, a module whose exe is gone is skipped),
+its id, version and path logged, and the old `current_exe() --console`
+fallback behind it, with the same `CREATE_NO_WINDOW` and inherited
+environment (`ARMOURY_TEST_NS` pipe namespacing rides along). Three small
+modules moved whole so both binaries could share them: `net.rs` (the one
+HTTP client, out of `catalog.rs`; `catalog::agent` retired, four callers now
+use `net::agent`), `fonts.rs` (the system font install, out of `ui.rs`) and
+`dpi.rs` (Per-Monitor-V2 awareness, out of `main.rs`). **C4 was decided
+dead** by the user — the SteamGridDB key stays in the elevated daemon
+exactly as-is; nothing in the sgdb pathway moved. **C3 needed nothing**: no
+protocol change, `Request::ConsoleHello` and the JSONL pipe are untouched.
+
+**Files touched.** `crates/armoury/Cargo.toml` (the bin target, `test =
+false`), `crates/armoury/src/{console_bin,dpi,fonts,net}.rs` (new),
+`crates/armoury/src/{main,ui,console_ui,art,catalog,daemon}.rs` (the
+re-homing, the selection, four `dpi::error` readers), `.github/workflows/ci.yml`
+(the artefact also carries the console exe), `tools/daemon-selftest.ps1`
+(scenario 20f, six checks, plus two helpers: `Wait-DaemonLogLine` and
+`Format-DaemonLogTail`), `DECISIONS.md` §29, `DESIGN.md` §8/§9, `GOTCHAS.md`
+traps 59-60, the top of this file, this entry, `README.md`, `CHANGELOG.md`.
+
+**Measured.**
+
+| | before | after |
+|---|---|---|
+| The unit tests | 411 (305 in `armoury` + 106 in `armoury-core`) | **417 (311 + 106)** — the six C2 selection tests; `test = false` on the console bin keeps the shared modules' tests single-run |
+| The harness checks | 163 (`Check` calls; the run printed 160 PASS + 2 SKIP for the real-catalogue pair) | **169** — six 20f checks, and the run printed **all 169 PASS / 0 SKIP: the real-catalogue pair ran signed** — the post-flip run the top block promised |
+| The release exes | daemon 13,325,824 bytes (released v1.2.0) | daemon **13,331,456** (+5,632, +0.04 % — the re-homing and the C2 selection only), console **7,036,928** bytes, the phase's own deliverable; no `VCRUNTIME140.dll` in either, `requireAdministrator` in both (the icon+manifest ride every bin) |
+| The daemon's idle cost | not comparable (see below) | **0.125 CPU s in 60 s = 0.21 % of one core** (v1.2.0, median of 3) vs **0.109 CPU s = 0.18 %** (the C tree, median of 3) — no regression |
+
+*Idle cost:* the A1 method, alternating, medians of three 60 s samples on
+throw-away namespaced instances (`ARMOURY_TEST_NS`, `--autostart`, the three
+shipped packs, no tracked apps — the installed daemon's four-app shape is
+left unmeasured, as since 1.1.5). `show_console` runs on request, not on the
+idle path, so no regression is also the expected shape.
+
+*Exe size:* the release builds of the run's artefact
+(`armourydaemon-windows-x64`, now carrying all three files). The size rule:
+Phase C is explicitly allowed to add (the second exe is C1's deliverable);
+the daemon exe's own +5,632 is the honest cost of the re-homing plus the
+C2 decision code — `DECISIONS.md` §29 records both.
+
+*The branch's runs:*
+
+| Run | What | Conclusion | Wall time |
+|---|---|---|---|
+| `40495766191` | the tests-only commit (`1664c85`, dispatch) — **red**: `E0425 cannot find function console_helper/matches_console_entry`, seven errors in the ArmouryDaemon test build | failed | 1m18s |
+| `40496720091` | the implementation — **red**: `E0308`, the fallback match arm's `.arg("--console")` handed back `&mut Command` while the helper arm builds an owned `Command` | failed | 1m01s |
+| `40497404892` | `1dc48c0` (`let mut` fix) — **red in the harness**: the 20f module exe was the B3 fixture's 78-byte placeholder, and the daemon **froze silently inside `spawn`** after logging its choice; no later check could pass | failed | 5m05s |
+| `40498530997` | `176f8c9` (the 20f checks carry the daemon's own log lines) — **red, and diagnosed**: the log dump shows the choice line as the daemon's last words, the frozen spawn, nothing else for 20+ s | failed | 5m33s |
+| `40499523579` | `dd93fb1` (the 20f module now carries a real image, a copy of `cmd.exe` under the console's name) — **green**: 311 + 106 tests, **169 checks ALL PASSED / 0 SKIP**, and the artefact above | green | 11m12s |
+
+**Decisions.** `DECISIONS.md` §29: one crate, two binaries (no new crate, no
+lib split); the three whole-module re-homes; the helper preference by file
+name, deterministic, checked; C4 dead; the accepted costs on both sides. The
+`test = false` on the console bin is recorded there too — the shared modules'
+tests run once, in the daemon binary's test harness, which compiles the
+identical sources.
+
+**Surprises.**
+
+- **The `#[path]` rule of a non-`main.rs` crate root** was found reading,
+  not from a red run: `src/console_bin.rs` declaring `mod art;` would look
+  for `src/console_bin/art.rs`. Seven `#[path = "…"]` declarations, no
+  restructuring (trap 59).
+- **A malformed image can freeze the daemon inside `spawn` — on the CI
+  runners, twice, reproducibly; on this machine the same file fails in 54 ms
+  with BadExeFormat.** The helper-choice probe shipped with the B3 fixture,
+  logged its choice and went silent forever: no later request, no later log
+  line, fully six minutes to the run's end. The diagnosis took one extra
+  run (the checks now carry the daemon's own log tail), and the rule is in
+  trap 60: a harness probe that asks the daemon to spawn a file must hand it
+  a real PE.
+- **The two-code-commit reds (`E0425`, `E0308`) each cost exactly one little
+  price**: the tests-first shape pays for itself again — the first red named
+  the missing functions, the second was one arm of the new `match` (chained
+  builder methods hand back `&mut Command`; the arm has to build the owned
+  command and return it — GOTCHAS trap 47's family, one more member).
+- **The release grows twice now.** The same seven sources compile into both
+  binaries; the acceptance's size rule was written for the one exe, so
+  §29 records the daemon exe's +5,632 against its baseline and the console
+  exe as the phase's own deliverable.
+- **The console exe asks for administrator rights** — `build.rs` links the
+  same `.res` into every bin of the crate (`rustc-link-arg-bins`), so the
+  icon and the `requireAdministrator` manifest ride ArmouryConsole.exe as
+  well, exactly like the `--console` mode of the daemon binary did. A
+  non-elevated helper was never the design (C4's linked-token story died
+  with it); the harness's C2 install probe is unaffected because only the
+  *probe exes* raise UAC, never the daemon.
+
+**Next.** Merge `feature/c1-c3-console-split` into `main` with a plain
+`--no-ff` merge (this session), watch the post-merge run, prune the branch.
+**Phase D** is next in the work order — the Inno installer (`D1`), the
+build-from-source script (`D2`), and the self-update decision (`D3`); the
+`C:\Apps` install of 1.2.0, the signing key and the next release remain the
+user's calls.
 
 ---
 
