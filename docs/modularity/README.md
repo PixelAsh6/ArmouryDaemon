@@ -43,9 +43,10 @@ background.
   (`net.rs`/`fonts.rs`/`dpi.rs` moved out of `catalog.rs`/`ui.rs`/`main.rs` so both
   binaries share them), `show_console` prefers an installed
   `modules/<id>/ArmouryConsole.exe` helper (the module's id, version and path logged,
-  lower id first, a module whose exe is gone skipped), and the old
-  `current_exe() --console` fallback stays behind it with the environment untouched —
-  so `ARMOURY_TEST_NS` still namespaces the pipe end to end. **C4 is dead**: the
+  lower id first, a module whose exe is gone skipped). **Since 2026-10-27 the console is
+  only a pack**: the `--console` entry point and the console UI module are out of the
+  daemon binary, and `show_console` with no helper logs that the pack is missing and
+  starts nothing. **C4 is dead**: the
   SteamGridDB key stays in the elevated daemon. Counts: **417 unit tests**
   (311 `armoury` + 106 `armoury-core`), **169 harness checks, 0 SKIP** (the
   real-catalogue pair ran against the signed live manifest for the first time), daemon

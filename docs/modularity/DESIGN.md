@@ -317,7 +317,7 @@ module needs.
 | `suspends_packs` | `daemon.rs:1726` (`enter_idle`) / `:1759` (`exit_idle`) | the mode drives `Engine::set_idle` |
 | `react_to_tracked` | `daemon.rs:1350` | a tracked app starting while the mode is engaged re-engages it |
 | Installing a module | `daemon.rs:2572` (the `InstallPack` handler) | one handler per kind |
-| The console helper | `daemon.rs:2024` (`show_console`) | **done in C2**: spawn the installed helper, fall back to `current_exe() --console` (`DECISIONS.md` §29) |
+| The console helper | `daemon.rs:2024` (`show_console`) | **done in C2, completed 2026-10-27**: spawn the installed helper; with none installed, log that the console pack is missing and start nothing (`DECISIONS.md` §29) |
 | The killswitch | `daemon.rs:1919` (`toggle_killswitch`) | **done in A5**: `killswitch_enabled` (default `true`, doubles as the "module installed" flag), `set_killswitch` over the pipe, and a release on quit (`DECISIONS.md` §23) |
 
 The pack worker **was** a single serial thread (`packs.rs:171`,

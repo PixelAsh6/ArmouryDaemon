@@ -547,6 +547,24 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     installed") and the five checks after the failed one passed. Rule:
     `Send-And-Wait <json> 'pack_op'` is for checks that look at the
     answer; `Send-Pipe` stays for fire-and-forget sends.
+62. **`git commit --amend` commits the INDEX, not the working tree.** Two
+    commits in a row amended after a `str_replace` fix but before `git add`
+    rebuilt the same broken tree, and CI failed identically twice. Worse,
+    the second run's record stuck as `in_progress` after the job had
+    finished (13 s build failure), so `gh run view --log-failed` refused and
+    the compiler message had to be fetched through the API
+    (`gh api repos/.../actions/jobs/<id>/logs`). Rule: after an amend that is
+    meant to fix a build, run `git show HEAD:<file> | grep <the fix>` — the
+    committed blob, not the working copy, is what CI builds.
+63. **A window's rect read by title can belong to a window that is not on
+    screen.** `FindWindowW(None, title)` finds a minimized window too, and
+    Windows parks those at about **-32000**. Feed that to the chain placement
+    and it clamps to the work area's top-left: `(20, 20)`. This machine runs
+    two `ArmouryDaemon.exe` processes (the installed daemon and the test
+    copy), so a title is not unique either. `on_screen_rect` (ui.rs) rejects
+    such a rect at both lookups; when reading a *new* window's rect, prefer
+    the viewport's own `ctx.input(|i| i.viewport().outer_rect)` over a title
+    lookup.
 
 ---
 

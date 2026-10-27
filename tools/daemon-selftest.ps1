@@ -1131,7 +1131,7 @@ try {
         $probe = Invoke-CliProbe @('--help')
         $r = $probe.Run
         Check 'help exits 0' ($r.Exit -eq 0) $probe.Detail
-        $flags = @('--autostart', '--ui', '--console', '--catalog-list', '--catalog-install', '--catalog-url', '--module-list', '--version', '--help')
+        $flags = @('--autostart', '--ui', '--catalog-list', '--catalog-install', '--catalog-url', '--module-list', '--version', '--help')
         $missing = @($flags | Where-Object { -not $r.Text.Contains($_) })
         Check 'help lists every flag the binary accepts' ($missing.Count -eq 0) "missing: $($missing -join ' ')"
 
@@ -1475,13 +1475,13 @@ function Format-DaemonLogTail([int]$lines = 8) {
 
 # -- 20f. show_console prefers an installed console helper (Phase C1/C2) --
         #
-        # The console is its own exe now (ArmouryConsole.exe), and a helper module that
-        # carries it is installed through the B5 request. show_console must prefer that
-        # module's exe (`modules/<id>/ArmouryConsole.exe`) over the `--console` fallback on
-        # the daemon binary. The module here carries a **real** image (a copy of cmd.exe
-        # under the console's name): a malformed image froze the daemon's main loop inside
-        # CreateProcess on a runner twice now (trap 60), and the fallback afterward starts
-        # a real band, which the probe ends by the pid the daemon logged.
+        # The console is its own exe (ArmouryConsole.exe) and it is a **pack**: a helper
+        # module that carries it is installed through the B5 request, and show_console
+        # launches that module's exe. Since 2026-10-27 there is no `--console` fallback on
+        # the daemon binary at all: with the helper removed again, show_console must name the
+        # missing pack and start nothing. The module here carries a **real** image (a copy of
+        # cmd.exe under the console's name): a malformed image froze the daemon's main loop
+        # inside CreateProcess on a runner twice now (trap 60).
         $consoleZip = Join-Path $env:TEMP 'armoury-catalog-h-console.zip'
         $consoleStage = Join-Path $cliDir 'console-zip'
         New-Item -ItemType Directory -Force -Path $consoleStage | Out-Null
@@ -1513,15 +1513,13 @@ function Format-DaemonLogTail([int]$lines = 8) {
         Remove-Item -LiteralPath $consoleStage -Recurse -Force -ErrorAction SilentlyContinue
         Send-Pipe '{"type":"show_console"}' | Out-Null
         "20f after the second show_console: $(Format-DaemonLogTail 12)"
-        $fallbackLine = Wait-DaemonLogLine 'console launcher: no helper module'
-        Check 'show_console falls back to the daemon exe' (($null -ne $fallbackLine) -and ($fallbackLine.Contains('--console'))) "log: $(Format-DaemonLogTail)"
-        $childLine = Wait-DaemonLogLine 'spawned console launcher \(pid (\d+)\)'
-        Check 'the fallback spawns a console launcher' ($null -ne $childLine) "log: $(Format-DaemonLogTail)"
-        if ($childLine -match 'pid (\d+)') {
-            # the band is up for a moment; then it is stopped - the daemon keeps the
-            # child as its launcher, and the probe is done with it
-            Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue
-        }
+        # 2026-10-27: there is no fallback any more. The console is a pack, so with no helper
+        # installed show_console must name the missing pack and start nothing at all.
+        $missingLine = Wait-DaemonLogLine 'console launcher: the console pack is not installed'
+        Check 'show_console names the missing console pack' ($null -ne $missingLine) "log: $(Format-DaemonLogTail)"
+        Start-Sleep -Seconds 1
+        $spawned = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match 'spawned console launcher' })
+        Check 'without the pack nothing is spawned' (@($spawned).Count -eq 1) "spawned=$(@($spawned).Count)"
 
         $env:ARMOURY_TEST_NS = $ns
     }
