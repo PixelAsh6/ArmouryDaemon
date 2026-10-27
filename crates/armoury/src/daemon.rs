@@ -3244,6 +3244,123 @@ mod tests {
         );
     }
 
+    /// The console helper the daemon spawns (C2): the tests install real helper modules
+    /// into scratch `modules/` folders with the same machinery the request path uses, and
+    /// read the selection back through the same scan.
+    fn console_zip(entry: &str) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(entry, options)
+            .expect("a plain name always starts");
+        zip.write_all(b"MZ helper placeholder - nothing here runs in the tests")
+            .expect("entry bytes");
+        zip.finish().expect("the archive always finishes");
+        buffer.into_inner()
+    }
+
+    fn install_console_helper(search: &[std::path::PathBuf], id: &str, entry: &str) {
+        let pack = catalog::CatalogPack {
+            id: id.to_string(),
+            name: "Console helper".to_string(),
+            version: "1.0.0".to_string(),
+            description: String::new(),
+            kind: "helper".to_string(),
+            file: String::new(),
+            sha256: "not-checked-here".to_string(),
+            size: None,
+            min_engine: None,
+            entry: Some(entry.to_string()),
+        };
+        helpers::install_from_bytes(search, &pack, &console_zip(entry))
+            .expect("the helper installs");
+    }
+
+    #[test]
+    fn the_installed_console_helper_is_preferred() {
+        let scratch = Scratch::dir("console-helper");
+        let dirs = vec![scratch.root().to_path_buf()];
+        install_console_helper(&dirs, "console-test", "ArmouryConsole.exe");
+        let found = console_helper(&dirs).expect("the installed helper is the console");
+        assert_eq!(found.id, "console-test");
+        assert_eq!(
+            found.path,
+            scratch
+                .root()
+                .join("modules")
+                .join("console-test")
+                .join("ArmouryConsole.exe"),
+            "the helper's own recorded entry is what would be spawned"
+        );
+    }
+
+    #[test]
+    fn the_console_entry_matches_by_file_name_only() {
+        // The record's entry may name a subfolder; the file name alone has to decide.
+        for entry in [
+            "ArmouryConsole.exe",
+            "console/ArmouryConsole.exe",
+            "armouryconsole.EXE",
+        ] {
+            assert!(
+                matches_console_entry(entry, "ArmouryConsole.exe"),
+                "the entry {entry} is the console"
+            );
+        }
+        for entry in ["Run.exe", "ArmouryConsole.exe.old", ""] {
+            assert!(
+                !matches_console_entry(entry, "ArmouryConsole.exe"),
+                "the entry {entry:?} is not the console"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_with_another_entry_is_not_the_console() {
+        let scratch = Scratch::dir("console-helper-other");
+        let dirs = vec![scratch.root().to_path_buf()];
+        install_console_helper(&dirs, "run-check", "Run.exe");
+        assert!(
+            console_helper(&dirs).is_none(),
+            "a helper that does not carry the console exe is not the console"
+        );
+    }
+
+    #[test]
+    fn a_console_helper_whose_exe_is_gone_is_skipped() {
+        let scratch = Scratch::dir("console-helper-gone");
+        let dirs = vec![scratch.root().to_path_buf()];
+        install_console_helper(&dirs, "console-gone", "ArmouryConsole.exe");
+        let exe = scratch
+            .root()
+            .join("modules")
+            .join("console-gone")
+            .join("ArmouryConsole.exe");
+        std::fs::remove_file(&exe).expect("the entry exe is removed");
+        assert!(
+            console_helper(&dirs).is_none(),
+            "a recorded entry without a file on disk is not a launcher"
+        );
+    }
+
+    #[test]
+    fn two_console_helpers_pick_the_lower_id() {
+        let scratch = Scratch::dir("console-helper-order");
+        let dirs = vec![scratch.root().to_path_buf()];
+        install_console_helper(&dirs, "b-check", "ArmouryConsole.exe");
+        install_console_helper(&dirs, "a-check", "ArmouryConsole.exe");
+        let found = console_helper(&dirs).expect("one of the two is chosen");
+        assert_eq!(found.id, "a-check", "the choice must be deterministic: the lower id");
+    }
+
+    #[test]
+    fn no_modules_folder_leaves_the_console_to_the_fallback() {
+        let scratch = Scratch::dir("console-helper-none");
+        let dirs = vec![scratch.root().to_path_buf()];
+        assert!(console_helper(&dirs).is_none());
+    }
+
     #[test]
     fn launcher_entries_drop_hidden_tracked_apps_and_dedupe_pins() {
         let mut cfg = AppConfig::default();
