@@ -6825,16 +6825,29 @@ mod tests {
             assert!(Instant::now() < deadline, "the second download never finished");
             thread::sleep(Duration::from_millis(20));
         }
-        // The second one is queued behind the first, whichever download landed first.
-        let (queued, up) = {
+        // The second one is queued behind the first, whichever download landed first. The
+        // sheet holds the pack as its own file names it (its `file` is empty: it came from
+        // the pack.json, not from the catalogue), the queue holds the catalogue entry.
+        let queued = {
             let s = shared.lock().unwrap();
-            (
-                s.update_queue.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-                s.consent.as_ref().map(|c| c.entry.id.clone()),
-            )
+            s.update_queue
+                .iter()
+                .map(|e| (e.id.clone(), e.file.clone()))
+                .collect::<Vec<_>>()
         };
         assert_eq!(queued.len(), 1, "one pack waits for its turn: {queued:?}");
-        assert_ne!(Some(queued[0].clone()), up, "the queued one is not the one on screen");
+        assert!(
+            !queued[0].1.is_empty(),
+            "the queued one is the catalogue entry, not the sheet: {queued:?}"
+        );
+        assert!(
+            consent.path.exists(),
+            "the sheet's verified file is still there"
+        );
+        assert!(
+            consent.entry.file.is_empty(),
+            "the sheet was built from the pack file"
+        );
         let _ = std::fs::remove_file(&consent.path);
     }
 
