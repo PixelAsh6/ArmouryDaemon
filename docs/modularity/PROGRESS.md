@@ -1373,8 +1373,14 @@ window close (nothing clears `last_pack_op` but the settings window
 reopening or process death), so the button came back only on restart.
 The fix wraps that line like the notes under the rows; it is proven by
 the headless paint test `a_failed_download_leaves_the_row_offering_the_button`,
-red before the fix (`eb7ef63`) and green after it; the run ids, the
-merge commit and the totals join this entry once `main` is green.
+red before the fix and green after it. Runs: test-only commit `eb7ef63`
+→ red run `40462141865` (the new test fails exactly where the buttons
+were clipped: assertion `left == right` failed, 0 painted down of 2,
+and 303 other tests passed); fix commit `cb2b8dd` → green run
+`40462668740`; merge `ca575a6` → green run `40463810803`. Totals on
+both green runs and at the merge: **410 unit tests** (304 in `armoury`
++ 106 in `armoury-core`, 0 failed) and the harness's **163 checks**
+(160 PASS + 2 SKIP for the real-catalogue pair, **ALL CHECKS PASSED**).
 The repo-wide non-English character audit found nothing outside the
 accepted glyph set introduced by B4/B5; the characters that do appear
 (pre-paint glyph art, minus and comparison signs in the docs' byte
