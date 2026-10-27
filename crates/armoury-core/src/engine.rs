@@ -192,13 +192,15 @@ impl Engine {
 
     /// Freeze/thaw *automatic* switching. Pausing drops the window (no pack change may happen)
     /// and makes the intent match the current state, so nothing is held back. Unpausing catches
-    /// up at once — the window is gone, so there is nothing to wait for: a running tracked app
-    /// is applied right away, and with nothing running the revert lands right away and starts a
-    /// window of its own. Manual actions never go through here (the daemon forces them).
+    /// up at once — the window is gone, so there is nothing to wait for — and it is the user's
+    /// own action, so it is performed like every other manual one: it changes the packs and
+    /// starts **no** window. Manual actions never go through here (the daemon forces them).
     pub fn set_paused(&mut self, paused: bool, now: Instant) -> Option<Transition> {
         if self.paused == paused {
             return None;
         }
+        // A resume is the user's own action: the clock plays no part in it.
+        let _ = now;
         self.paused = paused;
         if paused {
             // Freeze: drop the window. The intent matches the machine, so nothing is held.
@@ -215,13 +217,17 @@ impl Engine {
             }
             self.applied = true;
             self.last_source = Some(self.source_label());
-            self.lock = Some(Window::new(now, self.cooldown));
             return Some(Transition::Applied);
         }
-        // Nothing is running: the revert lands now and starts a window of its own.
+        // Nothing is running: the revert lands now. A manual action starts no window.
         self.desired = false;
         self.lock = None;
-        self.try_change(now)
+        if self.applied {
+            self.applied = false;
+            self.last_source = None;
+            return Some(Transition::Reverted);
+        }
+        None
     }
 
     /// Enter or leave idle mode (black screens + muted audio). Entering reverts whatever is
@@ -1018,7 +1024,11 @@ mod tests {
             "nothing waits for a window the pause threw away"
         );
         assert!(!e.is_applied());
-        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
+        assert_eq!(
+            e.cooldown_remaining(now),
+            None,
+            "a manual action starts no window"
+        );
     }
 
     #[test]
