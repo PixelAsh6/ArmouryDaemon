@@ -2545,12 +2545,21 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 if let Some((ok, message)) = last_op {
-                    ui.small(
-                        RichText::new(message).color(if ok {
+                    // A fetch error names the URL it could not reach ("catalog: cannot
+                    // fetch … /console.zip"), so this line can be wider than the window -
+                    // and this window paints its labels extend-wide. One wide line widened
+                    // the whole list: the rows below were laid out into the wider room, so
+                    // their right-aligned buttons sat past the window edge and clipped
+                    // away to background where the Download button belonged - until the
+                    // process was killed, for a fresh check and a window reopen leave the
+                    // line in place. Wrap the line, like the notes under the rows are.
+                    ui.add(
+                        egui::Label::new(RichText::new(message).small().color(if ok {
                             Color32::from_rgb(52, 211, 153)
                         } else {
                             Color32::from_rgb(248, 113, 113)
-                        }),
+                        }))
+                        .wrap(),
                     );
                     ui.add_space(4.0);
                 }
