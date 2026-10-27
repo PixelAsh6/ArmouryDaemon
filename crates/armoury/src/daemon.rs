@@ -2305,7 +2305,7 @@ impl App {
         // Prefer an installed helper module (C2): the console is its own exe
         // (`ArmouryConsole.exe`) that a catalogue helper installs under `modules/<id>/`.
         // What remains is the old fallback: this very executable's `--console` mode.
-        let command = match console_helper(&pack_search_dirs()) {
+        let mut command = match console_helper(&pack_search_dirs()) {
             Some(module) => {
                 info!(
                     "console launcher: using module {} v{} ({})",
