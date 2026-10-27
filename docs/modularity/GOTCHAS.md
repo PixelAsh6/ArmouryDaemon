@@ -511,6 +511,16 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     `protocol_version = "HTTP/1.1"` (keep-alive) fixed it. Only a
     hand-rolled development server hits this; a real catalogue host
     keep-alives on its own.
+59. **A crate root that is not `main.rs` resolves its modules from its own
+    folder.** Phase C1 put a second `[[bin]]` in the `armoury` crate with
+    the crate root `src/console_bin.rs`; a bare `mod art;` there would look
+    for `src/console_bin/art.rs`, which does not exist. The modules the two
+    binaries share are declared with `#[path = "art.rs"] mod art;` (and so
+    on) in `console_bin.rs` - the same trick `#[cfg(test)] pub(crate) mod
+    testutil;` needed no help for, because `main.rs` sits at `src/` and
+    gets the root path free. Related house rule from B3: sibling modules
+    inside a shared file must name each other `crate::foo`, never bare
+    `foo`.
 
 ---
 

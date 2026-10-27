@@ -2305,7 +2305,7 @@ impl App {
         // Prefer an installed helper module (C2): the console is its own exe
         // (`ArmouryConsole.exe`) that a catalogue helper installs under `modules/<id>/`.
         // What remains is the old fallback: this very executable's `--console` mode.
-        let mut command = match console_helper(&pack_search_dirs()) {
+        let command = match console_helper(&pack_search_dirs()) {
             Some(module) => {
                 info!(
                     "console launcher: using module {} v{} ({})",
@@ -2324,7 +2324,9 @@ impl App {
                     }
                 };
                 info!("console launcher: no helper module — running {} --console", exe.display());
-                Command::new(exe).arg("--console")
+                let mut fallback = Command::new(exe);
+                fallback.arg("--console");
+                fallback
             }
         };
         match command.creation_flags(CREATE_NO_WINDOW).spawn() {

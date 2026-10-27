@@ -3,6 +3,32 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **The console launcher is its own executable.** `ArmouryConsole.exe`
+  (`--console`'s band, built from the same `console_ui`/`art`/`pad` sources
+  the daemon binary compiles) is the "helper module" shape of Phase C: a
+  catalogue entry of kind "helper" whose archive carries
+  `ArmouryConsole.exe`.
+- **The daemon prefers the installed console helper.** `show_console`
+  spawns the first `modules/<id>/ArmouryConsole.exe` a helper module
+  recorded (`module.json`'s `entry`, matched by file name, lower id first,
+  a module whose exe is gone is skipped), logs its id, version and path,
+  and falls back to `current_exe() --console` - the old path, unchanged in
+  behaviour - when no helper is installed
+  (`docs/modularity/DECISIONS.md` §29).
+
+### Changed
+
+- The process-wide HTTP client moved from `catalog.rs` to a shared
+  `net.rs` (`net::agent`), so the console exe needs no catalogue machinery;
+  `catalog::agent` retired. The system font install (`ui.rs`) and the
+  Per-Monitor-V2 awareness switch (`main.rs`) moved to `fonts.rs` and
+  `dpi.rs` the same way. No behaviour changed: same client, same fonts,
+  same DPI switch, one more binary.
+
 ## [1.2.0] - 2026-10-27
 
 ### Added
