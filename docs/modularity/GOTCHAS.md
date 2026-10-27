@@ -536,6 +536,17 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     never execute anything stay as they are. Rule: **a piece of the harness
     that asks the daemon to spawn a file must hand it a real PE, or it is
     not testing the spawn.**
+61. **A reply-asserting pipe check must read until its message type - the
+    daemon's status heartbeat can arrive first.** The daemon pushes
+    `Response::Status` to every open pipe connection at least once a
+    second (the `last_broadcast` heartbeat in `daemon.rs`'s request tick),
+    so a check that reads one line reads whichever lands first. The 20f
+    probe wrote `install_helper`, read the connection's first line, and
+    got a status object (`uptime_secs: 5`) instead of the `pack_op` ack -
+    the install had succeeded (the daemon's log said "Console helper
+    installed") and the five checks after the failed one passed. Rule:
+    `Send-And-Wait <json> 'pack_op'` is for checks that look at the
+    answer; `Send-Pipe` stays for fire-and-forget sends.
 
 ---
 

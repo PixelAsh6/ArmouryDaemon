@@ -1449,8 +1449,13 @@ try {
         $requestHash = (Get-FileHash -LiteralPath $requestZip -Algorithm SHA256).Hash.ToLowerInvariant()
         $requestSize = (Get-Item -LiteralPath $requestZip).Length
         $requestJson = '{"type":"install_helper","id":"h-request","name":"Requested helper","version":"0.9.9","entry":"ArmouryConsole.exe","file":"' + ($requestZip -replace '\\', '\\') + '","sha256":"' + $requestHash + '","size":' + $requestSize + '}'
-        $reply = Send-Pipe $requestJson
-        Check 'the daemon answers the helper request' ($reply -match '"ok"\s*:\s*true') "reply=$(Get-FirstLine $reply)"
+        # the daemon answers a helper request with pack_op on the same
+        # connection, but the 1 s status heartbeat can land first - read
+        # until the type shows up (Send-Pipe's one-line read took the
+        # heartbeat instead of the ack once, and the check failed while the
+        # install had succeeded)
+        $reply = Send-And-Wait $requestJson 'pack_op' 6000
+        Check 'the daemon answers the helper request' ($reply -and $reply.ok) "reply=$($reply | ConvertTo-Json -Compress)"
         $list = Invoke-Cli @('--module-list') 40
         Check 'the requested helper is listed by a fresh process' ($list.Text.Contains('h-request')) "output=$(Get-FirstLine $list.Text)"
         Check 'the requested helper archive left temp after the answer' (-not (Test-Path -LiteralPath $requestZip)) "still there: $requestZip"
@@ -1484,8 +1489,9 @@ function Format-DaemonLogTail([int]$lines = 8) {
         $consoleHash = (Get-FileHash -LiteralPath $consoleZip -Algorithm SHA256).Hash.ToLowerInvariant()
         $consoleSize = (Get-Item -LiteralPath $consoleZip).Length
         $consoleJson = '{"type":"install_helper","id":"h-console","name":"Console helper","version":"1.2.0","entry":"ArmouryConsole.exe","file":"' + ($consoleZip -replace '\\', '\\') + '","sha256":"' + $consoleHash + '","size":' + $consoleSize + '}'
-        $reply = Send-Pipe $consoleJson
-        Check 'the console helper installs' ($reply -match '"ok"\s*:\s*true') "reply=$(Get-FirstLine $reply)"
+        # read until pack_op: the status heartbeat rides the pipe too
+        $reply = Send-And-Wait $consoleJson 'pack_op' 6000
+        Check 'the console helper installs' ($reply -and $reply.ok) "reply=$($reply | ConvertTo-Json -Compress)"
 
         Send-Pipe '{"type":"show_console"}' | Out-Null
         $helperLine = Wait-DaemonLogLine 'console launcher: using module h-console v1\.2\.0'
