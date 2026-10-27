@@ -385,18 +385,30 @@ impl Watcher {
 /// out in the process *count*, never in the PID set. Both lists must be sorted, which is
 /// what the watcher holds.
 fn diff_pids(previous: &[u32], current: &[u32]) -> (Vec<u32>, Vec<u32>) {
-    // RED: the diff is a stub, the tests below say what it has to do.
-    let _ = (previous, current);
-    (Vec::new(), Vec::new())
+    let started: Vec<u32> = current
+        .iter()
+        .copied()
+        .filter(|pid| previous.binary_search(pid).is_err())
+        .collect();
+    let gone: Vec<u32> = previous
+        .iter()
+        .copied()
+        .filter(|pid| current.binary_search(pid).is_err())
+        .collect();
+    (started, gone)
 }
 
 /// The PIDs the current walk shows again: their process object exited, so whatever holds
 /// the PID now is a *new* process. The list is emptied — every exit is looked at exactly
 /// once.
 fn take_recycled(recycled: &mut Vec<u32>, current: &[u32]) -> Vec<u32> {
-    // RED: a stub, the tests below say what it has to do.
-    let _ = (recycled, current);
-    Vec::new()
+    let out: Vec<u32> = recycled
+        .iter()
+        .copied()
+        .filter(|pid| current.binary_search(pid).is_ok())
+        .collect();
+    recycled.clear();
+    out
 }
 
 /// A cheap fingerprint of the tracked list — it changes on any edit.
@@ -462,8 +474,29 @@ fn display_name(app: &TrackedApp) -> String {
 /// charged for. Names are needed only for PIDs that are new, and those have one resolved
 /// on the spot.
 fn process_list(buf: &mut Vec<u32>) -> usize {
-    // RED: the walk is a stub, the tests below say what it has to do.
-    let _ = (buf, EnumProcesses, GetLastError, ERROR_INSUFFICIENT_BUFFER, PID_CAPACITY);
+    // present the whole buffer: the walk fills it up to its length
+    let capacity = buf.capacity().max(PID_CAPACITY);
+    buf.resize(capacity, 0);
+    for _ in 0..4 {
+        let mut needed: u32 = 0;
+        let ok = unsafe {
+            EnumProcesses(
+                buf.as_mut_ptr(),
+                (buf.len() * std::mem::size_of::<u32>()) as u32,
+                &mut needed,
+            )
+        };
+        let n = needed as usize / std::mem::size_of::<u32>();
+        if ok == 0 {
+            // the buffer was too small: psapi asks for a bigger one instead of truncating
+            if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || n <= buf.len() {
+                return 0;
+            }
+        } else if n < buf.len() {
+            return n;
+        }
+        buf.resize(buf.len() * 2, 0);
+    }
     0
 }
 
