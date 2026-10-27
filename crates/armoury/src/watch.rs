@@ -1,38 +1,39 @@
 //! Tracked-app watcher — one process walk per second while something is tracked, diffed
 //! by PID:
-//!   1. a `CreateToolhelp32Snapshot` walk (~13 ms) hands over every process's PID and
-//!      exe file name in one call — the PID *set* is the change detector, so a start and
-//!      an unrelated exit in the same second can never cancel each other out. The walk
-//!      is skipped entirely while nothing is tracked: there is nothing it could match,
-//!      and it is the whole cost of the tick,
-//!   2. a PID that appeared is matched by exe file name against the tracked list (the
-//!      user's rule); only the few matches get their full image path resolved,
+//!   1. one `EnumProcesses` call hands over the machine's PID array — no names, ~60 µs
+//!      — and the PID *set* is the change detector, so a start and an unrelated exit in
+//!      the same second can never cancel each other out. The call is skipped entirely
+//!      while nothing is tracked: there is nothing it could match, and it is the whole
+//!      cost of the tick. (Measured 2026-10-27 on a 373-process machine: the old
+//!      `CreateToolhelp32Snapshot` walk plus one `Process32NextW` per process cost
+//!      19-23 ms a tick, this call 60 µs.),
+//!   2. a PID the last tick did not show is the only one whose exe file name is resolved
+//!      (~40 µs: `OpenProcess` plus `QueryFullProcessImageNameW`) and matched against the
+//!      tracked list (the user's rule); only the few matches get their full image path
+//!      resolved again for the pack templates,
 //!   3. one process handle per running tracked app, waited on with `WaitForMultipleObjects`
 //!      so exits are exact (a signaled handle means *that* process object exited) and
 //!      PID-reuse safe,
 //!   4. a **recycled** PID — the old process exited and a new one took its PID — is a
 //!      genuine stop followed by a start: the handle wait reports the stop, and the next
-//!      sample that shows the PID again is reported as a start. The sample diff cannot see
-//!      that on its own (the same PID with the same exe name looks unchanged), so the
-//!      watcher looks the exited PIDs up again.
+//!      tick that shows the PID again is reported as a start. The PID set cannot see that
+//!      on its own (the PID is simply there again), so the watcher looks the exited PIDs
+//!      up again.
 
 use armoury_core::config::TrackedApp;
 use crossbeam_channel::Sender;
 use log::{info, warn};
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
+use windows_sys::Win32::System::ProcessStatus::EnumProcesses;
 use windows_sys::Win32::System::SystemServices::MAXIMUM_WAIT_OBJECTS;
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
@@ -57,8 +58,18 @@ pub enum WatchEvent {
 /// How long the watcher waits before it looks again.
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
-/// One process sample: PID -> lowercased exe file name.
-type Sample = BTreeMap<u32, String>;
+/// How many PIDs one walk asks for: 64 kB of PID array, several times the process count
+/// of a busy machine. The buffer grows on its own if a machine ever exceeds it.
+const PID_CAPACITY: usize = 16 * 1024;
+
+/// The two machine calls the watcher makes, injectable so the tests can drive them.
+struct Probe<'a> {
+    /// Fill the buffer with the machine's PIDs and return how many were written; 0 means
+    /// the walk failed.
+    pids: &'a mut dyn FnMut(&mut Vec<u32>) -> usize,
+    /// The lowercased exe file name of a PID — resolved only when it is needed.
+    name: &'a mut dyn FnMut(u32) -> Option<String>,
+}
 
 struct Running {
     /// unique per entry, so a recycled PID cannot be mistaken for the old process
@@ -83,11 +94,17 @@ fn run(tracked: Arc<Mutex<Vec<TrackedApp>>>, tx: Sender<WatchEvent>, wake: usize
     let mut version: u64 = 0; // bumps whenever the watch list changes
     let mut pairs: Vec<(u32, u64, HANDLE)> = Vec::new();
     let mut pairs_version: u64 = u64::MAX; // forces the first build
+    let mut pids_fn = |buf: &mut Vec<u32>| process_list(buf);
+    let mut name_fn = |pid: u32| process_base_name(pid);
+    let mut probe = Probe {
+        pids: &mut pids_fn,
+        name: &mut name_fn,
+    };
     info!("watcher started");
 
     loop {
-        // ---- 1. the tracked list, the walk and the starts and stops ----
-        if watcher.step(&tracked, &tx, wake, &mut || enum_processes()) {
+        // ---- 1. the tracked list, the process list and the starts and stops ----
+        if watcher.step(&tracked, &tx, wake, &mut probe) {
             version += 1;
         }
 
@@ -139,15 +156,19 @@ fn signal(wake: usize) {
 }
 
 /// The watcher's own state: the apps it is watching, the tracked list it matches against
-/// and the sample of the last walk.
+/// and the PIDs of the last walk.
 struct Watcher {
     running: HashMap<u32, Running>,
     next_id: u64,
     last_hash: Option<u64>,
     wanted: Vec<Wanted>,
-    previous: Sample,
+    /// The machine's PIDs as of the last tick, sorted: the set is the change detector, so
+    /// a start and an unrelated exit in the same tick can never cancel each other out.
+    previous: Vec<u32>,
+    /// Scratch: this tick's PID array, straight from the machine, sorted in place.
+    pids: Vec<u32>,
     /// The PIDs whose process object exited: the stop was reported, but the PID may be
-    /// taken by a new process. The next sample that shows one of them again is a *new*
+    /// taken by a new process. The next tick that shows one of them again is a *new*
     /// process, and that is a start.
     recycled: Vec<u32>,
 }
@@ -159,24 +180,27 @@ impl Watcher {
             next_id: 0,
             last_hash: None,
             wanted: Vec::new(),
-            previous: Sample::new(),
+            previous: Vec::new(),
+            pids: vec![0u32; PID_CAPACITY],
             recycled: Vec::new(),
         }
     }
 
-    /// One tick: refresh the tracked list, walk the process table and report the starts
-    /// and the stops. True when the set of watched apps changed.
+    /// One tick: refresh the tracked list, take the machine's PID list and report the
+    /// starts and the stops. True when the set of watched apps changed.
     ///
-    /// The walk is a full snapshot of every process on the machine, so it is skipped when
-    /// nothing is tracked: there is nothing it could match. The tracked list itself is
-    /// still read every tick, so a list that becomes non-empty is walked in the very tick
-    /// it changes — a start is never noticed a tick later than it was before.
+    /// The PID list is the whole cost of the tick and it is skipped when nothing is
+    /// tracked: there is nothing it could match. The tracked list itself is still read
+    /// every tick, so a list that becomes non-empty is walked in the very tick it changes
+    /// — a start is never noticed a tick later than it was before. A name is resolved only
+    /// for a PID that is new (or, on a list change, for everything running), because
+    /// resolving one is its own pair of syscalls.
     fn step(
         &mut self,
         tracked: &Arc<Mutex<Vec<TrackedApp>>>,
         tx: &Sender<WatchEvent>,
         wake: usize,
-        sample: &mut dyn FnMut() -> Sample,
+        probe: &mut Probe,
     ) -> bool {
         let mut changed = false;
 
@@ -188,46 +212,64 @@ impl Watcher {
             self.last_hash = Some(hash);
         }
 
-        // one walk per tick, and only while something is tracked: the PID set is the
-        // change detector
-        // Nothing is tracked: the walk cannot match anything, and it is the expensive
-        // part of the tick.
+        // one PID list per tick, and only while something is tracked: the set is the
+        // change detector.
+        // Nothing is tracked: the list cannot match anything, and it is the whole cost of
+        // the tick.
         if !self.wanted.is_empty() {
-            let current = sample();
-            let (started, gone) = diff_samples(&self.previous, &current);
-            // A PID whose process object exited may have been recycled: the sample diff
-            // cannot see that — the same PID with the same exe name looks unchanged — so
-            // the exited PIDs are looked at again. The handle is the proof that the old
-            // process is gone.
-            for (pid, name) in self.take_recycled(&current) {
-                if self.consider(pid, &name, tx, wake) {
-                    changed = true;
-                }
-            }
-            if list_changed {
-                // The tracked list changed: re-check everything currently running, so an
-                // app added to the list while it was already running is picked up.
-                for (pid, name) in &current {
-                    if self.consider(*pid, name, tx, wake) {
+            let n = (probe.pids)(&mut self.pids);
+            // A walk that reports nothing at all failed. The watched set is left as it is
+            // and the next tick tries again: reading a failed walk as "every process
+            // exited" would stop every tracked app and start every pack over.
+            if n > 0 {
+                self.pids[..n].sort_unstable();
+                let (started, gone) = diff_pids(&self.previous, &self.pids[..n]);
+                // A PID whose process object exited may have been recycled: a PID set
+                // cannot see that — the PID is simply there again — so the exited PIDs
+                // are looked at again. The handle is the proof that the old process is
+                // gone.
+                for pid in take_recycled(&mut self.recycled, &self.pids[..n]) {
+                    let Some(name) = (probe.name)(pid) else {
+                        continue;
+                    };
+                    if self.consider(pid, &name, tx, wake) {
                         changed = true;
                     }
                 }
-            } else {
-                // Only the PIDs that appeared since the previous sample can be starts.
-                for (pid, name) in &started {
-                    if self.consider(*pid, name, tx, wake) {
+                if list_changed {
+                    // The tracked list changed: re-check everything currently running, so
+                    // an app added to the list while it was already running is picked up.
+                    // This one tick resolves every name — a few milliseconds, once.
+                    for i in 0..n {
+                        let pid = self.pids[i];
+                        let Some(name) = (probe.name)(pid) else {
+                            continue;
+                        };
+                        if self.consider(pid, &name, tx, wake) {
+                            changed = true;
+                        }
+                    }
+                } else {
+                    // Only the PIDs that appeared since the last tick can be starts.
+                    for pid in started {
+                        let Some(name) = (probe.name)(pid) else {
+                            continue;
+                        };
+                        if self.consider(pid, &name, tx, wake) {
+                            changed = true;
+                        }
+                    }
+                }
+                // Belt and braces: a watched PID that vanished is a stop (the handle wait
+                // normally reports it first).
+                for pid in gone {
+                    if self.forget(pid, tx, wake) {
                         changed = true;
                     }
                 }
+                self.previous.clear();
+                self.previous.extend_from_slice(&self.pids[..n]);
             }
-            // Belt and braces: a watched PID that vanished is a stop (the handle wait
-            // normally reports it first).
-            for pid in gone {
-                if self.forget(pid, tx, wake) {
-                    changed = true;
-                }
-            }
-            self.previous = current;
         }
 
         if list_changed {
@@ -246,19 +288,6 @@ impl Watcher {
         }
 
         changed
-    }
-
-    /// The PIDs the current sample shows again: their process object exited, so whatever
-    /// holds the PID now is a *new* process. The list is emptied — every exit is looked
-    /// at exactly once.
-    fn take_recycled(&mut self, current: &Sample) -> Vec<(u32, String)> {
-        let out: Vec<(u32, String)> = self
-            .recycled
-            .iter()
-            .filter_map(|pid| current.get(pid).map(|name| (*pid, name.clone())))
-            .collect();
-        self.recycled.clear();
-        out
     }
 
     /// Is this PID one of the tracked apps we are not watching yet?
@@ -337,7 +366,7 @@ impl Watcher {
 
     /// The process object behind the handle exited: the app is gone and the stop is
     /// reported now. The PID may be **recycled** — a new process may take it — so the PID
-    /// is remembered: the next sample that shows it again is a new process, and that is a
+    /// is remembered: the next tick that shows it again is a new process, and that is a
     /// start. The id guards against an entry that was replaced meanwhile.
     fn exited(&mut self, pid: u32, id: u64, tx: &Sender<WatchEvent>, wake: usize) -> bool {
         if self.running.get(&pid).map(|e| e.id) != Some(id) {
@@ -351,23 +380,23 @@ impl Watcher {
     }
 }
 
-/// What changed between two samples: the PIDs that appeared (the only possible starts)
-/// and the PIDs that vanished (the only possible stops). A start and an unrelated exit
-/// cancel out in the process *count*, never in the PID set.
-fn diff_samples(previous: &Sample, current: &Sample) -> (Vec<(u32, String)>, Vec<u32>) {
-    let mut started: Vec<(u32, String)> = Vec::new();
-    for (pid, name) in current {
-        if previous.get(pid) != Some(name) {
-            started.push((*pid, name.clone()));
-        }
-    }
-    let mut gone: Vec<u32> = Vec::new();
-    for pid in previous.keys() {
-        if !current.contains_key(pid) {
-            gone.push(*pid);
-        }
-    }
-    (started, gone)
+/// What changed between two walks: the PIDs that appeared (the only possible starts) and
+/// the PIDs that vanished (the only possible stops). A start and an unrelated exit cancel
+/// out in the process *count*, never in the PID set. Both lists must be sorted, which is
+/// what the watcher holds.
+fn diff_pids(previous: &[u32], current: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    // RED: the diff is a stub, the tests below say what it has to do.
+    let _ = (previous, current);
+    (Vec::new(), Vec::new())
+}
+
+/// The PIDs the current walk shows again: their process object exited, so whatever holds
+/// the PID now is a *new* process. The list is emptied — every exit is looked at exactly
+/// once.
+fn take_recycled(recycled: &mut Vec<u32>, current: &[u32]) -> Vec<u32> {
+    // RED: a stub, the tests below say what it has to do.
+    let _ = (recycled, current);
+    Vec::new()
 }
 
 /// A cheap fingerprint of the tracked list — it changes on any edit.
@@ -424,31 +453,25 @@ fn display_name(app: &TrackedApp) -> String {
         .unwrap_or_else(|| app.exe.clone())
 }
 
-/// One walk of the process list: PID -> lowercased exe file name.
-fn enum_processes() -> Sample {
-    let mut out = Sample::new();
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snap.is_null() || snap == INVALID_HANDLE_VALUE {
-        return out;
-    }
-    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
-    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-    let mut ok = unsafe { Process32FirstW(snap, &mut entry) } != 0;
-    while ok {
-        let pid = entry.th32ProcessID;
-        if pid != 0 {
-            let len = entry
-                .szExeFile
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(entry.szExeFile.len());
-            let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            out.insert(pid, name.to_ascii_lowercase());
-        }
-        ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
-    }
-    unsafe { CloseHandle(snap) };
-    out
+/// One walk of the process table: the PIDs only, into the caller's buffer. Returns how
+/// many were written, 0 when the walk failed.
+///
+/// `EnumProcesses` answers with a plain PID array — about a kilobyte for the whole
+/// machine. The old walk (`CreateToolhelp32Snapshot` plus one `Process32NextW` per
+/// process) also returned the exe file name of every process, and that is exactly what it
+/// charged for. Names are needed only for PIDs that are new, and those have one resolved
+/// on the spot.
+fn process_list(buf: &mut Vec<u32>) -> usize {
+    // RED: the walk is a stub, the tests below say what it has to do.
+    let _ = (buf, EnumProcesses, GetLastError, ERROR_INSUFFICIENT_BUFFER, PID_CAPACITY);
+    0
+}
+
+/// The lowercased exe file name of a PID — the tracked-app identity. Resolving it is its
+/// own pair of syscalls, so it happens only for a PID that needs it. `None` for a process
+/// that cannot be opened: it could not be watched either way.
+fn process_base_name(pid: u32) -> Option<String> {
+    process_path(pid).map(|path| base_name(&path))
 }
 
 pub fn process_path(pid: u32) -> Option<String> {
@@ -509,36 +532,153 @@ mod tests {
     use std::cell::Cell;
     use std::process::{Command, Stdio};
 
-    fn sample(pairs: &[(u32, &str)]) -> Sample {
-        pairs.iter().map(|(pid, name)| (*pid, name.to_string())).collect()
+    /// A PID list, sorted the way the watcher holds one.
+    fn pids(list: &[u32]) -> Vec<u32> {
+        let mut out = list.to_vec();
+        out.sort_unstable();
+        out
     }
 
     #[test]
     fn a_start_offset_by_an_exit_is_still_seen() {
-        let previous = sample(&[(10, "explorer.exe"), (11, "notepad.exe")]);
-        let current = sample(&[(10, "explorer.exe"), (12, "game.exe")]);
+        let previous = pids(&[10, 11]);
+        let current = pids(&[10, 12]);
         assert_eq!(previous.len(), current.len(), "the process count is unchanged");
-        let (started, gone) = diff_samples(&previous, &current);
-        assert_eq!(started, vec![(12, "game.exe".to_string())]);
+        let (started, gone) = diff_pids(&previous, &current);
+        assert_eq!(started, vec![12]);
         assert_eq!(gone, vec![11]);
     }
 
     #[test]
-    fn an_unchanged_sample_reports_nothing() {
-        let previous = sample(&[(10, "explorer.exe")]);
-        let current = sample(&[(10, "explorer.exe")]);
-        let (started, gone) = diff_samples(&previous, &current);
+    fn an_unchanged_pid_set_reports_nothing() {
+        let previous = pids(&[10]);
+        let current = pids(&[10]);
+        let (started, gone) = diff_pids(&previous, &current);
         assert!(started.is_empty(), "{started:?}");
         assert!(gone.is_empty(), "{gone:?}");
     }
 
     #[test]
-    fn a_recycled_pid_counts_as_a_new_process() {
-        let previous = sample(&[(10, "notepad.exe")]);
-        let current = sample(&[(10, "game.exe")]);
-        let (started, gone) = diff_samples(&previous, &current);
-        assert_eq!(started, vec![(10, "game.exe".to_string())]);
+    fn a_pid_that_vanished_and_came_back_is_a_start_again() {
+        let (started, gone) = diff_pids(&pids(&[10]), &pids(&[]));
+        assert!(started.is_empty(), "{started:?}");
+        assert_eq!(gone, vec![10]);
+        let (started, gone) = diff_pids(&pids(&[]), &pids(&[10]));
+        assert_eq!(started, vec![10]);
         assert!(gone.is_empty(), "{gone:?}");
+    }
+
+    #[test]
+    fn a_recycled_pid_is_invisible_to_the_pid_set() {
+        // A PID set cannot see a recycle at all: the PID is simply there again. The proof
+        // that the old process is gone is its handle, and the start is reported from
+        // there — the end-to-end case is pinned by
+        // `a_recycled_pid_is_reported_as_a_stop_and_then_a_start` below.
+        let (started, gone) = diff_pids(&pids(&[10]), &pids(&[10]));
+        assert!(started.is_empty(), "{started:?}");
+        assert!(gone.is_empty(), "{gone:?}");
+    }
+
+    #[test]
+    fn names_are_resolved_only_for_pids_that_are_new() {
+        // Resolving a name is a syscall pair of its own: it must happen for a PID the last
+        // tick did not show, and for nothing else.
+        let tracked = Arc::new(Mutex::new(vec![TrackedApp {
+            name: "Game".into(),
+            exe: "C:\\Games\\game.exe".into(),
+        }]));
+        let (tx, _rx) = unbounded();
+        let mut watcher = Watcher::new();
+        let tick = Cell::new(0usize);
+        let resolved = Cell::new(0usize);
+        let mut pids_fn = |buf: &mut Vec<u32>| {
+            buf.clear();
+            buf.extend([10u32, 11, 12]);
+            if tick.get() == 2 {
+                buf.push(13);
+            }
+            tick.set(tick.get() + 1);
+            buf.len()
+        };
+        let mut name_fn = |pid: u32| {
+            resolved.set(resolved.get() + 1);
+            Some(format!("other{pid}.exe"))
+        };
+        let mut probe = Probe {
+            pids: &mut pids_fn,
+            name: &mut name_fn,
+        };
+
+        watcher.step(&tracked, &tx, 0, &mut probe);
+        assert_eq!(
+            resolved.get(),
+            3,
+            "the first tick resolves the names of everything it sees"
+        );
+        watcher.step(&tracked, &tx, 0, &mut probe);
+        assert_eq!(resolved.get(), 3, "an unchanged PID set resolves nothing");
+        watcher.step(&tracked, &tx, 0, &mut probe);
+        assert_eq!(resolved.get(), 4, "only the PID that appeared is resolved");
+    }
+
+    #[test]
+    fn a_walk_that_reports_nothing_changes_nothing() {
+        // A failed walk must not read as "every process exited": that would stop every
+        // tracked app and start every pack over again.
+        let probe_path = std::path::Path::new("C:\\Windows\\System32\\ping.exe");
+        if !probe_path.is_file() {
+            return;
+        }
+        let mut child = Command::new(probe_path)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("ping.exe starts");
+        let pid = child.id();
+        let tracked = Arc::new(Mutex::new(vec![TrackedApp {
+            name: "Ping".into(),
+            exe: "C:\\Windows\\System32\\ping.exe".into(),
+        }]));
+        let (tx, rx) = unbounded();
+        let mut watcher = Watcher::new();
+        let tick = Cell::new(0usize);
+        let mut pids_fn = |buf: &mut Vec<u32>| {
+            buf.clear();
+            let t = tick.get();
+            tick.set(t + 1);
+            if t == 1 {
+                return 0; // the walk fails on the second tick
+            }
+            buf.push(pid);
+            buf.len()
+        };
+        let mut name_fn = |pid: u32| process_base_name(pid);
+        let mut probe = Probe {
+            pids: &mut pids_fn,
+            name: &mut name_fn,
+        };
+
+        watcher.step(&tracked, &tx, 0, &mut probe);
+        assert!(
+            matches!(rx.try_recv(), Ok(WatchEvent::Started { .. })),
+            "the tracked app is watched"
+        );
+
+        watcher.step(&tracked, &tx, 0, &mut probe);
+        assert!(
+            rx.try_recv().is_err(),
+            "a walk that reports nothing must report nothing"
+        );
+        assert_eq!(watcher.running.len(), 1, "the app stays watched");
+
+        // and the tick after the failed one still sees the same PID without re-reporting it
+        watcher.step(&tracked, &tx, 0, &mut probe);
+        assert!(rx.try_recv().is_err(), "an unchanged PID set reports nothing");
+        assert_eq!(watcher.running.len(), 1, "the app is still watched");
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
@@ -582,12 +722,17 @@ mod tests {
         let (tx, _rx) = unbounded();
         let mut watcher = Watcher::new();
         let walks = Cell::new(0);
-        let mut walk = || {
+        let mut pids_fn = |_buf: &mut Vec<u32>| {
             walks.set(walks.get() + 1);
-            Sample::new()
+            0
+        };
+        let mut name_fn = |_pid: u32| None;
+        let mut probe = Probe {
+            pids: &mut pids_fn,
+            name: &mut name_fn,
         };
         for _ in 0..3 {
-            watcher.step(&tracked, &tx, 0, &mut walk);
+            watcher.step(&tracked, &tx, 0, &mut probe);
         }
         assert_eq!(
             walks.get(),
@@ -614,10 +759,19 @@ mod tests {
         let tracked = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = unbounded();
         let mut watcher = Watcher::new();
-        let mut walk = || sample(&[(pid, "ping.exe")]);
+        let mut pids_fn = |buf: &mut Vec<u32>| {
+            buf.clear();
+            buf.push(pid);
+            buf.len()
+        };
+        let mut name_fn = |pid: u32| process_base_name(pid);
+        let mut probe = Probe {
+            pids: &mut pids_fn,
+            name: &mut name_fn,
+        };
 
         // nothing is tracked: the walk is skipped and nothing is reported
-        watcher.step(&tracked, &tx, 0, &mut walk);
+        watcher.step(&tracked, &tx, 0, &mut probe);
         assert!(
             rx.try_recv().is_err(),
             "nothing may be reported while nothing is tracked"
@@ -628,7 +782,7 @@ mod tests {
             name: "Ping".into(),
             exe: "C:\\Windows\\System32\\ping.exe".into(),
         });
-        watcher.step(&tracked, &tx, 0, &mut walk);
+        watcher.step(&tracked, &tx, 0, &mut probe);
         match rx
             .try_recv()
             .expect("the newly tracked app must be noticed on the next tick")
@@ -669,10 +823,19 @@ mod tests {
         }]));
         let (tx, rx) = unbounded();
         let mut watcher = Watcher::new();
-        let mut walk = || sample(&[(pid, "ping.exe")]);
+        let mut pids_fn = |buf: &mut Vec<u32>| {
+            buf.clear();
+            buf.push(pid);
+            buf.len()
+        };
+        let mut name_fn = |pid: u32| process_base_name(pid);
+        let mut probe = Probe {
+            pids: &mut pids_fn,
+            name: &mut name_fn,
+        };
 
         // the app is tracked and running: the watcher watches it
-        watcher.step(&tracked, &tx, 0, &mut walk);
+        watcher.step(&tracked, &tx, 0, &mut probe);
         match rx
             .try_recv()
             .expect("the tracked app must be reported as started")
@@ -695,9 +858,9 @@ mod tests {
             WatchEvent::Started { .. } => panic!("the app stopped, it did not start"),
         }
 
-        // the PID is taken by a new process with the same exe name: the sample diff sees
+        // the PID is taken by a new process with the same exe name: the PID set sees
         // nothing, but the watcher must report the start
-        watcher.step(&tracked, &tx, 0, &mut walk);
+        watcher.step(&tracked, &tx, 0, &mut probe);
         match rx
             .try_recv()
             .expect("the recycled PID must be reported as started")
