@@ -3,7 +3,7 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.2.0] - 2026-10-27
 
 ### Added
 
@@ -58,6 +58,13 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   with the process, while its mutes live on the audio devices — the machine could
   stay hidden and silent until the daemon started again. The killswitch is now
   released between the revert and the exit.
+- **A failed download leaves the row offering its button.** The Modules window's
+  last-op line painted with the window's extend-wide mode and no width cap, so a
+  wide fetch error widened the list and laid the rows' right-aligned buttons past
+  the window edge, where they clipped away; the button came back only when the line
+  was cleared - a settings reopening or a restart. The line wraps like the notes
+  under the rows now, proven by the paint test
+  `a_failed_download_leaves_the_row_offering_the_button`.
 
 ### Changed
 
@@ -326,6 +333,7 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
 - The spec 2 pack script host: a pack may carry a small Rhai script, and the daemon runs it in a
   sandboxed interpreter.
 
+[1.2.0]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.2.0
 [1.1.6]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.6
 [1.1.5]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.5
 [1.1.4]: https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.4
