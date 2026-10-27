@@ -540,32 +540,26 @@ try {
     Check 'a fast restart never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
     Check 'a fast restart does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
 
-    # ---- 9b. a fast restart after the lockout ended never reverts ----
-    # The close lands between two lockouts (2026-10-21): the close starts a window and holds
-    # the revert, the restart inside that window cancels it, and the packs stay applied the
-    # whole time.
+    # ---- 9b. a close after the lockout ended reverts at once ----
+    # The cooldown belongs to the change (2026-10-27): with no window running, the close puts
+    # the packs back at once and starts a cooldown of its own. A restart inside that cooldown
+    # waits for it and applies when it ends - the packs go back once and come back once, which
+    # is the accepted cost of the immediate revert (DECISIONS.md 30).
     $applies = @(Get-ChangeTimes 'apply').Count
     $reverts = @(Get-ChangeTimes 'revert').Count
     $p4 | Stop-Process -Force
-    Start-Sleep -Milliseconds 700
-    Check 'a close after the lockout ended holds the revert' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
+    $times = @(Wait-Change 'revert' $reverts 5)
+    Check 'a close after the lockout ended reverts at once' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
+    $reverts = @(Get-ChangeTimes 'revert').Count
     $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
-    # The decision of 2026-10-23 ("the game wins"): the start cancels the revert the window was
-    # holding, the machine stays in Turbo (the packs applied), and the window keeps running for
-    # the rest of its time - the guard is still up for whatever the packs try next.
-    $seen = $false
-    for ($i = 0; $i -lt 40 -and -not $seen; $i++) {
-        Start-Sleep -Milliseconds 100
-        $s = Status
-        $seen = ($s -and $s.trigger_source -eq 'timeout.exe')
-    }
-    Check 'the restart inside the window is seen' $seen "source=$(($s).trigger_source)"
-    Check 'the restart leaves the window of the held revert running' (($s.state -eq 'cooldown') -and ($s.cooldown_remaining_ms -gt 0)) "state=$($s.state) remaining=$($s.cooldown_remaining_ms)"
-    Check 'the restart cancels the change behind the window' ($null -eq $s.cooldown_action) "action=$($s.cooldown_action)"
+    $s = Status
+    Check 'the restart is held by the cooldown of the revert' ($s.state -eq 'cooldown') "state=$($s.state)"
+    Check 'the restart is waiting behind that window' ($s.cooldown_action -eq 'apply') "action=$($s.cooldown_action)"
+    $times = @(Wait-Change 'apply' $applies 20)
+    Check 'the restart applies when the cooldown ends' ($times.Count -ge $applies + 1) "applies=$applies now=$($times.Count)"
     $s = Wait-State 'triggered' 20
-    Check 'a fast restart after the lockout ended leaves the packs applied' ($s.state -eq 'triggered') "state=$($s.state)"
-    Check 'a fast restart after the lockout ended never reverts' (@(Get-ChangeTimes 'revert').Count -eq $reverts) "reverts=$reverts now=$(@(Get-ChangeTimes 'revert').Count)"
-    Check 'a fast restart after the lockout ended does not apply again' (@(Get-ChangeTimes 'apply').Count -eq $applies) "applies=$applies now=$(@(Get-ChangeTimes 'apply').Count)"
+    Check 'the restarted app leaves the packs applied' ($s.state -eq 'triggered') "state=$($s.state)"
+    Check 'the restarted app is the source again' ($s.trigger_source -eq 'timeout.exe') "source=$($s.trigger_source)"
 
     # ---- 9c. a start while the lockout runs waits for it ----
     # The lockout holds a change in both directions (2026-10-22): an app that starts while the
