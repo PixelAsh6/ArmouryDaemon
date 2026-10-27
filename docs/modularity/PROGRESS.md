@@ -1620,6 +1620,70 @@ user's calls.
 
 ---
 
+### 2026-10-27 — The `improvements` branch: the watcher, the cooldown, the Packs window
+
+**What I did.** Three changes on `improvements`, each proven by its own run pair.
+
+1. **The watcher stops paying for names it does not need.** `watch.rs` used
+   `CreateToolhelp32Snapshot` + one `Process32NextW` per process and carried the exe name of
+   every process through the tick. It now takes the PID array in one `EnumProcesses` call and
+   resolves a name only for a PID the previous tick did not show (or for everything running when
+   the tracked list itself changed). The event stream, the handle-based exit wait and the
+   recycled-PID proof are unchanged.
+2. **The cooldown is owned by the change** (`engine.rs`, DECISIONS.md 30). A change lands when
+   no window runs and starts the window; while one runs, nothing is checked; the tick at its end
+   reconciles the intent. A close with no window running reverts **at once** and starts a window
+   of its own. The `pending` flag is gone: `pending_change()` is now `desired != applied`.
+3. **The catalogue window is `Packs`, and a parked window is not a position** (`ui.rs`,
+   DECISIONS.md 31). The window title, the Settings button, the hover text, the empty hint, the
+   log lines and the tests all say Packs (the wire word in the manifest stays `modules`).
+   `on_screen_rect` rejects a rect that is parked (-32000), zero-sized or under 150 px wide, at
+   the one choke point both window lookups use, and the dashboard's own published rect is
+   filtered the same way; the settings window keeps its bottom-left corner when its content
+   changes size.
+
+**Files touched.** `crates/armoury/src/watch.rs`, `crates/armoury-core/src/engine.rs`,
+`crates/armoury/src/ui.rs`, `tools/daemon-selftest.ps1` (§6), `docs/PACKS.md` (new),
+`docs/modularity/DECISIONS.md` (30, 31).
+
+**Measured.** The watcher on this machine (375 processes): the shipping walk cost **19-23 ms per
+tick**; `EnumProcesses` alone is **0.068 ms** (310× less) and the steady-state design — PID set
+plus a name only for a new PID — lands at **0.062 ms**. Equivalence was proven before the
+change: identical PID sets and **213 on-demand names, 0 mismatches** (the 160 names that could
+not be resolved are protected processes the daemon can never watch). The exe is 13,320,192 B,
+smaller than the 1.3.0 build's 13,331,456 B. `engine.rs` is 329 lines shorter in diff terms
+(the `pending` branch and its tests are gone; the `try_change` body is 12 lines instead of 45).
+
+**Decisions.** DECISIONS.md 30 (the cooldown rule and the accepted restart-flicker cost) and 31
+(the rect guard, and the rejected HWND plumbing).
+
+**Surprises.**
+
+- **The top-left jump had one cause, and the screenshots showed both arms of it.** The placement
+  code finds our windows by **title**, and this machine has two `ArmouryDaemon.exe` processes
+  and a live window titled `Settings` (seen while writing this entry). A minimized window parks
+  at -32000; `place_left_px_in` clamps that result to the work area's top-left — `(20, 20)`, the
+  screenshot. Fixed at the lookup.
+- **`git commit --amend` committed the index, not the working tree** (trap 62): a `dedup` fix
+  was left unstaged and CI rebuilt the same broken tree twice before the cause was visible in
+  the job log (the run record was stuck "in progress", so `--log-failed` refused).
+- **The cooldown change makes a close cost nothing but a restart expensive**: a restart *after*
+  the cooldown now reverts first and re-applies when the revert's window ends. Pinned by
+  `a_fast_restart_after_the_lockout_reverts_and_reapplies_later`, so a later session can decide
+  with the cost in front of it.
+
+**Runs.** Watcher: red `40520802791` (the four new tests fail against the stub; 310 pass), green
+`40539483487`. Cooldown + Packs: `40541653898`.
+
+**Next.** The user's word is needed for the next release (1.3.0 is tagged at `merge: 1.3.0` on
+`main`; this branch carries the watcher, the cooldown and the window fixes on top). The remaining
+known gap is the **title ambiguity between two instances** — a second `ArmouryDaemon.exe` with
+the same window titles can still be found by `FindWindowW`; the real fix is each viewport
+publishing its own `outer_rect` into `Shared` the way the dashboard already does (`core_rect`),
+and `core_rect_px` preferring that published rect over the OS lookup.
+
+---
+
 ## Template for new entries
 
 ```markdown

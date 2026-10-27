@@ -1058,3 +1058,52 @@ gave the daemon an order of who to start:
   exe grows by the re-homing alone, and the console exe is the phase's own
   deliverable (the only new exe). The idle cost is unchanged by
   construction - `show_console` runs on request, not on the idle path.
+
+## 30. The cooldown starts with the change, and the revert does not wait for one
+
+**The user's rule (2026-10-27), replacing the 22 Oct one.** The cooldown is the settle time
+after a mode change: it starts **when the packs were switched**, not when the app opened or
+closed. While it runs, nothing is checked and nothing changes — a start or a stop only moves the
+intent. The tick that ends the window looks at the intent and lands one change if it differs.
+
+- **The revert is immediate.** Before this, a close that arrived with no window running opened
+  one and reverted *at its end*: going back cost a whole cooldown, on top of the one the apply
+  had already run. The user asked for the symmetric rule instead — no window, no wait — so a
+  close puts the packs back at once and starts a cooldown of its own.
+- **The `pending` flag is gone.** It existed to separate "the window this change started" from
+  "the leftover window of the previous change". With one rule for both directions, a change is
+  held exactly when the intent differs and a window is still running: `pending_change()` reads
+  that off `desired` and `applied`, and the two states can no longer disagree.
+- **Accepted cost, measured by a test.** A close *after* the cooldown, followed by a restart,
+  now reverts first and re-applies when the revert's window ends — the packs flicker back for
+  one cooldown. A restart *inside* the cooldown of the apply still never reverts
+  (`a_fast_restart_never_reverts`). If the flicker ever outweighs the immediate revert, this is
+  the decision to revisit, and the test that pins the trade-off is
+  `a_fast_restart_after_the_lockout_reverts_and_reapplies_later`.
+- **The harness moved with it.** Section 6 used to wait 3-12 s for a "held" revert; it now
+  checks that the close reverts within 3 s and starts a lockout of its own.
+
+## 31. A window that is not on screen is not a position
+
+**The report (2026-10-27, two screenshots).** The settings window jumped to the work area's
+top-left corner when an app was deleted, and once the dashboard went with it.
+
+**The cause.** Our own windows are found by **title** (`FindWindowW`): `ArmouryDaemon`,
+`Settings`, `Packs`, `Pack: <id>`. A title can belong to a window that is minimized (Windows
+parks it at about **-32000**), hidden, or left over from another instance — the test copy in
+`C:\Apps` runs beside the dev build. A placement computed from that rect is off the desktop, and
+`place_left_px_in` clamps its result to the work area's top-left corner: `(20, 20)`, exactly what
+the screenshot shows.
+
+**The fix, at one choke point.** `on_screen_rect` rejects a rect that is parked, zero-sized or
+under 150 px wide, and both window lookups (`window_rect_px`, `window_topleft_px`) return `None`
+for it — "not on screen", the same as a window that does not exist yet. The dashboard's own
+published rect is filtered the same way, so the chain is never anchored on a frame the OS has not
+placed. A second, independent hardening: when the settings window's content changes size, it
+keeps its **bottom-left** corner (the chain is bottom-aligned) instead of re-clamping the stored
+top-left, so deleting a row can no longer move it at all.
+
+**Rejected:** plumbing HWNDs from winit into the placement code. It is the real fix for the
+title ambiguity, but it touches every viewport and every placement call, and the rect guard
+closes the reported failure class without it. Worth doing if a *different* application with one
+of our titles is ever found in the same place.
