@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "armoury"
-version = "1.1.6"
+version = "1.2.0"
 dependencies = [
  "armoury-core",
  "crossbeam-channel",
@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "armoury-core"
-version = "1.1.6"
+version = "1.2.0"
 dependencies = [
  "log",
  "serde",
