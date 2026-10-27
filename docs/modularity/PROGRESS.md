@@ -1563,6 +1563,8 @@ C2 decision code — `DECISIONS.md` §29 records both.
 | `40497404892` | `1dc48c0` (`let mut` fix) — **red in the harness**: the 20f module exe was the B3 fixture's 78-byte placeholder, and the daemon **froze silently inside `spawn`** after logging its choice; no later check could pass | failed | 5m05s |
 | `40498530997` | `176f8c9` (the 20f checks carry the daemon's own log lines) — **red, and diagnosed**: the log dump shows the choice line as the daemon's last words, the frozen spawn, nothing else for 20+ s | failed | 5m33s |
 | `40499523579` | `dd93fb1` (the 20f module now carries a real image, a copy of `cmd.exe` under the console's name) — **green**: 311 + 106 tests, **169 checks ALL PASSED / 0 SKIP**, and the artefact above | green | 11m12s |
+| `40503047253` | the docs-only tip (`92a0bfb`) — **red, and diagnosed**: the 20f install check read the connection's first line and got the daemon's 1 s **status heartbeat** (`uptime_secs: 5`) instead of the `pack_op` ack; the install had succeeded, the five checks after it passed. The check's one-line read was `Send-Pipe`, the race the `Send-And-Wait` helper (B4) already knows about (trap 61) | failed | 4m44s |
+| `40504164741` | `3c83018` (both helper-install checks read until `pack_op` via `Send-And-Wait`, trap 61 recorded) — **green** again: 311 + 106 tests, ALL CHECKS PASSED, the six 20f checks pass by name | green | 8m15s |
 
 **Decisions.** `DECISIONS.md` §29: one crate, two binaries (no new crate, no
 lib split); the three whole-module re-homes; the helper preference by file
@@ -1590,6 +1592,13 @@ identical sources.
   the missing functions, the second was one arm of the new `match` (chained
   builder methods hand back `&mut Command`; the arm has to build the owned
   command and return it — GOTCHAS trap 47's family, one more member).
+- **A reply-asserting pipe check can eat a run on a race the harness
+  already built a helper against.** The doc-only tip's run lost the 20f
+  install check: `Send-Pipe`'s one-line read took the daemon's 1 s status
+  heartbeat off the fresh connection while the `pack_op` ack stood right
+  behind it, so the check failed though the install had succeeded and the
+  five checks after it passed. `Send-And-Wait` (B4) exists exactly for
+  this; both helper-install checks use it now, and the rule is trap 61.
 - **The release grows twice now.** The same seven sources compile into both
   binaries; the acceptance's size rule was written for the one exe, so
   §29 records the daemon exe's +5,632 against its baseline and the console
