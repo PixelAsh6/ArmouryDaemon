@@ -10,9 +10,9 @@ anything surprising you found.**
 
 | | |
 |---|---|
-| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`), **B4** (`4d7886b`) and **B5 done and merged** (`3f3a772`): a helper installs through the daemon's `InstallHelper` request, the Modules window's helper buttons are armed, and the daemon re-verifies the archive's bytes before they land anywhere. **The tree became 1.2.0 and the release is published** (2026-10-27, tag `v1.2.0` on `e9e393a`). The packs repo's flip waits for its own step (prepared at `539773c` + `2cd49ce`); the signing key, the flip and the install are the user's calls |
+| **Phase** | A - **A1, A2, A3, A4, A5 and A6 done**; B - **B1** (`e56a72a`), **B2** (`e94110d`), **B3** (`c8c0468`), **B4** (`4d7886b`) and **B5 done and merged** (`3f3a772`): a helper installs through the daemon's `InstallHelper` request, the Modules window's helper buttons are armed, and the daemon re-verifies the archive's bytes before they land anywhere. **The tree became 1.2.0 and the release is published** (2026-10-27, tag `v1.2.0` on `e9e393a`). The packs repo's flip is published and signed (the prepared `539773c` + `2cd49ce` pushed to the packs repo's `origin/main`, the signature committed as `f4d1604` behind them); the `C:\Apps` install of the stashed exe is the user's call |
 | **Next action** | **Phase C** (the console as a helper module; read `WORK-ORDER.md`'s C section first), plus the fold-in opportunities: the dashboard cooldown-gap, audio_mute_all crash-recovery, the harness 12c caveat, the tautological tests, the sleep/resume lockout, and the harness 20a literal version at `tools/daemon-selftest.ps1:1110` (bumped to 1.2.0; the check itself remains literal). Ask the user before taking any of them in |
-| **Branch** | **1.2.0 released; `feature/b5-helper-request` pruned (its tip `8d5f33f` is inside `main`).** Counts stand: **410 unit tests** (304 in `armoury` + 106 in `armoury-core`), **163 harness checks** (160 PASS + the real-catalogue pair as 2 SKIP until the flip); the released exe is **13,325,824 bytes** (+512 over the B5 branch tree's 13,325,312), sha256 `355b7dc1…a561`, `VCRUNTIME140.dll` still absent; the three runs on `e9e393a` are all green (main CI `40465726424` 6m41s, tag CI `40465726735` 9m14s, Release `40465726898` 7m06s). Idle cost **did not regress**: the daemon idles at about **15 ms of CPU per 10 s** with windows open (the UI's own redraw cost is separate) - same shape as the B4 measurement |
+| **Branch** | **1.2.0 released; `feature/b5-helper-request` pruned (its tip `8d5f33f` is inside `main`).** Counts stand: **410 unit tests** (304 in `armoury` + 106 in `armoury-core`), **163 harness checks** (160 PASS + the real-catalogue pair as 2 SKIP until the flip - the flip is published and signed now, so the next CI run is the pair's first run without its SKIP reason); the released exe is **13,325,824 bytes** (+512 over the B5 branch tree's 13,325,312), sha256 `355b7dc1…a561`, `VCRUNTIME140.dll` still absent; the three runs on `e9e393a` are all green (main CI `40465726424` 6m41s, tag CI `40465726735` 9m14s, Release `40465726898` 7m06s). Idle cost **did not regress**: the daemon idles at about **15 ms of CPU per 10 s** with windows open (the UI's own redraw cost is separate) - same shape as the B4 measurement |
 | **Tree** | clean |
 | **Blocking** | nothing |
 | **Open questions** | none - the design is settled in `DECISIONS.md`, and the review's one product question (`registry_set`'s capability) is settled in §20 |
@@ -1449,6 +1449,51 @@ because a CI run on the same lock had run first).
 **Next.** Phase C (the console as a helper module) and the remaining
 fold-ins are the work; the `C:\Apps` install of the stashed exe, the packs
 flip and the signing key are the user's calls.
+
+---
+
+### 2026-10-27 - the catalogue's flip is out and signed
+
+**What I did.** The packs repo's prepared flip went out and the catalogue
+is a signed pair now. Push one landed 2026-10-27 09:31:46 (+02:00) carrying the
+two commits prepared the day before (`539773c` 13:44:43, `2cd49ce` 14:35:24):
+the manifest is schema 2 (the entries under `modules`, each naming its kind)
+and the signing script that goes with it, so the packs `origin/main` moved
+`5f3d54e..2cd49ce`. The raw URL then served the flipped manifest byte for
+byte: schema 2, three modules, no `packs` key, 1,312 bytes, sha256
+`9a2020b7e3098ba264bfe19ca1e4ae9858133eec0103c7389141ba5fe003d390` on both
+sides (`fc.exe /b`: no differences). The signing ran 09:32:57 through
+`tools/sign-manifest.ps1` with the keeper's minisign key - unencrypted,
+checked in memory, no pass phrase prompted, read or kept - the script's own
+`-Vm` self-check passing against the sibling `.pub`, and minisign writing
+`signed: … (298 bytes)`. The signature was committed as `f4d1604`
+(`sign: the schema-2 manifest`, author and committer `PixelAsh6`) and pushed
+09:33:10 (`2cd49ce..f4d1604`). minisign's text is native CRLF, so the
+worktree copy reads 298 bytes while git stores the LF bytes (294): the
+committed blob and the served file are byte-equal (both sha256
+`c66d5a56f67db4fa8719b6cb6ca2e5b450fd399dd30e55bfc10ed117f429d091`).
+
+**Measured.** The chain the way the daemon's B3+ fetch sees it, over
+`raw.githubusercontent.com` bytes: the fetched `catalog/index.json.minisig`
+byte-compares against the committed blob, and the fetched manifest-plus-
+signature pair verifies with the keeper's public key on its own -
+`minisign -Vm index.json -p %USERPROFILE%\.minisign\ArmouryDaemonCatalog.pub`
+prints **`Signature and comment signature verified`** (exit 0), with the
+trusted comment naming its timestamp `2026-10-27 09:32:57 +02:00`. The
+brief's local command over the worktree pair prints the same line. The
+manifest is untouched between flip and sign: its blob is `ee8bd351` at
+`539773c`, `main`, the packs `origin/main` and the worktree alike, and the
+packs tree carries exactly one new file across all of it (the
+`index.json.minisig` alone).
+
+**What this settles.** No part of the release run is held by the catalogue
+any more: 1.2.0 is out (tag `v1.2.0` on `e9e393a`), and its Release run's
+catalogue check stands as the pre-flip historical check it was. The
+harness's real-catalogue pair has its signed manifest; its first CI run
+after the flip tells what it sees.
+
+**Next.** Phase C and the fold-ins, unchanged from the entry above. The
+`C:\Apps` install of the stashed exe is still the user's call.
 
 ---
 
