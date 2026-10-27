@@ -37,6 +37,22 @@ background.
 
 ## Current state
 
+- **Phase C1-C3 are done on `feature/c1-c3-console-split`** (green run `40499523579`):
+  the console launcher is its own exe — a second `[[bin]]` of the `armoury` crate whose
+  crate root (`src/console_bin.rs`) declares the seven shared modules with `#[path]`
+  (`net.rs`/`fonts.rs`/`dpi.rs` moved out of `catalog.rs`/`ui.rs`/`main.rs` so both
+  binaries share them), `show_console` prefers an installed
+  `modules/<id>/ArmouryConsole.exe` helper (the module's id, version and path logged,
+  lower id first, a module whose exe is gone skipped), and the old
+  `current_exe() --console` fallback stays behind it with the environment untouched —
+  so `ARMOURY_TEST_NS` still namespaces the pipe end to end. **C4 is dead**: the
+  SteamGridDB key stays in the elevated daemon. Counts: **417 unit tests**
+  (311 `armoury` + 106 `armoury-core`), **169 harness checks, 0 SKIP** (the
+  real-catalogue pair ran against the signed live manifest for the first time), daemon
+  exe **13,331,456 bytes** (+5,632) plus the new console exe **7,036,928 bytes**, idle
+  cost unchanged (medians 0.125 vs 0.109 CPU s per 60 s).
+  `DECISIONS.md` §29, `GOTCHAS.md` traps 59-60.
+
 - **Phase A4 is merged into `main`** (`cd4c3e3`, CI `40300606901` green): the pack
   worker is no longer a single serial thread. The plain packs keep their thread, the
   modes get a second one (`packs.rs:161`, `spawn_worker` :186), whole-state jobs
@@ -203,12 +219,13 @@ background.
 
 ## The next action
 
-**Phase B is in `main`** - B5 finished it: the daemon's `InstallHelper`
-request (the manifest entry's id, version, executable path, SHA-256 and
-size), the daemon's re-verification of the archive's bytes, and the
-Modules window's helper buttons armed to use it. The merge is `3f3a772`
-and the whole work's runs are green. The packs repo's flip, the signing
-key and the next release are the user's calls.
+**Phase C is done** — the console is its own exe and the daemon prefers it
+when a helper module carries it (`feature/c1-c3-console-split`, green run
+`40499523579`); the merge into `main`, the post-merge run and the branch
+prune complete this phase's session. **Phase D is next**: the Inno Setup
+installer (`D1`, core only, zero packs), the build-from-source script
+(`D2`), and the self-update decision (`D3`). The `C:\Apps` install of 1.2.0,
+the signing key and the next release are the user's calls.
 
 Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
 until the rest has shipped and settled.

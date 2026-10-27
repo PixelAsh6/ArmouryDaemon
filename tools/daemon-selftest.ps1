@@ -202,6 +202,20 @@ function Get-Gap($from, $to) {
     return ($to - $from).TotalSeconds
 }
 
+# Wait until the daemon log carries a line matching the pattern, and hand back the last
+# match, or $null when nothing matched (a $null in a check fails as "not there", never
+# as an error in the plumbing).
+function Wait-DaemonLogLine([string]$pattern, [int]$timeoutSec = 6) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $found = $null
+    while ((Get-Date) -lt $deadline) {
+        $found = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match $pattern } | Select-Object -Last 1)
+        if ($found) { return $found }
+        Start-Sleep -Milliseconds 250
+    }
+    return $null
+}
+
 # The times at which a named pack logged that it applied ('applied') or reverted ('reverted').
 # The line carries the pack's name, not its id: "Sluggish: reverted (target: n/a)".
 function Get-PackLineTimes([string]$name, [string]$action) {
@@ -1435,14 +1449,78 @@ try {
         $requestHash = (Get-FileHash -LiteralPath $requestZip -Algorithm SHA256).Hash.ToLowerInvariant()
         $requestSize = (Get-Item -LiteralPath $requestZip).Length
         $requestJson = '{"type":"install_helper","id":"h-request","name":"Requested helper","version":"0.9.9","entry":"ArmouryConsole.exe","file":"' + ($requestZip -replace '\\', '\\') + '","sha256":"' + $requestHash + '","size":' + $requestSize + '}'
-        $reply = Send-Pipe $requestJson
-        Check 'the daemon answers the helper request' ($reply -match '"ok"\s*:\s*true') "reply=$(Get-FirstLine $reply)"
+        # the daemon answers a helper request with pack_op on the same
+        # connection, but the 1 s status heartbeat can land first - read
+        # until the type shows up (Send-Pipe's one-line read took the
+        # heartbeat instead of the ack once, and the check failed while the
+        # install had succeeded)
+        $reply = Send-And-Wait $requestJson 'pack_op' 6000
+        Check 'the daemon answers the helper request' ($reply -and $reply.ok) "reply=$($reply | ConvertTo-Json -Compress)"
         $list = Invoke-Cli @('--module-list') 40
         Check 'the requested helper is listed by a fresh process' ($list.Text.Contains('h-request')) "output=$(Get-FirstLine $list.Text)"
         Check 'the requested helper archive left temp after the answer' (-not (Test-Path -LiteralPath $requestZip)) "still there: $requestZip"
         Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $requestZip -Force -ErrorAction SilentlyContinue
+
+        # The daemon's own words about the console, for a failing 20f check: the choice, the
+# spawn and the module scan are all in the throw-away instance's log, and the console
+# section's failures are only diagnosable with them in hand.
+function Format-DaemonLogTail([int]$lines = 8) {
+    return (((Read-Text $logPath) -split "`r?`n") |
+        Where-Object { $_ -match 'console|helper' } |
+        Select-Object -Last $lines) -join ' // '
+}
+
+# -- 20f. show_console prefers an installed console helper (Phase C1/C2) --
+        #
+        # The console is its own exe now (ArmouryConsole.exe), and a helper module that
+        # carries it is installed through the B5 request. show_console must prefer that
+        # module's exe (`modules/<id>/ArmouryConsole.exe`) over the `--console` fallback on
+        # the daemon binary. The module here carries a **real** image (a copy of cmd.exe
+        # under the console's name): a malformed image froze the daemon's main loop inside
+        # CreateProcess on a runner twice now (trap 60), and the fallback afterward starts
+        # a real band, which the probe ends by the pid the daemon logged.
+        $consoleZip = Join-Path $env:TEMP 'armoury-catalog-h-console.zip'
+        $consoleStage = Join-Path $cliDir 'console-zip'
+        New-Item -ItemType Directory -Force -Path $consoleStage | Out-Null
+        Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\cmd.exe') -Destination (Join-Path $consoleStage 'ArmouryConsole.exe') -Force
+        Compress-Archive -Path (Join-Path $consoleStage 'ArmouryConsole.exe') -DestinationPath $consoleZip -Force
+        $consoleHash = (Get-FileHash -LiteralPath $consoleZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        $consoleSize = (Get-Item -LiteralPath $consoleZip).Length
+        $consoleJson = '{"type":"install_helper","id":"h-console","name":"Console helper","version":"1.2.0","entry":"ArmouryConsole.exe","file":"' + ($consoleZip -replace '\\', '\\') + '","sha256":"' + $consoleHash + '","size":' + $consoleSize + '}'
+        # read until pack_op: the status heartbeat rides the pipe too
+        $reply = Send-And-Wait $consoleJson 'pack_op' 6000
+        Check 'the console helper installs' ($reply -and $reply.ok) "reply=$($reply | ConvertTo-Json -Compress)"
+
+        Send-Pipe '{"type":"show_console"}' | Out-Null
+        $helperLine = Wait-DaemonLogLine 'console launcher: using module h-console v1\.2\.0'
+        Check 'show_console uses the installed helper' ($null -ne $helperLine) "log=$(Get-FirstLine $helperLine)"
+        $fallbackLines = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match 'no helper module' })
+        Check 'the fallback stays quiet while a helper is installed' (@($fallbackLines).Count -eq 0) "count=$(@($fallbackLines).Count)"
+        $childLine = Wait-DaemonLogLine 'spawned console launcher \(pid (\d+)\)'
+        Check 'the module exe the daemon chose is the one it started' ($null -ne $childLine) "log: $(Format-DaemonLogTail)"
+        if ($childLine -match 'pid (\d+)') {
+            # the module's exe is running: the probe is done with it
+            Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue
+        }
+
+        # the helper goes away again: the choice has to fall back to the daemon exe
+        Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $consoleZip -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $consoleStage -Recurse -Force -ErrorAction SilentlyContinue
+        Send-Pipe '{"type":"show_console"}' | Out-Null
+        "20f after the second show_console: $(Format-DaemonLogTail 12)"
+        $fallbackLine = Wait-DaemonLogLine 'console launcher: no helper module'
+        Check 'show_console falls back to the daemon exe' (($null -ne $fallbackLine) -and ($fallbackLine.Contains('--console'))) "log: $(Format-DaemonLogTail)"
+        $childLine = Wait-DaemonLogLine 'spawned console launcher \(pid (\d+)\)'
+        Check 'the fallback spawns a console launcher' ($null -ne $childLine) "log: $(Format-DaemonLogTail)"
+        if ($childLine -match 'pid (\d+)') {
+            # the band is up for a moment; then it is stopped - the daemon keeps the
+            # child as its launcher, and the probe is done with it
+            Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue
+        }
 
         $env:ARMOURY_TEST_NS = $ns
     }

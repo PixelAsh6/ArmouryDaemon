@@ -1011,3 +1011,50 @@ three kinds from the same manifest.
   and the status snapshot still speak of packs - the config and status
   rename (DESIGN §7) rides the release that flips the catalogue
   (§25). Only the Modules window and its own copy say Modules.
+
+---
+
+## 29. The console is its own exe, and the daemon prefers it when it is installed
+
+**Settled 2026-10-27.** Phase C made the console launcher its own binary and
+gave the daemon an order of who to start:
+
+- **One crate, two binaries.** `ArmouryConsole` is a second `[[bin]]` of the
+  `armoury` package with its own crate root (`src/console_bin.rs`), not a
+  new crate and not a lib split. A crate root that is not `src/main.rs`
+  resolves its submodule paths from its own folder, so the modules it
+  carries are declared with `#[path]` - the seven files the band needs
+  (`art`, `console_ui`, `dpi`, `fonts`, `net`, `pad`, `pick`) compile into
+  both binaries. The bin target says `test = false`: the shared modules'
+  unit tests run once, in the daemon binary's test harness, which compiles
+  the identical code, so a second copy of every art/pad/console test run
+  would say nothing new.
+- **Three small modules moved whole so both exes could share them.**
+  `net.rs` (the one HTTP client, out of `catalog.rs`), `fonts.rs` (the
+  system font install, out of `ui.rs`) and `dpi.rs` (Per-Monitor-V2
+  awareness, out of `main.rs`). The console binary must not carry the
+  catalogue machinery (`catalog.rs` transitively pulls packs, trust,
+  helpers), and `net::agent` is the smallest honest cut: one owner, four
+  callers moved to it, `catalog::agent` retired. Rejected: linking the
+  whole daemon into the console exe (a second ~13 MB copy of the workspace),
+  and a new shared crate (the work order asked for a `[[bin]]`, and nothing
+  shared yet needs one).
+- **The helper preference is by file name, deterministic, and checked.**
+  `show_console` picks the first `modules/<id>/` whose recorded `entry`'s
+  **final path component** is `ArmouryConsole.exe` (case-insensitive: the
+  records travel between machines), and skips a module whose exe is gone
+  from disk. `helpers::installed` sorts by id, so two console helpers pick
+  the lower id - the order is not a race. The fallback is the old
+  `current_exe() --console`, launched with the same `CREATE_NO_WINDOW`, and
+  the child inherits the environment, so `ARMOURY_TEST_NS` keeps namespacing
+  the pipe end to end. The choice is logged with the module's id, version
+  and path - a future session can say which console ran.
+- **C4 is dead.** The SteamGridDB key stays in the elevated daemon exactly
+  as-is: the helper runs as a child of the elevated daemon and inherits
+  elevation, so there is no privilege the key could be moved below, and no
+  `CreateProcessWithTokenW` story is needed. Half-measures (a second key
+  copy, a lookup proxy) are rejected with it.
+- **Accepted costs.** Two binaries link the shared modules twice: the daemon
+  exe grows by the re-homing alone, and the console exe is the phase's own
+  deliverable (the only new exe). The idle cost is unchanged by
+  construction - `show_console` runs on request, not on the idle path.

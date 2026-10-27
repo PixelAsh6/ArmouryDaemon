@@ -172,14 +172,39 @@ New `Request` variants in `crates/armoury-core/src/protocol.rs` (the enum runs f
 
 - **C1.** New bin target: `console_ui.rs` + `art.rs` + `pad.rs` become
   `ArmouryConsole.exe`. Add a `[[bin]]` to `crates/armoury/Cargo.toml` (one already
-  exists at `:7-9`).
+  exists at `:7-9`). — **done (2026-10-27)**: `[[bin]] name = "ArmouryConsole",
+  path = "src/console_bin.rs"` (`test = false`; the shared modules' tests run once, in
+  the daemon binary's test harness). `console_bin.rs` is a second crate root that
+  declares the seven modules the band carries with `#[path]` (`art`, `console_ui`,
+  `dpi`, `fonts`, `net`, `pad`, `pick`) — a non-`main.rs` crate root resolves submodule
+  paths from its own folder, so `#[path]` is the honest spelling. The pieces the band
+  needs but could not take whole became three small shared modules: `net.rs` (the one
+  HTTP client, out of `catalog.rs`), `fonts.rs` (the system font install, out of
+  `ui.rs`) and `dpi.rs` (Per-Monitor-V2 awareness, out of `main.rs`). The daemon binary
+  keeps everything it had — `--ui`, the pack machine and the `--console` fallback run
+  in it as before.
 - **C2.** `show_console()` (`daemon.rs:2008`) currently spawns
   `Command::new(current_exe()).arg("--console")`. Spawn the installed helper when one
-  is present; fall back to `current_exe() --console` otherwise.
+  is present; fall back to `current_exe() --console` otherwise. — **done
+  (2026-10-27)**: `show_console` (now `daemon.rs:2290` — the file moved) picks the
+  first `modules/<id>/` whose recorded `entry` runs `ArmouryConsole.exe`, by file
+  name, case-insensitive, lower id first (`matches_console_entry` `:723`,
+  `console_helper` `:733`), logs the module's id, version and path, and refuses a
+  module whose exe is gone from disk; without a helper it logs and takes the old
+  `current_exe() --console` fallback. The
+  spawn keeps `CREATE_NO_WINDOW` and the child inherits the environment, so the
+  `ARMOURY_TEST_NS` pipe namespacing rides along unchanged. Harness 20f installs and
+  removes a console helper over the pipe and checks both log lines; the selection is
+  pinned by six unit tests.
 - **C3.** The helper already speaks the existing JSON-lines protocol over the existing
-  named pipe and already sends `Request::ConsoleHello`. **No new protocol.**
+  named pipe and already sends `Request::ConsoleHello`. **No new protocol.** — **done
+  (2026-10-27)**: nothing in `protocol.rs`, `ipc.rs` or the daemon's pipe server
+  changed.
 - **C4.** Decide whether to move the SteamGridDB key out of the elevated daemon
-  (`DESIGN.md` §9). Do not half-do it.
+  (`DESIGN.md` §9). Do not half-do it. — **decided 2026-10-27: dead.** The key stays
+  in the elevated daemon exactly as-is; the helper runs as a child of the elevated
+  daemon and inherits elevation, so no `CreateProcessWithTokenW` story is needed.
+  Nothing in the sgdb key pathway moved.
 
 ---
 

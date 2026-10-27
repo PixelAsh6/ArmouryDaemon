@@ -317,7 +317,7 @@ module needs.
 | `suspends_packs` | `daemon.rs:1726` (`enter_idle`) / `:1759` (`exit_idle`) | the mode drives `Engine::set_idle` |
 | `react_to_tracked` | `daemon.rs:1350` | a tracked app starting while the mode is engaged re-engages it |
 | Installing a module | `daemon.rs:2572` (the `InstallPack` handler) | one handler per kind |
-| The console helper | `daemon.rs:2024` (`show_console`) | spawn the installed helper, fall back to `current_exe() --console` |
+| The console helper | `daemon.rs:2024` (`show_console`) | **done in C2**: spawn the installed helper, fall back to `current_exe() --console` (`DECISIONS.md` §29) |
 | The killswitch | `daemon.rs:1919` (`toggle_killswitch`) | **done in A5**: `killswitch_enabled` (default `true`, doubles as the "module installed" flag), `set_killswitch` over the pipe, and a release on quit (`DECISIONS.md` §23) |
 
 The pack worker **was** a single serial thread (`packs.rs:171`,
@@ -328,15 +328,24 @@ The pack worker **was** a single serial thread (`packs.rs:171`,
 
 ## 9. The helper module (console)
 
+**Done in Phase C1-C3 (2026-10-27)**: the console is its own exe, and the
+daemon spawns the installed helper first (see `DECISIONS.md` §29 for the
+selection rule and the accepted costs).
+
 - A new `[[bin]]` in `crates/armoury/Cargo.toml` (one already exists at `:7-9`).
   `console_ui.rs` (2680 lines) + `art.rs` (1395 lines) + `pad.rs` become
-  `ArmouryConsole.exe`; the daemon keeps the dashboard (`ui.rs`).
+  `ArmouryConsole.exe`; the daemon keeps the dashboard (`ui.rs`). — the
+  actual split: a second crate root (`src/console_bin.rs`) declaring seven
+  modules with `#[path]`; `net.rs`/`fonts.rs`/`dpi.rs` were lifted out of
+  `catalog.rs`/`ui.rs`/`main.rs` so both binaries share them.
 - The helper speaks the **existing** JSON-lines protocol over the existing named pipe
-  (`interprocess` local sockets, `crates/armoury/src/ipc.rs`). It already sends
+  (`crates/armoury/src/ipc.rs`). It already sends
   `Request::ConsoleHello`. **No new protocol is needed.**
-- **Consider moving the SteamGridDB key out of the elevated daemon.** Today
-  `cfg.sgdb_api_key` is in the daemon's config and the daemon does the art lookups
+- **The SteamGridDB key stays in the elevated daemon — decided 2026-10-27.**
+  Today `cfg.sgdb_api_key` is in the daemon's config and the daemon does the art lookups
   (`daemon.rs:2135`, `daemon.rs:2469`). If the console owns the art code, the key can
   live with it — but a child of an elevated daemon inherits elevation, so a
-  *non-elevated* helper needs a linked-token `CreateProcessWithTokenW`. **Decide
-  explicitly; do not half-do it.**
+  *non-elevated* helper would need a linked-token `CreateProcessWithTokenW`. The
+  decision: **dead on arrival** - the daemon spawns the helper itself, the child
+  inherits the daemon's elevation, and the key stays where it is. Nothing in the
+  sgdb key pathway moved.

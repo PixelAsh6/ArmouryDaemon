@@ -511,6 +511,42 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     `protocol_version = "HTTP/1.1"` (keep-alive) fixed it. Only a
     hand-rolled development server hits this; a real catalogue host
     keep-alives on its own.
+59. **A crate root that is not `main.rs` resolves its modules from its own
+    folder.** Phase C1 put a second `[[bin]]` in the `armoury` crate with
+    the crate root `src/console_bin.rs`; a bare `mod art;` there would look
+    for `src/console_bin/art.rs`, which does not exist. The modules the two
+    binaries share are declared with `#[path = "art.rs"] mod art;` (and so
+    on) in `console_bin.rs` - the same trick `#[cfg(test)] pub(crate) mod
+    testutil;` needed no help for, because `main.rs` sits at `src/` and
+    gets the root path free. Related house rule from B3: sibling modules
+    inside a shared file must name each other `crate::foo`, never bare
+    `foo`.
+60. **`CreateProcess` on a malformed image can hang the daemon's whole main
+    loop - on the CI runners, twice observed.** The 20f console-helper
+    probe first served the B3 fixture (`ArmouryConsole.exe` holding 78
+    bytes of `MZ …` text). The daemon logged its choice and then went
+    silent: `Command::spawn` never returned, so no later request, no later
+    log line, no spawn failure of any kind for the rest of the run. On the
+    development machine the same file fails in **54 ms**
+    (`ERROR_BAD_EXE_FORMAT` wording: "not a valid application for this OS
+    platform"). The runner never said more. Whatever the runner-side
+    difference is, the shape of it cannot be tolerated in a harness: the
+    probe now stages a **real** image (a copy of `cmd.exe` under the
+    console's name), and the `--module-list`/`install_helper` machines that
+    never execute anything stay as they are. Rule: **a piece of the harness
+    that asks the daemon to spawn a file must hand it a real PE, or it is
+    not testing the spawn.**
+61. **A reply-asserting pipe check must read until its message type - the
+    daemon's status heartbeat can arrive first.** The daemon pushes
+    `Response::Status` to every open pipe connection at least once a
+    second (the `last_broadcast` heartbeat in `daemon.rs`'s request tick),
+    so a check that reads one line reads whichever lands first. The 20f
+    probe wrote `install_helper`, read the connection's first line, and
+    got a status object (`uptime_secs: 5`) instead of the `pack_op` ack -
+    the install had succeeded (the daemon's log said "Console helper
+    installed") and the five checks after the failed one passed. Rule:
+    `Send-And-Wait <json> 'pack_op'` is for checks that look at the
+    answer; `Send-Pipe` stays for fire-and-forget sends.
 
 ---
 
