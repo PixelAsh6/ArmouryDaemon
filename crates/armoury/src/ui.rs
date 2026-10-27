@@ -55,7 +55,7 @@ const UI_MARGIN_PX: f32 = 0.0;
 /// The folder that was looked in is not named here: the path is long and belongs to the
 /// machine, and a path that says nothing is worse than no path at all. The settings
 /// window has an "Open packs folder" button for the ones who want to see it.
-const NO_MODULES_HINT: &str = "No modules installed yet.\nFind them in Settings → Modules.";
+const NO_PACKS_HINT: &str = "No packs installed yet.\nFind them in Settings → Packs.";
 
 /// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
 /// packs lists as a built-in row with one dropdown.
@@ -1135,7 +1135,7 @@ impl eframe::App for App {
                 self.request(&Request::SetConsoleOpen { mode });
             }
             if packs.is_empty() {
-                ui.small(NO_MODULES_HINT);
+                ui.small(NO_PACKS_HINT);
             }
             let mut set_enabled: Option<(String, bool)> = None;
             let mut set_value: Option<(String, String, String)> = None;
@@ -1253,7 +1253,13 @@ impl eframe::App for App {
             self.placement.request(pos);
         }
 
-        if let Some(outer) = ctx.input(|i| i.viewport().outer_rect) {
+        // A frame the OS has not placed yet reports a rect that is nowhere (Windows parks a
+        // minimized window at about -32000): it is no position to publish, to anchor the chain
+        // on, or to read as a drag.
+        if let Some(outer) = ctx
+            .input(|i| i.viewport().outer_rect)
+            .filter(|r| on_screen_rect(*r))
+        {
             {
                 let mut s = self.shared.lock().unwrap();
                 if s.core_rect != Some(outer) {
@@ -1306,7 +1312,7 @@ impl eframe::App for App {
             ctx.show_viewport_deferred(
                 install_packs_viewport_id(),
                 egui::ViewportBuilder::default()
-                    .with_title("Modules")
+                    .with_title("Packs")
                     .with_decorations(false)
                     .with_resizable(false)
                     .with_visible(false)
@@ -1415,6 +1421,26 @@ fn clamp_into_work_area(
     Some(egui::pos2(clamped.x / ppp, clamped.y / ppp))
 }
 
+/// Is this the rect of a window that is really on screen?
+///
+/// Our own windows are found by **title**, and a title can belong to a window that is
+/// minimized (Windows parks it at about -32000), hidden, or left over from another instance of
+/// the daemon. None of those is where the user sees anything, so no placement may be computed
+/// from one: the anchor would be off the desktop, and `place_left_px_in` clamps such a result
+/// to the work area's top-left corner — the "every window jumped to the corner" reports of
+/// 2026-10-27 (both screenshots). A rect that fails this test is read as "not on screen", the
+/// same as a window that does not exist yet.
+fn on_screen_rect(rect: Rect) -> bool {
+    /// Anything parked this far out is minimized or hidden, not a second monitor: Windows
+    /// parks a minimized window at -32000, and a real layout on a monitor to the left stops
+    /// long before.
+    const PARKED: f32 = -10_000.0;
+    rect.width() >= 150.0
+        && rect.height() >= 50.0
+        && rect.min.x > PARKED
+        && rect.min.y > PARKED
+}
+
 /// Actual rect (physical pixels) of one of our own windows, straight from the OS.
 fn window_rect_px(title: &str) -> Option<Rect> {
     use windows::Win32::Foundation::RECT;
@@ -1425,10 +1451,13 @@ fn window_rect_px(title: &str) -> Option<Rect> {
     let hwnd = unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) }.ok()?;
     let mut rect = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
-    Some(Rect::from_min_max(
+    let found = Rect::from_min_max(
         egui::pos2(rect.left as f32, rect.top as f32),
         egui::pos2(rect.right as f32, rect.bottom as f32),
-    ))
+    );
+    // A window that is minimized or hidden is not where the user sees it: read it as absent,
+    // so nothing is placed against it (see `on_screen_rect`).
+    on_screen_rect(found).then_some(found)
 }
 
 /// The dashboard's rect in physical pixels: what the OS says, or the points converted.
@@ -1555,7 +1584,7 @@ fn reanchor(ctx: &egui::Context, s: &mut Shared, core: Rect) {
     for item in s.chain.clone() {
         let (size, title) = match &item {
             ChainItem::Settings => (s.settings_size, "Settings".to_string()),
-            ChainItem::InstallPacks => (s.install_packs_size, "Modules".to_string()),
+            ChainItem::InstallPacks => (s.install_packs_size, "Packs".to_string()),
             ChainItem::Pack(id) => (s.pack_sizes.get(id).copied(), format!("Pack: {id}")),
         };
         let Some(size) = size else {
@@ -1653,7 +1682,7 @@ fn leftmost_edge_px(s: &Shared, skip: &str, core_left_px: f32) -> f32 {
         edges.push(rect.left());
     }
     if s.install_packs_open
-        && let Some(rect) = window_rect_px("Modules")
+        && let Some(rect) = window_rect_px("Packs")
     {
         edges.push(rect.left());
     }
@@ -1851,7 +1880,7 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
             }
         }
         1 => {
-            if let Some(core) = s.core_rect {
+            if let Some(core) = s.core_rect.filter(|r| on_screen_rect(*r)) {
                 // Anchor on the leftmost window already on screen (Settings included), so a new
                 // pack window always lands next to its neighbour, never over it and never with a
                 // gap where a dragged window used to be.
@@ -2103,8 +2132,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // A tighter gap than the app's default: the two buttons have to share one row.
             ui.spacing_mut().item_spacing.x = 6.0;
             if ui
-                .button("Modules")
-                .on_hover_text("Open the Modules window: the catalogue of packs and helpers")
+                .button("Packs")
+                .on_hover_text("Open the Packs window: the catalogue of packs and helpers")
                 .clicked()
             {
                 let mut s = shared.lock().unwrap();
@@ -2343,7 +2372,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
         // The packs row: two buttons side by side.
         w = w.max(
-            tw(&button_font, "Modules")
+            tw(&button_font, "Packs")
                 + 24.0
                 + tw(&button_font, "Open packs folder")
                 + 24.0
@@ -2390,7 +2419,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // The settings window is too big and can't sit on top of the main window, so it
             // joins the same leftward chain as the pack windows: immediately left of the
             // current leftmost window, bottom-aligned to the dashboard. Never above it.
-            let pos = match s.core_rect {
+            let pos = match s.core_rect.filter(|r| on_screen_rect(*r)) {
                 Some(core) => {
                     let core_px = core_rect_px(ctx, core);
                     let anchor = leftmost_edge_to_clear_px(&s, core_px.left());
@@ -2441,12 +2470,22 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             }
             if size_changed {
                 log::info!("settings window resized ({:.0}x{:.0})", desired.x, desired.y);
+                // The window keeps its **bottom-left** corner. The chain is bottom-aligned, so a
+                // row leaving the list (a removed app or pack) makes the window shorter from the
+                // top — it does not hop across the screen. Before 2026-10-27 the stored top-left
+                // was kept instead and then clamped, which is how a delete could leave the
+                // window somewhere the user never put it.
+                let old = s.settings_size;
                 ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
                 s.settings_size = Some(desired);
+                let kept = pos.map(|p| match old {
+                    Some(old) => egui::pos2(p.x, p.y + old.y - desired.y),
+                    None => p,
+                });
                 // The settings window keeps its slot in the chain: re-anchoring it against the
                 // current leftmost window would swap it with a pack window opened after it.
-                // The stored position is only clamped, so the window stays on screen.
-                let clamped = pos.and_then(|p| clamp_into_work_area(ctx, p, desired));
+                // The kept position is only clamped, so the window stays on screen.
+                let clamped = kept.and_then(|p| clamp_into_work_area(ctx, p, desired));
                 if let Some(pos) = clamped {
                     ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                     s.settings_target = Some(pos);
@@ -2509,7 +2548,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 
         // ---- title bar ----
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Modules").strong().size(16.0));
+            ui.label(RichText::new("Packs").strong().size(16.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, 20.0, draw_close).clicked() {
                     close = true;
@@ -2673,7 +2712,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             let desired = s
                 .install_packs_size
                 .unwrap_or_else(|| egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT));
-            let pos = match s.core_rect {
+            let pos = match s.core_rect.filter(|r| on_screen_rect(*r)) {
                 Some(core) => {
                     // The window joins the chain at its left end: it clears every window
                     // that is already on screen.
@@ -2698,7 +2737,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         2 => {
             // Same rule as the dashboard: only show once the OS reports the position.
             let ppp = ctx.pixels_per_point().max(0.5);
-            let placed = match (s.install_packs_target, window_topleft_px("Modules")) {
+            let placed = match (s.install_packs_target, window_topleft_px("Packs")) {
                 (Some(t), Some((x, y))) => {
                     let want = ((t.x * ppp).round() as i32, (t.y * ppp).round() as i32);
                     (x - want.0).abs() <= 2 && (y - want.1).abs() <= 2
@@ -2725,7 +2764,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // The window is up. It keeps its slot in the chain; the user may have dragged
             // it, and then the real position wins over the stored one.
             let target = s.install_packs_target;
-            let pos = window_rect_pts(ctx, "Modules").map(|r| r.min).or(target);
+            let pos = window_rect_pts(ctx, "Packs").map(|r| r.min).or(target);
             if pos != target {
                 s.install_packs_target = pos;
             }
@@ -3048,7 +3087,11 @@ fn window_topleft_px(title: &str) -> Option<(i32, i32)> {
     let hwnd = unsafe { FindWindowW(None, PCWSTR(wide.as_ptr())) }.ok()?;
     let mut rect = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
-    Some((rect.left, rect.top))
+    let found = Rect::from_min_max(
+        egui::pos2(rect.left as f32, rect.top as f32),
+        egui::pos2(rect.right as f32, rect.bottom as f32),
+    );
+    on_screen_rect(found).then_some((rect.left, rect.top))
 }
 
 /// System DPI scale (primary monitor) — usable before any window exists.
@@ -4142,6 +4185,30 @@ mod tests {
     }
 
     #[test]
+    fn a_minimized_or_hidden_window_is_not_on_screen() {
+        // Windows parks a minimized window at about -32000. Reading that as a position made
+        // every placement clamp to the work area's top-left corner: the "settings jumped to
+        // the corner" report (2026-10-27, both screenshots).
+        let parked = Rect::from_min_max(egui::pos2(-32000.0, -32000.0), egui::pos2(-31475.0, -31251.0));
+        assert!(!on_screen_rect(parked), "a parked window is not a position");
+        // a rect the OS has not filled in yet
+        let empty = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.0, 0.0));
+        assert!(!on_screen_rect(empty), "a zero-sized rect is not a window yet");
+        let sliver = Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(180.0, 400.0));
+        assert!(!on_screen_rect(sliver), "nothing we draw is 80 px wide");
+    }
+
+    #[test]
+    fn a_real_window_rect_is_on_screen() {
+        // The dashboard on a second monitor to the left of the primary one: negative x is a
+        // real position, and the test must not throw it away.
+        let dashboard = Rect::from_min_max(egui::pos2(-1920.0, 40.0), egui::pos2(-1540.0, 260.0));
+        assert!(on_screen_rect(dashboard), "a monitor to the left is a real place");
+        let settings = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(330.0, 700.0));
+        assert!(on_screen_rect(settings));
+    }
+
+    #[test]
     fn growing_the_window_keeps_the_bottom_edge() {
         // The window is anchored by its bottom edge: when the content grows, the top moves up
         // and the bottom stays on the work area - the window never drops off the screen.
@@ -4538,25 +4605,25 @@ mod tests {
     }
 
     #[test]
-    fn the_empty_modules_message_points_at_the_catalogue() {
+    fn the_empty_packs_message_points_at_the_catalogue() {
         // The message used to carry a placeholder that was never substituted
         // ("looked in <app>/packs"), so a first-time user saw broken templating.
         assert!(
-            !NO_MODULES_HINT.contains('<') && !NO_MODULES_HINT.contains('>'),
-            "the message must have no placeholder: {NO_MODULES_HINT}"
+            !NO_PACKS_HINT.contains('<') && !NO_PACKS_HINT.contains('>'),
+            "the message must have no placeholder: {NO_PACKS_HINT}"
         );
         assert!(
-            NO_MODULES_HINT.contains("No modules installed"),
-            "the message must say that nothing is installed: {NO_MODULES_HINT}"
+            NO_PACKS_HINT.contains("No packs installed"),
+            "the message must say that nothing is installed: {NO_PACKS_HINT}"
         );
         assert!(
-            NO_MODULES_HINT.contains("Settings → Modules"),
-            "the message must point at the catalogue: {NO_MODULES_HINT}"
+            NO_PACKS_HINT.contains("Settings → Packs"),
+            "the message must point at the catalogue: {NO_PACKS_HINT}"
         );
         // Every line has to fit the dashboard: it is as narrow as its content, and a
         // line that does not fit is a line that is cut off. The longest line is 32
         // characters, and the limit leaves room for it to grow.
-        for line in NO_MODULES_HINT.lines() {
+        for line in NO_PACKS_HINT.lines() {
             assert!(
                 line.chars().count() <= 40,
                 "the line is too long for the dashboard: {line}"
@@ -4919,7 +4986,7 @@ mod tests {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         // The catalogue is checked in the Modules window, so the
                         // settings window has two buttons and not three.
-                        for label in ["Modules", "Open packs folder"] {
+                        for label in ["Packs", "Open packs folder"] {
                             let rect = ui.button(label).rect;
                             rows.push(rect.top());
                             widths.push(rect.width());
