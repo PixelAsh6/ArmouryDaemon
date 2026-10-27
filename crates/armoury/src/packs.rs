@@ -7,8 +7,8 @@
 //! Nothing here ever goes through a shell, and packs can only use whitelisted mechanisms.
 
 use armoury_core::pack::{
-    CapSet, Capability, Pack, PackKind, Step, StepBlock, TemplateCtx, substitute, version_at_least,
-};
+        CapSet, Capability, Pack, PackKind, Step, StepBlock, TemplateCtx, substitute, version_at_least,
+    };
 use crossbeam_channel::Receiver;
 use log::{info, warn};
 use std::collections::HashMap;
@@ -40,6 +40,91 @@ pub const DAEMON_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CARRY_WINDOW: Duration = Duration::from_secs(10);
 
 type CaptureMap = HashMap<String, HashMap<String, String>>;
+
+/// Feature 8: cut the capabilities the user unticked at install time out of the pack's grant
+/// set. Done once, when the packs are loaded, so every step and script downstream sees the
+/// trimmed set - the denial is structural, exactly like a capability never declared.
+pub fn apply_denials(
+    installed: &mut [Installed],
+    denials: &HashMap<String, Vec<String>>,
+) {
+    for pack in installed.iter_mut() {
+        let Some(denied) = denials.get(&pack.pack.id) else {
+            continue;
+        };
+        for name in denied {
+            if let Some(capability) = Capability::from_name(name) {
+                pack.pack.capabilities = pack.pack.capabilities.without(capability);
+            }
+        }
+    }
+}
+
+/// Feature 8: what a pack will do on apply, one line per effect, in the words of the install
+/// preview - the effect, never the mechanism name. Anything the summary cannot name is said
+/// plainly instead of hidden, so a preview never reads as safer than the pack is.
+pub fn describe(pack: &Pack) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let target = if pack.targets.process.is_empty() {
+        String::new()
+    } else {
+        pack.targets.process.join(", ")
+    };
+    if !target.is_empty() {
+        lines.push(format!("Watches for {target}"));
+    }
+    for step in &pack.apply.steps {
+        let exe = step
+            .exe
+            .clone()
+            .or_else(|| step.exe_from_setting.clone())
+            .unwrap_or_default();
+        let line = match step.mechanism.as_str() {
+            "cli" => {
+                let args = step.args.join(" ");
+                if args.is_empty() {
+                    format!("Runs {exe}")
+                } else {
+                    format!("Runs {exe} {args}")
+                }
+            }
+            "hotkey" => format!("Sends keystrokes to {exe}"),
+            "process_kill" => format!("Stops {exe}"),
+            "process_start" => format!("Starts {exe}"),
+            "registry_set" => match &step.registry {
+                Some(reg) => format!("Writes {} to {}", reg.name, reg.path),
+                None => "Writes a registry value".to_string(),
+            },
+            other => format!("Runs a '{other}' step"),
+        };
+        lines.push(line);
+    }
+    for capture in &pack.capture {
+        match capture.mechanism.as_str() {
+            "json_file" => {
+                let path = capture.path.clone().unwrap_or_default();
+                let pointer = capture.pointer.clone().unwrap_or_default();
+                lines.push(format!("Reads {pointer} from {path}"));
+            }
+            "process_running" => lines.push(format!("Checks whether {target} is running")),
+            other => lines.push(format!("Runs a '{other}' check")),
+        }
+    }
+    if !pack.script.is_empty() {
+        // The script is not read here: a preview that described a program line by line
+        // would promise more than the daemon checks. The capabilities below say what it
+        // may reach.
+        lines.push("Runs the pack's own script (it can only use the permissions below)".to_string());
+    }
+    for setting in &pack.settings {
+        lines.push(format!(
+            "Shows the '{}' dropdown ({})",
+            setting.label,
+            setting.values.join(" / ")
+        ));
+    }
+    lines
+}
 
 pub struct Installed {
     pub pack: Pack,
@@ -77,6 +162,11 @@ pub struct PackOutcome {
     pub captured: HashMap<String, HashMap<String, String>>,
     pub succeeded: Vec<String>,
     pub failed: Vec<(String, String)>,
+    /// What the apply found when it went back to look, per pack id (2026-10-27): a pack whose
+    /// captured value reads exactly as it did before the block ran changed nothing, however
+    /// cleanly its steps returned. The daemon shows this on the pack row instead of a silent
+    /// "applied". Empty for a revert — the pack is back to the state it captured.
+    pub notes: Vec<(String, String)>,
 }
 
 /// Text files written on Windows often start with a UTF-8 BOM; serde_json rejects it.
@@ -214,6 +304,7 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
     let targets = snapshot_targets();
     let mut strings: Vec<String> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
+    let mut notes: Vec<(String, String)> = Vec::new();
     let mut applied_ids: Vec<String> = Vec::new();
     let mut captured_out: CaptureMap = HashMap::new();
     let mut reverted_captures: CaptureMap = HashMap::new();
@@ -365,6 +456,44 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
         }
 
         // Past the guards: this pack's captures (steps and/or script) belong in the journal.
+        if job.apply && result.is_ok() {
+            // Feature 2 (2026-10-27): did it stick? Re-read each JSON capture now that the
+            // block has run and compare it with the value captured before it. A pack whose write
+            // was rejected (the app rewrote its config, the path moved) reads back unchanged —
+            // that is exactly the silent failure the dashboard used to call "applied".
+            let mut unverified = Vec::new();
+            for step in &pack.capture {
+                if step.mechanism != "json_file" {
+                    continue;
+                }
+                let Some(before) = ctx.captured.get(&step.key) else {
+                    continue;
+                };
+                if before.is_empty() {
+                    continue; // nothing was there to compare against
+                }
+                let pointer = step.pointer.as_deref().unwrap_or("/");
+                let after = step
+                    .path
+                    .as_deref()
+                    .map(expand_env)
+                    .and_then(|p| json_pointer(&p, pointer))
+                    .unwrap_or_default();
+                if after.is_empty() {
+                    unverified.push(format!(
+                        "could not read {pointer} back after the apply, so the change is unverified"
+                    ));
+                } else if &after == before {
+                    unverified.push(format!(
+                        "nothing changed at {pointer} (still {after}), so the pack had no effect"
+                    ));
+                }
+            }
+            for line in unverified {
+                warn!("{}: {line}", pack.id);
+                notes.push((pack.id.clone(), line));
+            }
+        }
         if job.apply {
             captured_out.insert(pack.id.clone(), ctx.captured.clone());
             // "applied" means the block was started. A pack that failed halfway has already changed
@@ -418,6 +547,7 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
         captured: captured_out,
         succeeded: strings,
         failed,
+        notes,
     }
 }
 
@@ -1951,6 +2081,48 @@ mod tests {
         "apply": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-stop"] } ] },
         "revert": { "steps": [ { "mechanism": "cli", "exe": "sample.exe", "args": ["-play"] } ] }
     }"#;
+
+    #[test]
+    fn a_denied_capability_is_cut_from_the_grant_set() {
+        let pack = Pack::parse(SAMPLE).expect("the sample parses");
+        let before = pack.capabilities;
+        let mut installed = vec![Installed { pack }];
+        let mut denials: HashMap<String, Vec<String>> = HashMap::new();
+        denials.insert("sample".into(), vec!["exec".into(), "not-a-capability".into()]);
+        denials.insert("some-other-pack".into(), vec!["files".into()]);
+        apply_denials(&mut installed, &denials);
+        let after = installed[0].pack.capabilities;
+        assert!(!after.grants(Capability::Exec), "exec was refused");
+        assert!(
+            after.grants(Capability::Files),
+            "only the pack that asked for it loses files"
+        );
+        assert!(
+            before.grants(Capability::Exec) && before.grants(Capability::Files),
+            "the sample declares both: the test would pass on a pack that has neither"
+        );
+        assert!(
+            before.grants(Capability::Process) && after.grants(Capability::Process),
+            "a capability nobody unticked is untouched"
+        );
+    }
+
+    #[test]
+    fn the_preview_says_what_the_pack_does() {
+        let pack = Pack::parse(SAMPLE).expect("the sample parses");
+        let lines = describe(&pack);
+        assert!(lines.iter().any(|l| l == "Watches for sample.exe"), "{lines:?}");
+        assert!(
+            lines.iter().any(|l| l == "Runs sample.exe -stop"),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Checks whether")),
+            "{lines:?}"
+        );
+        // The dropdown is part of what the pack will show, and it is named by its label.
+        assert!(lines.iter().any(|l| l.contains("'Action'")), "{lines:?}");
+    }
 
     #[test]
     fn the_rainmeter_pack_scripts_compile() {

@@ -76,10 +76,49 @@ pub struct AppConfig {
     /// SteamGridDB API key for cover art (https://www.steamgriddb.com/profile/preferences).
     #[serde(default)]
     pub sgdb_api_key: Option<String>,
+    /// The two global hotkeys. A combination is written the way the settings window shows it
+    /// (`ctrl+alt+k`, `home`); an unreadable one falls back to the default when the daemon
+    /// builds its hook, and the settings window says so.
+    #[serde(default)]
+    pub hotkeys: Hotkeys,
+    /// Capabilities the user refused, per pack id (feature 8). A refused capability is cut
+    /// from the pack's grant set: the step or script that needed it fails as an unknown
+    /// host function, and the rest of the pack still runs. Kept per id, so an update to the
+    /// pack does not silently hand back a permission the user took away.
+    #[serde(default)]
+    pub capability_denials: std::collections::HashMap<String, Vec<String>>,
     /// The keys this build does not know. They are written back untouched, so a config
     /// written by a newer build is not silently truncated by the next save.
     #[serde(flatten)]
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// The daemon's two global hotkeys, as the user typed them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hotkeys {
+    /// Enter or leave idle mode. Default: Home.
+    #[serde(default = "default_idle_hotkey")]
+    pub idle: String,
+    /// Hide and mute every tracked app. Default: End.
+    #[serde(default = "default_killswitch_hotkey")]
+    pub killswitch: String,
+}
+
+fn default_idle_hotkey() -> String {
+    "home".to_string()
+}
+
+fn default_killswitch_hotkey() -> String {
+    "end".to_string()
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Self {
+            idle: default_idle_hotkey(),
+            killswitch: default_killswitch_hotkey(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -108,6 +147,8 @@ impl Default for AppConfig {
             catalog_url: None,
             last_played: HashMap::new(),
             sgdb_api_key: None,
+            hotkeys: Hotkeys::default(),
+            capability_denials: Default::default(),
             extra: Default::default(),
         }
     }

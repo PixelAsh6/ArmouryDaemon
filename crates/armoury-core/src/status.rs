@@ -71,6 +71,16 @@ pub struct StatusSnapshot {
     pub idle_failsafe_enabled: bool,
     #[serde(default)]
     pub idle_failsafe_minutes: u64,
+    /// The global hotkeys as the settings window shows them (`ctrl+alt+k`, `home`). Defaults
+    /// on the wire so an older daemon's snapshot still loads.
+    #[serde(default)]
+    pub hotkeys: crate::config::Hotkeys,
+    /// Feature 9: the newer daemon the release feed named, if any.
+    #[serde(default)]
+    pub update_available: Option<String>,
+    /// What the last self-update check or install said, ready to show.
+    #[serde(default)]
+    pub update_message: String,
     /// The user's configured tracked-app list.
     #[serde(default)]
     pub tracked_apps: Vec<TrackedApp>,
@@ -119,6 +129,11 @@ pub struct PackStatus {
     pub settings: Vec<PackSettingStatus>,
     /// Currently applied (game mode on) per the journal.
     pub applied: bool,
+    /// What the last apply found when it went back to look (2026-10-27): a pack that claims it
+    /// changed something, but whose captured value is exactly what it was before, is reported
+    /// here instead of being shown as a silent success. `None` = nothing to report.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// One dropdown of a pack.

@@ -145,6 +145,70 @@ enum Picked {
 struct PendingInstall {
     path: PathBuf,
     entry: CatalogPack,
+    /// The capabilities the user unticked in the preview (feature 8).
+    deny: Vec<String>,
+}
+
+/// Feature 8: a pack that has been fetched (or picked from disk) and waits for the user to
+/// agree to what it does. Nothing is installed until this is accepted.
+struct Consent {
+    entry: CatalogPack,
+    path: PathBuf,
+    /// What the pack will do, in plain words, one line per effect.
+    summary: Vec<String>,
+    /// (capability, what it lets the pack do, granted). Unticking one cuts it from the
+    /// pack's grant set; the rest of the pack still runs.
+    capabilities: Vec<(String, String, bool)>,
+}
+
+/// Read a pack file and build its consent sheet. A file that does not parse is refused here,
+/// before anything is installed.
+fn consent_for(path: PathBuf) -> Result<Consent, String> {
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let pack = armoury_core::pack::Pack::parse(&text)?;
+    let capabilities = armoury_core::pack::ALL_CAPABILITIES
+        .iter()
+        .filter(|capability| pack.capabilities.grants(**capability))
+        .map(|capability| {
+            (
+                capability.name().to_string(),
+                capability.effect().to_string(),
+                true,
+            )
+        })
+        .collect();
+    Ok(Consent {
+        entry: CatalogPack {
+            id: pack.id.clone(),
+            name: pack.name.clone(),
+            version: pack.version.clone(),
+            description: String::new(),
+            kind: "pack".to_string(),
+            file: String::new(),
+            sha256: String::new(),
+            size: None,
+            min_engine: None,
+            entry: None,
+        },
+        path,
+        summary: crate::packs::describe(&pack),
+        capabilities,
+    })
+}
+
+/// Feature 6: the settings window's hotkey editor. It keeps the typed text, which field is
+/// recording a combination, and the two conflict lines, so a repaint never loses an edit.
+#[derive(Default)]
+struct HotkeyEditor {
+    idle: String,
+    killswitch: String,
+    /// `Some(true)` = recording the idle combination, `Some(false)` = the killswitch.
+    recording: Option<bool>,
+    /// Why each combination is a bad idea, as `hotkey::conflict` saw it.
+    conflicts: (Option<String>, Option<String>),
+    /// Something that went wrong with the last edit (an unreadable key, a refused pair).
+    message: Option<String>,
 }
 
 #[derive(Default)]
@@ -220,6 +284,15 @@ struct Shared {
     /// Verified catalogue downloads waiting for the daemon's install request, each with
     /// the manifest entry it was verified against.
     pending_installs: Vec<PendingInstall>,
+    /// "Update all" hands the outdated packs over here, and the root starts the next one
+    /// when the daemon has answered for the one before it: one download at a time.
+    update_queue: std::collections::VecDeque<CatalogPack>,
+    /// Feature 6: the settings window's hotkey editor.
+    hotkeys: HotkeyEditor,
+    /// Feature 8: the pack waiting for consent. Nothing installs while one is here.
+    consent: Option<Consent>,
+    /// Feature 10: where the last diagnostics bundle was written (or why it was not).
+    diagnostics: Option<String>,
     /// Per-pack windows: ids in open order.
     open_packs: Vec<String>,
     /// Per-pack window placement state: (stage 0 settle / 1 positioned / 2 shown, target).
@@ -570,6 +643,10 @@ impl eframe::App for App {
             self.request(&req);
         }
 
+        // Feature 5: an "Update all" gets one download at a time, whichever windows happen
+        // to be open. The next one starts when the daemon has answered for the last.
+        drain_update_queue(&self.shared, &ctx);
+
         // Native file dialog results: a tracked app to add, or a pack to install.
         while let Ok(path) = self.pick_rx.try_recv() {
             match path {
@@ -584,10 +661,19 @@ impl eframe::App for App {
                     self.add_tracked(name, exe);
                 }
                 Picked::PackJson(path) => {
-                    log::info!("installing pack from {}", path.display());
-                    self.request(&Request::InstallPack {
-                        source: path.display().to_string(),
-                    });
+                    // Feature 8: a picked pack is shown before it is installed too - the user
+                    // sees what it does, and what it asks for, before it reaches the disk.
+                    log::info!("pack picked: {}", path.display());
+                    let outcome = consent_for(path);
+                    {
+                        let mut s = self.shared.lock().unwrap();
+                        match outcome {
+                            Ok(consent) => s.consent = Some(consent),
+                            Err(e) => s.last_pack_op = Some((false, e)),
+                        }
+                    }
+                    // The window that shows the sheet is the packs window: tell it now.
+                    request_catalog_repaint(ctx, &self.shared);
                 }
             }
         }
@@ -702,6 +788,7 @@ impl eframe::App for App {
             } else {
                 Request::InstallPack {
                     source: ready.path.display().to_string(),
+                    deny: ready.deny.clone(),
                 }
             };
             self.request(&request);
@@ -779,6 +866,7 @@ impl eframe::App for App {
             packs,
             idle,
             console_open,
+            outdated,
         ) = {
             let s = self.shared.lock().unwrap();
             let (text, color) = status_line(s.status.as_ref());
@@ -842,6 +930,10 @@ impl eframe::App for App {
                 .as_ref()
                 .map(|st| st.console_open.clone())
                 .unwrap_or_default();
+            // Feature 5: which installed packs the repo has a newer version of. Read here,
+            // while the lock is held for the pack list anyway, so the row badge costs no
+            // second lock and no per-frame read of the catalogue.
+            let outdated = outdated_packs(&s.catalog, &packs);
             (
                 text,
                 color,
@@ -854,6 +946,7 @@ impl eframe::App for App {
                 packs,
                 idle,
                 console_open,
+                outdated,
             )
         };
 
@@ -1172,6 +1265,28 @@ impl eframe::App for App {
                     }
                     if pack.applied {
                         ui.small(APPLIED_MARKER);
+                    }
+                    // Feature 5: a newer version sits in the repo.
+                    if let Some((_, _, version)) =
+                        outdated.iter().find(|(id, _, _)| *id == pack.id)
+                    {
+                        ui.small(
+                            RichText::new(UPDATE_MARKER)
+                                .color(Color32::from_rgb(96, 165, 250)),
+                        )
+                        .on_hover_text(format!(
+                            "v{version} is available - open Packs to update"
+                        ));
+                    }
+                    // Feature 2: the daemon went back and looked. A pack that claims it changed
+                    // something but reads back unchanged gets a visible mark, not a silent
+                    // "applied" — the full sentence is in the hover.
+                    if let Some(note) = &pack.note {
+                        ui.small(
+                            RichText::new(NOTE_MARKER)
+                                .color(Color32::from_rgb(251, 191, 36)),
+                        )
+                        .on_hover_text(note);
                     }
                     // The row shows one setting; the pack window has them all.
                     if let Some(extra) = extra_settings(pack.settings.len()) {
@@ -1658,6 +1773,10 @@ fn close_settings(s: &mut Shared) {
     s.settings_open = false;
     s.chain.retain(|c| *c != ChainItem::Settings);
     s.chain_place.remove(&ChainItem::Settings);
+    // Feature 6: a window that closes mid-record must not leave the hook suspended — the
+    // hotkeys would stop working and nothing would say why.
+    s.hotkeys.recording = None;
+    crate::hotkey::suspend(false);
 }
 
 /// The install-packs window closed: it leaves the chain.
@@ -2089,6 +2208,80 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             ui.ctx().request_repaint();
         }
 
+        // ---- the daemon itself: version, self-update, diagnostics (features 9 and 10) ----
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.label(RichText::new("Daemon").strong());
+        let (version, available, update_message, diagnostics) = {
+            let s = shared.lock().unwrap();
+            (
+                s.daemon_version.clone(),
+                s.status.as_ref().and_then(|st| st.update_available.clone()),
+                s.status
+                    .as_ref()
+                    .map(|st| st.update_message.clone())
+                    .unwrap_or_default(),
+                s.diagnostics.clone(),
+            )
+        };
+        ui.horizontal(|ui| {
+            ui.label(format!("v{version}"));
+            if ui
+                .small_button("Check for updates")
+                .on_hover_text("Ask the release feed whether a newer daemon exists")
+                .clicked()
+            {
+                send_request(shared, &Request::CheckSelfUpdate);
+                ui.ctx().request_repaint();
+            }
+            if available.is_some()
+                && ui
+                    .button("Update")
+                    .on_hover_text(
+                        "Download, verify and swap it in, then restart; the old build comes \
+                         back if the new one never answers",
+                    )
+                    .clicked()
+            {
+                send_request(shared, &Request::InstallSelfUpdate);
+                ui.ctx().request_repaint();
+            }
+        });
+        if let Some(new) = &available {
+            ui.small(
+                RichText::new(format!("v{new} is available")).color(Color32::from_rgb(96, 165, 250)),
+            );
+        }
+        if !update_message.is_empty() {
+            ui.small(RichText::new(&update_message).weak());
+        }
+        if ui
+            .small_button("Save diagnostics…")
+            .on_hover_text(
+                "Writes a zip with the logs, the config (key blanked), the status and the \
+                 display layout",
+            )
+            .clicked()
+        {
+            let layout = display_layout(ui.ctx(), shared);
+            let status = shared.lock().unwrap().status.clone();
+            let dir = armoury_core::config::config_dir().join("diagnostics");
+            let line = match crate::diagnostics::write(&dir, status.as_ref(), &layout) {
+                Ok(path) => format!("written to {}", path.display()),
+                Err(e) => e,
+            };
+            log::info!("diagnostics: {line}");
+            shared.lock().unwrap().diagnostics = Some(line);
+            ui.ctx().request_repaint();
+        }
+        if let Some(line) = &diagnostics {
+            ui.small(RichText::new(line).weak());
+        }
+
+        // ---- hotkeys (feature 6) ----
+        hotkeys_ui(ui, shared);
+
         // ---- packs: what is installed, install more, remove ----
         ui.add_space(8.0);
         ui.separator();
@@ -2499,6 +2692,245 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     ctx.request_repaint_after(Duration::from_secs(1));
 }
 
+/// Feature 10: the display layout the diagnostics bundle carries. This is the data the
+/// window-jump reports needed and did not have: the DPI, the work area, and where every
+/// window of this process actually is.
+fn display_layout(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("pixels_per_point: {:.3}\n", ctx.pixels_per_point()));
+    out.push_str(&format!(
+        "viewport_rect: {:?}\n",
+        ctx.input(|i| i.viewport().inner_rect)
+    ));
+    if let Some((x, y, w, h)) = work_area_physical_px() {
+        out.push_str(&format!("work_area_px: {x},{y} {w}x{h}\n"));
+    }
+    {
+        let s = shared.lock().unwrap();
+        out.push_str(&format!("dashboard_rect: {:?}\n", s.core_rect));
+        out.push_str(&format!("settings_target: {:?}\n", s.settings_target));
+        out.push_str(&format!("packs_target: {:?}\n", s.install_packs_target));
+        out.push_str(&format!("chain: {:?}\n", s.chain));
+    }
+    for title in ["ArmouryDaemon", "Settings", "Packs"] {
+        out.push_str(&format!("{title}: {:?}\n", window_rect_pts(ctx, title)));
+    }
+    out
+}
+
+/// Feature 6: the two global hotkeys, typed or recorded.
+///
+/// Recording reads the keys this window itself sees - it has the focus while you press them
+/// - and the hook posts nothing meanwhile, so pressing End to record it does not also toggle
+/// the killswitch. A combination another app already owns is named under the field: the hook
+/// still makes the daemon act, but the other owner acts too, and that is worth knowing.
+fn hotkeys_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
+    let current = {
+        let s = shared.lock().unwrap();
+        s.status
+            .as_ref()
+            .map(|st| st.hotkeys.clone())
+            .unwrap_or_default()
+    };
+    let (mut idle, mut kill, mut recording, mut conflicts, mut message) = {
+        let s = shared.lock().unwrap();
+        (
+            s.hotkeys.idle.clone(),
+            s.hotkeys.killswitch.clone(),
+            s.hotkeys.recording,
+            s.hotkeys.conflicts.clone(),
+            s.hotkeys.message.clone(),
+        )
+    };
+    // First paint (or the daemon changed them behind our back): show what is in force.
+    if idle.is_empty() {
+        idle = current.idle.clone();
+    }
+    if kill.is_empty() {
+        kill = current.killswitch.clone();
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(RichText::new("Hotkeys").strong());
+    ui.add_space(4.0);
+
+    // The hook follows the recorder every frame, so a window that closes mid-record cannot
+    // leave the hotkeys dead.
+    crate::hotkey::suspend(recording.is_some());
+
+    // One press while recording is the combination. It goes to whichever field asked to
+    // record - the button says which.
+    let mut recorded: Option<String> = None;
+    if recording.is_some() {
+        recorded = ui.input(|i| {
+            i.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => hotkey_text(*key, *modifiers),
+                _ => None,
+            })
+        });
+        if recorded.is_none() {
+            message = Some("press the combination (click Record again to cancel)".to_string());
+        }
+        ui.ctx().request_repaint();
+    }
+
+    let mut commit = false;
+    for which_idle in [true, false] {
+        let label = if which_idle { "Idle mode" } else { "Killswitch" };
+        let text = if which_idle { &mut idle } else { &mut kill };
+        let is_recording = recording == Some(which_idle);
+        ui.horizontal(|ui| {
+            ui.label(label);
+            let resp = ui.add_sized(
+                [110.0, 20.0],
+                egui::TextEdit::singleline(text).char_limit(24),
+            );
+            if resp.lost_focus() {
+                commit = true;
+            }
+            let button = if is_recording { "Press…" } else { "Record" };
+            if ui
+                .small_button(button)
+                .on_hover_text("Click, then press the combination")
+                .clicked()
+            {
+                recording = if is_recording { None } else { Some(which_idle) };
+                // While recording, the keys belong to the recorder, not to the text box.
+                ui.memory_mut(|m| m.surrender_focus(resp.id));
+                message = None;
+            }
+        });
+        let conflict = if which_idle {
+            &conflicts.0
+        } else {
+            &conflicts.1
+        };
+        if let Some(why) = conflict {
+            ui.small(RichText::new(why).color(Color32::from_rgb(251, 191, 36)));
+        }
+    }
+
+    if let Some(text) = recorded {
+        match recording {
+            Some(true) => idle = text,
+            Some(false) => kill = text,
+            None => {}
+        }
+        recording = None;
+        commit = true;
+    }
+    if let Some(why) = &message {
+        ui.small(RichText::new(why).weak());
+    }
+
+    if commit {
+        // Both fields are sent together: a half-applied pair could leave an action with no
+        // way to reach it. An unreadable one keeps what is in force and says so.
+        let bad = if crate::hotkey::Binding::parse(&idle).is_none() {
+            Some(idle.clone())
+        } else if crate::hotkey::Binding::parse(&kill).is_none() {
+            Some(kill.clone())
+        } else {
+            None
+        };
+        match bad {
+            Some(text) => {
+                message = Some(format!(
+                    "'{text}' is not a combination - try ctrl+alt+k or f9"
+                ));
+                idle = current.idle.clone();
+                kill = current.killswitch.clone();
+            }
+            None => {
+                message = None;
+                // The probe registers the combination for a moment and gives it straight
+                // back: a refusal means somebody else already owns it.
+                conflicts = (
+                    crate::hotkey::conflict(&idle),
+                    crate::hotkey::conflict(&kill),
+                );
+                if idle != current.idle || kill != current.killswitch {
+                    send_request(
+                        shared,
+                        &Request::SetHotkeys {
+                            idle: idle.clone(),
+                            killswitch: kill.clone(),
+                        },
+                    );
+                    ui.ctx().request_repaint();
+                }
+            }
+        }
+    }
+
+    {
+        let mut s = shared.lock().unwrap();
+        s.hotkeys.idle = idle;
+        s.hotkeys.killswitch = kill;
+        s.hotkeys.recording = recording;
+        s.hotkeys.conflicts = conflicts;
+        s.hotkeys.message = message;
+    }
+}
+
+/// The text form of a key press, in the vocabulary `hotkey::Binding::parse` reads: the
+/// modifiers in a fixed order, then the key. A key the parser does not know (a media key,
+/// the compose key, a bare modifier) is refused rather than stored as something that will
+/// never fire - the field can still be typed into by hand.
+fn hotkey_text(key: egui::Key, mods: egui::Modifiers) -> Option<String> {
+    use egui::Key;
+    // egui calls the number row Num0..Num9, and `num0` in the parser already means the
+    // numpad key: the digits are named here instead of through the debug name.
+    let digits = [
+        (Key::Num0, "0"),
+        (Key::Num1, "1"),
+        (Key::Num2, "2"),
+        (Key::Num3, "3"),
+        (Key::Num4, "4"),
+        (Key::Num5, "5"),
+        (Key::Num6, "6"),
+        (Key::Num7, "7"),
+        (Key::Num8, "8"),
+        (Key::Num9, "9"),
+    ];
+    let name = match digits.iter().find(|(k, _)| *k == key) {
+        Some((_, digit)) => (*digit).to_string(),
+        None => match format!("{key:?}").to_ascii_lowercase().as_str() {
+            // egui names the arrows its own way; the parser has one name per key.
+            "arrowup" => "up".to_string(),
+            "arrowdown" => "down".to_string(),
+            "arrowleft" => "left".to_string(),
+            "arrowright" => "right".to_string(),
+            other => other.to_string(),
+        },
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if mods.ctrl {
+        parts.push("ctrl".to_string());
+    }
+    if mods.alt {
+        parts.push("alt".to_string());
+    }
+    if mods.shift {
+        parts.push("shift".to_string());
+    }
+    if mods.command {
+        // On Windows that is the Windows key.
+        parts.push("win".to_string());
+    }
+    parts.push(name);
+    let text = parts.join("+");
+    crate::hotkey::Binding::parse(&text).map(|_| text)
+}
+
 /// The install-packs window: every pack in the catalog, each with a download button.
 /// The list is the only place the catalog shows: the settings window has no copy of it.
 fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
@@ -2541,6 +2973,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let mut close = false;
     let mut refresh = false;
     let mut install_file = false;
+    let mut update_all = false;
 
     let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
     frame.show(ui, |ui| {
@@ -2560,6 +2993,13 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.add_space(6.0);
 
         // ---- the catalog ----
+        // Feature 5: the whole backlog in one click. It downloads one pack at a time, and an
+        // applied pack waits - its files must not change under the journal that holds them.
+        let outdated = outdated_packs(&catalog_state, &packs);
+        let queued_left = {
+            let s = shared.lock().unwrap();
+            s.update_queue.len()
+        };
         ui.horizontal(|ui| {
             if ui
                 .button("Check for updates")
@@ -2569,11 +3009,32 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             {
                 refresh = true;
             }
+            if !outdated.is_empty() {
+                let label = if queued_left > 0 {
+                    format!("Update all ({queued_left} left)")
+                } else {
+                    format!("Update all ({})", outdated.len())
+                };
+                if ui
+                    .button(label)
+                    .on_hover_text(
+                        "Download and install every outdated pack, one at a time; an applied \
+                         pack is updated once it has reverted",
+                    )
+                    .clicked()
+                {
+                    update_all = true;
+                }
+            }
             if catalog_checking {
                 ui.small(RichText::new("Checking…").weak());
             }
         });
         ui.add_space(4.0);
+
+        // Feature 8: the consent sheet, before anything touches the disk. It sits above the
+        // list, so it is the first thing read and cannot scroll out of sight.
+        consent_sheet(ui, shared);
 
         // The list takes the room that is left above the foot of the window, so the
         // "Local pack" button is always inside it. The list also shrinks to the
@@ -2679,6 +3140,54 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             spawn_picker(tx, Picker::PackJson);
         }
     }
+    if update_all {
+        let mut s = shared.lock().unwrap();
+        let mut skipped = 0;
+        let mut queued = 0;
+        let none: Vec<CatalogPack> = Vec::new();
+        let entries = match &catalog_state {
+            Some(Ok(entries)) => entries,
+            _ => &none,
+        };
+        for entry in entries {
+            if entry.engine_gate() != EngineGate::Supported {
+                continue;
+            }
+            let Some(installed) = packs.iter().find(|p| p.id == entry.id) else {
+                continue;
+            };
+            if !catalog::is_newer(&entry.version, &installed.version) {
+                continue;
+            }
+            if installed.applied {
+                // Its captured values belong to the version on disk: swap the files now and
+                // the revert would restore a state the new version never wrote.
+                skipped += 1;
+                continue;
+            }
+            if s.catalog_installing.contains(&entry.id)
+                || s.update_queue.iter().any(|q| q.id == entry.id)
+            {
+                continue;
+            }
+            s.update_queue.push_back(entry.clone());
+            queued += 1;
+        }
+        if skipped > 0 || queued > 0 {
+            s.last_pack_op = Some((
+                true,
+                match (queued, skipped) {
+                    (0, n) => format!("{n} pack(s) are applied - they update once they revert"),
+                    (q, 0) => format!("{q} pack(s) queued; they download one at a time"),
+                    (q, n) => format!("{q} pack(s) queued, {n} applied pack(s) waiting for their revert"),
+                },
+            ));
+        }
+        drop(s);
+        // The root starts the first one on its next tick, not at the next second: the
+        // window that asked for it must show the first "installing…" at once.
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
 
     // ---- place the window, then show it ----
     let ctx = ui.ctx();
@@ -2783,6 +3292,101 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // Keep the window live: a download in flight and the result of the last install have
     // to show up on their own.
     ctx.request_repaint_after(Duration::from_secs(1));
+}
+
+/// Feature 8: the consent sheet. What the pack will do, what it asks for, and an Install
+/// button that is the only way it reaches the disk. A capability the user unticks is cut
+/// from the pack's grant set - the feature that needed it degrades, the pack still runs.
+fn consent_sheet(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
+    let (entry, summary, mut capabilities) = {
+        let s = shared.lock().unwrap();
+        let Some(consent) = s.consent.as_ref() else {
+            return;
+        };
+        (
+            consent.entry.clone(),
+            consent.summary.clone(),
+            consent.capabilities.clone(),
+        )
+    };
+    let name = if entry.name.is_empty() {
+        entry.id.clone()
+    } else {
+        entry.name.clone()
+    };
+
+    let mut install = false;
+    let mut cancel = false;
+    ui.add_space(4.0);
+    let frame = egui::Frame::NONE
+        .inner_margin(egui::Margin::same(6))
+        .fill(Color32::from_rgb(24, 26, 32))
+        .corner_radius(4.0);
+    frame.show(ui, |ui| {
+        ui.label(RichText::new(format!("{name} — what it will do")).strong());
+        ui.add_space(2.0);
+        egui::ScrollArea::vertical()
+            .max_height(150.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for line in &summary {
+                    ui.small(line.as_str());
+                }
+            });
+        if !capabilities.is_empty() {
+            ui.add_space(4.0);
+            ui.small(RichText::new("It asks for:").strong());
+            for (_, effect, granted) in &mut capabilities {
+                ui.checkbox(granted, effect.as_str())
+                    .on_hover_text("Untick to refuse: the part that needs it stops working");
+            }
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Install").clicked() {
+                install = true;
+            }
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    ui.add_space(4.0);
+
+    if cancel {
+        // The downloaded file is a temp file the daemon would have removed: take it away.
+        let path = shared
+            .lock()
+            .unwrap()
+            .consent
+            .as_ref()
+            .map(|c| c.path.clone());
+        if let Some(path) = path.filter(|p| p.starts_with(std::env::temp_dir())) {
+            let _ = std::fs::remove_file(path);
+        }
+        shared.lock().unwrap().consent = None;
+        ui.ctx().request_repaint();
+    }
+    if install {
+        let mut s = shared.lock().unwrap();
+        if let Some(consent) = s.consent.take() {
+            let deny = consent
+                .capabilities
+                .iter()
+                .filter(|(_, _, granted)| !granted)
+                .map(|(name, _, _)| name.clone())
+                .collect();
+            s.pending_installs.push(PendingInstall {
+                path: consent.path,
+                entry: consent.entry,
+                deny,
+            });
+        }
+        drop(s);
+        // The root sends the install request on its next tick; the row has to say so now.
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+        ui.ctx().request_repaint();
+    }
 }
 
 /// The width of the description column in the Modules window. A one-sentence
@@ -3215,6 +3819,54 @@ fn start_catalog_install(shared: &Arc<Mutex<Shared>>, entry: &CatalogPack, ctx: 
     download_pack_in_background(shared, entry, &url, ctx);
 }
 
+/// The installed packs the repo has a newer version of, as (id, name, version) - the packs
+/// an "Update all" would update. A pack the repo no longer lists, or one this daemon is too
+/// old to run, is not one of them.
+fn outdated_packs(
+    catalog_state: &Option<Result<Vec<CatalogPack>, String>>,
+    packs: &[PackStatus],
+) -> Vec<(String, String, String)> {
+    let Some(Ok(entries)) = catalog_state else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|entry| entry.engine_gate() == EngineGate::Supported)
+        .filter_map(|entry| {
+            let installed = packs.iter().find(|p| p.id == entry.id)?;
+            if !catalog::is_newer(&entry.version, &installed.version) {
+                return None;
+            }
+            let name = if entry.name.is_empty() {
+                entry.id.clone()
+            } else {
+                entry.name.clone()
+            };
+            Some((entry.id.clone(), name, entry.version.clone()))
+        })
+        .collect()
+}
+
+/// The next pack of an "Update all", started only once the daemon has answered for the one
+/// before it. Sequential on purpose: the temp folder holds one verified file per id, and the
+/// user asked for the packs one by one, not all at once.
+fn drain_update_queue(shared: &Arc<Mutex<Shared>>, ctx: &egui::Context) {
+    let next = {
+        let mut s = shared.lock().unwrap();
+        if !s.catalog_installing.is_empty() {
+            return; // the one before this is still coming down
+        }
+        if s.consent.is_some() {
+            return; // one pack at a time: this one is waiting for the user's answer
+        }
+        s.update_queue.pop_front()
+    };
+    if let Some(entry) = next {
+        log::info!("catalog: update all, next is {}", entry.id);
+        start_catalog_install(shared, &entry, ctx);
+    }
+}
+
 /// The download itself, on a worker thread. `url` is the catalogue manifest to read.
 ///
 /// The pack is marked as on its way before the thread starts, so the row that asked for it
@@ -3259,10 +3911,32 @@ fn download_pack_in_background(
                         entry.id,
                         started.elapsed().as_millis()
                     );
-                    s.pending_installs.push(PendingInstall {
-                        path: dest,
-                        entry: entry.clone(),
-                    });
+                    if entry.kind == "helper" {
+                        s.pending_installs.push(PendingInstall {
+                            path: dest,
+                            entry: entry.clone(),
+                            deny: Vec::new(),
+                        });
+                    } else {
+                        // Feature 8: a pack is shown before it is installed - what it does,
+                        // and what it asks for. The row stops saying "installing…": the
+                        // consent block is what is happening now.
+                        s.catalog_installing.retain(|id| id != &entry.id);
+                        match consent_for(dest) {
+                            Ok(consent) if s.consent.is_none() => s.consent = Some(consent),
+                            Ok(consent) => {
+                                // One sheet at a time: the pack that is already waiting keeps
+                                // its place, and this one goes back in the queue.
+                                log::info!(
+                                    "catalog: {} waits - a consent sheet is already up",
+                                    entry.id
+                                );
+                                let _ = std::fs::remove_file(&consent.path);
+                                s.update_queue.push_back(entry.clone());
+                            }
+                            Err(e) => s.last_pack_op = Some((false, e)),
+                        }
+                    }
                 }
                 Err(e) => {
                     // The pack never lands: the row must not keep saying "installing…".
@@ -3635,6 +4309,11 @@ fn snug_width(longest_line: f32, work_width: Option<f32>) -> f32 {
 /// switch, so its space is always reserved: the width of the window drives its size, and
 /// the size moves the window.
 const APPLIED_MARKER: &str = "· applied";
+/// The mark on a pack row whose last apply did not verify (feature 2): the pack's own write
+/// read back unchanged. Reserved like the applied marker, for the same reason.
+const NOTE_MARKER: &str = "⚠";
+/// The badge on a pack row whose repo version is newer than the installed one (feature 5).
+const UPDATE_MARKER: &str = "↑";
 /// The badge on a pack row that says how many settings the row does not show. Reserved
 /// like the applied marker, for the same reason.
 const BADGE_RESERVE: &str = "+9";
@@ -3743,6 +4422,8 @@ fn probe_width(measure: &dyn Fn(FontKind, &str) -> f32, probe: &WidthProbe) -> f
     for (name, dropdown) in &probe.packs {
         let mut row = measure(FontKind::Body, name) + 56.0; // ‹ button + checkbox
         row += measure(FontKind::Small, APPLIED_MARKER) + 10.0; // always reserved
+        row += measure(FontKind::Small, NOTE_MARKER) + 6.0; // always reserved
+        row += measure(FontKind::Small, UPDATE_MARKER) + 6.0; // always reserved
         row += measure(FontKind::Small, BADGE_RESERVE) + 10.0; // always reserved
         if *dropdown {
             row += 130.0; // the dropdown
@@ -3847,6 +4528,7 @@ mod tests {
                 })
                 .collect(),
             applied,
+            note: None,
         }
     }
 
@@ -3887,6 +4569,9 @@ mod tests {
             idle_devices: 0,
             idle_failsafe_enabled: false,
             idle_failsafe_minutes: 0,
+            hotkeys: Default::default(),
+            update_available: None,
+            update_message: String::new(),
             tracked_apps: Vec::new(),
             tracked_apps_running: Vec::new(),
             packs: Vec::new(),
@@ -4585,6 +5270,7 @@ mod tests {
             enabled: true,
             settings: Vec::new(),
             applied: false,
+            note: None,
         }
     }
 
@@ -4881,6 +5567,35 @@ mod tests {
             stage, 1,
             "the window is still waiting for its size: it is at step {stage}"
         );
+    }
+
+    #[test]
+    fn only_installed_and_outdated_packs_are_an_update() {
+        let catalog = Some(Ok(vec![
+            catalog_entry("g-helper", "G-Helper", "1.3.1"),
+            catalog_entry("rainmeter", "Rainmeter", "1.4.0"),
+            catalog_entry("console", "Console", "2.0.0"),
+            catalog_entry_needing("wallpaper", "Wallpaper", "9.0.0", "99.0.0"),
+        ]));
+        let packs = vec![
+            installed_pack("g-helper", "1.3.1"), // current
+            installed_pack("rainmeter", "1.3.0"), // behind
+            installed_pack("wallpaper", "1.0.0"), // behind, but this daemon cannot run it
+        ];
+        // `console` is in the repo but not installed: nothing to update.
+        assert_eq!(
+            outdated_packs(&catalog, &packs),
+            vec![(
+                "rainmeter".to_string(),
+                "Rainmeter".to_string(),
+                "1.4.0".to_string()
+            )]
+        );
+        // No catalogue (or a failed check) means nothing is known to be outdated.
+        assert!(outdated_packs(&None, &packs).is_empty());
+        let failed: Option<Result<Vec<CatalogPack>, String>> =
+            Some(Err("catalog: no network".to_string()));
+        assert!(outdated_packs(&failed, &packs).is_empty());
     }
 
     #[test]
@@ -5880,6 +6595,47 @@ mod tests {
         entry
     }
 
+    /// A pack file the consent sheet can read. The download tests used to serve arbitrary
+    /// bytes, which was fine while a pack was installed straight from the temp file; since
+    /// feature 8 a pack is parsed before it is offered, so the bytes have to be a pack.
+    fn test_pack_body(id: &str) -> Vec<u8> {
+        serde_json::json!({
+            "spec": 1,
+            "id": id,
+            "name": id,
+            "version": "1.0.0",
+            "targets": { "process": ["nothing.exe"] },
+            "apply": { "steps": [{ "mechanism": "process_start", "exe": "nothing.exe" }] },
+            "revert": { "steps": [{ "mechanism": "process_kill", "exe": "nothing.exe" }] }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// Wait until a pack download has landed as a consent sheet.
+    fn wait_for_consent(shared: &Arc<Mutex<Shared>>) -> Consent {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(consent) = shared.lock().unwrap().consent.as_ref() {
+                let out = Consent {
+                    entry: consent.entry.clone(),
+                    path: consent.path.clone(),
+                    summary: consent.summary.clone(),
+                    capabilities: consent.capabilities.clone(),
+                };
+                return out;
+            }
+            if Instant::now() >= deadline {
+                let s = shared.lock().unwrap();
+                panic!(
+                    "the download never asked for consent (installing: {:?}, last op: {:?})",
+                    s.catalog_installing, s.last_pack_op
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Ask for one pack and wait until the download has ended.
     fn download_from(repo: &TestRepo, entry: &CatalogPack) -> Arc<Mutex<Shared>> {
         let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
@@ -5921,9 +6677,9 @@ mod tests {
     fn the_catalogue_download_does_not_hold_up_the_thread_that_asked_for_it() {
         // The pack takes a moment to come down. The call that asks for it must come back
         // long before that: the thread that draws the window may not wait for the network.
-        let body = b"the bytes the manifest promises".to_vec();
-        let repo = TestRepo::start(body.clone(), Duration::from_millis(700));
         let id = test_pack_id("slow");
+        let body = test_pack_body(&id);
+        let repo = TestRepo::start(body.clone(), Duration::from_millis(700));
         let entry = entry_for(&body, &id);
 
         let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
@@ -5937,14 +6693,21 @@ mod tests {
         );
         // The pack is on its way: the row says so before the download ends.
         assert_eq!(shared.lock().unwrap().catalog_installing, vec![id.clone()]);
-        // And the download ends on its own, on the worker.
-        let paths = wait_for_files(&shared, 1);
+        // And the download ends on its own, on the worker - as a consent sheet, not as an
+        // install: feature 8 puts the pack in front of the user first.
+        let consent = wait_for_consent(&shared);
+        assert_eq!(consent.entry.id, id);
         assert_eq!(
-            std::fs::read(&paths[0].path).expect("the verified file"),
+            std::fs::read(&consent.path).expect("the verified file"),
             body,
             "the file holds the bytes that were served"
         );
-        let _ = std::fs::remove_file(&paths[0].path);
+        assert!(
+            !consent.summary.is_empty(),
+            "the sheet says what the pack will do: {:?}",
+            consent.summary
+        );
+        let _ = std::fs::remove_file(&consent.path);
     }
 
     #[test]
@@ -6035,12 +6798,16 @@ mod tests {
     #[test]
     fn a_second_pack_does_not_throw_the_first_one_away() {
         // Two packs are asked for while the first one is still coming down. Both are on
-        // their way, and both files wait for the daemon: the second one must not push the
-        // first one out of the way.
-        let body = b"the bytes the manifest promises".to_vec();
+        // their way, but only one consent sheet can be up: the second one waits its turn
+        // in the update queue instead of overwriting the first.
+        let first_id = test_pack_id("first");
+        let second_id = test_pack_id("second");
+        // One body for both: the test repo serves the same bytes to every request, and a
+        // mismatched hash would be a download failure, which is a different test.
+        let body = test_pack_body(&first_id);
         let repo = TestRepo::start(body.clone(), Duration::from_millis(0));
-        let first = entry_for(&body, &test_pack_id("first"));
-        let second = entry_for(&body, &test_pack_id("second"));
+        let first = entry_for(&body, &first_id);
+        let second = entry_for(&body, &second_id);
 
         let shared: Arc<Mutex<Shared>> = Arc::new(Mutex::new(Shared::default()));
         let ctx = egui::Context::default();
@@ -6051,11 +6818,24 @@ mod tests {
             vec![first.id.clone(), second.id.clone()],
             "both packs are on their way"
         );
-        let paths = wait_for_files(&shared, 2);
-        assert_eq!(paths.len(), 2, "both downloads are kept");
-        for landed in paths {
-            let _ = std::fs::remove_file(&landed.path);
+        let consent = wait_for_consent(&shared);
+        // The second download lands on its own time: wait for it before reading the queue.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !shared.lock().unwrap().catalog_installing.is_empty() {
+            assert!(Instant::now() < deadline, "the second download never finished");
+            thread::sleep(Duration::from_millis(20));
         }
+        // The second one is queued behind the first, whichever download landed first.
+        let (queued, up) = {
+            let s = shared.lock().unwrap();
+            (
+                s.update_queue.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+                s.consent.as_ref().map(|c| c.entry.id.clone()),
+            )
+        };
+        assert_eq!(queued.len(), 1, "one pack waits for its turn: {queued:?}");
+        assert_ne!(Some(queued[0].clone()), up, "the queued one is not the one on screen");
+        let _ = std::fs::remove_file(&consent.path);
     }
 
     #[test]

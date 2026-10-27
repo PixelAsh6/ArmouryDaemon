@@ -12,6 +12,7 @@ use crate::killswitch;
 use crate::overlay;
 use crate::pad;
 use crate::packs;
+use crate::update;
 use crate::watch;
 use armoury_core::config::{
     AppConfig, CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, ConsoleApp, TrackedApp,
@@ -25,8 +26,10 @@ use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, 
 use interprocess::os::windows::local_socket::ListenerOptionsExt;
 use interprocess::os::windows::security_descriptor::SecurityDescriptor;
 use log::{error, info, warn};
+use crossbeam_channel::Receiver;
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -54,6 +57,21 @@ const CONSOLE_GRACE: Duration = Duration::from_secs(10);
 /// actions). Entering and leaving must behave the same, or the packs would stay reverted
 /// after the user leaves idle mode.
 const IDLE_IS_FORCED: bool = true;
+
+/// One answer from the self-update worker (feature 9).
+#[derive(Debug)]
+enum UpdateEvent {
+    /// The feed names a newer build.
+    Available(String),
+    /// A verified download is waiting for the swap.
+    Staged {
+        version: String,
+        staged: std::path::PathBuf,
+        trusted_by: String,
+    },
+    /// Nothing to do, or nothing could be done: the message says which.
+    Message(String),
+}
 
 /// How this daemon was started.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -204,6 +222,11 @@ pub fn run(start: Start) {
 
     ipc::start(listener, pipe_tx, wake_handle);
     info!("pipe server ready ({})", pipe_name);
+    // Feature 9: the update script waits for this file. It is written only once the pipe is
+    // listening, so a new build that starts but never answers leaves the old one to be put
+    // back. A daemon started by hand writes it too, which is harmless: the script deletes it
+    // before starting the new build and looks for it again after the wait.
+    update::heartbeat();
 
     // ---- tracked-app watcher + trigger engine ----
     let tracked = Arc::new(Mutex::new(cfg.tracked_apps.clone()));
@@ -319,10 +342,10 @@ pub fn run(start: Start) {
         }
     };
 
-    // ---- keyboard hook (End = killswitch, Home = idle mode) ----
+    // ---- keyboard hook (the user's combinations, Home/End by default) ----
     // A low-level hook, not RegisterHotKey: the key must keep working in the foreground
     // application, and it has to be installed on this thread (the one that pumps the messages).
-    let (hotkey_hook, hotkey_rx) = match hotkey::install() {
+    let (hotkey_hook, hotkey_rx) = match hotkey::install(hotkey::bindings_from(&cfg.hotkeys)) {
         Some((hook, rx)) => (Some(hook), Some(rx)),
         None => (None, None),
     };
@@ -356,6 +379,11 @@ pub fn run(start: Start) {
         pack_out_rx,
         pack_catalog,
         applied_packs: Vec::new(),
+        pack_notes: HashMap::new(),
+        update_available: None,
+        update_message: String::new(),
+        staged_update: None,
+        update_rx: None,
         captured_by_pack: HashMap::new(),
         pending_removal: None,
         started: Instant::now(),
@@ -484,6 +512,9 @@ pub fn run(start: Start) {
         while let Ok(ev) = app.launch_rx.try_recv() {
             app.on_launch(ev);
         }
+        while let Some(event) = app.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            app.on_update_event(event);
+        }
         loop {
             match app.pack_out_rx.try_recv() {
                 Ok(o) => app.on_pack_outcome(o),
@@ -515,6 +546,10 @@ pub fn run(start: Start) {
             app.revert_before_quit();
             app.release_killswitch_for_exit();
             app.leave_idle_for_exit();
+            // Feature 9: a verified update waiting for the swap starts its script now. The
+            // script's first act is to wait for this pid, so starting it before the process
+            // goes is exactly right.
+            app.start_staged_update();
             break true;
         }
 
@@ -1004,6 +1039,17 @@ struct App {
     pack_catalog: Vec<PackMeta>,
     /// Packs currently in the applied (game-mode) state.
     applied_packs: Vec<String>,
+    /// Per pack id, the last apply's verification note (feature 2, 2026-10-27): "nothing
+    /// changed at /performance_mode (still Silent)". Cleared by a clean apply or a revert.
+    pack_notes: HashMap<String, String>,
+    /// Feature 9: the newer daemon the release feed named, and what the last check or
+    /// install said. `staged_update` is the verified file waiting for the swap.
+    update_available: Option<String>,
+    update_message: String,
+    staged_update: Option<PathBuf>,
+    /// The check and the download run on a worker thread: a 15 s network timeout must not
+    /// stall the event loop. Results arrive here and are applied on the next tick.
+    update_rx: Option<Receiver<UpdateEvent>>,
     /// Journal: per-pack values captured at apply time, replayed on revert.
     captured_by_pack: HashMap<String, HashMap<String, String>>,
     /// A pack removal that is waiting for its revert to finish: (pack id, requesting client).
@@ -1446,6 +1492,9 @@ impl App {
             idle_devices: self.overlay.muted_devices() as u32,
             idle_failsafe_enabled: self.cfg.idle_failsafe_enabled,
             idle_failsafe_minutes: self.cfg.idle_failsafe_minutes,
+            hotkeys: self.cfg.hotkeys.clone(),
+            update_available: self.update_available.clone(),
+            update_message: self.update_message.clone(),
             tracked_apps: self.cfg.tracked_apps.clone(),
             tracked_apps_running: self.engine.running_names(),
             console_open: self.cfg.console_open.clone(),
@@ -1483,6 +1532,7 @@ impl App {
                         enabled,
                         settings,
                         applied: self.applied_packs.contains(&m.id),
+                        note: self.pack_notes.get(&m.id).cloned(),
                     }
                 })
                 .collect(),
@@ -1699,6 +1749,12 @@ impl App {
         // of the applied state or the journal — and for the common single-worker case the
         // scope is everything, which lands exactly where the old replace/clear put it.
         merge_scoped(&mut self.applied_packs, &mut self.captured_by_pack, &o);
+        // Feature 2: the verification notes follow the applied state. An apply that found its
+        // write unchanged reports it; a clean apply (or a revert) clears the old note.
+        self.pack_notes.retain(|id, _| !o.scoped.contains(id));
+        for (id, note) in &o.notes {
+            self.pack_notes.insert(id.clone(), note.clone());
+        }
         for line in &o.succeeded {
             info!("pack {line}");
         }
@@ -1775,6 +1831,9 @@ impl App {
     fn reload_packs(&mut self) {
         let mut installed = packs::load(&self.search);
         enrich_rainmeter(&mut installed);
+        // Feature 8: the permissions the user unticked at install time are cut from the
+        // grant set here, once, so every step and script downstream sees the trimmed set.
+        packs::apply_denials(&mut installed, &self.cfg.capability_denials);
         self.pack_catalog = build_catalog(&installed);
         let (tx, rx) = crossbeam_channel::unbounded::<packs::PackJob>();
         let (modex, modex_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
@@ -1784,6 +1843,116 @@ impl App {
         self.mode_tx = modex;
         self.pack_out_rx = out_rx;
         info!("pack list reloaded: {} installed", self.pack_catalog.len());
+        self.broadcast_status();
+    }
+
+    /// Feature 9: start the swap script for a verified download. Called on the way out.
+    fn start_staged_update(&mut self) {
+        let Some(staged) = self.staged_update.take() else {
+            return;
+        };
+        let Some(exe) = install::our_executable() else {
+            warn!("self-update: this daemon's own path cannot be resolved — not swapping");
+            return;
+        };
+        match update::apply(&exe, &staged) {
+            Ok(()) => info!("self-update: the swap script is running; exiting for it"),
+            Err(e) => warn!("self-update: {e}"),
+        }
+    }
+
+    /// Feature 9: ask the release feed whether a newer daemon exists. The round trip runs on
+    /// a worker thread; a 15 s network timeout must never stall the event loop.
+    fn check_self_update(&mut self) {
+        if self.update_rx.is_some() {
+            info!("self-update: a check is already running");
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded::<UpdateEvent>();
+        self.update_rx = Some(rx);
+        self.update_message = "checking the release feed…".to_string();
+        thread::spawn(move || {
+            let event = match update::check(update::FEED) {
+                Ok(release) => UpdateEvent::Available(release.version),
+                Err(e) => UpdateEvent::Message(e),
+            };
+            let _ = tx.send(event);
+        });
+        self.broadcast_status();
+    }
+
+    /// Feature 9: download the named release, verify it, and hand the swap to the script.
+    /// The daemon then quits the way the tray's Quit does, so the packs are put back before
+    /// the executable is replaced.
+    fn install_self_update(&mut self) {
+        let Some(version) = self.update_available.clone() else {
+            self.update_message = "no update has been found yet — check first".to_string();
+            self.broadcast_status();
+            return;
+        };
+        if self.update_rx.is_some() {
+            info!("self-update: a check or download is already running");
+            return;
+        }
+        let Some(exe) = install::our_executable() else {
+            self.update_message = "cannot find this daemon's own executable".to_string();
+            self.broadcast_status();
+            return;
+        };
+        let (tx, rx) = crossbeam_channel::unbounded::<UpdateEvent>();
+        self.update_rx = Some(rx);
+        self.update_message = format!("downloading {version}…");
+        self.broadcast_status();
+        thread::spawn(move || {
+            let release = match update::check(update::FEED) {
+                Ok(release) => release,
+                Err(e) => {
+                    let _ = tx.send(UpdateEvent::Message(e));
+                    return;
+                }
+            };
+            let event = match update::stage(&release, &exe) {
+                Ok((staged, trusted_by)) => UpdateEvent::Staged {
+                    version: release.version,
+                    staged,
+                    trusted_by,
+                },
+                Err(e) => UpdateEvent::Message(e),
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    /// One answer from the self-update worker.
+    fn on_update_event(&mut self, event: UpdateEvent) {
+        self.update_rx = None;
+        match event {
+            UpdateEvent::Available(version) => {
+                info!("self-update: {version} is available");
+                self.update_available = Some(version.clone());
+                self.update_message = format!("{version} is available");
+            }
+            UpdateEvent::Message(message) => {
+                info!("self-update: {message}");
+                // "up to date" and "the feed could not be reached" are both answers, and a
+                // failure must not leave the button offering an update that is not there.
+                self.update_available = None;
+                self.update_message = message;
+            }
+            UpdateEvent::Staged {
+                version,
+                staged,
+                trusted_by,
+            } => {
+                info!("self-update: {version} staged at {} ({trusted_by})", staged.display());
+                self.update_message = format!("{version} is verified — restarting to swap it in");
+                self.staged_update = Some(staged);
+                self.broadcast_status();
+                // The swap script waits for this process to go: quit the ordinary way, so
+                // the packs are reverted and the audio comes back first.
+                self.quit_requested.ask();
+            }
+        }
         self.broadcast_status();
     }
 
@@ -1929,24 +2098,23 @@ impl App {
         self.broadcast_status();
     }
 
-    /// The low-level keyboard hook saw a hotkey. The hook only forwards the key — the work
-    /// happens here, on the event-loop thread.
-    fn on_hotkey(&mut self, vk: u32) {
-        match hotkey::action_for(vk) {
-            Some(hotkey::Action::Killswitch) => {
-                info!("killswitch hotkey (End)");
+    /// The low-level keyboard hook resolved a combination to an action. The hook only forwards
+    /// the action — the work happens here, on the event-loop thread.
+    fn on_hotkey(&mut self, action: hotkey::Action) {
+        match action {
+            hotkey::Action::Killswitch => {
+                info!("killswitch hotkey ({})", self.cfg.hotkeys.killswitch);
                 self.toggle_killswitch();
             }
-            Some(hotkey::Action::Idle) => {
+            hotkey::Action::Idle => {
                 if self.overlay.is_active() {
-                    info!("idle mode off (Home hotkey)");
+                    info!("idle mode off ({} hotkey)", self.cfg.hotkeys.idle);
                     self.exit_idle();
                 } else {
-                    info!("idle mode on (Home hotkey)");
+                    info!("idle mode on ({} hotkey)", self.cfg.hotkeys.idle);
                     self.enter_idle();
                 }
             }
-            None => {}
         }
     }
 
@@ -2628,6 +2796,8 @@ impl App {
                 // An explicit request over the pipe (the settings preview asks for the
                 // band): the user asked for it, so it opens even while a game is running.
                 Request::ShowConsole => self.open_console(ConsoleOpen::Explicit),
+                Request::CheckSelfUpdate => self.check_self_update(),
+                Request::InstallSelfUpdate => self.install_self_update(),
                 Request::SetConsoleOpen { mode } => {
                     let mode = normalize_console_open(&mode).to_string();
                     let changed = self.cfg.console_open != mode;
@@ -2832,6 +3002,23 @@ impl App {
                     info!("cooldown set to {}s", self.cfg.cooldown_seconds);
                     self.broadcast_status();
                 }
+                Request::SetHotkeys { idle, killswitch } => {
+                    // Both must parse, or nothing changes: a half-applied pair could leave an
+                    // action with no way to reach it.
+                    if hotkey::Binding::parse(&idle).is_none()
+                        || hotkey::Binding::parse(&killswitch).is_none()
+                    {
+                        warn!("hotkeys refused: '{idle}' / '{killswitch}' do not parse");
+                    } else {
+                        self.cfg.hotkeys.idle = idle;
+                        self.cfg.hotkeys.killswitch = killswitch;
+                        hotkey::apply(&self.cfg.hotkeys);
+                        if let Err(e) = armoury_core::config::save(&self.cfg) {
+                            warn!("failed to save config: {e}");
+                        }
+                        self.broadcast_status();
+                    }
+                }
                 Request::SetIdleFailsafe { enabled, minutes } => {
                     self.cfg.idle_failsafe_enabled = enabled;
                     self.cfg.idle_failsafe_minutes = minutes.max(1);
@@ -2846,10 +3033,23 @@ impl App {
                     self.broadcast_status();
                 }
                 Request::SetKillswitch { enabled } => self.set_killswitch_config(enabled),
-                Request::InstallPack { source } => {
+                Request::InstallPack { source, deny } => {
                     let result = install_pack_file(&self.search, std::path::Path::new(&source));
                     match result {
                         Ok((pack_id, updated)) => {
+                            // Feature 8: what the user unticked in the preview is remembered
+                            // per pack id, so a later update cannot quietly hand a permission
+                            // back. An empty list clears them (the user kept everything).
+                            if deny.is_empty() {
+                                self.cfg.capability_denials.remove(&pack_id);
+                            } else {
+                                self.cfg
+                                    .capability_denials
+                                    .insert(pack_id.clone(), deny.clone());
+                            }
+                            if let Err(e) = armoury_core::config::save(&self.cfg) {
+                                warn!("failed to save config: {e}");
+                            }
                             self.reload_packs();
                             let name = self
                                 .pack_catalog
@@ -3443,6 +3643,7 @@ mod tests {
                 captured: journal,
                 succeeded: vec![],
                 failed: vec![],
+                notes: vec![],
             }
         };
         let pack_half = half(true, &["g-pack"], &["g-pack"], &["g-pack"]);
@@ -3488,6 +3689,7 @@ mod tests {
                 captured: HashMap::new(),
                 succeeded: vec![],
                 failed: vec![],
+                notes: vec![],
             },
         );
         assert_eq!(applied, vec!["g-pack"]);

@@ -16,6 +16,7 @@ mod art;
 mod catalog;
 mod console;
 mod daemon;
+mod diagnostics;
 mod dpi;
 mod fonts;
 mod hotkey;
@@ -31,6 +32,7 @@ mod pick;
 mod script;
 mod trust;
 mod ui;
+mod update;
 mod watch;
 
 /// The scratch folders the tests write into. Only there while the tests run.

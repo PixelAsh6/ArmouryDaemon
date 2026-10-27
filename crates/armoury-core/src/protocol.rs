@@ -27,11 +27,21 @@ pub enum Request {
     SetIdleFailsafe { enabled: bool, minutes: u64 },
     /// Change the revert cooldown.
     SetCooldown { seconds: u64 },
+    /// Change the two global hotkeys (the text forms the settings window shows: `ctrl+alt+k`,
+    /// `home`). A string that does not parse is refused with a warning and the old combination
+    /// stays in force.
+    SetHotkeys { idle: String, killswitch: String },
     /// Enable or disable the killswitch. `false` is the config-level off: the toggle turns
     /// into a no-op and, if the killswitch is engaged at that moment, it releases first.
     SetKillswitch { enabled: bool },
-    /// Install a pack from a local `pack.json` (or a folder holding one).
-    InstallPack { source: String },
+    /// Install a pack from a local `pack.json` (or a folder holding one). `deny` lists the
+    /// capabilities the user unticked in the install preview; they are cut from the pack's
+    /// grant set and remembered per pack id.
+    InstallPack {
+        source: String,
+        #[serde(default)]
+        deny: Vec<String>,
+    },
     /// Install a helper module from an archive the catalogue download verified and left
     /// in temp. The daemon re-verifies the file's bytes against the signed manifest's
     /// `sha256` and `size` after it reads them, then extracts into `modules/<id>/`;
@@ -68,6 +78,12 @@ pub enum Request {
     SetArt { exe: String, slot: ArtSlot, url: String },
     /// Open the console launcher now (tray menu / settings preview), pad or not.
     ShowConsole,
+    /// Ask the release feed whether there is a newer daemon (feature 9). The answer lands in
+    /// the status snapshot: `update_available` and `update_message`.
+    CheckSelfUpdate,
+    /// Download, verify and swap in the newer daemon, then restart. Refused unless a check
+    /// has already found one: nothing is downloaded on a guess.
+    InstallSelfUpdate,
     /// Quit the daemon: revert the packs, then exit. Same as the tray menu's "Quit".
     Quit,
 }
@@ -269,6 +285,7 @@ mod tests {
             &mut out,
             &Request::InstallPack {
                 source: "C:\\x\\pack.json".into(),
+                deny: vec!["exec".into()],
             },
         )
         .unwrap();
@@ -330,6 +347,9 @@ mod tests {
                 idle_devices: 0,
                 idle_failsafe_enabled: true,
                 idle_failsafe_minutes: 180,
+                hotkeys: crate::config::Hotkeys::default(),
+                update_available: None,
+                update_message: String::new(),
                 tracked_apps: vec![],
                 tracked_apps_running: vec![],
                 packs: vec![],
