@@ -2302,33 +2302,27 @@ impl App {
             None => {}
         }
 
-        // Prefer an installed helper module (C2): the console is its own exe
-        // (`ArmouryConsole.exe`) that a catalogue helper installs under `modules/<id>/`.
-        // What remains is the old fallback: this very executable's `--console` mode.
-        let mut command = match console_helper(&pack_search_dirs()) {
-            Some(module) => {
-                info!(
-                    "console launcher: using module {} v{} ({})",
-                    module.id,
-                    module.version,
-                    module.path.display()
-                );
-                Command::new(module.path)
-            }
+        // The console is a **pack**: its exe (`ArmouryConsole.exe`) comes from a catalogue
+        // helper installed under `modules/<id>/`, and this binary carries no code that could
+        // draw its band (2026-10-27). Without the pack there is no console to show, so say so
+        // and leave the machine alone — launching something that is not installed was the old
+        // `--console` fallback, and it is gone.
+        let module = match console_helper(&pack_search_dirs()) {
+            Some(module) => module,
             None => {
-                let exe = match std::env::current_exe() {
-                    Ok(exe) => exe,
-                    Err(e) => {
-                        warn!("cannot resolve own executable path: {e}");
-                        return;
-                    }
-                };
-                info!("console launcher: no helper module — running {} --console", exe.display());
-                let mut fallback = Command::new(exe);
-                fallback.arg("--console");
-                fallback
+                info!(
+                    "console launcher: the console pack is not installed — install it from the Packs window"
+                );
+                return;
             }
         };
+        info!(
+            "console launcher: using module {} v{} ({})",
+            module.id,
+            module.version,
+            module.path.display()
+        );
+        let mut command = Command::new(module.path);
         match command.creation_flags(CREATE_NO_WINDOW).spawn() {
             Ok(child) => {
                 info!("spawned console launcher (pid {})", child.id());
@@ -3393,7 +3387,9 @@ mod tests {
     }
 
     #[test]
-    fn no_modules_folder_leaves_the_console_to_the_fallback() {
+    fn no_modules_folder_leaves_no_console_at_all() {
+        // The console is a pack and nothing else: with no helper installed there is no exe to
+        // launch, and the daemon must not fall back to a mode of its own (2026-10-27).
         let scratch = Scratch::dir("console-helper-none");
         let dirs = vec![scratch.root().to_path_buf()];
         assert!(console_helper(&dirs).is_none());

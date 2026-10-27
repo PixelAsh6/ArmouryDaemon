@@ -552,9 +552,16 @@ try {
     Check 'a close after the lockout ended reverts at once' ($times.Count -ge $reverts + 1) "reverts=$reverts now=$($times.Count)"
     $reverts = @(Get-ChangeTimes 'revert').Count
     $p4 = Start-Tracked 'C:\Windows\System32\timeout.exe' '40'
-    $s = Status
-    Check 'the restart is held by the cooldown of the revert' ($s.state -eq 'cooldown') "state=$($s.state)"
-    Check 'the restart is waiting behind that window' ($s.cooldown_action -eq 'apply') "action=$($s.cooldown_action)"
+    # the start has to reach the watcher first (one tick): poll for the held change, or the
+    # status is read before the daemon knows the app is up
+    $held = $null
+    for ($i = 0; $i -lt 40 -and $null -eq $held; $i++) {
+        Start-Sleep -Milliseconds 100
+        $t = Status
+        if ($t -and $t.cooldown_action -eq 'apply') { $held = $t }
+    }
+    Check 'the restart is held by the cooldown of the revert' ($null -ne $held) "action=$(($held).cooldown_action)"
+    Check 'the restart is waiting behind that window' ($null -ne $held -and $held.cooldown_remaining_ms -gt 0) "remaining=$(($held).cooldown_remaining_ms)"
     $times = @(Wait-Change 'apply' $applies 20)
     Check 'the restart applies when the cooldown ends' ($times.Count -ge $applies + 1) "applies=$applies now=$($times.Count)"
     $s = Wait-State 'triggered' 20

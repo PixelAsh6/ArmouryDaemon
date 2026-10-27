@@ -1,8 +1,8 @@
 //! ArmouryDaemon — single executable, six entry paths.
 //! Without arguments: the resident daemon (tray, hotkey, pipe server, UI lifecycle).
 //! With `--ui`: the on-demand GUI process (spawned by the daemon from this same file).
-//! With `--console`: the pad-driven console launcher (spawned by the daemon on a controller
-//! connect; the tray menu and the settings preview can open it too).
+//! The console launcher is **not** here: it is a pack, its exe comes from the catalogue, and
+//! this binary carries no code that could draw its band.
 //! With `--autostart`: the scheduled task's start — identical to the daemon, except that an
 //! already-running instance is left completely alone (no dashboard pops up on resume from sleep).
 //! With `--install`: register the autostart task and exit — the elevated copy of the daemon,
@@ -15,7 +15,6 @@
 mod art;
 mod catalog;
 mod console;
-mod console_ui;
 mod daemon;
 mod dpi;
 mod fonts;
@@ -60,7 +59,6 @@ fn main() {
             });
         }
         Action::Ui => ui::run(),
-        Action::Console => console_ui::run(),
         Action::Install => install::install_self(),
         Action::CatalogList(ref url) => catalog_list(url.clone()),
         Action::CatalogInstall(ref id, ref url) => catalog_install(id, url.clone()),
@@ -88,8 +86,6 @@ enum Action {
     Run,
     /// The settings window.
     Ui,
-    /// The pad-driven console.
-    Console,
     /// Register the autostart task and exit: the elevated copy of the daemon.
     Install,
     /// List the packs of a catalog. The URL is the one `--catalog-url` gave, if it was given.
@@ -119,7 +115,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
     let mut install_id: Option<String> = None;
     let mut url: Option<String> = None;
     let mut ui = false;
-    let mut console = false;
     let mut install_task = false;
     let mut help = false;
     let mut version = false;
@@ -135,7 +130,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
             // arguments.
             "--autostart" => {}
             "--ui" => ui = true,
-            "--console" => console = true,
             "--install" => install_task = true,
             "--catalog-list" => list = true,
             "--module-list" => modules = true,
@@ -181,9 +175,6 @@ fn parse_args(args: impl Iterator<Item = String>) -> Action {
     if let Some(url) = url {
         return Action::CatalogUrl(url);
     }
-    if console {
-        return Action::Console;
-    }
     if ui {
         return Action::Ui;
     }
@@ -203,7 +194,6 @@ fn is_autostart(args: &[String]) -> bool {
 const FLAGS: &[(&str, &str)] = &[
     ("--autostart", "start the daemon without opening the dashboard"),
     ("--ui", "run the settings window"),
-    ("--console", "run the pad-driven console"),
     ("--install", "register the autostart task (logon + resume) and exit"),
     ("--catalog-list", "list the packs of the catalog and exit"),
     ("--catalog-install <id>", "install one pack from the catalog and exit"),
@@ -360,7 +350,6 @@ mod tests {
     #[test]
     fn the_entry_paths_are_recognised() {
         assert_eq!(parse(&["--ui"]), Action::Ui);
-        assert_eq!(parse(&["--console"]), Action::Console);
         assert_eq!(parse(&["--install"]), Action::Install);
     }
 
@@ -450,7 +439,6 @@ mod tests {
         for flag in [
             "--autostart",
             "--ui",
-            "--console",
             "--install",
             "--catalog-list",
             "--catalog-install",

@@ -10,12 +10,14 @@ path = "src/main.rs"
 
 # C1: the console launcher as its own exe. The modules it carries (console_ui, art, pad,
 # pick, fonts, dpi, net) are declared with `#[path]` in `src/console_bin.rs`, so both
-# binaries compile the same sources. `test = false`: the shared modules' unit tests run
-# once, in the daemon binary's test harness, which compiles exactly the same code.
+# binaries compile the same sources.
+#
+# Its tests run **here** now: since 2026-10-27 the daemon binary does not link `console_ui`
+# at all (the console is a pack), so this is the only binary that compiles it — and the only
+# place its unit tests can run.
 [[bin]]
 name = "ArmouryConsole"
 path = "src/console_bin.rs"
-test = false
 
 [dependencies]
 armoury-core.workspace = true
