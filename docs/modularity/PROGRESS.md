@@ -1641,6 +1641,13 @@ user's calls.
    the one choke point both window lookups use, and the dashboard's own published rect is
    filtered the same way; the settings window keeps its bottom-left corner when its content
    changes size.
+4. **The console is a pack, so the daemon carries none** (`main.rs`, `daemon.rs`,
+   `armoury/Cargo.toml`). `mod console_ui` is out of the daemon binary, `--console` is gone from
+   the argv (and from the help), and `show_console` only ever launches the installed helper: with
+   no pack it logs `console launcher: the console pack is not installed — install it from the
+   Packs window` and starts nothing. The console bin now runs `console_ui`'s unit tests, which
+   had nowhere to run once the daemon stopped linking the module. The daemon exe lost
+   **358,400 bytes** to the move (13,320,192 → 12,961,792).
 
 **Files touched.** `crates/armoury/src/watch.rs`, `crates/armoury-core/src/engine.rs`,
 `crates/armoury/src/ui.rs`, `tools/daemon-selftest.ps1` (§6), `docs/PACKS.md` (new),
@@ -1650,9 +1657,11 @@ user's calls.
 tick**; `EnumProcesses` alone is **0.068 ms** (310× less) and the steady-state design — PID set
 plus a name only for a new PID — lands at **0.062 ms**. Equivalence was proven before the
 change: identical PID sets and **213 on-demand names, 0 mismatches** (the 160 names that could
-not be resolved are protected processes the daemon can never watch). The exe is 13,320,192 B,
-smaller than the 1.3.0 build's 13,331,456 B. `engine.rs` is 329 lines shorter in diff terms
-(the `pending` branch and its tests are gone; the `try_change` body is 12 lines instead of 45).
+not be resolved are protected processes the daemon can never watch). The exe went
+13,331,456 B (1.3.0) → 13,320,192 B (watcher) → **12,961,792 B** (console out of the daemon).
+The `try_change` body is 12 lines instead of 45, and the `pending` flag is gone with its
+branches. Suite: **450 unit tests** (55 console bin + 289 daemon + 106 core) and **167 harness
+checks, 0 SKIP** — the count moved with the changed checks (section 6 -1, 9b -1, 20f -1, +2).
 
 **Decisions.** DECISIONS.md 30 (the cooldown rule and the accepted restart-flicker cost) and 31
 (the rect guard, and the rejected HWND plumbing).
@@ -1673,7 +1682,11 @@ smaller than the 1.3.0 build's 13,331,456 B. `engine.rs` is 329 lines shorter in
   with the cost in front of it.
 
 **Runs.** Watcher: red `40520802791` (the four new tests fail against the stub; 310 pass), green
-`40539483487`. Cooldown + Packs: `40541653898`.
+`40539483487`. Cooldown + Packs: `40541653898` (one engine pin: a resume is a manual action and
+starts no cooldown), `40542209753` (harness 6 and 9b still encoded the old rule), `40543291338`
+(one check read the status before the watcher had seen the start). Console as a pack:
+`40544363195` (the flag list and the 20f fallback checks were stale), **green `40545529645`** —
+the whole suite, the harness and the release build.
 
 **Next.** The user's word is needed for the next release (1.3.0 is tagged at `merge: 1.3.0` on
 `main`; this branch carries the watcher, the cooldown and the window fixes on top). The remaining
