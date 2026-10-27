@@ -111,7 +111,7 @@ pub fn run(start: Start) {
         eprintln!("logging init failed: {e}");
     }
     info!("daemon starting (v{})", armoury_core::VERSION);
-    if let Some(code) = crate::dpi_error() {
+    if let Some(code) = crate::dpi::error() {
         // The DPI switch failed before the logger existed; now it can be said.
         info!("DPI awareness was not set (error {code}): the process may already be aware");
     }
@@ -712,6 +712,28 @@ pub(crate) fn pack_search_dirs() -> Vec<std::path::PathBuf> {
         }
     }
     packs::usable_search_dirs(&search)
+}
+
+/// The file name the console launcher runs under, in a helper module's own record.
+const CONSOLE_EXE: &str = "ArmouryConsole.exe";
+
+/// Is a helper module's recorded `entry` this launcher? The entry may name a subfolder
+/// (`console/ArmouryConsole.exe`); the file name alone decides, and Windows file names
+/// are case-insensitive.
+fn matches_console_entry(entry: &str, exe: &str) -> bool {
+    entry
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|file| file.eq_ignore_ascii_case(exe))
+}
+
+/// The installed console helper to spawn: the first `modules/<id>/` whose recorded entry
+/// runs the console exe and whose exe is actually on disk. `helpers::installed` sorts by
+/// id, so the choice is deterministic: two console helpers pick the lower id.
+fn console_helper(search: &[std::path::PathBuf]) -> Option<helpers::HelperModule> {
+    helpers::installed(search).into_iter().find(|module| {
+        matches_console_entry(&module.entry, CONSOLE_EXE) && module.path.is_file()
+    })
 }
 
 /// Install a pack from a file and clean up after it.
@@ -2280,18 +2302,32 @@ impl App {
             None => {}
         }
 
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(e) => {
-                warn!("cannot resolve own executable path: {e}");
-                return;
+        // Prefer an installed helper module (C2): the console is its own exe
+        // (`ArmouryConsole.exe`) that a catalogue helper installs under `modules/<id>/`.
+        // What remains is the old fallback: this very executable's `--console` mode.
+        let mut command = match console_helper(&pack_search_dirs()) {
+            Some(module) => {
+                info!(
+                    "console launcher: using module {} v{} ({})",
+                    module.id,
+                    module.version,
+                    module.path.display()
+                );
+                Command::new(module.path)
+            }
+            None => {
+                let exe = match std::env::current_exe() {
+                    Ok(exe) => exe,
+                    Err(e) => {
+                        warn!("cannot resolve own executable path: {e}");
+                        return;
+                    }
+                };
+                info!("console launcher: no helper module — running {} --console", exe.display());
+                Command::new(exe).arg("--console")
             }
         };
-        match Command::new(&exe)
-            .arg("--console")
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-        {
+        match command.creation_flags(CREATE_NO_WINDOW).spawn() {
             Ok(child) => {
                 info!("spawned console launcher (pid {})", child.id());
                 self.console_spawned = Some(Instant::now());

@@ -216,4 +216,5 @@ jobs:
           path: |
             target/release/ArmouryDaemon.exe
             target/release/ArmouryDaemon.exe.sha256
+            target/release/ArmouryConsole.exe
           if-no-files-found: error

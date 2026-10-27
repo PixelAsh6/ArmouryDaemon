@@ -23,8 +23,6 @@ use std::time::Duration;
 
 use armoury_core::protocol::{ArtListing, ArtPhoto, ArtSlot};
 
-use crate::catalog;
-
 /// An empty marker older than this is re-tried (covers art uploaded later).
 const MISS_RETRY: Duration = Duration::from_secs(7 * 24 * 3600);
 
@@ -988,12 +986,12 @@ fn sgdb_hero_url(key: &str, game: u32, dim: &str) -> Result<String, String> {
         .ok_or_else(|| format!("no {dim} hero"))
 }
 
-/// The client the cover art is fetched with: the process-wide one (see `catalog::agent`).
+/// The client the cover art is fetched with: the process-wide one (see `net::agent`).
 ///
 /// The art travels over the same client as the catalogue, so it is validated against the same
 /// root store — the Windows certificate store — and it reuses the same connections.
 fn client() -> &'static ureq::Agent {
-    catalog::agent()
+    crate::net::agent()
 }
 
 /// GET with the `catalog.rs` HTTP shape: the shared client, body as bytes.
@@ -1416,7 +1414,7 @@ mod tests {
         // One client, one connection pool: a client of its own would rebuild the rustls config
         // and the platform verifier for every single fetch.
         assert!(
-            std::ptr::eq::<ureq::Agent>(client(), catalog::agent()),
+            std::ptr::eq::<ureq::Agent>(client(), crate::net::agent()),
             "the art fetch must share the client's connection pool with the catalogue"
         );
     }

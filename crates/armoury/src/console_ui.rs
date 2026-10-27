@@ -24,7 +24,6 @@ use eframe::egui::epaint::{CornerRadius, Mesh, RectShape};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced};
 
 use crate::art;
-use crate::catalog;
 use crate::pad;
 
 /// The launcher's window is the band itself: a fixed 90% x 35% of the full screen, console style.
@@ -213,7 +212,7 @@ pub fn run() {
         eprintln!("logging init failed: {e}");
     }
     log::info!("console starting (v{})", armoury_core::VERSION);
-    if let Some(code) = crate::dpi_error() {
+    if let Some(code) = crate::dpi::error() {
         // The DPI switch failed before the logger existed; now it can be said.
         log::info!("DPI awareness was not set (error {code}): the process may already be aware");
     }
@@ -1316,13 +1315,13 @@ fn invalidate_art<T>(
     hero_want.remove(key);
 }
 
-/// The client the thumbnails are fetched with: the process-wide one (see `catalog::agent`).
+/// The client the thumbnails are fetched with: the process-wide one (see `net::agent`).
 ///
 /// The band is a process of its own, so this is an agent of its own too — but the same one
 /// the catalogue and the cover art use: the Windows certificate store is the root store, and
 /// the connections are pooled.
 fn client() -> &'static ureq::Agent {
-    catalog::agent()
+    crate::net::agent()
 }
 
 /// Download one thumbnail and decode it.
@@ -1379,7 +1378,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         if self.first_frame {
-            crate::ui::install_fonts(&ctx);
+            crate::fonts::install_fonts(&ctx);
         }
         ctx.request_repaint(); // the pad is polled per frame
 
@@ -2704,7 +2703,7 @@ mod tests {
         // One client, one connection pool: a client of its own would rebuild the rustls config
         // and the platform verifier for every single thumbnail.
         assert!(
-            std::ptr::eq::<ureq::Agent>(client(), catalog::agent()),
+            std::ptr::eq::<ureq::Agent>(client(), crate::net::agent()),
             "the thumbnails must share the client's connection pool with the catalogue"
         );
     }

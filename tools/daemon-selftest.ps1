@@ -202,6 +202,20 @@ function Get-Gap($from, $to) {
     return ($to - $from).TotalSeconds
 }
 
+# Wait until the daemon log carries a line matching the pattern, and hand back the last
+# match, or $null when nothing matched (a $null in a check fails as "not there", never
+# as an error in the plumbing).
+function Wait-DaemonLogLine([string]$pattern, [int]$timeoutSec = 6) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    $found = $null
+    while ((Get-Date) -lt $deadline) {
+        $found = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match $pattern } | Select-Object -Last 1)
+        if ($found) { return $found }
+        Start-Sleep -Milliseconds 250
+    }
+    return $null
+}
+
 # The times at which a named pack logged that it applied ('applied') or reverted ('reverted').
 # The line carries the pack's name, not its id: "Sluggish: reverted (target: n/a)".
 function Get-PackLineTimes([string]$name, [string]$action) {
@@ -1443,6 +1457,47 @@ try {
         Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $requestZip -Force -ErrorAction SilentlyContinue
+
+        # -- 20f. show_console prefers an installed console helper (Phase C1/C2) --
+        #
+        # The console is its own exe now (ArmouryConsole.exe), and a helper module that
+        # carries it is installed through the B5 request. show_console must prefer that
+        # module's exe (`modules/<id>/ArmouryConsole.exe`) over the `--console` fallback on
+        # the daemon binary. The fixture's exe is a placeholder that cannot run (bad PE
+        # image), so the daemon names the choice in its log and the spawn fails - the band
+        # never opens in a headless run. Removing the module brings the fallback back; that
+        # probe really starts the console band, so the child is stopped by the pid the
+        # daemon logged.
+        $consoleZip = Join-Path $env:TEMP 'armoury-catalog-h-console.zip'
+        Copy-Item -LiteralPath (Join-Path $fixtures 'helper-harness-test.zip') -Destination $consoleZip -Force
+        $consoleHash = (Get-FileHash -LiteralPath $consoleZip -Algorithm SHA256).Hash.ToLowerInvariant()
+        $consoleSize = (Get-Item -LiteralPath $consoleZip).Length
+        $consoleJson = '{"type":"install_helper","id":"h-console","name":"Console helper","version":"1.2.0","entry":"ArmouryConsole.exe","file":"' + ($consoleZip -replace '\\', '\\') + '","sha256":"' + $consoleHash + '","size":' + $consoleSize + '}'
+        $reply = Send-Pipe $consoleJson
+        Check 'the console helper installs' ($reply -match '"ok"\s*:\s*true') "reply=$(Get-FirstLine $reply)"
+
+        Send-Pipe '{"type":"show_console"}' | Out-Null
+        $helperLine = Wait-DaemonLogLine 'console launcher: using module h-console v1\.2\.0'
+        Check 'show_console uses the installed helper' ($null -ne $helperLine) "log=$(Get-FirstLine $helperLine)"
+        $fallbackLines = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match 'no helper module' })
+        Check 'the fallback stays quiet while a helper is installed' (@($fallbackLines).Count -eq 0) "count=$(@($fallbackLines).Count)"
+        $failLine = Wait-DaemonLogLine 'failed to spawn the console launcher'
+        Check 'the placeholder helper names itself at the spawn' ($null -ne $failLine) 'no spawn attempt went at the module exe'
+
+        # the helper goes away again: the choice has to fall back to the daemon exe
+        Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $consoleZip -Force -ErrorAction SilentlyContinue
+        Send-Pipe '{"type":"show_console"}' | Out-Null
+        $fallbackLine = Wait-DaemonLogLine 'console launcher: no helper module'
+        Check 'show_console falls back to the daemon exe' (($null -ne $fallbackLine) -and ($fallbackLine.Contains('--console'))) "log=$(Get-FirstLine $fallbackLine)"
+        $childLine = Wait-DaemonLogLine 'spawned console launcher \(pid (\d+)\)'
+        Check 'the fallback spawns a console launcher' ($null -ne $childLine) 'no pid in the log'
+        if ($childLine -match 'pid (\d+)') {
+            # the band is up for a moment; then it is stopped - the daemon keeps the
+            # child as its launcher, and the probe is done with it
+            Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue
+        }
 
         $env:ARMOURY_TEST_NS = $ns
     }

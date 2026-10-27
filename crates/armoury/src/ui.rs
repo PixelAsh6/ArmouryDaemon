@@ -4,7 +4,7 @@
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
 use crate::catalog::{self, CatalogPack, EngineGate};
-use crate::{daemon, helpers, packs};
+use crate::{daemon, fonts, helpers, packs};
 use armoury_core::config::{
     CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, CONSOLE_OPEN_PAD, TrackedApp,
 };
@@ -237,7 +237,7 @@ pub fn run() {
         eprintln!("logging init failed: {e}");
     }
     log::info!("ui starting (v{})", armoury_core::VERSION);
-    if let Some(code) = crate::dpi_error() {
+    if let Some(code) = crate::dpi::error() {
         // The DPI switch failed before the logger existed; now it can be said.
         log::info!("DPI awareness was not set (error {code}): the process may already be aware");
     }
@@ -497,7 +497,7 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.styled {
             self.styled = true;
-            install_fonts(ctx);
+            fonts::install_fonts(ctx);
             ctx.all_styles_mut(|style| {
                 style
                     .text_styles
@@ -3138,48 +3138,8 @@ fn sgdb_field_hint(status: Option<&StatusSnapshot>) -> &'static str {
 
 /// Use the machine's own fonts instead of egui's embedded ones: Segoe UI Variable Text
 /// (Windows 11) → Segoe UI → Arial. Exactly one file is loaded (the first that exists) and
-/// it also backs the monospace family, so nothing extra is kept in memory.
-pub(crate) fn install_fonts(ctx: &egui::Context) {
-    let (fonts, chosen) = system_fonts();
-    match chosen {
-        Some(label) => log::info!("using the system font: {label}"),
-        None => log::warn!("no system UI font found; text may not render"),
-    }
-    ctx.set_fonts(fonts);
-}
-
-/// The fonts the app draws with, and the name of the one that was found (None when the
-/// machine has none of them and egui's own font is used).
-fn system_fonts() -> (egui::FontDefinitions, Option<&'static str>) {
-    const CANDIDATES: [(&str, &str); 3] = [
-        ("C:\\Windows\\Fonts\\SegUIVar.ttf", "Segoe UI Variable Text"),
-        ("C:\\Windows\\Fonts\\segoeui.ttf", "Segoe UI"),
-        ("C:\\Windows\\Fonts\\arial.ttf", "Arial"),
-    ];
-
-    let mut fonts = egui::FontDefinitions::default();
-    let mut chosen = None;
-    for (path, label) in CANDIDATES {
-        if let Ok(bytes) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "ui".to_owned(),
-                std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-            );
-            chosen = Some(label);
-            break;
-        }
-    }
-
-    if chosen.is_some() {
-        let family = vec!["ui".to_owned()];
-        fonts
-            .families
-            .insert(egui::FontFamily::Proportional, family.clone());
-        fonts.families.insert(egui::FontFamily::Monospace, family);
-    }
-
-    (fonts, chosen)
-}
+/// it also backs the monospace family, so nothing extra is kept in memory. It lives in
+/// `fonts.rs`, next to the console band's copy.
 
 fn file_name(path: &str) -> String {
     std::path::Path::new(path)
@@ -4112,7 +4072,7 @@ mod tests {
         // The fonts are only built once the context has run a pass.
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         out.textures_delta.clear();
-        install_fonts(&ctx);
+        fonts::install_fonts(&ctx);
         let mut out = ctx.run_ui(egui::RawInput::default(), |_| {});
         out.textures_delta.clear();
         let p = ctx.debug_painter();
@@ -5047,7 +5007,7 @@ mod tests {
     /// The app's own fonts and styles, so a test measures the text as it is drawn.
     /// Returns the name of the system font, or None when the machine has none.
     fn app_style(ctx: &egui::Context) -> Option<&'static str> {
-        let (fonts, chosen) = system_fonts();
+        let (fonts, chosen) = fonts::system_fonts();
         ctx.set_fonts(fonts);
         ctx.all_styles_mut(|style| {
             style

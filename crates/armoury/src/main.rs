@@ -17,11 +17,14 @@ mod catalog;
 mod console;
 mod console_ui;
 mod daemon;
+mod dpi;
+mod fonts;
 mod hotkey;
 mod helpers;
 mod install;
 mod ipc;
 mod killswitch;
+mod net;
 mod overlay;
 mod pad;
 mod packs;
@@ -40,7 +43,7 @@ fn main() {
     // screen before their window exists, and Win32 only hands out physical pixels to a
     // process that says so. Winit sets the same context later, inside `EventLoop::new()`,
     // which is far too late for those measurements.
-    set_dpi_awareness();
+    dpi::set();
 
     // The release build is a windows-subsystem binary: when it is launched from a terminal the
     // maintenance modes still need that console, or their output would vanish.
@@ -335,37 +338,6 @@ fn attach_parent_console() {
     use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
     unsafe {
         AttachConsole(ATTACH_PARENT_PROCESS);
-    }
-}
-
-/// Make the process Per-Monitor-V2 DPI aware, before any window, COM object or font exists:
-/// a DPI-unaware process gets virtualised screen metrics and 96-DPI GDI text. Failing is not
-/// fatal — the process may already be aware (ERROR_ACCESS_DENIED) or the system may not know
-/// the context — the mode still runs either way.
-///
-/// The error is kept instead of logged: there is no logger yet at this point, so the message
-/// would be lost. `dpi_error()` lets the mode report it once `logging::init` has run.
-fn set_dpi_awareness() {
-    use windows_sys::Win32::Foundation::GetLastError;
-    use windows_sys::Win32::UI::HiDpi::{
-        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-    };
-
-    unsafe {
-        if SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) == 0 {
-            DPI_ERROR.store(GetLastError(), std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-/// The Win32 error of the DPI switch (0 = it worked).
-static DPI_ERROR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// The error of the DPI switch, if it failed. Read it after the logger exists.
-pub fn dpi_error() -> Option<u32> {
-    match DPI_ERROR.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => None,
-        code => Some(code),
     }
 }
 

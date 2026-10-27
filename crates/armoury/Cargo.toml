@@ -8,6 +8,15 @@ rust-version.workspace = true
 name = "ArmouryDaemon"
 path = "src/main.rs"
 
+# C1: the console launcher as its own exe. The modules it carries (console_ui, art, pad,
+# pick, fonts, dpi, net) are declared with `#[path]` in `src/console_bin.rs`, so both
+# binaries compile the same sources. `test = false`: the shared modules' unit tests run
+# once, in the daemon binary's test harness, which compiles exactly the same code.
+[[bin]]
+name = "ArmouryConsole"
+path = "src/console_bin.rs"
+test = false
+
 [dependencies]
 armoury-core.workspace = true
 log.workspace = true
