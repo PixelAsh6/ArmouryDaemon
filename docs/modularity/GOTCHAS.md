@@ -521,6 +521,21 @@ Biggest symbols: `daemon::run` 247.2 KiB, `console_ui::ui` 92.5 KiB,
     gets the root path free. Related house rule from B3: sibling modules
     inside a shared file must name each other `crate::foo`, never bare
     `foo`.
+60. **`CreateProcess` on a malformed image can hang the daemon's whole main
+    loop - on the CI runners, twice observed.** The 20f console-helper
+    probe first served the B3 fixture (`ArmouryConsole.exe` holding 78
+    bytes of `MZ …` text). The daemon logged its choice and then went
+    silent: `Command::spawn` never returned, so no later request, no later
+    log line, no spawn failure of any kind for the rest of the run. On the
+    development machine the same file fails in **54 ms**
+    (`ERROR_BAD_EXE_FORMAT` wording: "not a valid application for this OS
+    platform"). The runner never said more. Whatever the runner-side
+    difference is, the shape of it cannot be tolerated in a harness: the
+    probe now stages a **real** image (a copy of `cmd.exe` under the
+    console's name), and the `--module-list`/`install_helper` machines that
+    never execute anything stay as they are. Rule: **a piece of the harness
+    that asks the daemon to spawn a file must hand it a real PE, or it is
+    not testing the spawn.**
 
 ---
 

@@ -1472,13 +1472,15 @@ function Format-DaemonLogTail([int]$lines = 8) {
         # The console is its own exe now (ArmouryConsole.exe), and a helper module that
         # carries it is installed through the B5 request. show_console must prefer that
         # module's exe (`modules/<id>/ArmouryConsole.exe`) over the `--console` fallback on
-        # the daemon binary. The fixture's exe is a placeholder that cannot run (bad PE
-        # image), so the daemon names the choice in its log and the spawn fails - the band
-        # never opens in a headless run. Removing the module brings the fallback back; that
-        # probe really starts the console band, so the child is stopped by the pid the
-        # daemon logged.
+        # the daemon binary. The module here carries a **real** image (a copy of cmd.exe
+        # under the console's name): a malformed image froze the daemon's main loop inside
+        # CreateProcess on a runner twice now (trap 60), and the fallback afterward starts
+        # a real band, which the probe ends by the pid the daemon logged.
         $consoleZip = Join-Path $env:TEMP 'armoury-catalog-h-console.zip'
-        Copy-Item -LiteralPath (Join-Path $fixtures 'helper-harness-test.zip') -Destination $consoleZip -Force
+        $consoleStage = Join-Path $cliDir 'console-zip'
+        New-Item -ItemType Directory -Force -Path $consoleStage | Out-Null
+        Copy-Item -LiteralPath (Join-Path $env:WINDIR 'System32\cmd.exe') -Destination (Join-Path $consoleStage 'ArmouryConsole.exe') -Force
+        Compress-Archive -Path (Join-Path $consoleStage 'ArmouryConsole.exe') -DestinationPath $consoleZip -Force
         $consoleHash = (Get-FileHash -LiteralPath $consoleZip -Algorithm SHA256).Hash.ToLowerInvariant()
         $consoleSize = (Get-Item -LiteralPath $consoleZip).Length
         $consoleJson = '{"type":"install_helper","id":"h-console","name":"Console helper","version":"1.2.0","entry":"ArmouryConsole.exe","file":"' + ($consoleZip -replace '\\', '\\') + '","sha256":"' + $consoleHash + '","size":' + $consoleSize + '}'
@@ -1490,13 +1492,18 @@ function Format-DaemonLogTail([int]$lines = 8) {
         Check 'show_console uses the installed helper' ($null -ne $helperLine) "log=$(Get-FirstLine $helperLine)"
         $fallbackLines = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match 'no helper module' })
         Check 'the fallback stays quiet while a helper is installed' (@($fallbackLines).Count -eq 0) "count=$(@($fallbackLines).Count)"
-        $failLine = Wait-DaemonLogLine 'failed to spawn the console launcher'
-        Check 'the placeholder helper names itself at the spawn' ($null -ne $failLine) "log: $(Format-DaemonLogTail)"
+        $childLine = Wait-DaemonLogLine 'spawned console launcher \(pid (\d+)\)'
+        Check 'the module exe the daemon chose is the one it started' ($null -ne $childLine) "log: $(Format-DaemonLogTail)"
+        if ($childLine -match 'pid (\d+)') {
+            # the module's exe is running: the probe is done with it
+            Stop-Process -Id ([int]$Matches[1]) -Force -ErrorAction SilentlyContinue
+        }
 
         # the helper goes away again: the choice has to fall back to the daemon exe
         Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $consoleZip -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $consoleStage -Recurse -Force -ErrorAction SilentlyContinue
         Send-Pipe '{"type":"show_console"}' | Out-Null
         "20f after the second show_console: $(Format-DaemonLogTail 12)"
         $fallbackLine = Wait-DaemonLogLine 'console launcher: no helper module'
