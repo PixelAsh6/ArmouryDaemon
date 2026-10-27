@@ -1458,7 +1458,16 @@ try {
         Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-request') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $requestZip -Force -ErrorAction SilentlyContinue
 
-        # -- 20f. show_console prefers an installed console helper (Phase C1/C2) --
+        # The daemon's own words about the console, for a failing 20f check: the choice, the
+# spawn and the module scan are all in the throw-away instance's log, and the console
+# section's failures are only diagnosable with them in hand.
+function Format-DaemonLogTail([int]$lines = 8) {
+    return (((Read-Text $logPath) -split "`r?`n") |
+        Where-Object { $_ -match 'console|helper' } |
+        Select-Object -Last $lines) -join ' // '
+}
+
+# -- 20f. show_console prefers an installed console helper (Phase C1/C2) --
         #
         # The console is its own exe now (ArmouryConsole.exe), and a helper module that
         # carries it is installed through the B5 request. show_console must prefer that
@@ -1482,17 +1491,18 @@ try {
         $fallbackLines = @(((Read-Text $logPath) -split "`r?`n") | Where-Object { $_ -match 'no helper module' })
         Check 'the fallback stays quiet while a helper is installed' (@($fallbackLines).Count -eq 0) "count=$(@($fallbackLines).Count)"
         $failLine = Wait-DaemonLogLine 'failed to spawn the console launcher'
-        Check 'the placeholder helper names itself at the spawn' ($null -ne $failLine) 'no spawn attempt went at the module exe'
+        Check 'the placeholder helper names itself at the spawn' ($null -ne $failLine) "log: $(Format-DaemonLogTail)"
 
         # the helper goes away again: the choice has to fall back to the daemon exe
         Remove-Item -LiteralPath (Join-Path $exeDir 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath (Join-Path $repoRoot 'modules\h-console') -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item -LiteralPath $consoleZip -Force -ErrorAction SilentlyContinue
         Send-Pipe '{"type":"show_console"}' | Out-Null
+        "20f after the second show_console: $(Format-DaemonLogTail 12)"
         $fallbackLine = Wait-DaemonLogLine 'console launcher: no helper module'
-        Check 'show_console falls back to the daemon exe' (($null -ne $fallbackLine) -and ($fallbackLine.Contains('--console'))) "log=$(Get-FirstLine $fallbackLine)"
+        Check 'show_console falls back to the daemon exe' (($null -ne $fallbackLine) -and ($fallbackLine.Contains('--console'))) "log: $(Format-DaemonLogTail)"
         $childLine = Wait-DaemonLogLine 'spawned console launcher \(pid (\d+)\)'
-        Check 'the fallback spawns a console launcher' ($null -ne $childLine) 'no pid in the log'
+        Check 'the fallback spawns a console launcher' ($null -ne $childLine) "log: $(Format-DaemonLogTail)"
         if ($childLine -match 'pid (\d+)') {
             # the band is up for a moment; then it is stopped - the daemon keeps the
             # child as its launcher, and the probe is done with it
