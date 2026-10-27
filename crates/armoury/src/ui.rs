@@ -5499,6 +5499,100 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_download_leaves_the_row_offering_the_button() {
+        // A failed helper download fit the scans: the row painted its name, and where the
+        // button was there was blank. The failure line is why: it names the URL it could
+        // not fetch ("catalog: cannot fetch … /console.zip"), the Modules window paints it
+        // with the list's extend-wide mode, and a one-line galley wider than the window
+        // widened the whole list. From the next repaint on, the rows were laid out into
+        // that wider room, so their right edges (the buttons) sat past the window and
+        // clipped away; the line outlived a fresh check and a window reopen, so only
+        // killing the process gave the button back. The line has to wrap, like the notes
+        // under the rows already do.
+        let ctx = egui::Context::default();
+        app_style(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let entries = vec![
+            {
+                let mut helper = catalog_entry("armoury-console", "Armoury Console", "0.2.0");
+                helper.kind = "helper".to_string();
+                helper
+            },
+            catalog_entry("rainmeter", "Rainmeter", "1.4.0"),
+        ];
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        {
+            let mut s = shared.lock().unwrap();
+            s.catalog = Some(Ok(entries));
+            // The message the console's 404 produced: a fetch error names the URL it
+            // could not reach, so this line is wider than the window.
+            s.last_pack_op = Some((
+                false,
+                "catalog: cannot fetch \
+                 https://raw.githubusercontent.com/PixelAsh6/ArmouryDaemon_Packs/main/\
+                 catalog/console.zip (HTTP Status 404 Not Found)"
+                    .to_string(),
+            ));
+        }
+        // Two frames: what the first one paints is the width the second one lays its rows
+        // into. Nothing changes between them; the widening is a repaint effect.
+        let run = |input: egui::RawInput| {
+            let output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| install_packs_ui(ui, &shared));
+            });
+            let text = painted_text(&output);
+            output.drop_without_applying_deltas();
+            text
+        };
+        let first = run(input.clone());
+        let text = run(input);
+        // The first frame is fine: the row offers the download inside the window.
+        let download = |rects: &[(String, Rect, usize)]| {
+            rects
+                .iter()
+                .filter(|(t, _, _)| t == "Download")
+                .map(|(_, rect, _)| *rect)
+                .collect::<Vec<Rect>>()
+        };
+        assert_eq!(
+            download(&first).len(),
+            2,
+            "with two rows, both of them offer the download in the first frame"
+        );
+        // From the next repaint on, both rows must still offer the download, inside the
+        // window. The empty-collection failure says where the blank is: the buttons were
+        // laid out past the window edge and clipped.
+        let on_window: Vec<Rect> = download(&text).into_iter().filter(|rect| {
+            rect.right() <= INSTALL_PACKS_WIDTH + 0.5
+        }).collect();
+        assert_eq!(
+            on_window.len(),
+            2,
+            "both rows keep their download button inside the window after the failure \
+             painted: the ones on screen were {on_window:?} of all painted {:?}",
+            download(&text)
+        );
+        // And the failure line itself wrapped: no one-line galley runs past the window.
+        let failure = text
+            .iter()
+            .find(|(t, _, _)| t.starts_with("catalog: cannot fetch"))
+            .expect("the failure line is still shown");
+        assert!(
+            failure.1.right() <= INSTALL_PACKS_WIDTH + 0.5,
+            "the failure line is a wide line: {:?}",
+            failure.1
+        );
+    }
+
+    #[test]
     fn the_picker_says_how_many_matches_it_did_not_show() {
         // A list that reads as complete but is not is a lie: the count is said.
         assert_eq!(more_matches_note(8, APP_MATCH_ROWS), None);
