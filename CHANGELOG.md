@@ -3,7 +3,7 @@
 All notable changes to ArmouryDaemon are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.3.0] - 2026-10-27
 
 ### Added
 
@@ -28,6 +28,14 @@ All notable changes to ArmouryDaemon are recorded here. The format follows
   Per-Monitor-V2 awareness switch (`main.rs`) moved to `fonts.rs` and
   `dpi.rs` the same way. No behaviour changed: same client, same fonts,
   same DPI switch, one more binary.
+
+### Fixed
+
+- The catalogue check's error line wraps too. When a check fails before any
+  row is painted - a signature fetch or verification failure, or no network
+  at all - the message is painted in the rows' place, and that line could
+  run wide enough that the window edge cut it mid-URL. It wraps like the row
+  failure line now: the second arm of the same fix.
 
 ## [1.2.0] - 2026-10-27
 
