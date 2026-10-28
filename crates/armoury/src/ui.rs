@@ -4,7 +4,7 @@
 //! A second launch of the same exe carries the daemon's pipe traffic.
 
 use crate::catalog::{self, CatalogPack, EngineGate};
-use crate::{daemon, fonts, helpers, packs};
+use crate::{daemon, fonts, helpers};
 use armoury_core::config::{
     CONSOLE_OPEN_ALWAYS, CONSOLE_OPEN_NEVER, CONSOLE_OPEN_PAD, TrackedApp,
 };
@@ -263,18 +263,13 @@ struct Shared {
     pick_tx: Option<crossbeam_channel::Sender<Picked>>,
     /// Result of the last pack install/remove, shown in the settings window.
     last_pack_op: Option<(bool, String)>,
-    /// The capabilities of the installed packs, per id, shown under their rows as
-    /// the permission line (the effect, not the API). Filled by a worker thread on
-    /// every catalogue check and again after every pack op - reading every
-    /// pack.json per frame would compile scripts per frame.
-    pack_capabilities: HashMap<String, Vec<String>>,
-    /// The installed helpers' versions, per id, read from their module.json
-    /// records on the same worker pass as the capability line. The helper row
-    /// shows "v1.0 installed" from this, not from the daemon's pack status -
-    /// helpers are no packs and never appear in it.
+    /// The installed helpers' versions, per id, read from their module.json records on a
+    /// worker thread after every catalogue check and every pack op. The helper row shows
+    /// "v1.0 installed" from this, not from the daemon's pack status - helpers are no
+    /// packs and never appear in it.
     helper_versions: HashMap<String, String>,
-    /// A capabilities re-read is waiting for the app's next tick.
-    pack_capabilities_requested: bool,
+    /// A helper-version re-read is waiting for the app's next tick.
+    module_versions_requested: bool,
     /// Result of the last console-app add/remove, shown in the settings window.
     last_console_op: Option<(bool, String)>,
     /// Catalog (Phase 8) state for the settings window: the last check's result, whether a
@@ -623,7 +618,7 @@ impl eframe::App for App {
                         // WHICH op): the permission line the Modules window shows under
                         // each row and the helper rows' installed state are both re-read
                         // from disk.
-                        s.pack_capabilities_requested = true;
+                        s.module_versions_requested = true;
                         // The daemon has answered for the pack that was on its way, so its
                         // row may offer the button again. The answers come in the order the
                         // requests went out, so the first one is the first pack.
@@ -726,38 +721,23 @@ impl eframe::App for App {
         // (the effect, not the API). Parsing every pack per frame would compile
         // scripts per frame, so this is a cached read on a worker thread - one cache
         // for the whole window, not one read per row.
-        let caps = {
+        let reread = {
             let mut s = self.shared.lock().unwrap();
-            std::mem::take(&mut s.pack_capabilities_requested)
+            std::mem::take(&mut s.module_versions_requested)
         };
-        if caps {
+        if reread {
             let shared = Arc::clone(&self.shared);
             let ctx = ctx.clone();
             thread::spawn(move || {
                 let dirs = daemon::pack_search_dirs();
-                let map = packs::load(&dirs)
-                    .into_iter()
-                    .map(|installed| {
-                        (
-                            installed.pack.id.clone(),
-                            installed
-                                .pack
-                                .capabilities
-                                .iter()
-                                .map(|c| c.effect().to_string())
-                                .collect::<Vec<String>>(),
-                        )
-                    })
-                    .collect::<HashMap<String, Vec<String>>>();
-                // The helpers, meanwhile, are read straight off the modules folders:
-                // each folder's module.json is a small record the install wrote there.
+                // The helpers are read straight off the modules folders: each folder's
+                // module.json is a small record the install wrote there.
                 let helper_versions = helpers::installed(&dirs)
                     .into_iter()
                     .map(|module| (module.id, module.version))
                     .collect::<HashMap<String, String>>();
                 {
                     let mut s = shared.lock().unwrap();
-                    s.pack_capabilities = map;
                     s.helper_versions = helper_versions;
                 }
                 request_catalog_repaint(&ctx, &shared);
@@ -2965,7 +2945,6 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         catalog_installing,
         last_op,
         packs,
-        pack_capabilities,
         helper_versions,
     ) = {
         let s = shared.lock().unwrap();
@@ -2978,7 +2957,6 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 .as_ref()
                 .map(|st| st.packs.clone())
                 .unwrap_or_default(),
-            s.pack_capabilities.clone(),
             s.helper_versions.clone(),
         )
     };
@@ -3120,7 +3098,6 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                                 entry,
                                 &packs,
                                 &catalog_installing,
-                                &pack_capabilities,
                                 &helper_versions,
                             );
                         }
@@ -3196,7 +3173,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         s.catalog_check_requested = true;
         s.catalog_checking = true;
         // a fresh catalogue means fresh rows; the permission line under them follows
-        s.pack_capabilities_requested = true;
+        s.module_versions_requested = true;
         drop(s);
         // The root does the HTTPS round trip on its own thread.
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
@@ -3276,7 +3253,7 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     s.catalog_check_requested = true;
                     s.catalog_checking = true;
                     // and the permission line under the rows is re-read too
-                    s.pack_capabilities_requested = true;
+                    s.module_versions_requested = true;
                     // The root picks the request up on its next frame, and its next frame
                     // is a tick away: ask for it now, so the round trip starts now.
                     ctx.request_repaint_of(egui::ViewportId::ROOT);
@@ -3501,7 +3478,6 @@ fn catalog_row(
     entry: &CatalogPack,
     packs: &[PackStatus],
     installing: &[String],
-    pack_capabilities: &HashMap<String, Vec<String>>,
     helper_versions: &HashMap<String, String>,
 ) {
     // A helper's installed state is its module.json record on disk (read by the
@@ -3579,18 +3555,10 @@ fn catalog_row(
             entry.description.as_str(),
         );
     }
-    // The permission line: what the pack may do, in the words of an effect, not an
-    // API ("Send keystrokes", not "input()"). A helper's own permission line
-    // arrives with its download in the next release; a pack's is read from its
-    // pack.json on disk, so only an installed pack shows one.
-    if entry.kind != "helper" {
-        if let Some(abilities) = pack_capabilities.get(&entry.id) {
-            if !abilities.is_empty() {
-                let list = abilities.join("; ");
-                indented_note(ui, entry.id.as_str(), "catalog-capabilities", &list);
-            }
-        }
-    }
+    // One short description per row, and nothing else. The permission line used to be
+    // dumped here after a pack was installed - a dozen effects joined by semicolons, six
+    // lines tall - and three installed packs were enough to push the window off the
+    // screen. What a pack asks for is shown once, where it is consented to.
     ui.add_space(6.0);
 }
 
