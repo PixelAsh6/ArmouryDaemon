@@ -290,6 +290,9 @@ struct Shared {
     update_queue: std::collections::VecDeque<CatalogPack>,
     /// Feature 6: the settings window's hotkey editor.
     hotkeys: HotkeyEditor,
+    /// The pack window that is recording a key chord, as (pack id, setting key). One at a
+    /// time: the keyboard belongs to whoever asked for it last.
+    pack_recording: Option<(String, String)>,
     /// Feature 8: the pack waiting for consent. Nothing installs while one is here.
     consent: Option<Consent>,
     /// Feature 10: where the last diagnostics bundle was written (or why it was not).
@@ -1184,13 +1187,28 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.label(RichText::new("Packs").strong());
             ui.add_space(4.0);
-            // The console launcher's row: it comes from a helper pack, and this is the policy
-            // the daemon applies to it (when it opens by itself). No enable checkbox and no
-            // pack window, because there is nothing here to install or remove.
+            // The console launcher is a helper module, but it is listed like a pack: the
+            // same ‹ button, the same on/off box, its policy on the right. Its window holds
+            // the open method, its games and the art key.
             let mut set_console_open: Option<String> = None;
+            let mut open_console_window = false;
             ui.horizontal(|ui| {
-                ui.add_space(22.0); // lines up with a pack row's ‹ button + checkbox
-                ui.label(CONSOLE_FEATURE);
+                open_console_window = ui
+                    .small_button("‹")
+                    .on_hover_text("Open the console launcher's window")
+                    .clicked();
+                let mut on = console_open != "never";
+                if ui
+                    .checkbox(&mut on, "")
+                    .on_hover_text("Turn the launcher on or off")
+                    .changed()
+                {
+                    set_console_open = Some(if on { "pad" } else { "never" }.to_string());
+                }
+                let name = ui.add(egui::Label::new(CONSOLE_FEATURE).sense(egui::Sense::click()));
+                if name.double_clicked() {
+                    open_console_window = true;
+                }
                 ui.small(RichText::new(CONSOLE_ORIGIN).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let combo = egui::ComboBox::from_id_salt("builtin-console-open")
@@ -1213,6 +1231,16 @@ impl eframe::App for App {
             });
             if let Some(mode) = set_console_open {
                 self.request(&Request::SetConsoleOpen { mode });
+            }
+            if open_console_window {
+                let mut s = self.shared.lock().unwrap();
+                if !s.open_packs.iter().any(|p| p == "console") {
+                    s.open_packs.push("console".to_string());
+                    s.pack_windows.remove("console");
+                    s.pack_first_seen
+                        .insert("console".to_string(), Instant::now());
+                    log::info!("console window requested");
+                }
             }
             if packs.is_empty() {
                 ui.small(NO_PACKS_HINT);
@@ -1501,6 +1529,28 @@ fn clamp_to_work_area_px(pos: egui::Pos2, work: Rect, size: egui::Vec2) -> egui:
         pos.x.clamp(work.left(), max_x),
         pos.y.clamp(work.top(), max_y),
     )
+}
+
+/// Put a window's **outer** bottom edge on the dashboard's.
+///
+/// Placement is computed from the inner size the viewport was asked for; Windows adds a
+/// border on top of it, so the window the user sees is a few pixels taller than the size we
+/// asked for — and every window on the chain ends up with a different bottom. The OS rect is
+/// the only honest measurement, so the correction is made against it. `None` when the edges
+/// already agree (or the window is not there yet).
+fn align_bottom_with_core(
+    ctx: &egui::Context,
+    title: &str,
+    core_bottom_px: f32,
+) -> Option<egui::Pos2> {
+    let rect = window_rect_px(title)?;
+    let delta = rect.bottom() - core_bottom_px;
+    if delta.abs() <= 1.0 {
+        return None;
+    }
+    let ppp = ctx.pixels_per_point().max(0.5);
+    let pos = window_rect_pts(ctx, title)?.min;
+    Some(egui::pos2(pos.x, pos.y - delta / ppp))
 }
 
 /// Keep a window inside the work area after it grew: the position is clamped (in physical
@@ -1829,6 +1879,25 @@ fn leftmost_edge_to_clear_px(s: &Shared, core_left_px: f32) -> f32 {
 /// One pack's own window: enable toggle + its single dropdown.
 fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index: usize) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    // A hotkey setting is recorded here: the hook must not act on the keys the recorder is
+    // taking, or recording Home would also toggle the very mode being edited.
+    let mut recording = { shared.lock().unwrap().pack_recording.clone() };
+    crate::hotkey::suspend(recording.is_some());
+    let mut recorded: Option<String> = None;
+    if recording.is_some() {
+        recorded = ui.input(|i| {
+            i.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => hotkey_text(*key, *modifiers),
+                _ => None,
+            })
+        });
+    }
     let bg = ui.interact(
         ui.max_rect(),
         ui.scope_id().with(("pack-drag", id)),
@@ -1838,7 +1907,23 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
 
-    let pack = {
+    let pack = if id == "console" {
+        // The console launcher is a helper module, not a pack on disk. Its window is the
+        // pack window with the launcher's own body: same chrome, same placement.
+        let s = shared.lock().unwrap();
+        Some(armoury_core::status::PackStatus {
+            id: "console".to_string(),
+            name: CONSOLE_FEATURE.to_string(),
+            version: s.helper_versions.get("console").cloned().unwrap_or_default(),
+            enabled: s
+                .status
+                .as_ref()
+                .is_some_and(|st| st.console_open != "never"),
+            settings: Vec::new(),
+            applied: false,
+            note: None,
+        })
+    } else {
         let s = shared.lock().unwrap();
         s.status
             .as_ref()
@@ -1874,13 +1959,24 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         ui.horizontal(|ui| {
             let mut enabled = pack.enabled;
             if ui.checkbox(&mut enabled, "Enabled").changed() {
-                send_request(
-                    shared,
-                    &Request::SetPackEnabled {
-                        id: pack.id.clone(),
-                        enabled,
-                    },
-                );
+                if pack.id == "console" {
+                    // A helper module has no enabled flag of its own: "off" is the mode
+                    // that never opens it by itself, and the tray stays a manual escape.
+                    send_request(
+                        shared,
+                        &Request::SetConsoleOpen {
+                            mode: if enabled { "pad" } else { "never" }.to_string(),
+                        },
+                    );
+                } else {
+                    send_request(
+                        shared,
+                        &Request::SetPackEnabled {
+                            id: pack.id.clone(),
+                            enabled,
+                        },
+                    );
+                }
             }
             if pack.applied {
                 ui.small("· applied");
@@ -1888,29 +1984,88 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         });
 
         ui.add_space(6.0);
+        if pack.id == "console" {
+            console_body(ui, shared);
+        }
         for setting in &pack.settings {
-            if !setting.label.is_empty() {
-                ui.small(&setting.label);
-            }
             let current = setting.value.clone().unwrap_or_default();
-            egui::ComboBox::from_id_salt(format!("pack-win-{}-{}", pack.id, setting.key))
-                .selected_text(current.clone())
-                .width(190.0)
-                .show_ui(ui, |ui| {
-                    for value in &setting.values {
-                        if ui.selectable_label(value == &current, value).clicked() {
-                            send_request(
-                                shared,
-                                &Request::SetPackValue {
-                                    id: pack.id.clone(),
-                                    key: setting.key.clone(),
-                                    value: value.clone(),
-                                },
-                            );
-                        }
+            if setting.kind == "hotkey" {
+                // A key chord, not a dropdown: the mode packs listen for it, so it is
+                // edited the way the old global hotkeys were - type it or record it.
+                let mine = (pack.id.clone(), setting.key.clone());
+                let is_recording = recording.as_ref() == Some(&mine);
+                ui.horizontal(|ui| {
+                    let label = if setting.label.is_empty() {
+                        "Hotkey"
+                    } else {
+                        &setting.label
+                    };
+                    ui.label(label);
+                    let mut text = current.clone();
+                    let resp = ui.add_sized(
+                        [110.0, 20.0],
+                        egui::TextEdit::singleline(&mut text).char_limit(24),
+                    );
+                    if resp.lost_focus() && text != current && !is_recording {
+                        send_request(
+                            shared,
+                            &Request::SetPackValue {
+                                id: pack.id.clone(),
+                                key: setting.key.clone(),
+                                value: text,
+                            },
+                        );
+                    }
+                    let button = if is_recording { "Press…" } else { "Record" };
+                    if ui
+                        .small_button(button)
+                        .on_hover_text("Click, then press the combination (up to 4 keys)")
+                        .clicked()
+                    {
+                        recording = if is_recording { None } else { Some(mine) };
+                        ui.memory_mut(|m| m.surrender_focus(resp.id));
                     }
                 });
+                if is_recording {
+                    ui.small(RichText::new("press the combination…").weak());
+                }
+            } else {
+                if !setting.label.is_empty() {
+                    ui.small(&setting.label);
+                }
+                egui::ComboBox::from_id_salt(format!("pack-win-{}-{}", pack.id, setting.key))
+                    .selected_text(current.clone())
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for value in &setting.values {
+                            if ui.selectable_label(value == &current, value).clicked() {
+                                send_request(
+                                    shared,
+                                    &Request::SetPackValue {
+                                        id: pack.id.clone(),
+                                        key: setting.key.clone(),
+                                        value: value.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    });
+            }
             ui.add_space(4.0);
+        }
+        if let Some((id, key)) = &recording
+            && id == &pack.id
+            && let Some(text) = recorded
+        {
+            send_request(
+                shared,
+                &Request::SetPackValue {
+                    id: pack.id.clone(),
+                    key: key.clone(),
+                    value: text,
+                },
+            );
+            recording = None;
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -1926,6 +2081,8 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
             });
         });
     });
+
+    shared.lock().unwrap().pack_recording = recording;
 
     if close {
         let mut s = shared.lock().unwrap();
@@ -2038,12 +2195,123 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
                     s.pack_windows.insert(id.to_string(), (3, Some(pos)));
                 }
             }
+            // The chain stands on one line: every bottom edge on the dashboard's, measured
+            // from the OS rect and not from the size we asked for.
+            if let Some(core) = s.core_rect.filter(|r| on_screen_rect(*r))
+                && !ctx.input(|i| i.pointer.any_down())
+                && let Some(pos) = align_bottom_with_core(
+                    ctx,
+                    &format!("Pack: {id}"),
+                    core_rect_px(ctx, core).bottom(),
+                )
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                s.pack_windows.insert(id.to_string(), (3, Some(pos)));
+            }
         }
     }
     // Keep the window live: the daemon changes the pack state on its own schedule, so the
     // "· applied" marker, the "Applied right now." line and the version bubble have to be
     // refreshed. Without this the window only redraws when the OS sends it an input event.
     ctx.request_repaint_after(Duration::from_secs(1));
+}
+
+/// The console launcher's own body: when it opens, the games pinned to it, and the
+/// SteamGridDB key its cover art needs. Everything here used to live in the settings window.
+fn console_body(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
+    let (open, apps, key_set, hint) = {
+        let s = shared.lock().unwrap();
+        let st = s.status.as_ref();
+        (
+            st.map(|x| x.console_open.clone()).unwrap_or_default(),
+            st.map(|x| x.console_apps.clone()).unwrap_or_default(),
+            st.is_some_and(|x| x.sgdb_api_key_set),
+            sgdb_field_hint(st),
+        )
+    };
+
+    ui.horizontal(|ui| {
+        ui.label("Opens");
+        let mut chosen: Option<String> = None;
+        egui::ComboBox::from_id_salt("console-window-open")
+            .selected_text(console_open_label(&open))
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for (mode, label) in CONSOLE_OPEN_MODES {
+                    if ui.selectable_label(mode == open.as_str(), label).clicked() {
+                        chosen = Some(mode.to_string());
+                    }
+                }
+            });
+        if let Some(mode) = chosen {
+            send_request(shared, &Request::SetConsoleOpen { mode });
+        }
+        if ui
+            .small_button("Open now")
+            .on_hover_text("Show the launcher")
+            .clicked()
+        {
+            send_request(shared, &Request::ShowConsole);
+        }
+    });
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("Games").strong());
+    let mut remove: Option<String> = None;
+    if apps.is_empty() {
+        ui.small(RichText::new("No console apps yet.").weak());
+    } else {
+        egui::Grid::new("console-window-apps")
+            .num_columns(2)
+            .spacing(egui::vec2(10.0, 4.0))
+            .show(ui, |ui| {
+                for a in &apps {
+                    ui.horizontal(|ui| {
+                        ui.label(&a.name);
+                        ui.small(RichText::new(file_name(&a.exe)).weak());
+                    });
+                    if ui
+                        .small_button("Remove")
+                        .on_hover_text("Remove from the launcher (tracking is unaffected)")
+                        .clicked()
+                    {
+                        remove = Some(a.exe.clone());
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+    if let Some(exe) = remove {
+        send_request(shared, &Request::RemoveConsoleApp { exe });
+    }
+
+    ui.add_space(6.0);
+    ui.label(RichText::new("SteamGridDB").strong());
+    let mut text = shared.lock().unwrap().sgdb_text.clone();
+    let mut save = false;
+    let mut clear = false;
+    ui.horizontal(|ui| {
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut text)
+                .password(true)
+                .hint_text(hint)
+                .desired_width(170.0),
+        );
+        save = ui.small_button("Save").clicked();
+        save |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if key_set {
+            clear = ui.small_button("Clear").clicked();
+        }
+    });
+    shared.lock().unwrap().sgdb_text = text.clone();
+    if save && !text.is_empty() {
+        send_request(shared, &Request::SetSgdbKey { key: text });
+        shared.lock().unwrap().sgdb_text.clear();
+    } else if clear {
+        send_request(shared, &Request::SetSgdbKey { key: String::new() });
+        shared.lock().unwrap().sgdb_text.clear();
+    }
+    ui.small(RichText::new(if key_set { "Key set." } else { "No key set." }).weak());
 }
 
 fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
@@ -2097,32 +2365,18 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 s.failsafe_text.clone(),
             )
         };
-        let (
-            packs,
-            last_op,
-            last_console_op,
-            catalog_state,
-            catalog_checking,
-            console_open,
-        ) = {
+        let (packs, last_op, catalog_state, catalog_checking) = {
             let s = shared.lock().unwrap();
             let packs = s
                 .status
                 .as_ref()
                 .map(|st| st.packs.clone())
                 .unwrap_or_default();
-            let console_open = s
-                .status
-                .as_ref()
-                .map(|st| st.console_open.clone())
-                .unwrap_or_default();
             (
                 packs,
                 s.last_pack_op.clone(),
-                s.last_console_op.clone(),
                 s.catalog.clone(),
                 s.catalog_checking,
-                console_open,
             )
         };
 
@@ -2270,8 +2524,6 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             ui.small(RichText::new(line).weak());
         }
 
-        // ---- hotkeys (feature 6) ----
-        hotkeys_ui(ui, shared);
 
         // ---- packs: what is installed, install more, remove ----
         ui.add_space(8.0);
@@ -2363,145 +2615,6 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             );
         }
 
-        // ---- the console launcher and its pinned apps ----
-        // The launcher is a helper pack; this is its row and the policy the daemon applies
-        // to it. It has no heading of its own - it is a row in the settings body.
-        let console_apps = {
-            let s = shared.lock().unwrap();
-            s.status
-                .as_ref()
-                .map(|x| x.console_apps.clone())
-                .unwrap_or_default()
-        };
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-        let mut set_console_open: Option<String> = None;
-        ui.horizontal(|ui| {
-            ui.label(CONSOLE_FEATURE);
-            ui.small(RichText::new(CONSOLE_ORIGIN).weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let combo = egui::ComboBox::from_id_salt("settings-console-open")
-                    .selected_text(console_open_label(&console_open))
-                    .width(130.0)
-                    .show_ui(ui, |ui| {
-                        for (mode, label) in CONSOLE_OPEN_MODES {
-                            if ui
-                                .selectable_label(mode == console_open.as_str(), label)
-                                .clicked()
-                            {
-                                set_console_open = Some(mode.to_string());
-                            }
-                        }
-                    });
-                combo.response.on_hover_text(
-                    "When the launcher opens by itself. The tray always opens it.",
-                );
-            });
-        });
-        if let Some(mode) = set_console_open {
-            send_request(shared, &Request::SetConsoleOpen { mode });
-        }
-        let mut remove_console: Option<String> = None;
-        if console_apps.is_empty() {
-            // Short on purpose: a long hint here would set the window's width.
-            ui.small(RichText::new("No console apps yet.").weak());
-        } else {
-            egui::Grid::new("settings-console-apps")
-                .num_columns(2)
-                .spacing(egui::vec2(10.0, 4.0))
-                .show(ui, |ui| {
-                    for a in &console_apps {
-                        ui.horizontal(|ui| {
-                            ui.label(&a.name);
-                            ui.small(RichText::new(file_name(&a.exe)).weak());
-                        });
-                        if ui
-                            .small_button("Remove")
-                            .on_hover_text("Remove from the launcher (tracking is unaffected)")
-                            .clicked()
-                        {
-                            remove_console = Some(a.exe.clone());
-                        }
-                        ui.end_row();
-                    }
-                });
-        }
-        if let Some(exe) = remove_console {
-            send_request(shared, &Request::RemoveConsoleApp { exe });
-        }
-        if let Some((ok, message)) = last_console_op {
-            ui.add_space(2.0);
-            ui.small(
-                RichText::new(message).color(if ok {
-                    Color32::from_rgb(52, 211, 153)
-                } else {
-                    Color32::from_rgb(248, 113, 113)
-                }),
-            );
-        }
-
-        // ---- SteamGridDB: cover/hero art for games Steam doesn't know ----
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(6.0);
-        ui.label(RichText::new("SteamGridDB").strong());
-        ui.add_space(4.0);
-        let (sgdb_set, sgdb_hint) = {
-            let s = shared.lock().unwrap();
-            (
-                s.status.as_ref().is_some_and(|st| st.sgdb_api_key_set),
-                sgdb_field_hint(s.status.as_ref()),
-            )
-        };
-        let mut sgdb_text = shared.lock().unwrap().sgdb_text.clone();
-        let mut save_sgdb = false;
-        let mut clear_sgdb = false;
-        ui.horizontal(|ui| {
-            let spacing = ui.spacing().item_spacing.x;
-            let save_w = 52.0;
-            // The key is masked, so the field stays narrow and does not stretch the window.
-            let field_w = 190.0_f32.min((ui.available_width() - save_w - spacing).max(120.0));
-            // Masked: the key is never shown in the clear. The daemon does not send it
-            // either, so the field only ever holds a key the user is typing right now.
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut sgdb_text)
-                    .password(true)
-                    .hint_text(sgdb_hint)
-                    .desired_width(field_w),
-            );
-            save_sgdb = ui
-                .add_sized(
-                    [save_w, ui.spacing().interact_size.y],
-                    egui::Button::new("Save"),
-                )
-                .on_hover_text("Save this key")
-                .clicked();
-            save_sgdb |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if sgdb_set {
-                clear_sgdb = ui
-                    .add_sized(
-                        [save_w, ui.spacing().interact_size.y],
-                        egui::Button::new("Clear"),
-                    )
-                    .on_hover_text("Remove the saved key")
-                    .clicked();
-            }
-        });
-        // Keep the in-progress text so a repaint (or another window taking focus) keeps it.
-        shared.lock().unwrap().sgdb_text = sgdb_text.clone();
-        if save_sgdb && !sgdb_text.is_empty() {
-            send_request(shared, &Request::SetSgdbKey { key: sgdb_text.clone() });
-            // The key is never shown again: the field goes back to the mask.
-            shared.lock().unwrap().sgdb_text.clear();
-            ui.ctx().request_repaint();
-        } else if clear_sgdb {
-            send_request(shared, &Request::SetSgdbKey { key: String::new() });
-            shared.lock().unwrap().sgdb_text.clear();
-            ui.ctx().request_repaint();
-        }
-        ui.small(RichText::new(if sgdb_set { "Key set." } else { "No key set." }).weak());
-
         // ---- logs + config ----
         ui.add_space(8.0);
         ui.separator();
@@ -2524,7 +2637,6 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // ---- shrink-wrap, position above the core window, then show ----
     let title_font = FontId::new(16.0, FontFamily::Proportional);
     let body_font = TextStyle::Body.resolve(ui.style());
-    let small_font = TextStyle::Small.resolve(ui.style());
     let button_font = TextStyle::Button.resolve(ui.style());
     // The core (dashboard) window publishes its rect; the settings window takes its width
     // from it, so the two are exactly as wide as each other.
@@ -2544,9 +2656,6 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut w = tw(&title_font, "Settings") + 24.0 + 20.0;
         // Helper lines are drawn with `ui.small(...)`: measuring them at the body font (as this
         // used to) inflated the window by ~30%. Measure each string at the font it is drawn in.
-        for text in ["No console apps yet.", "No key set."] {
-            w = w.max(tw(&small_font, text));
-        }
         for text in ["Leave idle after", "Cooldown", "Idle failsafe"] {
             w = w.max(tw(&body_font, text));
         }
@@ -2561,12 +2670,6 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 + tw(&button_font, "Open packs folder")
                 + 24.0
                 + 6.0,
-        );
-        // The SteamGridDB row: the masked field, Save and Clear.
-        w = w.max(190.0 + 52.0 + 52.0 + 24.0);
-        // The console row: name + where it comes from + its 120 pt dropdown.
-        w = w.max(
-            tw(&body_font, CONSOLE_FEATURE) + 10.0 + tw(&small_font, CONSOLE_ORIGIN) + 10.0 + 120.0,
         );
         // A pack row: name + version bubble + the Remove button.
         w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&button_font, "Remove") + 24.0);
@@ -2677,6 +2780,17 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                     s.settings_target = Some(pos);
                 }
             }
+            if let Some(core) = s.core_rect.filter(|r| on_screen_rect(*r))
+                && !ctx.input(|i| i.pointer.any_down())
+                && let Some(pos) = align_bottom_with_core(
+                    ctx,
+                    "Settings",
+                    core_rect_px(ctx, core).bottom(),
+                )
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                s.settings_target = Some(pos);
+            }
         }
     }
     drop(s);
@@ -2717,6 +2831,7 @@ fn display_layout(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>) -> String {
 /// - and the hook posts nothing meanwhile, so pressing End to record it does not also toggle
 /// the killswitch. A combination another app already owns is named under the field: the hook
 /// still makes the daemon act, but the other owner acts too, and that is worth knowing.
+#[allow(dead_code)]
 fn hotkeys_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let current = {
         let s = shared.lock().unwrap();
@@ -3327,6 +3442,14 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             let pos = window_rect_pts(ctx, "Packs").map(|r| r.min).or(target);
             if pos != target {
                 s.install_packs_target = pos;
+            }
+            if let Some(core) = s.core_rect.filter(|r| on_screen_rect(*r))
+                && !ctx.input(|i| i.pointer.any_down())
+                && let Some(pos) =
+                    align_bottom_with_core(ctx, "Packs", core_rect_px(ctx, core).bottom())
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                s.install_packs_target = Some(pos);
             }
         }
     }

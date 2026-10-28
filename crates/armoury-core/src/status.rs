@@ -141,8 +141,16 @@ pub struct PackStatus {
 pub struct PackSettingStatus {
     pub key: String,
     pub label: String,
+    /// `enum` (a dropdown) or `hotkey` (a key chord the pack's trigger listens for).
+    /// Defaults on the wire so an older daemon's snapshot still loads.
+    #[serde(default = "default_setting_kind")]
+    pub kind: String,
     pub values: Vec<String>,
     pub value: Option<String>,
+}
+
+fn default_setting_kind() -> String {
+    "enum".to_string()
 }
 
 #[cfg(test)]

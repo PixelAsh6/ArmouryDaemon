@@ -1584,6 +1584,7 @@ impl App {
                         .map(|s| PackSettingStatus {
                             key: s.key.clone(),
                             label: s.label.clone(),
+                            kind: s.kind.clone(),
                             values: s.values.clone(),
                             value: Some(
                                 user.and_then(|u| u.values.get(&s.key).cloned())
