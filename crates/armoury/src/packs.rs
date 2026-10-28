@@ -1101,6 +1101,86 @@ pub fn ensure_empty_layout() -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Dropdown discovery
+
+/// Fill every dropdown that declares a `discover` block from the machine it runs on. Pure
+/// per pack: a pack that declares nothing keeps the values in its manifest, so this is the
+/// only place that knows a dropdown can be dynamic at all.
+pub fn apply_discovery(installed: &mut [Installed]) {
+    for p in installed.iter_mut() {
+        let id = p.pack.id.clone();
+        for setting in p.pack.settings.iter_mut() {
+            let Some(rule) = setting.discover.clone() else {
+                continue;
+            };
+            let mut values = if rule.from == "folder" {
+                rule.path.as_deref().map(folder_names).unwrap_or_default()
+            } else {
+                // The schema refuses an unknown `from`; a pack that reached here was edited
+                // on disk after it was parsed. Say so rather than silently dropping values.
+                warn!(
+                    "{id}: dropdown '{}' uses unknown discovery '{}' — left as declared",
+                    setting.key, rule.from
+                );
+                continue;
+            };
+            values.retain(|v| !rule.exclude.iter().any(|x| x.eq_ignore_ascii_case(v)));
+            let ensured = rule.ensure.as_deref().and_then(ensure_value);
+            if let Some(name) = &ensured
+                && !values.iter().any(|v| v.eq_ignore_ascii_case(name))
+            {
+                values.push(name.clone());
+            }
+            values.extend(rule.append.iter().cloned());
+            // Nothing on this machine to offer: the declared list is the fallback, not an
+            // empty dropdown with no way back.
+            if values.is_empty() {
+                info!(
+                    "{id}: nothing to discover for '{}' — keeping the declared values",
+                    setting.key
+                );
+                continue;
+            }
+            info!(
+                "{id}: dropdown '{}' offers {}",
+                setting.key,
+                values.join(", ")
+            );
+            setting.values = values;
+            if setting.default.is_none() {
+                setting.default = ensured;
+            }
+        }
+    }
+}
+
+/// The sub-folder names under `path` (content-unchecked), sorted. `%NAME%` expands from the
+/// environment, so a manifest can name `%APPDATA%\Rainmeter\Layouts` without hardcoding a
+/// user profile. A path that cannot be read yields nothing: the caller falls back.
+fn folder_names(path: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(expand_env(path)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Run a preparation hook a pack named in its `discover` block. The name is validated when
+/// the pack is parsed, so this match is exhaustive over the schema: adding a preparation
+/// means adding it here and to `ALLOWED_ENSURE`.
+fn ensure_value(hook: &str) -> Option<String> {
+    match hook {
+        "rainmeter_empty_layout" => ensure_empty_layout(),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Install / remove / restart reconciliation
 
 /// The `packs` folder the daemon reads and writes: the first search dir that already has
@@ -2344,6 +2424,49 @@ mod tests {
         assert!(!install.join("packs").join("x").exists());
         assert!(load(std::slice::from_ref(&install)).is_empty());
         // the scratch folder goes away with the guard
+    }
+
+    /// A dropdown with a `discover` block gets the machine's values, not the manifest's.
+    #[test]
+    fn a_declared_discovery_fills_the_dropdown_from_the_machine() {
+        let scratch = Scratch::dir("discovery");
+        let root = scratch.root().to_path_buf();
+        for name in ["Beta", "Alpha", "@Backup"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let mut pack = Pack::parse(SAMPLE).expect("the sample pack is valid");
+        assert!(!pack.settings.is_empty(), "the sample has a dropdown");
+        pack.settings[0].discover = Some(armoury_core::pack::Discover {
+            from: "folder".into(),
+            path: Some(root.to_string_lossy().into_owned()),
+            exclude: vec!["@Backup".into()],
+            append: vec!["kill".into()],
+            ensure: None,
+        });
+        let mut installed = vec![Installed { pack }];
+        apply_discovery(&mut installed);
+        assert_eq!(
+            installed[0].pack.settings[0].values,
+            vec!["Alpha", "Beta", "kill"],
+            "sorted, the excluded folder left out, the literal appended"
+        );
+    }
+
+    /// Nothing to discover is not an empty dropdown: the declared list is the way back.
+    #[test]
+    fn a_dropdown_with_nothing_to_discover_keeps_the_declared_values() {
+        let mut pack = Pack::parse(SAMPLE).expect("the sample pack is valid");
+        let declared = pack.settings[0].values.clone();
+        pack.settings[0].discover = Some(armoury_core::pack::Discover {
+            from: "folder".into(),
+            path: Some("Z:\\armoury-no-such-folder".into()),
+            exclude: Vec::new(),
+            append: Vec::new(),
+            ensure: None,
+        });
+        let mut installed = vec![Installed { pack }];
+        apply_discovery(&mut installed);
+        assert_eq!(installed[0].pack.settings[0].values, declared);
     }
 
     /// The sample pack with a `min_engine` line.

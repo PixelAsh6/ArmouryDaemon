@@ -489,10 +489,38 @@ pub struct Setting {
     /// "enum" in v1 (rendered as a dropdown).
     #[serde(rename = "type")]
     pub kind: String,
+    /// The fallback list: what the dropdown offers on a machine the `discover` block
+    /// finds nothing on, and what `default` is validated against when the pack is parsed.
     #[serde(default)]
     pub values: Vec<String>,
     #[serde(default)]
     pub default: Option<String>,
+    /// Where the dropdown's real values come from on the machine it runs on. A pack that
+    /// declares this stops being a special case in the daemon: Rainmeter's layouts come
+    /// from a folder listing like any other pack's would.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discover: Option<Discover>,
+}
+
+/// How a dropdown finds its values at runtime. The mechanism is whitelisted and the path is
+/// read-only: a pack may name a folder to list, never a command to run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Discover {
+    /// "folder" today: the sub-folder names under `path`.
+    pub from: String,
+    /// The folder for `from: folder`. `%NAME%` expands from the environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Names to leave out of the list, compared case-insensitively (Rainmeter's `@Backup`).
+    #[serde(default)]
+    pub exclude: Vec<String>,
+    /// Literal values added after the discovered ones, e.g. Rainmeter's `kill`.
+    #[serde(default)]
+    pub append: Vec<String>,
+    /// A named preparation hook that guarantees one value exists before the list is built
+    /// (Rainmeter's empty layout, so the dropdown always has a layout it can restore to).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ensure: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -693,6 +721,11 @@ const ALLOWED_MECHANISMS: [&str; 5] = [
     "registry_set",
 ];
 const ALLOWED_CAPTURES: [&str; 3] = ["process_running", "json_file", "target_path"];
+/// The ways a dropdown may find its values. A listing only: nothing here runs a command.
+const ALLOWED_DISCOVERY: [&str; 1] = ["folder"];
+/// The named preparation hooks a pack may ask for. Each one is implemented in the pack
+/// engine; a name the daemon does not know is refused at parse time, not ignored at run time.
+const ALLOWED_ENSURE: [&str; 1] = ["rainmeter_empty_layout"];
 
 /// A version split into its numbers ("1.2.3" -> [1, 2, 3]). Only digits and dots are
 /// allowed, the shape of a `Cargo.toml` version: "1", "1.0" and "1.0.0" are versions,
@@ -815,6 +848,32 @@ impl Pack {
                         "setting '{}': default '{default}' is not one of the values",
                         s.key
                     ));
+                }
+            }
+            if let Some(discover) = &s.discover {
+                if !ALLOWED_DISCOVERY.contains(&discover.from.as_str()) {
+                    errs.push(format!(
+                        "setting '{}': unsupported discovery '{}'",
+                        s.key, discover.from
+                    ));
+                }
+                // A listing without a folder would always come back empty, and the pack
+                // would look like it works while the dropdown never changes.
+                if discover.from == "folder"
+                    && discover
+                        .path
+                        .as_deref()
+                        .map_or(true, |p| p.trim().is_empty())
+                {
+                    errs.push(format!("setting '{}': discovery 'folder' needs a path", s.key));
+                }
+                if let Some(hook) = &discover.ensure {
+                    if !ALLOWED_ENSURE.contains(&hook.as_str()) {
+                        errs.push(format!(
+                            "setting '{}': unknown preparation hook '{hook}'",
+                            s.key
+                        ));
+                    }
                 }
             }
         }
@@ -1164,6 +1223,7 @@ mod tests {
                 kind: "enum".into(),
                 values: vec!["a".into()],
                 default: None,
+                discover: None,
             });
         }
         let errs = pack.validate();
@@ -1806,6 +1866,7 @@ mod tests {
                 kind: "enum".into(),
                 values: vec!["a".into()],
                 default: None,
+                discover: None,
             });
         }
         let started = Instant::now();

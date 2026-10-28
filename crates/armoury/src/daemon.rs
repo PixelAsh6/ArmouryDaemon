@@ -266,7 +266,9 @@ pub fn run(start: Start) {
     if no_packs {
         info!("packs: none installed — install them from the settings window");
     }
-    enrich_rainmeter(&mut installed);
+    // Every dropdown a pack declared discovery for, filled from this machine. No pack is
+    // named here: Rainmeter's layouts arrive the same way any other pack's would.
+    packs::apply_discovery(&mut installed);
 
     let pack_catalog: Vec<PackMeta> = build_catalog(&installed);
     let (pack_tx, pack_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
@@ -906,35 +908,6 @@ fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
     };
     a.to_string_lossy()
         .eq_ignore_ascii_case(b.to_string_lossy().as_ref())
-}
-
-/// Rainmeter: guarantee a truly empty layout exists and offer the machine's real layouts.
-fn enrich_rainmeter(installed: &mut [packs::Installed]) {
-    let Some(empty) = packs::ensure_empty_layout() else {
-        return;
-    };
-    let mut values: Vec<String> = packs::rainmeter_layouts()
-        .into_iter()
-        .filter(|l| !l.eq_ignore_ascii_case("@Backup"))
-        .collect();
-    if !values.iter().any(|v| v.eq_ignore_ascii_case(&empty)) {
-        values.push(empty.clone());
-    }
-    values.push("kill".to_string());
-    for p in installed.iter_mut() {
-        if p.pack.id == "rainmeter" {
-            if let Some(setting) = p.pack.settings.first_mut() {
-                setting.values = values.clone();
-                if setting.default.is_none() {
-                    setting.default = Some(empty.clone());
-                }
-            }
-        }
-    }
-    info!(
-        "Rainmeter: empty layout '{empty}' ready; dropdown offers {}",
-        values.join(", ")
-    );
 }
 
 /// What the dashboard needs to know about one installed pack.
@@ -1830,7 +1803,7 @@ impl App {
     /// list. Dropping the old senders makes the old worker threads exit on their own.
     fn reload_packs(&mut self) {
         let mut installed = packs::load(&self.search);
-        enrich_rainmeter(&mut installed);
+        packs::apply_discovery(&mut installed);
         // Feature 8: the permissions the user unticked at install time are cut from the
         // grant set here, once, so every step and script downstream sees the trimmed set.
         packs::apply_denials(&mut installed, &self.cfg.capability_denials);

@@ -12,7 +12,14 @@
       "label": "Layout while a tracked app runs",
       "type": "enum",
       "values": ["Empty", "Default", "illustro default", "kill"],
-      "default": "Empty"
+      "default": "Empty",
+      "discover": {
+        "from": "folder",
+        "path": "%APPDATA%\\Rainmeter\\Layouts",
+        "exclude": ["@Backup"],
+        "append": ["kill"],
+        "ensure": "rainmeter_empty_layout"
+      }
     }
   ],
   "capture": [
