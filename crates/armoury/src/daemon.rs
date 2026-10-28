@@ -2198,7 +2198,24 @@ impl App {
             warn!("hotkey for pack {id}, which is not an installed mode — nothing to do");
             return;
         };
-        let engaged = self.mode_applied.contains(id);
+        // Ask the feature what it is doing, not what the last press did: idle mode
+        // dismisses itself on any input, so a remembered flag would be wrong half the time
+        // and the next press would run the hide block instead of the show block.
+        let engaged = if mode
+            .apply
+            .iter()
+            .any(|a| a == "idle_show" || a == "idle_toggle")
+        {
+            self.overlay.is_active()
+        } else if mode
+            .apply
+            .iter()
+            .any(|a| a == "killswitch_on" || a == "killswitch_toggle")
+        {
+            self.killswitch.is_active()
+        } else {
+            self.mode_applied.contains(id)
+        };
         let actions = if engaged { mode.revert } else { mode.apply };
         if actions.is_empty() {
             warn!("mode pack {id} has no daemon actions — the hotkey does nothing");
