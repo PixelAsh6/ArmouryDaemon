@@ -28,19 +28,23 @@ pub const VK_END: u32 = 0x23;
 pub const VK_HOME: u32 = 0x24;
 
 /// What a hotkey press means for the daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Hide and mute every running tracked app.
     Killswitch,
     /// Enter or leave idle mode.
     Idle,
+    /// An installed mode pack: the combination comes from the pack's own trigger, and the
+    /// press toggles it. The pack owns what the press does — the daemon only carries it out.
+    Pack(String),
 }
 
 impl Action {
-    pub fn label(self) -> &'static str {
+    pub fn label(&self) -> String {
         match self {
-            Action::Killswitch => "killswitch",
-            Action::Idle => "idle mode",
+            Action::Killswitch => "killswitch".to_string(),
+            Action::Idle => "idle mode".to_string(),
+            Action::Pack(id) => format!("pack {id}"),
         }
     }
 }
@@ -319,7 +323,7 @@ fn action_for_press(vk: u32, mods: (bool, bool, bool, bool)) -> Option<Action> {
     table
         .iter()
         .find(|(binding, _)| binding.matches(vk, mods))
-        .map(|(_, action)| *action)
+        .map(|(_, action)| action.clone())
 }
 
 /// Post the action to the daemon's event loop. The channel is unbounded, so the hook never

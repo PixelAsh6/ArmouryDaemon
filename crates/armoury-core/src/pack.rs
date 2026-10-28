@@ -566,8 +566,13 @@ impl Default for Guard {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
-    /// "cli" | "hotkey" | "process_kill" | "process_start" | "registry_set"
+    /// "cli" | "hotkey" | "process_kill" | "process_start" | "registry_set" | "daemon"
     pub mechanism: String,
+    /// For `daemon` steps: which of the daemon's own features to act on
+    /// (`idle_show`, `idle_hide`, `killswitch_on`, `killswitch_off`, …). A mode pack
+    /// drives the daemon itself, so it needs no exe and no process target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
     #[serde(default)]
     pub exe: Option<String>,
     /// Pick the exe from a dropdown instead of `exe` (e.g. which binary of an app to drive).
@@ -713,12 +718,24 @@ pub fn substitute(template: &str, ctx: &TemplateCtx) -> (String, Vec<String>) {
     (out, unknown)
 }
 
-const ALLOWED_MECHANISMS: [&str; 5] = [
+const ALLOWED_MECHANISMS: [&str; 6] = [
     "cli",
     "hotkey",
     "process_kill",
     "process_start",
     "registry_set",
+    "daemon",
+];
+/// The daemon features a `daemon` step may name. A whitelist, not a command: a pack can
+/// ask the daemon for one of these, never for anything it does not know.
+const ALLOWED_ACTIONS: [&str; 7] = [
+    "idle_show",
+    "idle_hide",
+    "idle_toggle",
+    "killswitch_on",
+    "killswitch_off",
+    "killswitch_toggle",
+    "console_show",
 ];
 const ALLOWED_CAPTURES: [&str; 3] = ["process_running", "json_file", "target_path"];
 /// The ways a dropdown may find its values. A listing only: nothing here runs a command.
@@ -822,7 +839,10 @@ impl Pack {
                 }
             }
         }
-        if self.targets.process.is_empty() {
+        // A mode pack can act on the daemon itself (`idle_show`, `killswitch_on`): it has
+        // no process to watch. A pack that follows a tracked app still has to name one,
+        // or it would never apply.
+        if self.targets.process.is_empty() && self.kind != PackKind::Mode {
             errs.push("targets.process must list at least one exe file name".into());
         }
         if self.settings.len() > 4 {
@@ -836,19 +856,25 @@ impl Pack {
             if !seen_keys.insert(s.key.as_str()) {
                 errs.push(format!("setting '{}': duplicate key", s.key));
             }
-            if s.kind != "enum" {
+            // `enum` is a dropdown; `hotkey` is a key chord the daemon listens for
+            // (a mode pack's trigger reads its `hotkey` setting, so the user can move it).
+            if s.kind != "enum" && s.kind != "hotkey" {
                 errs.push(format!("setting '{}': unsupported type '{}'", s.key, s.kind));
             }
-            if s.values.is_empty() {
-                errs.push(format!("setting '{}': needs values", s.key));
-            }
-            if let Some(default) = &s.default {
-                if !s.values.iter().any(|v| v == default) {
-                    errs.push(format!(
-                        "setting '{}': default '{default}' is not one of the values",
-                        s.key
-                    ));
+            if s.kind == "enum" {
+                if s.values.is_empty() {
+                    errs.push(format!("setting '{}': needs values", s.key));
                 }
+                if let Some(default) = &s.default {
+                    if !s.values.iter().any(|v| v == default) {
+                        errs.push(format!(
+                            "setting '{}': default '{default}' is not one of the values",
+                            s.key
+                        ));
+                    }
+                }
+            } else if s.default.as_deref().map_or(true, |d| d.trim().is_empty()) {
+                errs.push(format!("setting '{}': a hotkey setting needs a default key", s.key));
             }
             if let Some(discover) = &s.discover {
                 if !ALLOWED_DISCOVERY.contains(&discover.from.as_str()) {
@@ -931,6 +957,16 @@ impl Pack {
                 }
                 if step.mechanism == "registry_set" && step.registry.is_none() {
                     errs.push(format!("{block} step {i}: registry_set needs a registry block"));
+                }
+                if step.mechanism == "daemon" {
+                    match step.action.as_deref() {
+                        Some(action) if ALLOWED_ACTIONS.contains(&action) => {}
+                        Some(action) => errs.push(format!(
+                            "{block} step {i}: unknown daemon action '{action}' (expected one of {})",
+                            ALLOWED_ACTIONS.join(", ")
+                        )),
+                        None => errs.push(format!("{block} step {i}: daemon needs an action")),
+                    }
                 }
                 if step.mechanism == "hotkey" && step.map.is_empty() {
                     errs.push(format!("{block} step {i}: hotkey needs a map"));
@@ -2107,6 +2143,13 @@ mod tests {
     fn every_mechanism_a_step_may_name_has_a_capability() {
         // The table the gate uses, next to the list of mechanisms the schema accepts.
         for mechanism in ALLOWED_MECHANISMS {
+            if mechanism == "daemon" {
+                // A daemon step only asks the daemon for one of its own features: it
+                // reaches nothing outside the process, so there is no capability to
+                // grant or refuse.
+                assert_eq!(Capability::of_mechanism(mechanism), None);
+                continue;
+            }
             assert!(
                 Capability::of_mechanism(mechanism).is_some(),
                 "'{mechanism}' is an allowed mechanism with no capability"

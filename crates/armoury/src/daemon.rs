@@ -269,6 +269,10 @@ pub fn run(start: Start) {
     // Every dropdown a pack declared discovery for, filled from this machine. No pack is
     // named here: Rainmeter's layouts arrive the same way any other pack's would.
     packs::apply_discovery(&mut installed);
+    // The modes' hotkeys are their manifests' to declare: nothing is bound unless an
+    // installed, enabled mode pack asks for it (idle and killswitch are packs now).
+    let installed_mode_packs = installed_modes(&installed);
+    let mode_hotkeys = mode_bindings(&installed, &cfg);
 
     let pack_catalog: Vec<PackMeta> = build_catalog(&installed);
     let (pack_tx, pack_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
@@ -347,7 +351,7 @@ pub fn run(start: Start) {
     // ---- keyboard hook (the user's combinations, Home/End by default) ----
     // A low-level hook, not RegisterHotKey: the key must keep working in the foreground
     // application, and it has to be installed on this thread (the one that pumps the messages).
-    let (hotkey_hook, hotkey_rx) = match hotkey::install(hotkey::bindings_from(&cfg.hotkeys)) {
+    let (hotkey_hook, hotkey_rx) = match hotkey::install(mode_hotkeys) {
         Some((hook, rx)) => (Some(hook), Some(rx)),
         None => (None, None),
     };
@@ -380,6 +384,8 @@ pub fn run(start: Start) {
         mode_tx,
         pack_out_rx,
         pack_catalog,
+        mode_packs: installed_mode_packs,
+        mode_applied: std::collections::HashSet::new(),
         applied_packs: Vec::new(),
         pack_notes: HashMap::new(),
         update_available: None,
@@ -938,6 +944,89 @@ fn is_mode(catalog: &[PackMeta], id: &str) -> bool {
     catalog.iter().any(|m| m.id == id && m.kind == PackKind::Mode)
 }
 
+/// A mode pack's whole job: the daemon actions its apply block asks for, and the ones its
+/// revert block asks for. A mode acts on the daemon itself, so there is no worker, no exe and
+/// no process to watch — the actions are the pack.
+#[derive(Debug, Clone, Default)]
+struct ModePack {
+    apply: Vec<String>,
+    revert: Vec<String>,
+}
+
+fn daemon_actions(steps: &[armoury_core::pack::Step]) -> Vec<String> {
+    steps
+        .iter()
+        .filter(|s| s.mechanism == "daemon")
+        .filter_map(|s| s.action.clone())
+        .collect()
+}
+
+/// The modes among the installed packs, keyed by id.
+fn installed_modes(installed: &[packs::Installed]) -> HashMap<String, ModePack> {
+    installed
+        .iter()
+        .filter(|p| p.pack.kind == PackKind::Mode)
+        .map(|p| {
+            (
+                p.pack.id.clone(),
+                ModePack {
+                    apply: daemon_actions(&p.pack.apply.steps),
+                    revert: daemon_actions(&p.pack.revert.steps),
+                },
+            )
+        })
+        .collect()
+}
+
+/// The key a mode answers to: its `hotkey` setting when it has one (so the user can move it),
+/// else the key its trigger names.
+fn mode_key(
+    pack: &armoury_core::pack::Pack,
+    values: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    if let Some(key) = values
+        .and_then(|v| v.get("hotkey"))
+        .filter(|k| !k.trim().is_empty())
+    {
+        return Some(key.clone());
+    }
+    if let Some(key) = pack
+        .settings
+        .iter()
+        .find(|s| s.key == "hotkey")
+        .and_then(|s| s.default.clone())
+    {
+        return Some(key);
+    }
+    pack.triggers.iter().find_map(|t| t.key.clone())
+}
+
+/// The hotkey table the installed, enabled mode packs ask for. A mode the user turned off
+/// keeps its key out of the table: a disabled pack must not answer to anything.
+fn mode_bindings(
+    installed: &[packs::Installed],
+    cfg: &armoury_core::config::AppConfig,
+) -> Vec<(hotkey::Binding, hotkey::Action)> {
+    let mut out = Vec::new();
+    for p in installed.iter().filter(|p| p.pack.kind == PackKind::Mode) {
+        let user = cfg.packs.get(&p.pack.id);
+        if !user.map(|u| u.enabled).unwrap_or(false) {
+            continue;
+        }
+        let Some(text) = mode_key(&p.pack, user.map(|u| &u.values)) else {
+            continue;
+        };
+        match hotkey::Binding::parse(&text) {
+            Some(binding) => out.push((binding, hotkey::Action::Pack(p.pack.id.clone()))),
+            None => warn!(
+                "hotkey '{text}' for pack {} does not parse — that mode has no key",
+                p.pack.id
+            ),
+        }
+    }
+    out
+}
+
 /// Split a whole-state job's enabled set by kind (A4): each worker only gets the packs of
 /// its own kind, so a slow mode cannot stand in front of a pack job on the pack worker.
 /// An id that is not in the catalogue keeps its old home (the pack worker).
@@ -1010,6 +1099,11 @@ struct App {
     /// scoped to, and the daemon merges the halves (A4).
     pack_out_rx: crossbeam_channel::Receiver<packs::PackOutcome>,
     pack_catalog: Vec<PackMeta>,
+    /// The installed mode packs and the daemon actions their blocks ask for. A mode has no
+    /// worker: its key press runs these actions here, on the event loop.
+    mode_packs: HashMap<String, ModePack>,
+    /// Mode packs engaged right now (toggled on), so the next press runs the revert block.
+    mode_applied: std::collections::HashSet<String>,
     /// Packs currently in the applied (game-mode) state.
     applied_packs: Vec<String>,
     /// Per pack id, the last apply's verification note (feature 2, 2026-10-27): "nothing
@@ -1808,6 +1902,8 @@ impl App {
         // grant set here, once, so every step and script downstream sees the trimmed set.
         packs::apply_denials(&mut installed, &self.cfg.capability_denials);
         self.pack_catalog = build_catalog(&installed);
+        self.mode_packs = installed_modes(&installed);
+        hotkey::set_bindings(mode_bindings(&installed, &self.cfg));
         let (tx, rx) = crossbeam_channel::unbounded::<packs::PackJob>();
         let (modex, modex_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
         let (out_tx, out_rx) = crossbeam_channel::unbounded::<packs::PackOutcome>();
@@ -1949,6 +2045,7 @@ impl App {
             warn!("failed to save config: {e}");
         }
         info!("pack {id} {}", if enabled { "enabled" } else { "disabled" });
+        self.rebind_mode_hotkeys();
 
         if enabled {
             // Flipping a switch mid-session should act now, not at some future trigger.
@@ -1987,6 +2084,7 @@ impl App {
             warn!("failed to save config: {e}");
         }
         info!("pack {id}: {key} = {value}");
+        self.rebind_mode_hotkeys();
         self.apply_now_if_triggered(&format!("pack {id} changed to {value}"));
         self.broadcast_status();
     }
@@ -2088,7 +2186,57 @@ impl App {
                     self.enter_idle();
                 }
             }
+            hotkey::Action::Pack(id) => self.toggle_mode(&id),
         }
+    }
+
+    /// A mode pack's key was pressed: run the block the pack's current state asks for. The
+    /// pack carries the actions, so a new mode needs no new code here.
+    fn toggle_mode(&mut self, id: &str) {
+        let Some(mode) = self.mode_packs.get(id).cloned() else {
+            warn!("hotkey for pack {id}, which is not an installed mode — nothing to do");
+            return;
+        };
+        let engaged = self.mode_applied.contains(id);
+        let actions = if engaged { mode.revert } else { mode.apply };
+        if actions.is_empty() {
+            warn!("mode pack {id} has no daemon actions — the hotkey does nothing");
+            return;
+        }
+        info!("mode pack {id}: {}", if engaged { "off" } else { "on" });
+        for action in &actions {
+            match action.as_str() {
+                "idle_show" => self.enter_idle(),
+                "idle_hide" => self.exit_idle(),
+                "idle_toggle" => {
+                    if self.overlay.is_active() {
+                        self.exit_idle();
+                    } else {
+                        self.enter_idle();
+                    }
+                }
+                "killswitch_on" => self.engage_killswitch(),
+                "killswitch_off" => self.release_killswitch(),
+                "killswitch_toggle" => self.toggle_killswitch(),
+                "console_show" => self.show_console(),
+                other => warn!("mode pack {id}: unknown daemon action '{other}'"),
+            }
+        }
+        if engaged {
+            self.mode_applied.remove(id);
+        } else {
+            self.mode_applied.insert(id.to_string());
+        }
+        self.broadcast_status();
+    }
+
+    /// Re-read the mode hotkeys after a pack was enabled or reconfigured. The manifests own
+    /// the combinations, so the hook table follows them.
+    fn rebind_mode_hotkeys(&mut self) {
+        let mut installed = packs::load(&self.search);
+        packs::apply_discovery(&mut installed);
+        self.mode_packs = installed_modes(&installed);
+        hotkey::set_bindings(mode_bindings(&installed, &self.cfg));
     }
 
     fn enter_idle(&mut self) {
@@ -2165,20 +2313,35 @@ impl App {
             return;
         }
         if self.killswitch.is_active() {
+            self.release_killswitch();
+        } else {
+            self.engage_killswitch();
+        }
+        self.broadcast_status();
+    }
+
+    /// Hide and mute every tracked app that is running now.
+    fn engage_killswitch(&mut self) {
+        if !self.cfg.killswitch_enabled || self.killswitch.is_active() {
+            return;
+        }
+        let pids: Vec<u32> = self.running_pids.values().flatten().copied().collect();
+        if pids.is_empty() {
+            info!("killswitch: no tracked app is running — nothing to hide or mute");
+            return;
+        }
+        killswitch::engage(&pids, &mut self.killswitch);
+        self.set_tray_icon(true);
+        self.kill_item.set_text("Release killswitch");
+    }
+
+    /// Put back every window the killswitch hid and every session it muted.
+    fn release_killswitch(&mut self) {
+        if self.killswitch.is_active() {
             killswitch::disengage(&mut self.killswitch);
             self.set_tray_icon(false);
             self.kill_item.set_text("Toggle killswitch");
-        } else {
-            let pids: Vec<u32> = self.running_pids.values().flatten().copied().collect();
-            if pids.is_empty() {
-                info!("killswitch: no tracked app is running — nothing to hide or mute");
-                return;
-            }
-            killswitch::engage(&pids, &mut self.killswitch);
-            self.set_tray_icon(true);
-            self.kill_item.set_text("Release killswitch");
         }
-        self.broadcast_status();
     }
 
     /// The config-level killswitch switch (`set_killswitch` over the pipe). Turning it off
