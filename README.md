@@ -373,13 +373,13 @@ Windows in them.
 
 ## Documentation
 
-The published documentation is this README, **[deploy/README.md](deploy/README.md)** and
-**[CHANGELOG.md](CHANGELOG.md)** — the scripted install, the exact ACL, the update and the
-uninstall, and what each release changed. The **pack documentation** lives in the packs
-repository, linked from the Packs section above.
+The published documentation is this README and **[deploy/README.md](deploy/README.md)** —
+the scripted install, the exact ACL, the update and the uninstall. The **pack documentation**
+lives in the packs repository, linked from the Packs section above.
 
-Everything else — the handover notes, the test checklists, the decision log and the
-specifications — are working documents. They stay local, and they are **not published**.
+Everything else — the changelog, the handover notes, the test checklists, the decision log
+and the specifications — are working documents. They stay local, they are **not published**,
+and `.gitignore` keeps them out of the repository the same way it keeps keys out.
 
 ## Licence
 

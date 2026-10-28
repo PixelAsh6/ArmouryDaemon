@@ -16,6 +16,11 @@ Two rules that shape everything:
 - **Nothing downloaded may run arbitrary code as Administrator.** The daemon runs
   elevated. This is the hard constraint; read `GOTCHAS.md` §7 before writing any of it.
 
+> **These companion files are not in the repository.** `DECISIONS.md`, `DESIGN.md`,
+> `WORK-ORDER.md`, `GOTCHAS.md` and `PROGRESS.md` sit next to this README **on disk** and
+> are gitignored, like keys. This README is the only file in this folder that is published,
+> so every `NAME.md` mentioned below means the local copy, not a link you can click.
+
 ---
 
 ## The files here
