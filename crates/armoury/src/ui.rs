@@ -28,6 +28,9 @@ const MIN_SETTINGS_WIDTH: f32 = 330.0;
 /// handful of packs. The list scrolls when the catalog is longer.
 const INSTALL_PACKS_WIDTH: f32 = 430.0;
 const INSTALL_PACKS_HEIGHT: f32 = 470.0;
+/// The shortest the Packs window may become when its catalogue is empty: the title bar,
+/// the buttons and the foot of the window, with nothing in between.
+const INSTALL_PACKS_MIN_HEIGHT: f32 = 260.0;
 /// The height of the foot of the install-packs window: the rule and the "Local pack"
 /// button. The list above it leaves this much room, so the button is inside the
 /// window whatever the catalog holds.
@@ -1346,7 +1349,9 @@ impl eframe::App for App {
             let w = probe_width(&measure, &probe);
             egui::vec2(
                 (w + 2.0 * PAD_F + 8.0).max(MIN_WINDOW_WIDTH),
-                (ui.min_rect().height() + 4.0).max(150.0),
+                (ui.min_rect().height() + 4.0)
+                    .max(150.0)
+                    .min(max_window_height(ui.ctx())),
             )
         };
 
@@ -1966,7 +1971,9 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         }
         egui::vec2(
             (w + 2.0 * PAD_F + 8.0).max(MIN_SETTINGS_WIDTH),
-            (ui.min_rect().height() + 4.0).max(160.0),
+            (ui.min_rect().height() + 4.0)
+                .max(160.0)
+                .min(max_window_height(ui.ctx())),
         )
     };
     let ctx = ui.ctx();
@@ -2587,7 +2594,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let content = snug_width(w, work_area_pts(ui.ctx()).map(|(left, _, right, _)| right - left));
         egui::vec2(
             core_width.map_or(content, |cw| cw.max(MIN_SETTINGS_WIDTH)),
-            (ui.min_rect().height() + 4.0).max(170.0),
+            (ui.min_rect().height() + 4.0)
+                .max(170.0)
+                .min(max_window_height(ui.ctx())),
         )
     };
 
@@ -2974,6 +2983,10 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     let mut refresh = false;
     let mut install_file = false;
     let mut update_all = false;
+    // Measured during the frame: where the list starts, and how tall the content inside
+    // it is. The window is sized from the pair.
+    let mut list_top = 0.0;
+    let mut list_height = 0.0;
 
     let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
     frame.show(ui, |ui| {
@@ -3035,6 +3048,11 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         // Feature 8: the consent sheet, before anything touches the disk. It sits above the
         // list, so it is the first thing read and cannot scroll out of sight.
         consent_sheet(ui, shared);
+
+        // Where the list starts, in the window's own coordinates. With the sheet above it
+        // and the footer below, this is what turns "how tall is the content" into "how
+        // tall the window should be".
+        list_top = ui.min_rect().bottom();
 
         // The list takes the room that is left above the foot of the window, so the
         // "Local pack" button is always inside it. The list also shrinks to the
@@ -3104,6 +3122,9 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                         }
                     }
                 }
+                // The scroll area gives its content unbounded height, so this is what the
+                // list would need if the window did not cut it off.
+                list_height = ui.min_rect().height();
             });
         ui.add_space(6.0);
         ui.separator();
@@ -3116,6 +3137,48 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             install_file = true;
         }
     });
+
+    // ---- auto-fit ----
+    // The window follows its content, the way the settings and pack windows do. A
+    // catalogue row arrives, a consent sheet appears, a download finishes: the window is
+    // one line short of the button that finishes the job, and the user has no way to
+    // scroll the window itself. The sheet is measured as part of `list_top`, so a pack
+    // that asks for ten capabilities makes the window taller instead of pushing Install
+    // past the bottom edge.
+    {
+        let ctx = ui.ctx();
+        let natural = list_top + list_height + INSTALL_PACKS_FOOTER_HEIGHT;
+        let desired = egui::vec2(
+            INSTALL_PACKS_WIDTH,
+            natural.clamp(INSTALL_PACKS_MIN_HEIGHT, max_window_height(ctx)),
+        );
+        let current = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size());
+        let up = shared.lock().unwrap().install_packs_stage >= 3;
+        if up && current.is_some_and(|c| (c - desired).length() > 1.0) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(desired));
+            // Keep the foot of the window where it is: the chain stands on one line at the
+            // dashboard's bottom edge, and a window that grew downwards would hang off the
+            // screen with its buttons on the taskbar.
+            let kept = window_rect_pts(ctx, "Packs").and_then(|rect| {
+                clamp_into_work_area(ctx, egui::pos2(rect.min.x, rect.max.y - desired.y), desired)
+            });
+            {
+                let mut s = shared.lock().unwrap();
+                s.install_packs_size = Some(desired);
+                if let Some(pos) = kept {
+                    s.install_packs_target = Some(pos);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                }
+            }
+            log::info!(
+                "packs window: fitted to {:.0}x{:.0} (content {:.0})",
+                desired.x,
+                desired.y,
+                natural
+            );
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    }
 
     if close {
         let mut s = shared.lock().unwrap();
@@ -3297,11 +3360,14 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
 /// Feature 8: the consent sheet. What the pack will do, what it asks for, and an Install
 /// button that is the only way it reaches the disk. A capability the user unticks is cut
 /// from the pack's grant set - the feature that needed it degrades, the pack still runs.
-fn consent_sheet(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
+///
+/// Returns the height it took (0 when there is no sheet), so the window can size itself
+/// around it: the sheet is the one part of the window whose height the user cannot predict.
+fn consent_sheet(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) -> f32 {
     let (entry, summary, mut capabilities) = {
         let s = shared.lock().unwrap();
         let Some(consent) = s.consent.as_ref() else {
-            return;
+            return 0.0;
         };
         (
             consent.entry.clone(),
@@ -3322,25 +3388,35 @@ fn consent_sheet(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         .inner_margin(egui::Margin::same(6))
         .fill(Color32::from_rgb(24, 26, 32))
         .corner_radius(4.0);
-    frame.show(ui, |ui| {
+    let sheet = frame.show(ui, |ui| {
         ui.label(RichText::new(format!("{name} — what it will do")).strong());
         ui.add_space(2.0);
+        // The window is a fixed size and this sheet sits at its top, so the sheet has to
+        // work inside whatever room is left: the text scrolls, the two buttons stay at the
+        // foot of the sheet. A pack that asks for ten capabilities used to push Install
+        // below the edge of the window, where nothing could reach it.
+        let buttons = 34.0;
+        // Capped, not just bounded by the window: the window sizes itself from the
+        // content, and a sheet that grew with the window would chase its own tail.
+        let body = (ui.available_height() - buttons).clamp(96.0, 240.0);
         egui::ScrollArea::vertical()
-            .max_height(150.0)
+            .id_salt("consent-body")
+            .max_height(body)
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for line in &summary {
                     ui.small(line.as_str());
                 }
+                if !capabilities.is_empty() {
+                    ui.add_space(4.0);
+                    ui.small(RichText::new("It asks for:").strong());
+                    for (_, effect, granted) in &mut capabilities {
+                        ui.checkbox(granted, effect.as_str()).on_hover_text(
+                            "Untick to refuse: the part that needs it stops working",
+                        );
+                    }
+                }
             });
-        if !capabilities.is_empty() {
-            ui.add_space(4.0);
-            ui.small(RichText::new("It asks for:").strong());
-            for (_, effect, granted) in &mut capabilities {
-                ui.checkbox(granted, effect.as_str())
-                    .on_hover_text("Untick to refuse: the part that needs it stops working");
-            }
-        }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button("Install").clicked() {
@@ -3387,6 +3463,7 @@ fn consent_sheet(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
         ui.ctx().request_repaint();
     }
+    sheet.response.rect.height()
 }
 
 /// The width of the description column in the Modules window. A one-sentence
@@ -4297,6 +4374,15 @@ fn bottom_corner(ctx: &egui::Context, size: egui::Vec2) -> egui::Pos2 {
 
 /// Snug width for a panel: the longest line plus the frame padding, clamped to the shared minimum
 /// and to the work area (keeping `UI_MARGIN` free on each side).
+/// The tallest a window may be and still fit the work area. Past this its bottom edge is
+/// under the taskbar or off the screen, and the buttons there cannot be reached at all -
+/// which is exactly what a window taller than the display did.
+fn max_window_height(ctx: &egui::Context) -> f32 {
+    work_area_pts(ctx)
+        .map(|(_, top, _, bottom)| (bottom - top).max(240.0))
+        .unwrap_or(1200.0)
+}
+
 fn snug_width(longest_line: f32, work_width: Option<f32>) -> f32 {
     let wanted = longest_line + 2.0 * PAD_F + 8.0;
     let cap = work_width
