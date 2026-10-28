@@ -60,9 +60,12 @@ const UI_MARGIN_PX: f32 = 0.0;
 /// window has an "Open packs folder" button for the ones who want to see it.
 const NO_PACKS_HINT: &str = "No packs installed yet.\nFind them in Settings → Packs.";
 
-/// The console launcher is a daemon-owned feature, not an installed pack: it appears in the
-/// packs lists as a built-in row with one dropdown.
+/// The console launcher arrives as a helper pack (C2), so this row is its policy, not a
+/// daemon feature: one dropdown saying when the pack opens itself, in both packs lists.
 const CONSOLE_FEATURE: &str = "Console launcher";
+/// What the row says about where the launcher comes from. It used to say "built-in", back
+/// when the daemon carried the console; the daemon does not carry one any more.
+const CONSOLE_ORIGIN: &str = "(pack)";
 /// What the SteamGridDB field shows instead of the key: a row of dots.
 const SGDB_MASK: &str = "••••••••••••";
 /// Auto-open modes in dropdown order: (value stored in config.json, label).
@@ -1201,13 +1204,14 @@ impl eframe::App for App {
             ui.add_space(6.0);
             ui.label(RichText::new("Packs").strong());
             ui.add_space(4.0);
-            // Built-in entry: the console launcher. It sits beside the packs but the daemon owns
-            // it — no enable checkbox, no pack window, nothing to install or remove.
+            // The console launcher's row: it comes from a helper pack, and this is the policy
+            // the daemon applies to it (when it opens by itself). No enable checkbox and no
+            // pack window, because there is nothing here to install or remove.
             let mut set_console_open: Option<String> = None;
             ui.horizontal(|ui| {
                 ui.add_space(22.0); // lines up with a pack row's ‹ button + checkbox
                 ui.label(CONSOLE_FEATURE);
-                ui.small(RichText::new("(built-in)").weak());
+                ui.small(RichText::new(CONSOLE_ORIGIN).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let combo = egui::ComboBox::from_id_salt("builtin-console-open")
                         .selected_text(console_open_label(&console_open))
@@ -1235,8 +1239,8 @@ impl eframe::App for App {
             }
             let mut set_enabled: Option<(String, bool)> = None;
             let mut set_value: Option<(String, String, String)> = None;
-            // The rows are shown by name. The console launcher above them is a built-in
-            // feature and not a pack, so it keeps its place and is not in this list.
+            // The rows are shown by name. The console launcher above them is a helper pack
+            // with its own policy row, so it keeps its place and is not in this list.
             for pack in sorted_packs(&packs) {
                 ui.horizontal(|ui| {
                     let mut open_this = ui
@@ -2303,8 +2307,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             .num_columns(2)
             .spacing(egui::vec2(10.0, 4.0))
             .show(ui, |ui| {
-                // Only the installed packs: the console launcher is a built-in feature, not a
-                // pack, and it has its own row further down.
+                // Only the installed packs: the console launcher is a helper pack with a
+                // policy row of its own further down.
                 for pack in sorted_packs(&packs) {
                     ui.horizontal(|ui| {
                         ui.label(&pack.name);
@@ -2380,8 +2384,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         }
 
         // ---- the console launcher and its pinned apps ----
-        // The console launcher is a built-in daemon feature, not an installed pack: it has
-        // no heading of its own, it is a row in the settings body.
+        // The launcher is a helper pack; this is its row and the policy the daemon applies
+        // to it. It has no heading of its own - it is a row in the settings body.
         let console_apps = {
             let s = shared.lock().unwrap();
             s.status
@@ -2395,7 +2399,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut set_console_open: Option<String> = None;
         ui.horizontal(|ui| {
             ui.label(CONSOLE_FEATURE);
-            ui.small(RichText::new("(built-in)").weak());
+            ui.small(RichText::new(CONSOLE_ORIGIN).weak());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let combo = egui::ComboBox::from_id_salt("settings-console-open")
                     .selected_text(console_open_label(&console_open))
@@ -2580,9 +2584,9 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         );
         // The SteamGridDB row: the masked field, Save and Clear.
         w = w.max(190.0 + 52.0 + 52.0 + 24.0);
-        // The built-in console row: name + "(built-in)" + its 120 pt dropdown.
+        // The console row: name + where it comes from + its 120 pt dropdown.
         w = w.max(
-            tw(&body_font, CONSOLE_FEATURE) + 10.0 + tw(&small_font, "(built-in)") + 10.0 + 120.0,
+            tw(&body_font, CONSOLE_FEATURE) + 10.0 + tw(&small_font, CONSOLE_ORIGIN) + 10.0 + 120.0,
         );
         // A pack row: name + version bubble + the Remove button.
         w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&button_font, "Remove") + 24.0);
@@ -5522,8 +5526,8 @@ mod tests {
 
     #[test]
     fn the_console_launcher_is_not_one_of_the_sorted_packs() {
-        // The console launcher is a built-in feature and not a pack: it has its own row
-        // in the settings window and is not in the list the sort works on.
+        // The console launcher is a helper pack with a policy row of its own: it is not in
+        // the list the sort works on.
         let packs = vec![
             named_pack("wallpaper-engine", "Wallpaper Engine"),
             named_pack("g-helper", "G-Helper"),
