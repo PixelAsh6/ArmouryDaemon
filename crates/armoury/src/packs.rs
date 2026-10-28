@@ -473,19 +473,38 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
                     continue; // nothing was there to compare against
                 }
                 let pointer = step.pointer.as_deref().unwrap_or("/");
-                let after = step
-                    .path
-                    .as_deref()
-                    .map(expand_env)
-                    .and_then(|p| json_pointer(&p, pointer))
-                    .unwrap_or_default();
+                let read = || {
+                    step.path
+                        .as_deref()
+                        .map(expand_env)
+                        .and_then(|p| json_pointer(&p, pointer))
+                        .unwrap_or_default()
+                };
+                // The app writes its config once it has handled the request - G-Helper takes
+                // a hotkey in its UI thread and saves afterwards - so a read on the same
+                // millisecond as the keystroke is a read of the old value. Poll for the
+                // change for three seconds before calling it unverified.
+                // A second and a half, not three: this blocks the pack worker, and the
+                // worker is the one that would carry the revert when the app closes.
+                let mut after = read();
+                let mut waited = 0;
+                while (&after == before || after.is_empty()) && waited < 6 {
+                    std::thread::sleep(Duration::from_millis(250));
+                    waited += 1;
+                    after = read();
+                }
+                let waited_ms = waited * 250;
                 if after.is_empty() {
                     unverified.push(format!(
                         "could not read {pointer} back after the apply, so the change is unverified"
                     ));
                 } else if &after == before {
+                    // Softer than "the pack had no effect": the pack did everything it was
+                    // asked to do. It is the app's config that still shows the old value, and
+                    // some apps only write it when they close.
                     unverified.push(format!(
-                        "nothing changed at {pointer} (still {after}), so the pack had no effect"
+                        "{pointer} still reads {after} {waited_ms} ms after the apply - the pack \
+                         ran, but the app has not written the change yet"
                     ));
                 }
             }

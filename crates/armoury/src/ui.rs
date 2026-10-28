@@ -3140,9 +3140,16 @@ fn install_packs_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             // Keep the foot of the window where it is: the chain stands on one line at the
             // dashboard's bottom edge, and a window that grew downwards would hang off the
             // screen with its buttons on the taskbar.
-            let kept = window_rect_pts(ctx, "Packs").and_then(|rect| {
-                clamp_into_work_area(ctx, egui::pos2(rect.min.x, rect.max.y - desired.y), desired)
-            });
+            // Move by the height difference, not to an absolute bottom: the outer rect
+            // carries a border the inner size does not, so anchoring on the outer bottom
+            // walked the window up by the border on every resize (it sat a few pixels above
+            // the rest of the chain after a handful of them).
+            let kept = window_rect_pts(ctx, "Packs")
+                .map(|rect| {
+                    let shift = current.map_or(0.0, |c| c.y - desired.y);
+                    egui::pos2(rect.min.x, rect.min.y + shift)
+                })
+                .and_then(|pos| clamp_into_work_area(ctx, pos, desired));
             {
                 let mut s = shared.lock().unwrap();
                 s.install_packs_size = Some(desired);
