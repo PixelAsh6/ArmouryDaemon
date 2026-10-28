@@ -44,3 +44,22 @@ config.json
 /SPEC3-SCRIPTING.md
 /PACK-SPEC-PROPOSAL.md
 /finish.md
+
+# Documentation and keys are the same kind of thing: ours, never versioned. A README is
+# the one exception, because a repository with no README is a repository nobody can start.
+# Everything else (design, decisions, progress, the pack spec, the handover, the changelog)
+# lives on disk and leaves this machine only if it is pasted somewhere by hand.
+*.md
+*.markdown
+*.txt
+*.pdf
+*.docx
+*.odt
+*.rtf
+!README.md
+!**/README.md
+
+# release-notes/ is ignored like every other doc *except* for the file the release
+# workflow reads out of the checkout: `release-notes/<tag>.md` is the release body, and the
+# build fails outright when it is missing (release.yml, "the release notes are missing").
+!release-notes/*.md
