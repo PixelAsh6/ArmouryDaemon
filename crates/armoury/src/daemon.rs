@@ -3148,7 +3148,9 @@ impl App {
                     } else {
                         self.cfg.hotkeys.idle = idle;
                         self.cfg.hotkeys.killswitch = killswitch;
-                        hotkey::apply(&self.cfg.hotkeys);
+                        // The table belongs to the installed mode packs now: the old
+                        // config hotkeys are kept for the wire format, not bound.
+                        self.rebind_mode_hotkeys();
                         if let Err(e) = armoury_core::config::save(&self.cfg) {
                             warn!("failed to save config: {e}");
                         }
