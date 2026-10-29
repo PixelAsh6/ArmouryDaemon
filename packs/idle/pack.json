@@ -1,0 +1,41 @@
+{
+  "spec": 1,
+  "id": "idle",
+  "name": "Idle mode",
+  "version": "1.0.0",
+  "kind": "mode",
+  "order": 10,
+  "targets": {
+    "process": []
+  },
+  "triggers": [
+    {
+      "kind": "hotkey",
+      "key": "home"
+    }
+  ],
+  "settings": [
+    {
+      "key": "hotkey",
+      "label": "Hotkey",
+      "type": "hotkey",
+      "default": "home"
+    }
+  ],
+  "apply": {
+    "steps": [
+      {
+        "mechanism": "daemon",
+        "action": "idle_show"
+      }
+    ]
+  },
+  "revert": {
+    "steps": [
+      {
+        "mechanism": "daemon",
+        "action": "idle_hide"
+      }
+    ]
+  }
+}

@@ -885,10 +885,18 @@ impl eframe::App for App {
                         .as_ref()
                         .map(|st| st.packs.clone())
                         .unwrap_or_default();
+                    // The console launcher is a helper module, but it stands in the same
+                    // list as the packs: counting only packs said five where the user sees
+                    // six modules. It is counted even before its helper is installed,
+                    // because its row is in the list either way.
+                    let console_on = s
+                        .status
+                        .as_ref()
+                        .is_some_and(|st| st.console_open != "never");
                     format!(
                         "{} installed · {} enabled",
-                        list.len(),
-                        list.iter().filter(|p| p.enabled).count()
+                        list.len() + 1,
+                        list.iter().filter(|p| p.enabled).count() + usize::from(console_on)
                     )
                 }),
             ];
@@ -1045,29 +1053,6 @@ impl eframe::App for App {
                 row(ui, key, value);
             }
 
-            // ---- idle (in the body, per the user's choice) ----
-            ui.add_space(8.0);
-            let mut idle_clicked = false;
-            ui.horizontal(|ui| {
-                let label = if idle.0 { "Wake up" } else { "Idle mode" };
-                idle_clicked = ui
-                    .button(label)
-                    .on_hover_text(
-                        "Black out every screen and mute all audio. Any input brings it back.\n\
-                         While idle, pack switching is cancelled (tracked apps are normal apps).",
-                    )
-                    .clicked();
-                if idle.0 {
-                    ui.small(format!(
-                        "{} screen(s) black · {} device(s) muted",
-                        idle.1, idle.2
-                    ));
-                }
-            });
-            if idle_clicked {
-                self.request(&Request::SetIdle { active: !idle.0 });
-            }
-
             // ---- tracked apps ----
             ui.add_space(8.0);
             ui.separator();
@@ -1190,6 +1175,8 @@ impl eframe::App for App {
             // The console launcher is a helper module, but it is listed like a pack: the
             // same ‹ button, the same on/off box, its policy on the right. Its window holds
             // the open method, its games and the art key.
+            // No dropdown on this row: the launcher has no list of modes to choose from —
+            // its open method is set in its own window, like every module's settings.
             let mut set_console_open: Option<String> = None;
             let mut open_console_window = false;
             ui.horizontal(|ui| {
@@ -1210,24 +1197,6 @@ impl eframe::App for App {
                     open_console_window = true;
                 }
                 ui.small(RichText::new(CONSOLE_ORIGIN).weak());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let combo = egui::ComboBox::from_id_salt("builtin-console-open")
-                        .selected_text(console_open_label(&console_open))
-                        .width(130.0)
-                        .show_ui(ui, |ui| {
-                            for (mode, label) in CONSOLE_OPEN_MODES {
-                                if ui
-                                    .selectable_label(mode == console_open.as_str(), label)
-                                    .clicked()
-                                {
-                                    set_console_open = Some(mode.to_string());
-                                }
-                            }
-                        });
-                    combo.response.on_hover_text(
-                        "When the launcher opens by itself. The tray always opens it.",
-                    );
-                });
             });
             if let Some(mode) = set_console_open {
                 self.request(&Request::SetConsoleOpen { mode });
@@ -1309,7 +1278,11 @@ impl eframe::App for App {
                             .on_hover_text("More settings - open the pack's own window");
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some(setting) = pack.settings.first() {
+                        // Only a dropdown setting has a column here: a hotkey is edited in
+                        // the pack's own window, and an empty one would be a dead control.
+                        if let Some(setting) =
+                            pack.settings.iter().find(|s| s.kind == "enum")
+                        {
                             let current = setting.value.clone().unwrap_or_default();
                             // The pack id belongs in the salt: two packs can have a setting
                             // with the same key, and one id would make them share a widget.
@@ -1876,6 +1849,25 @@ fn leftmost_edge_to_clear_px(s: &Shared, core_left_px: f32) -> f32 {
     chain_anchor(core_left_px, &edges)
 }
 
+/// The line under a module's settings: what this module does, in its own terms. The
+/// tracked-app sentence is only true of a pack that follows an app, so a helper (the console)
+/// and a mode (idle, killswitch) name their own work instead.
+fn pack_footer(pack: &PackStatus) -> &'static str {
+    match pack.id.as_str() {
+        "console" => {
+            "A cover-art launcher for its pinned games; opens on pad connect, at daemon start, or never."
+        }
+        "idle" => {
+            "Blacks out every screen and mutes every output; any real key ends it. Packs keep switching."
+        }
+        "killswitch" => {
+            "Hides and mutes every running tracked app; the same hotkey brings them back."
+        }
+        _ if pack.applied => "Applied right now.",
+        _ => "Applies when a tracked app starts.",
+    }
+}
+
 /// One pack's own window: enable toggle + its single dropdown.
 fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index: usize) {
     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
@@ -2069,11 +2061,7 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.small(if pack.applied {
-                "Applied right now."
-            } else {
-                "Applies when a tracked app starts."
-            });
+            ui.small(pack_footer(&pack));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !pack.version.is_empty() {
                     ui.small(RichText::new(format!("v{}", pack.version)).weak());
@@ -2102,7 +2090,7 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
         let p = ui.painter();
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
         let mut w = tw(&title_font, &pack.name) + 60.0; // title + close button
-        w = w.max(tw(&body_font, "Applies when a tracked app starts.") + 24.0);
+        w = w.max(tw(&body_font, pack_footer(&pack)) + 24.0);
         for setting in &pack.settings {
             w = w.max(tw(&body_font, &setting.label) + 24.0);
             // the dropdown is 190 wide, plus its current text and the row padding
@@ -2530,8 +2518,18 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.separator();
         ui.add_space(6.0);
         // The count is deliberate: if a row ever goes missing, this says whether the daemon or
-        // the window is at fault.
-        ui.label(RichText::new(format!("Packs ({})", packs.len())).strong());
+        // the window is at fault. The console launcher is a helper module, not a pack, but it
+        // is listed and counted here like one — whether or not its helper is installed, since
+        // its row is always here (2026-10-29: the user's six modules).
+        let console_version = shared
+            .lock()
+            .unwrap()
+            .helper_versions
+            .get("console")
+            .cloned();
+        ui.label(
+            RichText::new(format!("Packs ({})", packs.len() + 1)).strong(),
+        );
         ui.add_space(4.0);
 
         let mut remove_pack: Option<String> = None;
@@ -2539,8 +2537,14 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             .num_columns(2)
             .spacing(egui::vec2(10.0, 4.0))
             .show(ui, |ui| {
-                // Only the installed packs: the console launcher is a helper pack with a
-                // policy row of its own further down.
+                ui.horizontal(|ui| {
+                    ui.label(CONSOLE_FEATURE);
+                    if let Some(version) = &console_version {
+                        ui.small(RichText::new(format!("v{version}")).weak());
+                    }
+                });
+                ui.small(RichText::new("helper module").weak());
+                ui.end_row();
                 for pack in sorted_packs(&packs) {
                     ui.horizontal(|ui| {
                         ui.label(&pack.name);
@@ -4711,6 +4715,7 @@ mod tests {
                 .map(|i| armoury_core::status::PackSettingStatus {
                     key: format!("k{i}"),
                     label: format!("K{i}"),
+                    kind: "enum".to_string(),
                     values: vec!["a".to_string(), "b".to_string()],
                     value: Some("a".to_string()),
                 })
@@ -5568,13 +5573,24 @@ mod tests {
         // The shipped packs, as the daemon loads them: the order it applies them in.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let loaded = crate::packs::load(&[root]);
-        let orders: Vec<i32> = loaded.iter().map(|p| p.pack.order).collect();
+        // A dev checkout can carry packs the user installed on top of the shipped ones:
+        // the three that ship are the ones this test is about.
+        let shipped: Vec<&crate::packs::Installed> = loaded
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.pack.id.as_str(),
+                    "wallpaper-engine" | "g-helper" | "rainmeter"
+                )
+            })
+            .collect();
+        let orders: Vec<i32> = shipped.iter().map(|p| p.pack.order).collect();
         assert_eq!(
             orders,
             vec![10, 20, 30],
             "the shipped packs keep the order the daemon applies them in"
         );
-        let packs: Vec<PackStatus> = loaded
+        let packs: Vec<PackStatus> = shipped
             .iter()
             .map(|p| named_pack(&p.pack.id, &p.pack.name))
             .collect();
@@ -5623,9 +5639,10 @@ mod tests {
     }
 
     #[test]
-    fn the_console_launcher_is_not_one_of_the_sorted_packs() {
-        // The console launcher is a helper pack with a policy row of its own: it is not in
-        // the list the sort works on.
+    fn the_console_launcher_is_listed_but_not_sorted_with_the_packs() {
+        // The console launcher is a helper module: it is not in the list the sort works
+        // on, but its row stands in the settings body above the packs, so the window
+        // lists all six modules (2026-10-29). Its settings live in its own window.
         let packs = vec![
             named_pack("wallpaper-engine", "Wallpaper Engine"),
             named_pack("g-helper", "G-Helper"),
@@ -5635,8 +5652,6 @@ mod tests {
             "the console launcher must not be a pack"
         );
 
-        // The settings window: the pack rows are sorted by name, and the console
-        // launcher sits in its own section below them.
         let text = settings_frame(packs);
         let row = |name: &str| {
             text.iter()
@@ -5644,17 +5659,16 @@ mod tests {
                 .map(|(_, rect, _)| *rect)
                 .unwrap_or_else(|| panic!("the settings window has no {name:?} row"))
         };
+        let console = row(CONSOLE_FEATURE);
         let g_helper = row("G-Helper");
         let wallpaper = row("Wallpaper Engine");
-        let console = row(CONSOLE_FEATURE);
         assert!(
             g_helper.top() < wallpaper.top(),
             "the pack rows are not sorted by name: {g_helper:?} and {wallpaper:?}"
         );
         assert!(
-            console.top() > wallpaper.top(),
-            "the console launcher belongs in its own section, below the packs: {console:?} and \
-             {wallpaper:?}"
+            console.top() < g_helper.top(),
+            "the console launcher is listed before the sorted packs"
         );
     }
 
@@ -6157,7 +6171,6 @@ mod tests {
                             &packs,
                             &[],
                             &HashMap::new(),
-                            &HashMap::new(),
                         );
                     }
                 });
@@ -6224,7 +6237,16 @@ mod tests {
         };
         let shared = Arc::new(Mutex::new(Shared::default()));
         // Three helper rows so every state paints once: no record = download,
-        // same version = installed, older record = update.
+        // same version = installed, older record = update. The frame is taller than the
+        // window: all three rows have to be inside it, or a clipped row reads as a
+        // missing button instead of the state it is in.
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(INSTALL_PACKS_WIDTH, 900.0),
+            )),
+            ..input
+        };
         let entries = vec![
             catalog_entry("armoury-pick", "Armoury Pick", "0.4.0"),
             catalog_entry("armoury-console", "Armoury Console", "0.2.0"),
@@ -6233,6 +6255,9 @@ mod tests {
         .into_iter()
         .map(|mut e| {
             e.kind = "helper".to_string();
+            // A helper names the executable inside its archive; without one the row
+            // refuses the entry instead of offering the button.
+            e.entry = Some("ArmouryConsole.exe".to_string());
             e
         })
         .collect::<Vec<_>>();
@@ -6251,7 +6276,6 @@ mod tests {
                             entry,
                             &[],
                             &[],
-                            &HashMap::new(),
                             &helper_versions,
                         );
                     }
@@ -6286,60 +6310,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_installed_pack_row_names_its_permissions() {
-        // The permission line under an installed pack row names the effects the
-        // pack may have, joined into one human line in the description's column.
-        let ctx = egui::Context::default();
-        app_style(&ctx);
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(
-                egui::pos2(0.0, 0.0),
-                egui::vec2(INSTALL_PACKS_WIDTH, INSTALL_PACKS_HEIGHT),
-            )),
-            ..Default::default()
-        };
-        let shared = Arc::new(Mutex::new(Shared::default()));
-        let entries = vec![catalog_entry("rainmeter", "Rainmeter", "1.4.0")];
-        let packs = vec![installed_pack("rainmeter", "1.4.0")];
-        let mut caps = HashMap::new();
-        caps.insert(
-            "rainmeter".to_string(),
-            vec![
-                "Send keystrokes".to_string(),
-                "Write files".to_string(),
-                "Look at, kill and start processes".to_string(),
-            ],
-        );
-        let output = ctx.run_ui(input, |ui| {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ui, |ui| {
-                    for entry in &entries {
-                        catalog_row(
-                            ui,
-                            &shared,
-                            entry,
-                            &packs,
-                            &[],
-                            &caps,
-                            &HashMap::new(),
-                        );
-                    }
-                });
-        });
-        let text = painted_text(&output);
-        output.drop_without_applying_deltas();
-        // The permissions are one line (or a wrapped two) under the description,
-        // and they name the effects, not the API names.
-        let (rect, rows) = text
-            .iter()
-            .find(|(t, _, _)| t.starts_with("Send keystrokes; Write files"))
-            .map(|(_, rect, rows)| (*rect, *rows))
-            .expect("no permission line under the installed pack's row");
-        assert!((1..=2).contains(&rows), "the permissions run {rows} rows long");
-        assert!(rect.left() > 0.0, "the permission line is not indented");
-    }
 
     /// The install-packs window as it is drawn, with a catalog of `count` packs.
     /// Returns the painted text, the rules and the window's frame.

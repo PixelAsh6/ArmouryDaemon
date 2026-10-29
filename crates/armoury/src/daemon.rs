@@ -52,11 +52,6 @@ const LAUNCH_GRACE: Duration = Duration::from_millis(600);
 /// How long a fresh console launcher gets to show its band. Until the band is up the
 /// launcher has no window on screen, and that is not yet a stale launcher.
 const CONSOLE_GRACE: Duration = Duration::from_secs(10);
-/// Entering and leaving idle mode are the user's own actions: they change the packs even
-/// while the daemon is paused (the pause stops *automatic* switching, not the user's own
-/// actions). Entering and leaving must behave the same, or the packs would stay reverted
-/// after the user leaves idle mode.
-const IDLE_IS_FORCED: bool = true;
 
 /// One answer from the self-update worker (feature 9).
 #[derive(Debug)]
@@ -709,18 +704,6 @@ fn forget_error(slot: &mut Option<LastError>, prefix: &str) {
 ///
 /// `GetAsyncKeyState`'s low bit means "pressed since the previous call", so the caller must
 /// **prime** this once when idle engages, or a keypress from before would dismiss it immediately.
-fn keyboard_pressed_since_last_poll() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
-    let mut pressed = false;
-    // 0x01..=0x07 are the mouse buttons, the wheel and VK_CANCEL: never treated as a wake key.
-    for vk in 0x08..=0xFE {
-        if unsafe { GetAsyncKeyState(vk) } & 0x0001 != 0 {
-            pressed = true; // keep draining every flag, so nothing is reported twice
-        }
-    }
-    pressed
-}
-
 fn tick_count() -> u32 {
     unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount() }
 }
@@ -1701,9 +1684,8 @@ impl App {
             self.broadcast_status();
             return;
         }
-        // Hand the transition to the workers. A4: split the enabled set by kind — the pack
-        // half on the pack worker, the mode half on the mode worker — and pass `values` and
-        // `captured` whole to both (`run_job` looks them up per pack id).
+        // Hand the transition to the pack worker. The modes stay out of it: they are the
+        // user's own switches, and a transition must not run their blocks (see below).
         let job = packs::PackJob {
             apply: t == Transition::Applied,
             tag: None,
@@ -1721,7 +1703,7 @@ impl App {
                 .collect(),
             captured: self.captured_by_pack.clone(),
         };
-        self.send_by_kind(job);
+        self.send_pack_jobs(job);
         match t {
             Transition::Applied => info!(
                 "packs applied (triggered by {})",
@@ -1732,27 +1714,22 @@ impl App {
         self.broadcast_status();
     }
 
-    /// A4: a whole-state job goes out as two halves, one per worker — the pack half on the
-    /// pack worker, the mode half on the mode worker. `values` and `captured` stay whole
-    /// (`run_job` looks them up per pack id), and each outcome echoes the ids its half was
-    /// scoped to, so the daemon merges both halves order-independently.
-    fn send_by_kind(&self, job: packs::PackJob) {
+    /// A tracked-app transition drives the packs, never the modes. A mode answers to its own
+    /// trigger; running its block here undid the user's own action, because entering idle
+    /// reverts the applied packs — and the idle pack's revert step then hid the overlay the
+    /// daemon had just shown (2026-10-28: idle only died while a tracked app was running, the
+    /// one case where there was something to revert). The same path engaged the killswitch on
+    /// every tracked-app start. A mode that has to be undone at startup is handled by the
+    /// journal revert, which is the one job that still goes to the mode worker.
+    fn send_pack_jobs(&self, job: packs::PackJob) {
         let packs::PackJob { apply, tag, enabled, values, captured } = job;
-        let (pack_enabled, mode_enabled) = split_enabled(enabled, &self.pack_catalog);
         let _ = self.pack_tx.send(packs::PackJob {
             apply,
-            tag: tag.clone(),
-            enabled: pack_enabled,
-            values: values.clone(),
-            captured: captured.clone(),
+            tag,
+            enabled: split_enabled(enabled, &self.pack_catalog).0,
+            values,
+            captured,
         });
-        // The mode half is skipped when no mode is part of the job: waking a worker to
-        // report that everything is disabled would only add an empty outcome to merge.
-        if mode_enabled.values().any(|v| *v) {
-            let _ = self
-                .mode_tx
-                .send(packs::PackJob { apply, tag, enabled: mode_enabled, values, captured });
-        }
     }
 
     /// The worker that owns this pack's jobs (A4): a tagged, single-pack operation (a
@@ -2115,7 +2092,7 @@ impl App {
                 .collect(),
             captured: self.captured_by_pack.clone(),
         };
-        self.send_by_kind(job);
+        self.send_pack_jobs(job);
         info!("packs applied now ({why}, a tracked app is already running)");
     }
 
@@ -2273,20 +2250,17 @@ impl App {
         }
         self.idle_engage_tick = tick_count();
         self.last_idle_beat = Some(Instant::now());
-        // Drain the "pressed since last poll" flags so only keys pressed from now on wake us.
-        let _ = keyboard_pressed_since_last_poll();
+        // Drain the real-key flag so only keys pressed from now on wake us.
+        let _ = hotkey::take_real_key();
         self.idle_item.set_text("Wake up");
         self.idle_deadline = if self.cfg.idle_failsafe_enabled {
             Some(Instant::now() + Duration::from_secs(self.cfg.idle_failsafe_minutes.max(1) * 60))
         } else {
             None
         };
-        // Idle cancels switching: whatever is applied reverts now (decision B8). This is a manual
-        // action, so it happens even while paused.
-        if let Some(t) = self.engine.set_idle(true) {
-            info!("idle mode: tracked apps are normal apps again");
-            self.send_transition(t, IDLE_IS_FORCED);
-        }
+        // Idle is an overlay and a mute, nothing else: it does not revert, apply or freeze the
+        // packs, so a tracked app starting or closing behind the black screens leaves it alone
+        // (2026-10-29: the user's definition).
         self.broadcast_status();
     }
 
@@ -2300,13 +2274,7 @@ impl App {
         self.idle_deadline = None;
         self.last_idle_beat = None;
         self.idle_item.set_text("Idle mode");
-        // Idle over: re-apply if a tracked app is running at this moment (decision B8). Like
-        // entering idle, this is a manual action: it goes through even while the daemon is
-        // paused, so the packs are not left reverted after the user leaves idle mode.
-        if let Some(t) = self.engine.set_idle(false) {
-            info!("idle mode over: a tracked app is running, applying the packs again");
-            self.send_transition(t, IDLE_IS_FORCED);
-        }
+        // Nothing to undo in the packs: idle never changed them.
         self.broadcast_status();
     }
 
@@ -2434,7 +2402,7 @@ impl App {
             captured: self.captured_by_pack.clone(),
         };
         info!("quit: reverting the packs before exiting");
-        self.send_by_kind(job);
+        self.send_pack_jobs(job);
 
         // Shutdown is not time-critical; the kill/relaunch paths can take a few seconds.
         // A4: the two halves of the revert report separately (a slow mode may take seconds
@@ -2463,8 +2431,9 @@ impl App {
     fn on_tick(&mut self) {
         if self.overlay.is_active() {
             overlay::pump();
-            // A keypress ends idle (keyboard only — a mouse twitch must not wake an AFK session).
-            if keyboard_pressed_since_last_poll() {
+            // A real keypress ends idle (keyboard only — a mouse twitch must not wake an AFK
+            // session, and the keys a pack injects while a game starts are not a keypress).
+            if hotkey::take_real_key() {
                 info!("idle overlay dismissed by a keypress");
                 self.exit_idle();
             } else {
@@ -4323,10 +4292,9 @@ mod tests {
     }
 
     #[test]
-    fn leaving_idle_while_paused_applies_the_packs_again() {
-        // The dashboard showed "Triggered" while the packs were still reverted: leaving idle
-        // mode took the paused path, so the apply was dropped — and the engine believed it
-        // had happened, so nothing ever applied the packs again.
+    fn removing_the_last_tracked_app_while_paused_reverts_the_packs() {
+        // A manual action still changes the packs while the automatic switching is frozen,
+        // and the engine and the machine must agree afterwards.
         let now = Instant::now();
         let mut m = Machine {
             engine: Engine::new(Duration::from_secs(60)),
@@ -4346,19 +4314,13 @@ mod tests {
         m.paused = true;
         assert!(m.engine.set_paused(true, now).is_none());
 
-        // idle mode: the packs are reverted (a manual action, so it happens while paused)
-        let t = m.engine.set_idle(true).expect("idle reverts the packs");
-        m.send(t, IDLE_IS_FORCED);
-        assert!(!m.applied);
-        assert!(!m.engine.is_applied());
-
-        // idle mode ends: the packs are applied again — that is a manual action too
+        // the manual removal takes effect at once, pause or no pause
         let t = m
             .engine
-            .set_idle(false)
-            .expect("leaving idle applies the packs again");
-        m.send(t, IDLE_IS_FORCED);
-        assert!(m.applied, "leaving idle must apply the packs again");
+            .on_untracked("game.exe", now)
+            .expect("removing the last app reverts the packs");
+        m.send(t, true);
+        assert!(!m.applied, "the packs are reverted while paused");
         assert_eq!(m.engine.is_applied(), m.applied, "the engine and the machine agree");
 
         // and unpausing changes nothing
@@ -4366,7 +4328,7 @@ mod tests {
         if let Some(t) = m.engine.set_paused(false, now) {
             m.send(t, false);
         }
-        assert!(m.applied, "the packs must be applied after the unpause");
+        assert!(!m.applied, "nothing is running, so the packs stay reverted");
         assert_eq!(m.engine.is_applied(), m.applied, "the engine and the machine agree");
     }
 

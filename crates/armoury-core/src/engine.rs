@@ -27,11 +27,11 @@
 //! - The capture of the "previous" state therefore always happens on a settled machine: a fast
 //!   app restart can no longer capture the daemon's own value back (the "stuck on Turbo" bug),
 //!   and the carry no longer has to paper over it.
-//! - Idle mode cancels switching entirely (entering reverts, leaving re-applies immediately).
-//! - Manual actions — removing a tracked app, pausing, entering or leaving idle — bypass the
-//!   lockout: they change the packs at once, drop a running lockout and start none. Unpausing is
-//!   the one exception: with nothing running it schedules the revert, so a lockout is started to
-//!   time that revert.
+//! - Idle mode does not touch the engine at all: it is an overlay and a mute, so packs keep
+//!   switching underneath it (2026-10-29).
+//! - Manual actions — removing a tracked app, pausing — bypass the lockout: they change the
+//!   packs at once, drop a running lockout and start none. Unpausing is the one exception: with
+//!   nothing running it schedules the revert, so a lockout is started to time that revert.
 //! - The engine only believes a change when the daemon really performed it: a transition the
 //!   daemon drops (the packs are paused) is handed back to the engine, which goes back to the
 //!   state the machine is in. The intent is kept, so the change happens later, not never.
@@ -85,7 +85,6 @@ pub struct Engine {
     applied: bool,
     /// Should they be applied? (true = a tracked app is running)
     desired: bool,
-    idle: bool,
     paused: bool,
     /// The settling window. While it is running, no change may touch the packs.
     lock: Option<Window>,
@@ -100,7 +99,6 @@ impl Engine {
             cooldown,
             applied: false,
             desired: false,
-            idle: false,
             paused: false,
             lock: None,
             running: BTreeMap::new(),
@@ -176,7 +174,7 @@ impl Engine {
     /// nothing is waiting — the machine is where the intent says it is. A difference can only
     /// be held by a running window: without one, the next tick lands it.
     pub fn pending_change(&self) -> Option<Transition> {
-        if self.idle || self.paused || self.desired == self.applied {
+        if self.paused || self.desired == self.applied {
             return None;
         }
         Some(if self.desired {
@@ -184,10 +182,6 @@ impl Engine {
         } else {
             Transition::Reverted
         })
-    }
-
-    pub fn is_idle_mode(&self) -> bool {
-        self.idle
     }
 
     /// Freeze/thaw *automatic* switching. Pausing drops the window (no pack change may happen)
@@ -228,34 +222,6 @@ impl Engine {
             return Some(Transition::Reverted);
         }
         None
-    }
-
-    /// Enter or leave idle mode (black screens + muted audio). Entering reverts whatever is
-    /// applied; leaving re-applies when a tracked app is running right now. A mode change is
-    /// deliberate: it drops a running lockout and starts none.
-    pub fn set_idle(&mut self, idle: bool) -> Option<Transition> {
-        if self.idle == idle {
-            return None;
-        }
-        self.idle = idle;
-        self.lock = None;
-        if idle {
-            if self.applied {
-                self.applied = false;
-                self.last_source = None;
-                return Some(Transition::Reverted);
-            }
-            None
-        } else if !self.running.is_empty() && !self.applied {
-            // Back to normal with a tracked app still running: apply again (no lockout: this is
-            // a mode change, not an app start).
-            self.applied = true;
-            self.desired = true;
-            self.last_source = Some(self.source_label());
-            Some(Transition::Applied)
-        } else {
-            None
-        }
     }
 
     /// The daemon could not perform the transition it asked for (the packs are paused and the
@@ -358,10 +324,9 @@ impl Engine {
     /// starts a cooldown of its own (2026-10-27). Waiting for a window first made a close cost
     /// two cooldowns.
     ///
-    /// Idle and pause freeze the switching entirely. A change that does not happen starts no
-    /// window.
+    /// Pause freezes the switching entirely. A change that does not happen starts no window.
     fn try_change(&mut self, now: Instant) -> Option<Transition> {
-        if self.idle || self.paused {
+        if self.paused {
             return None;
         }
         if self.desired == self.applied {
@@ -863,31 +828,6 @@ mod tests {
     }
 
     #[test]
-    fn entering_idle_reverts_the_applied_packs() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-
-        assert_eq!(e.set_idle(true), Some(Transition::Reverted));
-        assert!(!e.is_applied());
-        assert!(e.is_idle_mode());
-        assert_eq!(e.set_idle(true), None); // a second press changes nothing
-        assert_eq!(e.cooldown_remaining(now), None); // the lockout is dropped
-    }
-
-    #[test]
-    fn while_idle_a_tracked_app_does_not_apply() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.set_idle(true);
-        assert_eq!(e.on_started("game.exe", "game.exe", 1, now), None);
-        assert!(!e.is_applied());
-        e.on_stopped("game.exe", 1, now);
-        assert_eq!(e.cooldown_remaining(now), None);
-        assert_eq!(e.state(now), EngineState::Idle);
-    }
-
-    #[test]
     fn removing_the_last_tracked_app_reverts_at_once() {
         // A manual action bypasses the lockout: the packs go back right away and no lockout is
         // left behind.
@@ -931,11 +871,12 @@ mod tests {
         assert!(e.is_applied(), "the packs are still applied");
         assert_eq!(e.cooldown_remaining(now), None, "no change, no lockout");
 
-        // the apply the daemon could not perform
+        // the apply the daemon could not perform: a game starts while paused, the unpause
+        // asks for the apply, and the daemon drops it
         let mut e = Engine::new(Duration::from_secs(C));
+        e.set_paused(true, now);
         e.on_started("game.exe", "game.exe", 1, now);
-        assert_eq!(e.set_idle(true), Some(Transition::Reverted));
-        assert_eq!(e.set_idle(false), Some(Transition::Applied));
+        assert_eq!(e.set_paused(false, now), Some(Transition::Applied));
         assert!(e.is_applied());
         e.transition_not_performed(Transition::Applied);
         assert!(!e.is_applied(), "the packs were never applied");
@@ -1029,40 +970,6 @@ mod tests {
             None,
             "a manual action starts no window"
         );
-    }
-
-    #[test]
-    fn a_mode_change_drops_the_lockout() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        assert_eq!(e.cooldown_remaining(now), Some(Duration::from_secs(C)));
-
-        // idle is deliberate: it drops the lockout and starts none
-        assert_eq!(e.set_idle(true), Some(Transition::Reverted));
-        assert_eq!(e.cooldown_remaining(now), None);
-        assert_eq!(e.set_idle(false), Some(Transition::Applied));
-        assert_eq!(e.cooldown_remaining(now), None);
-        assert_eq!(e.state(now), EngineState::Triggered);
-    }
-
-    #[test]
-    fn leaving_idle_reapplies_when_a_tracked_app_is_running() {
-        let now = t0();
-        let mut e = Engine::new(Duration::from_secs(C));
-        e.on_started("game.exe", "game.exe", 1, now);
-        e.set_idle(true);
-        assert!(!e.is_applied());
-
-        assert_eq!(e.set_idle(false), Some(Transition::Applied));
-        assert!(e.is_applied());
-        assert_eq!(e.state(now), EngineState::Triggered);
-
-        e.set_idle(true);
-        e.on_stopped("game.exe", 1, now);
-        assert_eq!(e.set_idle(false), None);
-        assert!(!e.is_applied());
-        assert_eq!(e.state(now), EngineState::Idle);
     }
 
     #[test]

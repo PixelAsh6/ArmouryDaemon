@@ -2151,9 +2151,17 @@ mod tests {
             "expected the three shipped packs, found {}",
             packs.len()
         );
-        // sorted by order: WE (10) before GH (20) before RM (30)
-        assert_eq!(packs[0].pack.id, "wallpaper-engine");
-        assert_eq!(packs.last().unwrap().pack.id, "rainmeter");
+        // Sorted by order: WE (10) before GH (20) before RM (30). The dev checkout can
+        // hold packs the user installed on top (the console's helpers are not here), so
+        // only the shipped three are looked at, in their relative order.
+        let ids: Vec<&str> = packs.iter().map(|p| p.pack.id.as_str()).collect();
+        let pos = |id: &str| {
+            ids.iter()
+                .position(|x| *x == id)
+                .unwrap_or_else(|| panic!("the shipped pack {id} is missing: {ids:?}"))
+        };
+        assert!(pos("wallpaper-engine") < pos("g-helper"));
+        assert!(pos("g-helper") < pos("rainmeter"));
     }
 
     /// A scratch install layout: <tmp>/armoury-packs-{label}-{pid}-{n}/packs

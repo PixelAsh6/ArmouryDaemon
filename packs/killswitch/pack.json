@@ -1,0 +1,41 @@
+{
+  "spec": 1,
+  "id": "killswitch",
+  "name": "Killswitch",
+  "version": "1.0.0",
+  "kind": "mode",
+  "order": 11,
+  "targets": {
+    "process": []
+  },
+  "triggers": [
+    {
+      "kind": "hotkey",
+      "key": "end"
+    }
+  ],
+  "settings": [
+    {
+      "key": "hotkey",
+      "label": "Hotkey",
+      "type": "hotkey",
+      "default": "end"
+    }
+  ],
+  "apply": {
+    "steps": [
+      {
+        "mechanism": "daemon",
+        "action": "killswitch_on"
+      }
+    ]
+  },
+  "revert": {
+    "steps": [
+      {
+        "mechanism": "daemon",
+        "action": "killswitch_off"
+      }
+    ]
+  }
+}

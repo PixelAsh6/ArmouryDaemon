@@ -62,7 +62,8 @@ pub struct Binding {
 
 impl Binding {
     /// Parse the text form: `ctrl+alt+k`, `shift+f9`, `home`. Case and spaces are forgiven,
-    /// and `control`/`meta`/`windows` are accepted for the four modifiers.
+    /// and `control`/`meta`/`windows` are accepted for the four modifiers. A combination is
+    /// one to four keys: four modifiers and a key would be five, and is refused.
     pub fn parse(text: &str) -> Option<Binding> {
         let mut binding = Binding {
             ctrl: false,
@@ -71,22 +72,26 @@ impl Binding {
             win: false,
             vk: 0,
         };
-        let mut parts = text
+        let parts: Vec<String> = text
             .split('+')
             .map(|part| part.trim().to_ascii_lowercase())
             .filter(|part| !part.is_empty())
-            .peekable();
+            .collect();
+        if parts.is_empty() || parts.len() > 4 {
+            return None;
+        }
+        let mut parts = parts.iter().map(String::as_str).peekable();
         let mut key: Option<u32> = None;
         while let Some(part) = parts.next() {
             let is_last = parts.peek().is_none();
             if is_last {
-                key = vk_of(&part);
+                key = vk_of(part);
                 if key.is_none() {
                     return None;
                 }
                 break;
             }
-            match part.as_str() {
+            match part {
                 "ctrl" | "control" => binding.ctrl = true,
                 "alt" => binding.alt = true,
                 "shift" => binding.shift = true,
@@ -292,6 +297,15 @@ static DOWN: [AtomicU32; 8] = [
     AtomicU32::new(0),
 ];
 
+/// Did a **real** key go down since the last call? `GetAsyncKeyState` cannot tell a
+/// keystroke from a `SendInput` one, and the daemon injects keys itself (the G-Helper pack),
+/// so an apply used to dismiss idle mode the moment a tracked app started.
+static REAL_KEY: AtomicBool = AtomicBool::new(false);
+
+pub fn take_real_key() -> bool {
+    REAL_KEY.swap(false, Ordering::Relaxed)
+}
+
 fn down_word(vk: u32) -> usize {
     ((vk >> 5) & 7) as usize
 }
@@ -347,6 +361,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if kbd.flags & LLKHF_UP != 0 {
                 DOWN[word].fetch_and(!bit, Ordering::Relaxed);
             } else if DOWN[word].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                // A real key, not one of ours: this is what may wake an idle session. The
+                // pack hotkeys are injected, so they must never count as the user arriving.
+                REAL_KEY.store(true, Ordering::Relaxed);
                 // the first press of this key: the auto-repeat must not toggle twice
                 if !SUSPENDED.load(Ordering::Relaxed)
                     && let Some(action) = action_for_press(kbd.vkCode, modifiers_now())
@@ -522,6 +539,17 @@ mod tests {
         assert!(Binding::parse("banana").is_none());
         assert!(Binding::parse("ctrl+banana").is_none());
         assert!(Binding::parse("f25").is_none());
+    }
+
+    #[test]
+    fn a_combination_is_one_to_four_keys() {
+        // up to four keys: three modifiers and a key is the longest chord
+        assert!(Binding::parse("ctrl+alt+shift+k").is_some());
+        assert!(
+            Binding::parse("ctrl+alt+shift+win+k").is_none(),
+            "five keys is one too many"
+        );
+        assert!(Binding::parse("home").is_some(), "one key is a combination too");
     }
 
     #[test]
