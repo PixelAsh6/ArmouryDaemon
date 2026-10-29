@@ -19,7 +19,7 @@ use armoury_core::config::{
     normalize_console_open,
 };
 use armoury_core::engine::{Engine, EngineState, Transition};
-use armoury_core::pack::PackKind;
+use armoury_core::pack::{PackKind, TriggerKind};
 use armoury_core::protocol::{ArtListing, ArtSlot, Request, Response};
 use armoury_core::status::{LastError, PackSettingStatus, PackStatus, RunState, StatusSnapshot};
 use interprocess::local_socket::{prelude::*, ConnectOptions, GenericNamespaced, ListenerOptions};
@@ -267,6 +267,7 @@ pub fn run(start: Start) {
     // The modes' hotkeys are their manifests' to declare: nothing is bound unless an
     // installed, enabled mode pack asks for it (idle and killswitch are packs now).
     let installed_mode_packs = installed_modes(&installed);
+    let tracked_modes = tracked_app_modes(&installed);
     let mode_hotkeys = mode_bindings(&installed, &cfg);
 
     let pack_catalog: Vec<PackMeta> = build_catalog(&installed);
@@ -380,6 +381,7 @@ pub fn run(start: Start) {
         pack_out_rx,
         pack_catalog,
         mode_packs: installed_mode_packs,
+        tracked_modes,
         mode_applied: std::collections::HashSet::new(),
         applied_packs: Vec::new(),
         pack_notes: HashMap::new(),
@@ -944,6 +946,24 @@ fn daemon_actions(steps: &[armoury_core::pack::Step]) -> Vec<String> {
         .collect()
 }
 
+/// The installed modes a tracked-app transition may drive: the ones whose manifest declares a
+/// tracked-app trigger. A mode with no trigger follows the pack default (a tracked app); a
+/// hotkey mode answers its key and nothing else.
+fn tracked_app_modes(installed: &[packs::Installed]) -> std::collections::HashSet<String> {
+    installed
+        .iter()
+        .filter(|p| p.pack.kind == PackKind::Mode)
+        .filter(|p| {
+            p.pack.triggers.is_empty()
+                || p.pack
+                    .triggers
+                    .iter()
+                    .any(|t| t.kind == TriggerKind::TrackedApp)
+        })
+        .map(|p| p.pack.id.clone())
+        .collect()
+}
+
 /// The modes among the installed packs, keyed by id.
 fn installed_modes(installed: &[packs::Installed]) -> HashMap<String, ModePack> {
     installed
@@ -1085,6 +1105,9 @@ struct App {
     /// The installed mode packs and the daemon actions their blocks ask for. A mode has no
     /// worker: its key press runs these actions here, on the event loop.
     mode_packs: HashMap<String, ModePack>,
+    /// The modes a tracked-app transition may drive: only those whose own trigger says
+    /// `tracked_app`. Idle and killswitch declare a hotkey, so a transition leaves them be.
+    tracked_modes: std::collections::HashSet<String>,
     /// Mode packs engaged right now (toggled on), so the next press runs the revert block.
     mode_applied: std::collections::HashSet<String>,
     /// Packs currently in the applied (game-mode) state.
@@ -1684,8 +1707,9 @@ impl App {
             self.broadcast_status();
             return;
         }
-        // Hand the transition to the pack worker. The modes stay out of it: they are the
-        // user's own switches, and a transition must not run their blocks (see below).
+        // Hand the transition to both workers, each its own half. A mode is only in the mode
+        // half when its manifest declares a tracked-app trigger; a hotkey mode (idle, the
+        // killswitch) answers its key and nothing else (see `send_by_kind`).
         let job = packs::PackJob {
             apply: t == Transition::Applied,
             tag: None,
@@ -1703,7 +1727,7 @@ impl App {
                 .collect(),
             captured: self.captured_by_pack.clone(),
         };
-        self.send_pack_jobs(job);
+        self.send_by_kind(job);
         match t {
             Transition::Applied => info!(
                 "packs applied (triggered by {})",
@@ -1714,22 +1738,35 @@ impl App {
         self.broadcast_status();
     }
 
-    /// A tracked-app transition drives the packs, never the modes. A mode answers to its own
-    /// trigger; running its block here undid the user's own action, because entering idle
-    /// reverts the applied packs — and the idle pack's revert step then hid the overlay the
-    /// daemon had just shown (2026-10-28: idle only died while a tracked app was running, the
-    /// one case where there was something to revert). The same path engaged the killswitch on
-    /// every tracked-app start. A mode that has to be undone at startup is handled by the
-    /// journal revert, which is the one job that still goes to the mode worker.
-    fn send_pack_jobs(&self, job: packs::PackJob) {
+    /// A4: a whole-state job goes out as two halves, one per worker (`values` and `captured`
+    /// stay whole; `run_job` looks them up per pack id).
+    ///
+    /// A mode only takes part when its manifest declares a tracked-app trigger. Idle and the
+    /// killswitch declare a hotkey, so a tracked-app start or close must not run their blocks:
+    /// doing so hid the idle overlay the user had just asked for and engaged the killswitch
+    /// on every game start (2026-10-28). A mode that has to be undone at startup is handled
+    /// by the journal revert, which is the one job that still goes to the mode worker.
+    fn send_by_kind(&self, job: packs::PackJob) {
         let packs::PackJob { apply, tag, enabled, values, captured } = job;
+        let (pack_enabled, mut mode_enabled) = split_enabled(enabled, &self.pack_catalog);
+        mode_enabled.retain(|id, _| self.tracked_modes.contains(id));
         let _ = self.pack_tx.send(packs::PackJob {
             apply,
-            tag,
-            enabled: split_enabled(enabled, &self.pack_catalog).0,
-            values,
-            captured,
+            tag: tag.clone(),
+            enabled: pack_enabled,
+            values: values.clone(),
+            captured: captured.clone(),
         });
+        // A worker with nothing enabled would only add an empty outcome to merge.
+        if mode_enabled.values().any(|v| *v) {
+            let _ = self.mode_tx.send(packs::PackJob {
+                apply,
+                tag,
+                enabled: mode_enabled,
+                values,
+                captured,
+            });
+        }
     }
 
     /// The worker that owns this pack's jobs (A4): a tagged, single-pack operation (a
@@ -1881,6 +1918,7 @@ impl App {
         packs::apply_denials(&mut installed, &self.cfg.capability_denials);
         self.pack_catalog = build_catalog(&installed);
         self.mode_packs = installed_modes(&installed);
+        self.tracked_modes = tracked_app_modes(&installed);
         hotkey::set_bindings(mode_bindings(&installed, &self.cfg));
         let (tx, rx) = crossbeam_channel::unbounded::<packs::PackJob>();
         let (modex, modex_rx) = crossbeam_channel::unbounded::<packs::PackJob>();
@@ -2092,7 +2130,7 @@ impl App {
                 .collect(),
             captured: self.captured_by_pack.clone(),
         };
-        self.send_pack_jobs(job);
+        self.send_by_kind(job);
         info!("packs applied now ({why}, a tracked app is already running)");
     }
 
@@ -2402,7 +2440,7 @@ impl App {
             captured: self.captured_by_pack.clone(),
         };
         info!("quit: reverting the packs before exiting");
-        self.send_pack_jobs(job);
+        self.send_by_kind(job);
 
         // Shutdown is not time-critical; the kill/relaunch paths can take a few seconds.
         // A4: the two halves of the revert report separately (a slow mode may take seconds

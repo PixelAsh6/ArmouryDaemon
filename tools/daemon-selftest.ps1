@@ -39,6 +39,13 @@ $up2 = Split-Path (Split-Path $exeDir -Parent) -Parent
 if ($up2) { $searchDirs += $up2 }
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 
+# The version the binary must print, read from the workspace and never typed here: the
+# release workflow refuses a tag that disagrees with Cargo.toml, and so does this check.
+$workspaceToml = Get-Content -LiteralPath (Join-Path $repoRoot 'Cargo.toml') -Raw
+$versionMatch = [regex]::Match($workspaceToml, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"')
+if (-not $versionMatch.Success) { throw 'the workspace version could not be read from Cargo.toml' }
+$expectedVersion = $versionMatch.Groups[1].Value
+
 function Get-PacksRoot([string[]]$dirs) {
     foreach ($d in $dirs) {
         $candidate = [IO.Path]::GetFullPath((Join-Path $d 'packs'))
@@ -1033,10 +1040,9 @@ try {
     $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($fastDir.Replace('\','\\'))`"}" 'pack_op'
     Check 'the plain pack installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Start-Sleep -Milliseconds 500
-    $logText = Get-Content $logPath -Raw
-    Check 'the mode worker took the mode' ($logText -match 'mode worker started with 1 pack\(s\)') "no mode worker line in the log"
-    # the second mode goes in after that check, so the "1 pack(s)" line above stays the mark
-    # of a reload that saw one mode; this one turns it into two
+    # The mode worker's presence is not asserted by a pack count here: the repository's own
+    # packs include the two shipped modes, so the number depends on the checkout. The timing
+    # checks below are the real proof — a slow mode's block only lands on the mode worker.
     $op = Send-And-Wait "{`"type`":`"install_pack`",`"source`":`"$($slowRvDir.Replace('\','\\'))`"}" 'pack_op'
     Check 'the slow revert mode installs' ($op -and $op.ok) "reply=$($op | ConvertTo-Json -Compress)"
     Send-Pipe '{"type":"set_pack_enabled","id":"slowmode","enabled":true}' | Out-Null
@@ -1125,7 +1131,7 @@ try {
         $probe = Invoke-CliProbe @('--version')
         $r = $probe.Run
         Check 'version exits 0' ($r.Exit -eq 0) $probe.Detail
-        Check 'version prints the version' ($r.Text.Contains('ArmouryDaemon 1.3.0')) "output=$(Get-FirstLine $r.Text)"
+        Check 'version prints the version' ($r.Text.Contains("ArmouryDaemon $expectedVersion")) "expected '$expectedVersion', output=$(Get-FirstLine $r.Text)"
 
         # --help: the usage, exit 0, with every flag the parser accepts
         $probe = Invoke-CliProbe @('--help')
