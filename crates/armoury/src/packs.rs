@@ -289,7 +289,31 @@ fn spawn_worker(
         // The previous successful revert's captured values, kept for a short window: an apply that
         // follows it must restore *those*, not re-read a file the app has not rewritten yet.
         let mut carry: Option<(Instant, CaptureMap)> = None;
-        while let Ok(job) = jobs.recv() {
+        // A tagged job is a single-pack operation (a disable or a removal) and keeps its
+        // turn. A full-state job carries the whole desired state, so a newer one makes a
+        // queued one obsolete: a tracked app removed and added again while a slow step ran
+        // used to run the stale revert and then the apply, applying everything twice
+        // (2026-10-30, Wallpaper Engine's 10 s timeout).
+        let mut waiting: std::collections::VecDeque<PackJob> = std::collections::VecDeque::new();
+        loop {
+            let mut job = match waiting.pop_front() {
+                Some(job) => job,
+                None => match jobs.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                },
+            };
+            if job.tag.is_none() {
+                while let Ok(next) = jobs.try_recv() {
+                    if next.tag.is_none() {
+                        job = next;
+                    } else {
+                        // Order matters again from here: run this state, then the tagged op.
+                        waiting.push_back(next);
+                        break;
+                    }
+                }
+            }
             let outcome = run_job(&packs, &job, &mut carry);
             let _ = outcomes.send(outcome);
             if wake != 0 {
@@ -456,7 +480,18 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
         }
 
         // Past the guards: this pack's captures (steps and/or script) belong in the journal.
-        if job.apply && result.is_ok() {
+        //
+        // Only a script can write a captured JSON value itself; a hotkey pack (G-Helper)
+        // changes the app's mode and the app writes its config on its own schedule. Reading
+        // it back there measured the app's save delay, not the pack's work, and warned
+        // "/performance_mode not written yet" about a switch that had already happened
+        // (2026-10-30).
+        let script_writes = pack
+            .script
+            .apply
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty());
+        if job.apply && result.is_ok() && script_writes {
             // Feature 2 (2026-10-27): did it stick? Re-read each JSON capture now that the
             // block has run and compare it with the value captured before it. A pack whose write
             // was rejected (the app rewrote its config, the path moved) reads back unchanged —
@@ -483,12 +518,12 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
                 // The app writes its config once it has handled the request - G-Helper takes
                 // a hotkey in its UI thread and saves afterwards - so a read on the same
                 // millisecond as the keystroke is a read of the old value. Poll for the
-                // change for three seconds before calling it unverified.
-                // A second and a half, not three: this blocks the pack worker, and the
-                // worker is the one that would carry the revert when the app closes.
+                // change for three seconds before calling it unverified: G-Helper saves
+                // about 2.5 s after the chord (measured 2026-10-29), which a 1.5 s window
+                // reported as a false warning even though the mode had switched.
                 let mut after = read();
                 let mut waited = 0;
-                while (&after == before || after.is_empty()) && waited < 6 {
+                while (&after == before || after.is_empty()) && waited < 12 {
                     std::thread::sleep(Duration::from_millis(250));
                     waited += 1;
                     after = read();
@@ -503,8 +538,7 @@ fn run_job(packs: &[Installed], job: &PackJob, carry: &mut Option<(Instant, Capt
                     // asked to do. It is the app's config that still shows the old value, and
                     // some apps only write it when they close.
                     unverified.push(format!(
-                        "{pointer} still reads {after} {waited_ms} ms after the apply - the pack \
-                         ran, but the app has not written the change yet"
+                        "{pointer} not written yet after {waited_ms} ms - the app saves it later"
                     ));
                 }
             }
@@ -862,8 +896,12 @@ fn resolve_chord(
 }
 
 /// How long a pack's CLI call may run. The pack worker is serial, so a child that never exits
-/// would block every future apply and revert while the daemon still looks healthy.
-const CLI_TIMEOUT: Duration = Duration::from_secs(10);
+/// would block every future apply and revert while the daemon still looks healthy. Twenty
+/// seconds, not ten: Wallpaper Engine's `-control stop` hung past ten while the app was still
+/// shutting its renderer down, was killed, and the stop only landed on the next pass
+/// (2026-10-30). The worker coalesces queued full-state jobs, so a longer wait cannot build
+/// a backlog of stale applies.
+const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How much of a child's output is kept, per stream.
 const CLI_OUTPUT_CAP: usize = 64 * 1024;

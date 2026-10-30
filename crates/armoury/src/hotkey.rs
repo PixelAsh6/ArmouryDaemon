@@ -441,20 +441,6 @@ pub fn bindings_from(hotkeys: &armoury_core::config::Hotkeys) -> Vec<(Binding, A
     out
 }
 
-/// The settings window changed a combination: store it and use it from the next key press.
-pub fn apply(hotkeys: &armoury_core::config::Hotkeys) {
-    let bindings = bindings_from(hotkeys);
-    info!("hotkeys: {}", {
-        let mut parts: Vec<String> = bindings
-            .iter()
-            .map(|(binding, action)| format!("{} = {}", binding.label(), action.label()))
-            .collect();
-        parts.sort();
-        parts.join(", ")
-    });
-    set_bindings(bindings);
-}
-
 /// A one-line description of what is bound, for the log.
 fn describe() -> String {
     let table = BINDINGS.lock().unwrap_or_else(|e| e.into_inner());

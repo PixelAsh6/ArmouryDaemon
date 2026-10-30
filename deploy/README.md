@@ -2,7 +2,7 @@
 
 A small always-on Windows daemon that reacts to the apps you care about.
 
-This document describes **ArmouryDaemon 1.1.6** and is the reference for the scripted install,
+This document describes **ArmouryDaemon 1.3.2** and is the reference for the scripted install,
 the exact ACL, updating and uninstalling. The overview and the lone-exe install are in the
 [README](../README.md).
 
@@ -12,18 +12,18 @@ the exact ACL, updating and uninstalling. The overview and the lone-exe install 
   (`action` and `binary`). When the app closes, everything reverts to the state it was in before
   (after the `Cooldown` lockout you choose in Settings; a quick reopen keeps the packs
   applied).
-- **Killswitch** - **End** hides + mutes the running tracked apps; press again to restore. The key
-  still reaches the app you are typing in (it is a low-level keyboard hook, not a registered hotkey).
-- **Idle mode** - **Home** blacks out every screen and mutes all audio; a **keypress** brings it
-  back (with an optional 3 h failsafe). The wake is **keyboard-only** by design: the mouse
-  deliberately does not end an idle session, so a nudged mouse cannot do it by accident. While
-  idle is up, pack switching is cancelled: tracked apps are
-  treated as ordinary apps, and the packs are applied again when you wake it with a tracked app
-  still running.
+- **Killswitch** - a module, installed from the catalogue, bound to **End** by default: it hides
+  and mutes the running tracked apps, and pressing it again restores them. The key still reaches
+  the app you are typing in (it is a low-level keyboard hook, not a registered hotkey).
+- **Idle mode** - a module, bound to **Home** by default: it blacks out every screen and mutes
+  all audio, and a **keypress** brings it back (with an optional 3 h failsafe). The wake is
+  **keyboard-only** by design: the mouse deliberately does not end an idle session, so a nudged
+  mouse cannot do it by accident. It leaves the packs alone in both directions.
 - **Pause** - stop all pack switching without uninstalling anything.
-- **Console band** - a launcher strip along the bottom of the screen with the cover art of your
-  tracked and pinned apps. Open it from the tray, let it pop up on a controller connect, or keep
-  it out of the way. A game that does not start keeps the band open and shows you why.
+- **Console launcher** - a module: a launcher strip along the bottom of the screen with the
+  cover art of your tracked and pinned apps. Open it from the tray, let it pop up on a controller
+  connect, or keep it out of the way. A game that does not start keeps the band open and shows
+  you why.
 
 Everything is local. No telemetry. The only network traffic is the optional pack catalog and the
 cover art (Steam, or SteamGridDB when you set a key).
