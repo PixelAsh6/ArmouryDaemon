@@ -91,11 +91,6 @@ impl TrustKeyring {
         Ok(TrustKeyring { entries, source: source.to_string() })
     }
 
-    /// How many keys this ring trusts.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
     /// Verify a signature file's text over payload bytes against every key of the ring.
     /// The signature text is a minisign file's whole content: untrusted comment, base64
     /// signature, trusted comment, trusted-comment signature — `Signature::decode` takes
@@ -118,11 +113,6 @@ impl TrustKeyring {
             self.source,
             reasons.join("; ")
         ))
-    }
-
-    /// The source of the ring, for the messages that name what was checked.
-    pub fn source(&self) -> &str {
-        &self.source
     }
 }
 
@@ -156,7 +146,7 @@ mod tests {
     #[test]
     fn the_baked_keyring_parses_and_names_its_keys() {
         let ring = TrustKeyring::from_text(KEYS_JSON, "test").expect("the baked keyring must parse");
-        assert!(ring.len() >= 1, "a ring with no key trusts nothing");
+        assert!(!ring.entries.is_empty(), "a ring with no key trusts nothing");
     }
 
     #[test]
