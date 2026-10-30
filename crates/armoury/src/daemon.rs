@@ -38,7 +38,9 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
-use windows_sys::Win32::UI::WindowsAndMessaging::{MsgWaitForMultipleObjectsEx, QS_ALLINPUT};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AllowSetForegroundWindow, MsgWaitForMultipleObjectsEx, QS_ALLINPUT,
+};
 
 /// CREATE_NO_WINDOW: the child gets no console window, so nothing flashes on the desktop.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -394,6 +396,7 @@ pub fn run(start: Start) {
         started: Instant::now(),
         clients: HashMap::new(),
         ui_conn: None,
+        ui_pid: None,
         ui_child: None,
         spawning_ui: false,
         console_child: None,
@@ -1135,6 +1138,9 @@ struct App {
     started: Instant,
     clients: HashMap<u64, crossbeam_channel::Sender<Response>>,
     ui_conn: Option<u64>,
+    /// The UI's process, from its hello: Windows only lets the process that owns the
+    /// foreground grant it, and the tray click belongs to the daemon.
+    ui_pid: Option<u32>,
     ui_child: Option<Child>,
     spawning_ui: bool,
     /// The console-launcher process (spawned by a fresh pad connect or from the tray).
@@ -2872,12 +2878,20 @@ impl App {
     fn on_open(&mut self) {
         if let Some(ui_id) = self.ui_conn {
             if let Some(push) = self.clients.get(&ui_id) {
+                // Hand the UI the right to come to the front first: a SetForegroundWindow
+                // from a process that was not the last to receive input is refused, which
+                // is why a tray click only "requested focus" and the dashboard stayed
+                // behind the active window (2026-10-30).
+                if let Some(pid) = self.ui_pid {
+                    unsafe { AllowSetForegroundWindow(pid) };
+                }
                 if push.send(Response::Focus).is_ok() {
                     info!("UI already running — focus requested");
                     return;
                 }
             }
             self.ui_conn = None;
+            self.ui_pid = None;
         }
         if self.spawning_ui {
             info!("UI is already starting");
@@ -2914,6 +2928,7 @@ impl App {
                 self.clients.remove(&id);
                 if self.ui_conn == Some(id) {
                     self.ui_conn = None;
+                    self.ui_pid = None;
                     info!("UI disconnected");
                 }
             }
@@ -2921,6 +2936,7 @@ impl App {
                 Request::UiHello { pid } => {
                     info!("UI hello (ui pid {pid}) on connection {id}");
                     self.ui_conn = Some(id);
+                    self.ui_pid = Some(pid);
                     self.spawning_ui = false;
                     let status = self.status();
                     if let Some(push) = self.clients.get(&id) {

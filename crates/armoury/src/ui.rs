@@ -23,7 +23,14 @@ use std::time::{Duration, Instant};
 const SETTINGS_VIEWPORT: &str = "armoury-settings";
 const INSTALL_PACKS_VIEWPORT: &str = "armoury-install-packs";
 const MIN_WINDOW_WIDTH: f32 = 380.0;
-const MIN_SETTINGS_WIDTH: f32 = 330.0;
+/// The narrowest a pack, the settings or a panel window may be. It is a floor, not a target:
+/// a window grows to fit its content (2026-10-29: the pack windows all sat at the old
+/// 330 floor, so every one of them was wider than its content).
+const MIN_SETTINGS_WIDTH: f32 = 200.0;
+/// The width a module's footer is measured at. The footer wraps to the window, so a long
+/// description costs lines instead of making the window wide: the console's cover-art line
+/// alone used to stretch its window to 679 pt.
+const PACK_FOOTER_WIDTH: f32 = 200.0;
 /// The install-packs window: wide enough for a wrapped description, tall enough for a
 /// handful of packs. The list scrolls when the catalog is longer.
 const INSTALL_PACKS_WIDTH: f32 = 430.0;
@@ -35,8 +42,10 @@ const INSTALL_PACKS_MIN_HEIGHT: f32 = 260.0;
 /// button. The list above it leaves this much room, so the button is inside the
 /// window whatever the catalog holds.
 const INSTALL_PACKS_FOOTER_HEIGHT: f32 = 62.0;
-/// Inner padding of every window (text must never hug the border).
-const PAD: i8 = 10;
+/// Inner padding of every window (text must never hug the border). Five, so a control sits
+/// 5 pt from the edge on every side (2026-10-29: 10 left too much empty frame in the
+/// narrow pack windows).
+const PAD: i8 = 5;
 const PAD_F: f32 = PAD as f32;
 /// Distance from the work area's right and bottom edges when a window opens above the tray.
 /// Zero: the window sits flush in the corner, right on top of the system tray. The chain's
@@ -62,10 +71,7 @@ const NO_PACKS_HINT: &str = "No packs installed yet.\nFind them in Settings → 
 
 /// The console launcher arrives as a helper pack (C2), so this row is its policy, not a
 /// daemon feature: one dropdown saying when the pack opens itself, in both packs lists.
-const CONSOLE_FEATURE: &str = "Console launcher";
-/// What the row says about where the launcher comes from. It used to say "built-in", back
-/// when the daemon carried the console; the daemon does not carry one any more.
-const CONSOLE_ORIGIN: &str = "(pack)";
+const CONSOLE_FEATURE: &str = "Console bar";
 /// What the SteamGridDB field shows instead of the key: a row of dots.
 const SGDB_MASK: &str = "••••••••••••";
 /// Auto-open modes in dropdown order: (value stored in config.json, label).
@@ -384,6 +390,10 @@ pub fn run() {
         outbox: Some(req_tx),
         pick_tx: Some(pick_tx.clone()),
         settings_viewport: Some(settings_viewport_id()),
+        // The helper versions live on disk, not in the daemon's status. Scan the modules
+        // folders on the first frame: without this a fresh UI showed the console as "not
+        // installed" until the Packs window happened to trigger a rescan (2026-10-29).
+        module_versions_requested: true,
         ..Default::default()
     }));
 
@@ -436,6 +446,51 @@ pub fn run() {
     );
 }
 
+/// Bring the dashboard to the front even when another app owns the foreground.
+///
+/// Windows refuses `SetForegroundWindow` from a process that was not the last to receive
+/// input - which is exactly the UI's situation after a tray click, because the click went to
+/// the shell and the daemon. Attaching to the foreground thread first makes the call legal;
+/// the always-on-top pulse in the caller covers the case where the attach is refused across
+/// integrity levels (2026-10-30).
+fn raise_dashboard() {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, FindWindowW, GetForegroundWindow, GetWindowThreadProcessId,
+        SW_SHOW, SetForegroundWindow, ShowWindow,
+    };
+    let title: Vec<u16> = "ArmouryDaemon\0".encode_utf16().collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        // The daemon's message window has no title, but check rather than trust: a
+        // same-titled window of another process must never be raised.
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != std::process::id() {
+            return;
+        }
+        let foreground = GetForegroundWindow();
+        let foreground_thread = if foreground.is_null() {
+            0
+        } else {
+            GetWindowThreadProcessId(foreground, std::ptr::null_mut())
+        };
+        let this_thread = GetCurrentThreadId();
+        if foreground_thread != 0 && foreground_thread != this_thread {
+            AttachThreadInput(this_thread, foreground_thread, 1);
+        }
+        ShowWindow(hwnd, SW_SHOW);
+        BringWindowToTop(hwnd);
+        SetForegroundWindow(hwnd);
+        if foreground_thread != 0 && foreground_thread != this_thread {
+            AttachThreadInput(this_thread, foreground_thread, 0);
+        }
+    }
+}
+
 /// The status line: the state the daemon reports, in the user's words.
 ///
 /// The cooldown names the app the window belongs to, so the user can see which app is
@@ -454,16 +509,13 @@ fn status_line(st: Option<&StatusSnapshot>) -> (String, Color32) {
             RunState::Cooldown => (
                 {
                     // The cooldown is the settling window after a change, not a pending
-                    // revert: the number is what is left to settle.
-                    let mut text = match st.cooldown_remaining_ms {
+                    // revert: the number is what is left to settle. The app's name used to
+                    // trail it; the tracked list already shows which app is running (green
+                    // dot), and naming it here made the line (and the window) wider.
+                    match st.cooldown_remaining_ms {
                         Some(ms) => format!("Cooling down — {}s", ms / 1000),
                         None => "Cooling down".to_string(),
-                    };
-                    if let Some(src) = &st.trigger_source {
-                        text.push_str(" · ");
-                        text.push_str(src);
                     }
-                    text
                 },
                 Color32::from_rgb(96, 165, 250),
             ),
@@ -514,6 +566,11 @@ struct App {
     pick_tx: crossbeam_channel::Sender<Picked>,
     styled: bool,
     last_desired: Option<egui::Vec2>,
+    /// Until when the dashboard stays always-on-top to be raised by a focus request. A
+    /// background process cannot steal the foreground, but SetWindowPos(TOPMOST) needs no
+    /// such right, so the window is lifted for a moment and then put back on the normal
+    /// level (2026-10-30).
+    raise_until: Option<Instant>,
     /// Where the dashboard's top-left is anchored. `None` = the automatic bottom corner; `Some`
     /// once the user dragged it away, so it grows downwards from there for the rest of the run.
     anchor: Option<egui::Pos2>,
@@ -547,6 +604,7 @@ impl App {
             pick_query: String::new(),
             styled: false,
             last_desired: None,
+            raise_until: None,
             // `None` = the automatic bottom corner; `Some` once the user dragged it away.
             anchor,
             placement: Placement::default(),
@@ -575,6 +633,15 @@ impl eframe::App for App {
         if !self.styled {
             self.styled = true;
             fonts::install_fonts(ctx);
+            // The window is created hidden and eframe reveals it after this frame. A UI
+            // spawned while another app owns the foreground would open behind it; the
+            // short topmost pulse makes the freshly opened dashboard visible (2026-10-30).
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                egui::WindowLevel::AlwaysOnTop,
+            ));
+            self.raise_until = Some(Instant::now() + Duration::from_millis(400));
+            ctx.request_repaint_after(Duration::from_millis(450));
+            raise_dashboard();
             ctx.all_styles_mut(|style| {
                 style
                     .text_styles
@@ -590,6 +657,12 @@ impl eframe::App for App {
                     .insert(TextStyle::Small, FontId::new(13.0, FontFamily::Proportional));
                 style.spacing.item_spacing = egui::vec2(10.0, 7.0);
             });
+        }
+
+        // The raise pulse ends on its own: the window must not stay above every other app.
+        if self.raise_until.is_some_and(|at| Instant::now() >= at) {
+            self.raise_until = None;
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::Normal));
         }
 
         while let Ok(ev) = self.rx.try_recv() {
@@ -611,7 +684,20 @@ impl eframe::App for App {
                     }
                     Response::Focus => {
                         log::info!("focus requested by daemon");
+                        // The daemon received the tray click, so it is the process Windows
+                        // lets grant the foreground; a bare Focus is refused when the UI is
+                        // not the active app, which left the dashboard behind another
+                        // window (2026-10-30). The daemon calls AllowSetForegroundWindow
+                        // for this process before sending the request.
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            egui::WindowLevel::AlwaysOnTop,
+                        ));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                        self.raise_until = Some(Instant::now() + Duration::from_millis(400));
+                        ctx.request_repaint_after(Duration::from_millis(450));
+                        raise_dashboard();
                     }
                     Response::PackOp { ok, message } => {
                         log::info!("pack op result: {message}");
@@ -949,7 +1035,11 @@ impl eframe::App for App {
 
         // ---- window body (padded so text never hugs the border) ----
         let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
-        frame.show(ui, |ui| {
+        // The width this frame had before anything was laid out. A row that comes out
+        // wider than this is measured below and the window grows past the estimate
+        // (2026-10-30: a right-aligned dropdown was clipped at the frame's edge).
+        let avail = ui.available_width();
+        let body = frame.show(ui, |ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
 
             // custom title bar
@@ -1196,7 +1286,6 @@ impl eframe::App for App {
                 if name.double_clicked() {
                     open_console_window = true;
                 }
-                ui.small(RichText::new(CONSOLE_ORIGIN).weak());
             });
             if let Some(mode) = set_console_open {
                 self.request(&Request::SetConsoleOpen { mode });
@@ -1272,11 +1361,6 @@ impl eframe::App for App {
                         )
                         .on_hover_text(note);
                     }
-                    // The row shows one setting; the pack window has them all.
-                    if let Some(extra) = extra_settings(pack.settings.len()) {
-                        ui.small(RichText::new(extra).weak())
-                            .on_hover_text("More settings - open the pack's own window");
-                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Only a dropdown setting has a column here: a hotkey is edited in
                         // the pack's own window, and an empty one would be a dead control.
@@ -1320,6 +1404,16 @@ impl eframe::App for App {
         let body_font = TextStyle::Body.resolve(ui.style());
         let small_font = TextStyle::Small.resolve(ui.style());
         let probe = width_probe(&status_text, &rows, &packs);
+        // By how much the laid-out body outgrew the window it was drawn in. The estimate
+        // above is a font measurement per row: it misses the widget padding egui adds
+        // (a combo box, a checkbox) and a right-aligned column that does not fit. This
+        // term is measured, not estimated, so a row can no longer end at the frame
+        // (2026-10-30: the right dropdown of a pack row was drawn past the right edge).
+        //
+        // The frame's rect is the outer one, so its two margins are part of it: they are
+        // subtracted here. Counting them as overflow made the window grow by 10 pt every
+        // frame until it covered the screen (2026-10-30).
+        let overflow = (body.response.rect.width() - 2.0 * PAD_F - avail).max(0.0);
         let desired = {
             let p = ui.painter();
             let measure = |kind: FontKind, text: &str| {
@@ -1331,10 +1425,25 @@ impl eframe::App for App {
                 };
                 p.layout_no_wrap(text.to_owned(), font, Color32::WHITE).rect.width()
             };
-            let w = probe_width(&measure, &probe);
+            // `avail` is the window's width and the frame adds PAD on each side, so the
+            // content width that fits is `avail - 2 * PAD` before the overflow is added.
+            // It is held inside the work area: a width that runs past the screen is not a
+            // fix for a clipped row (2026-10-30).
+            let cap = work_width_pts(ui.ctx()).unwrap_or(f32::INFINITY);
+            // The estimate is a content width, so it carries the frame's margins; the
+            // measured side is already a window width. With no overflow the window keeps
+            // the width it has - no slack is added here, or every frame would add more
+            // (2026-10-30: the +1 made the dashboard crawl open by a point a frame).
+            let w = (probe_width(&measure, &probe) + 2.0 * PAD_F + 1.0)
+                .max(avail + overflow)
+                .min(cap);
+            // The body's own height, margins included, and no slack: a `+1` here is a
+            // window that grows a point taller every frame (2026-10-30).
             egui::vec2(
-                (w + 2.0 * PAD_F + 8.0).max(MIN_WINDOW_WIDTH),
-                (ui.min_rect().height() + 4.0)
+                w.max(MIN_WINDOW_WIDTH),
+                body.response
+                    .rect
+                    .height()
                     .max(150.0)
                     .min(max_window_height(ui.ctx())),
             )
@@ -1934,13 +2043,22 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
 
     let frame = egui::Frame::NONE.inner_margin(egui::Margin::same(PAD));
     let mut close = false;
-    frame.show(ui, |ui| {
+    // The width before layout: whatever the body overflows it by is added to the window
+    // below, so a measured row can never end at the frame (2026-10-30).
+    let avail = ui.available_width();
+    let body = frame.show(ui, |ui| {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
         ui.horizontal(|ui| {
             ui.label(RichText::new(&pack.name).strong().size(16.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if icon_button(ui, 20.0, draw_close).clicked() {
                     close = true;
+                }
+                // The version rides in the title bar: on the footer row it shared a
+                // horizontal layout with the description, which made the window as wide as
+                // the description no matter how it wraps.
+                if !pack.version.is_empty() {
+                    ui.small(RichText::new(format!("v{}", pack.version)).weak());
                 }
             });
         });
@@ -2023,11 +2141,13 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
                 }
             } else {
                 if !setting.label.is_empty() {
-                    ui.small(&setting.label);
+                    // Wrapped: a long label (Wallpaper Engine's binary choice) used to set
+                    // the window's width at ~300. It now costs a second line instead.
+                    ui.add(egui::Label::new(RichText::new(&setting.label).small()).wrap());
                 }
                 egui::ComboBox::from_id_salt(format!("pack-win-{}-{}", pack.id, setting.key))
                     .selected_text(current.clone())
-                    .width(190.0)
+                    .width(130.0)
                     .show_ui(ui, |ui| {
                         for value in &setting.values {
                             if ui.selectable_label(value == &current, value).clicked() {
@@ -2060,14 +2180,9 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
             recording = None;
         }
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.small(pack_footer(&pack));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !pack.version.is_empty() {
-                    ui.small(RichText::new(format!("v{}", pack.version)).weak());
-                }
-            });
-        });
+        // Full width and wrapped: the description is 2-3 short lines instead of one long
+        // line, so it never sets the window's width.
+        ui.add(egui::Label::new(RichText::new(pack_footer(&pack)).small()).wrap());
     });
 
     shared.lock().unwrap().pack_recording = recording;
@@ -2086,21 +2201,98 @@ fn pack_window(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>, id: &str, _index:
     // stretches min_rect to the available width, which would grow the window every frame).
     let title_font = FontId::new(16.0, FontFamily::Proportional);
     let body_font = TextStyle::Body.resolve(ui.style());
+    let small_font = TextStyle::Small.resolve(ui.style());
+    let button_font = TextStyle::Button.resolve(ui.style());
+    // The console's body is not a list of settings: it has its own rows (the open mode,
+    // the games, the SteamGridDB key). Measure those rows too, or the window is sized for
+    // the title and the footer alone and cuts the right half of the Open/Clear buttons
+    // (2026-10-29).
+    let (console_apps, sgdb_key_set) = if id == "console" {
+        let s = shared.lock().unwrap();
+        let st = s.status.as_ref();
+        (
+            st.map(|st| st.console_apps.clone()).unwrap_or_default(),
+            st.is_some_and(|st| st.sgdb_api_key_set),
+        )
+    } else {
+        (Vec::new(), false)
+    };
+    // The frame's outer rect carries both margins; they are not overflow (see the
+    // dashboard's copy of this, 2026-10-30).
+    let overflow = (body.response.rect.width() - 2.0 * PAD_F - avail).max(0.0);
     let desired = {
         let p = ui.painter();
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
         let mut w = tw(&title_font, &pack.name) + 60.0; // title + close button
-        w = w.max(tw(&body_font, pack_footer(&pack)) + 24.0);
-        for setting in &pack.settings {
-            w = w.max(tw(&body_font, &setting.label) + 24.0);
-            // the dropdown is 190 wide, plus its current text and the row padding
-            w = w.max(
-                tw(&body_font, setting.value.as_deref().unwrap_or("")) + 190.0 + 60.0,
-            );
+        // The footer wraps, so it is measured at the width it wraps to, never at its
+        // natural length.
+        w = w.max(tw(&small_font, pack_footer(&pack)).min(PACK_FOOTER_WIDTH) + 24.0);
+        if id == "console" {
+            // "Opens [mode] [Open]" and "[key] [Save] [Clear]": the two widest rows.
+            // +16 is the small button's own padding (measured: 37.7 text → 53.7 button).
+            // The combo box grows past its 130 pt floor when the selected label is long
+            // ("On pad connect"); measuring it at 130 pushed the Open button over the
+            // right frame (2026-10-30).
+            let combo = 130.0f32.max(tw(&body_font, "At daemon start") + 34.0);
+            let mut row = tw(&body_font, "Opens") + 8.0 + combo + 8.0
+                + tw(&button_font, "Open") + 16.0;
+            let mut sgdb = 130.0 + 8.0 + tw(&button_font, "Save") + 16.0 + 8.0;
+            if sgdb_key_set {
+                sgdb += tw(&button_font, "Clear") + 16.0;
+            }
+            row = row.max(sgdb);
+            for app in &console_apps {
+                let game = tw(&body_font, &app.name)
+                    + 8.0
+                    + tw(&small_font, &file_name(&app.exe))
+                    + 10.0
+                    + tw(&button_font, "Remove")
+                    + 16.0
+                    + 10.0;
+                row = row.max(game);
+            }
+            w = w.max(row + 4.0);
         }
+        for setting in &pack.settings {
+            // The label is drawn small and may wrap: measure it at that size, capped.
+            w = w.max(
+                tw(&small_font, &setting.label).min(PACK_FOOTER_WIDTH) + 24.0,
+            );
+            if setting.kind == "hotkey" {
+                // label | 110 pt key field | Record. The field is fixed-width.
+                let label = if setting.label.is_empty() {
+                    "Hotkey"
+                } else {
+                    &setting.label
+                };
+                w = w.max(
+                    tw(&body_font, label)
+                        + 8.0
+                        + 110.0
+                        + 8.0
+                        + tw(&button_font, "Record")
+                        + 16.0
+                        + 4.0,
+                );
+            } else {
+                // The dropdown is 130 wide and its selected text is drawn inside it.
+                w = w.max(130.0 + 4.0);
+            }
+        }
+        // The measured overflow wins over the estimate: a row egui laid out wider than
+        // the window (a combo box with its arrow, a button with its padding) has already
+        // said how much room it needs (2026-10-30).
+        let cap = work_width_pts(ui.ctx()).unwrap_or(f32::INFINITY);
+        // Same rule as the dashboard: the estimate carries the margins, the measured
+        // width is the window's own, and nothing is added when it does not overflow.
+        let w = (w + 2.0 * PAD_F + 1.0).max(avail + overflow).min(cap);
+        // The body's own height, margins included, and no slack: a `+1` here is a window
+        // that grows a point taller every frame (2026-10-30).
         egui::vec2(
-            (w + 2.0 * PAD_F + 8.0).max(MIN_SETTINGS_WIDTH),
-            (ui.min_rect().height() + 4.0)
+            w.max(MIN_SETTINGS_WIDTH),
+            body.response
+                .rect
+                .height()
                 .max(160.0)
                 .min(max_window_height(ui.ctx())),
         )
@@ -2223,7 +2415,7 @@ fn console_body(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         let mut chosen: Option<String> = None;
         egui::ComboBox::from_id_salt("console-window-open")
             .selected_text(console_open_label(&open))
-            .width(150.0)
+            .width(130.0)
             .show_ui(ui, |ui| {
                 for (mode, label) in CONSOLE_OPEN_MODES {
                     if ui.selectable_label(mode == open.as_str(), label).clicked() {
@@ -2235,8 +2427,8 @@ fn console_body(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             send_request(shared, &Request::SetConsoleOpen { mode });
         }
         if ui
-            .small_button("Open now")
-            .on_hover_text("Show the launcher")
+            .small_button("Open")
+            .on_hover_text("Show the launcher now")
             .clicked()
         {
             send_request(shared, &Request::ShowConsole);
@@ -2283,7 +2475,7 @@ fn console_body(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             egui::TextEdit::singleline(&mut text)
                 .password(true)
                 .hint_text(hint)
-                .desired_width(170.0),
+                .desired_width(130.0),
         );
         save = ui.small_button("Save").clicked();
         save |= resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -2487,7 +2679,8 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             );
         }
         if !update_message.is_empty() {
-            ui.small(RichText::new(&update_message).weak());
+            // Wrapped: the window is narrow now, and this line is the release feed's text.
+            ui.add(egui::Label::new(RichText::new(&update_message).small().weak()).wrap());
         }
         if ui
             .small_button("Save diagnostics…")
@@ -2509,7 +2702,7 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
             ui.ctx().request_repaint();
         }
         if let Some(line) = &diagnostics {
-            ui.small(RichText::new(line).weak());
+            ui.add(egui::Label::new(RichText::new(line).small().weak()).wrap());
         }
 
 
@@ -2533,25 +2726,29 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         ui.add_space(4.0);
 
         let mut remove_pack: Option<String> = None;
+        // Three columns for every row: name | version | Remove. The version used to sit
+        // inside the name cell and the second cell mixed a Remove button with the console's
+        // "helper module" note, so the rows did not line up (2026-10-29).
         egui::Grid::new("settings-packs")
-            .num_columns(2)
+            .num_columns(3)
             .spacing(egui::vec2(10.0, 4.0))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(CONSOLE_FEATURE);
-                    if let Some(version) = &console_version {
-                        ui.small(RichText::new(format!("v{version}")).weak());
-                    }
-                });
-                ui.small(RichText::new("helper module").weak());
+                ui.label(CONSOLE_FEATURE);
+                match &console_version {
+                    Some(version) => ui.small(RichText::new(format!("v{version}")).weak()),
+                    None => ui.small(RichText::new("not installed").weak()),
+                };
+                // A helper module is not a folder in the packs directory, so there is
+                // nothing here to remove.
+                ui.label(RichText::new("—").weak());
                 ui.end_row();
                 for pack in sorted_packs(&packs) {
-                    ui.horizontal(|ui| {
-                        ui.label(&pack.name);
-                        if !pack.version.is_empty() {
-                            ui.small(RichText::new(format!("v{}", pack.version)).weak());
-                        }
-                    });
+                    ui.label(&pack.name);
+                    if pack.version.is_empty() {
+                        ui.label("");
+                    } else {
+                        ui.small(RichText::new(format!("v{}", pack.version)).weak());
+                    }
                     if ui
                         .small_button("Remove")
                         .on_hover_text("Delete this pack's folder and reload")
@@ -2595,12 +2792,15 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         });
         if let Some((ok, message)) = last_op {
             ui.add_space(2.0);
-            ui.small(
-                RichText::new(message).color(if ok {
-                    Color32::from_rgb(52, 211, 153)
-                } else {
-                    Color32::from_rgb(248, 113, 113)
-                }),
+            ui.add(
+                egui::Label::new(
+                    RichText::new(message).small().color(if ok {
+                        Color32::from_rgb(52, 211, 153)
+                    } else {
+                        Color32::from_rgb(248, 113, 113)
+                    }),
+                )
+                .wrap(),
             );
         }
         // One line: what the last check found in the repo. The check itself is the
@@ -2611,11 +2811,12 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
         } else if let Some(catalog) = &catalog_state {
             let summary = catalog_check_summary(catalog, &packs);
             ui.add_space(2.0);
-            ui.small(
-                RichText::new(summary).color(match catalog {
+            ui.add(
+                egui::Label::new(RichText::new(summary).small().color(match catalog {
                     Ok(_) => Color32::from_gray(150),
                     Err(_) => Color32::from_rgb(248, 113, 113),
-                }),
+                }))
+                .wrap(),
             );
         }
 
@@ -2641,21 +2842,34 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
     // ---- shrink-wrap, position above the core window, then show ----
     let title_font = FontId::new(16.0, FontFamily::Proportional);
     let body_font = TextStyle::Body.resolve(ui.style());
+    let small_font = TextStyle::Small.resolve(ui.style());
     let button_font = TextStyle::Button.resolve(ui.style());
-    // The core (dashboard) window publishes its rect; the settings window takes its width
-    // from it, so the two are exactly as wide as each other.
-    let core_width = shared.lock().unwrap().core_rect.map(|r| r.width());
+    // The settings window is as wide as its own content, not as the dashboard: it is a
+    // column of controls and nothing in it needs the dashboard's width.
     let desired = {
         let p = ui.painter();
         let tw = |f: &FontId, t: &str| p.layout_no_wrap(t.to_owned(), f.clone(), Color32::WHITE).rect.width();
-        // Pack names are dynamic, so read them from the status snapshot for the width probe.
-        let pack_names: Vec<String> = shared
-            .lock()
-            .unwrap()
-            .status
-            .as_ref()
-            .map(|st| st.packs.iter().map(|pack| pack.name.clone()).collect())
-            .unwrap_or_default();
+        // Pack names and versions are dynamic, so read them from the status snapshot for
+        // the width probe. The console row is included too: its "not installed" is the
+        // widest version cell, and leaving it out is what let the three-column grid run
+        // past the right edge and cut the Remove buttons (2026-10-29).
+        let (pack_names, pack_versions, console_installed) = {
+            let s = shared.lock().unwrap();
+            let (names, versions): (Vec<String>, Vec<String>) = s
+                .status
+                .as_ref()
+                .map(|st| {
+                    (
+                        st.packs.iter().map(|pack| pack.name.clone()).collect(),
+                        st.packs
+                            .iter()
+                            .map(|pack| pack.version.clone())
+                            .collect(),
+                    )
+                })
+                .unwrap_or_default();
+            (names, versions, s.helper_versions.contains_key("console"))
+        };
         // The title sits beside its close button.
         let mut w = tw(&title_font, "Settings") + 24.0 + 20.0;
         // Helper lines are drawn with `ui.small(...)`: measuring them at the body font (as this
@@ -2675,17 +2889,29 @@ fn settings_ui(ui: &mut egui::Ui, shared: &Arc<Mutex<Shared>>) {
                 + 24.0
                 + 6.0,
         );
-        // A pack row: name + version bubble + the Remove button.
-        w = w.max(tw(&body_font, "Wallpaper Engine") + 32.0 + tw(&button_font, "Remove") + 24.0);
+        // A pack row in three columns: name | version | Remove.
+        let mut name_w = tw(&body_font, CONSOLE_FEATURE);
         for pack in &pack_names {
-            w = w.max(tw(&body_font, pack) + 32.0 + tw(&button_font, "Remove") + 24.0);
+            name_w = name_w.max(tw(&body_font, pack));
         }
-        // The content width is only a fallback (the first frame, before the core has
-        // published its width): it never makes the window wider than the core.
+        let mut version_w = tw(&small_font, "v10.10.10");
+        if !console_installed {
+            version_w = version_w.max(tw(&small_font, "not installed"));
+        }
+        for version in &pack_versions {
+            version_w = version_w.max(tw(&small_font, &format!("v{version}")));
+        }
+        // 10 pt between the columns and the Remove button's own 16 pt of padding.
+        // +10 more than the columns need: the version label and the Remove button are
+        // separate widgets with their own item spacing, and the Remove button ended flush
+        // against the window's right edge (2026-10-30).
+        w = w.max(
+            name_w + 10.0 + version_w + 10.0 + tw(&button_font, "Remove") + 16.0 + 10.0,
+        );
         let content = snug_width(w, work_area_pts(ui.ctx()).map(|(left, _, right, _)| right - left));
         egui::vec2(
-            core_width.map_or(content, |cw| cw.max(MIN_SETTINGS_WIDTH)),
-            (ui.min_rect().height() + 4.0)
+            content,
+            (ui.min_rect().height() + 1.0)
                 .max(170.0)
                 .min(max_window_height(ui.ctx())),
         )
@@ -3949,11 +4175,6 @@ fn request_catalog_repaint(ctx: &egui::Context, shared: &Arc<Mutex<Shared>>) {
     }
 }
 
-/// The badge on a dashboard pack row that says how many settings the pack has that the row
-/// does not show: one setting → no badge, two settings → "+1".
-fn extra_settings(count: usize) -> Option<String> {
-    (count > 1).then(|| format!("+{}", count - 1))
-}
 
 /// What the SteamGridDB field shows: the key never leaves the daemon, so a key that is set
 /// shows as a row of dots and no key shows a prompt for one. The key in the snapshot is
@@ -4489,8 +4710,17 @@ fn max_window_height(ctx: &egui::Context) -> f32 {
         .unwrap_or(1200.0)
 }
 
+/// The width of the work area, in points: the widest a self-fitting window may be. A
+/// window wider than this is one the user cannot reach the right side of.
+fn work_width_pts(ctx: &egui::Context) -> Option<f32> {
+    work_area_pts(ctx).map(|(left, _, right, _)| (right - left).max(MIN_SETTINGS_WIDTH))
+}
+
 fn snug_width(longest_line: f32, work_width: Option<f32>) -> f32 {
-    let wanted = longest_line + 2.0 * PAD_F + 8.0;
+    // Exactly the frame's own padding plus one point of rounding slack: the +8 that used
+    // to be here sat entirely on the right edge, so every window had 5 pt on the left and
+    // 13 on the right (2026-10-30).
+    let wanted = longest_line + 2.0 * PAD_F + 1.0;
     let cap = work_width
         .map(|w| (w - 2.0 * UI_MARGIN).max(MIN_SETTINGS_WIDTH))
         .unwrap_or(f32::INFINITY);
@@ -4503,12 +4733,12 @@ fn snug_width(longest_line: f32, work_width: Option<f32>) -> f32 {
 const APPLIED_MARKER: &str = "· applied";
 /// The mark on a pack row whose last apply did not verify (feature 2): the pack's own write
 /// read back unchanged. Reserved like the applied marker, for the same reason.
-const NOTE_MARKER: &str = "⚠";
+///
+/// A plain `!`, not `⚠`: the bundled system font (Segoe UI Variable Text) has no U+26A0,
+/// so the dashboard drew a yellow empty box instead of a warning (2026-10-29).
+const NOTE_MARKER: &str = "!";
 /// The badge on a pack row whose repo version is newer than the installed one (feature 5).
 const UPDATE_MARKER: &str = "↑";
-/// The badge on a pack row that says how many settings the row does not show. Reserved
-/// like the applied marker, for the same reason.
-const BADGE_RESERVE: &str = "+9";
 /// The status lines the dashboard can show, with the countdown at its widest and the
 /// numbers at their largest. The window is measured from these, so a ticking countdown, a
 /// pause or a killswitch never resizes it.
@@ -4600,7 +4830,7 @@ fn pad_numbers(text: &str) -> String {
 }
 
 /// The width the dashboard needs, measured from the probe. The "· applied" marker and the
-/// "+N" badge are always measured, even when they are not shown: a pack switching would
+/// update badge are always measured, even when they are not shown: a pack switching would
 /// otherwise change the width, and the width drives the window's size - which moves the
 /// window.
 fn probe_width(measure: &dyn Fn(FontKind, &str) -> f32, probe: &WidthProbe) -> f32 {
@@ -4612,11 +4842,13 @@ fn probe_width(measure: &dyn Fn(FontKind, &str) -> f32, probe: &WidthProbe) -> f
         w = w.max(measure(FontKind::Body, key) + 32.0 + measure(FontKind::Body, value));
     }
     for (name, dropdown) in &probe.packs {
-        let mut row = measure(FontKind::Body, name) + 56.0; // ‹ button + checkbox
+        // 70, not 56: the row's six item gaps (10 pt each) and the two small buttons
+        // together are wider than a bare estimate, which left the right-hand dropdown
+        // clipped by its own window (2026-10-30).
+        let mut row = measure(FontKind::Body, name) + 70.0; // ‹ button + checkbox
         row += measure(FontKind::Small, APPLIED_MARKER) + 10.0; // always reserved
         row += measure(FontKind::Small, NOTE_MARKER) + 6.0; // always reserved
         row += measure(FontKind::Small, UPDATE_MARKER) + 6.0; // always reserved
-        row += measure(FontKind::Small, BADGE_RESERVE) + 10.0; // always reserved
         if *dropdown {
             row += 130.0; // the dropdown
         }
@@ -4779,17 +5011,18 @@ mod tests {
     }
 
     #[test]
-    fn the_cooldown_band_names_the_app_the_window_belongs_to() {
-        // The user reported on 22 Oct that the dashboard said "Cooling down — 2s" and gave
-        // no hint which app was running: the app is named now.
+    fn the_cooldown_band_names_the_window_and_not_the_app() {
+        // The band named the app until 2026-10-29. The tracked list already shows which app
+        // is running (green dot), and the executable's name made the line - and the core
+        // window - as wide as the name.
         let mut st = status_with_key(false, "");
         st.state = RunState::Cooldown;
         st.cooldown_remaining_ms = Some(2_000);
         st.trigger_source = Some("Warframe.x64.exe".to_string());
         let (text, _) = status_line(Some(&st));
-        assert_eq!(text, "Cooling down — 2s · Warframe.x64.exe");
+        assert_eq!(text, "Cooling down — 2s");
 
-        // no app is running: the band names none
+        // no app is running: still just the window
         st.trigger_source = None;
         let (text, _) = status_line(Some(&st));
         assert_eq!(text, "Cooling down — 2s");
@@ -4886,9 +5119,8 @@ mod tests {
 
     #[test]
     fn a_pack_row_keeps_its_width_when_the_applied_marker_comes_and_goes() {
-        // The "· applied" marker and the "+N" badge are always measured, so a pack
-        // switching does not change the width: the width drives the window's size, and the
-        // size moves the window.
+        // The "· applied" marker is always measured, so a pack switching does not change
+        // the width: the width drives the window's size, and the size moves the window.
         let measure = fake_measure();
         let applied = vec![
             pack("Wallpaper Engine", true, 2),
@@ -5038,15 +5270,15 @@ mod tests {
     #[test]
     fn snug_width_follows_the_content_and_the_screen() {
         // A ~382 pt helper line plus the frame padding is the snug width.
-        assert!((snug_width(382.0, Some(1638.4)) - 410.0).abs() < 1e-3);
+        assert!((snug_width(382.0, Some(1638.4)) - 393.0).abs() < 1e-3);
         // Narrow content still gets the shared minimum.
         assert!((snug_width(10.0, Some(1638.4)) - MIN_SETTINGS_WIDTH).abs() < 1e-3);
         // Wide content is capped so the window still fits inside the work area.
         assert!((snug_width(5000.0, Some(1638.4)) - (1638.4 - 2.0 * UI_MARGIN)).abs() < 1e-3);
         // A work area narrower than the minimum cannot push the width below it.
-        assert!((snug_width(5000.0, Some(300.0)) - MIN_SETTINGS_WIDTH).abs() < 1e-3);
+        assert!((snug_width(5000.0, Some(200.0)) - MIN_SETTINGS_WIDTH).abs() < 1e-3);
         // No work area (the query failed) means no cap.
-        assert!((snug_width(5000.0, None) - 5028.0).abs() < 1e-3);
+        assert!((snug_width(5000.0, None) - 5011.0).abs() < 1e-3);
     }
 
     #[test]
@@ -5199,16 +5431,6 @@ mod tests {
         assert!(grown.y >= work_px.top() && grown.y + 700.0 <= work_px.bottom());
         // Still to the left of the dashboard.
         assert!(grown.x + 525.0 <= core_left_px);
-    }
-
-    #[test]
-    fn the_badge_counts_the_settings_the_row_does_not_show() {
-        // A pack with one setting: nothing to point at.
-        assert_eq!(extra_settings(0), None);
-        assert_eq!(extra_settings(1), None);
-        // Wallpaper Engine: the row shows the first setting, the pack window has both.
-        assert_eq!(extra_settings(2), Some("+1".to_string()));
-        assert_eq!(extra_settings(4), Some("+3".to_string()));
     }
 
     #[test]
@@ -5880,9 +6102,9 @@ mod tests {
 
     #[test]
     fn the_two_packs_buttons_fit_on_one_row() {
-        // The settings window is as wide as the dashboard (418 pt) and the frame's padding
-        // takes 20 pt of it: the row has 398 pt.
-        const ROW_WIDTH: f32 = 398.0;
+        // The settings window is now ~287 pt (snug) and the frame's 5 pt padding takes 10
+        // points of it: the row has about 277 pt.
+        const ROW_WIDTH: f32 = 277.0;
         let ctx = egui::Context::default();
         let chosen = app_style(&ctx);
         let input = egui::RawInput {
