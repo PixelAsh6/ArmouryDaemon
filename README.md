@@ -1,7 +1,7 @@
 # ArmouryDaemon
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.1.6-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-1.3.2-blue.svg)](Cargo.toml)
 
 A resident Windows daemon that watches the applications you track and switches the rest of your
 machine around them. While a tracked app runs, Rainmeter, G-Helper and Wallpaper Engine get out
@@ -44,7 +44,10 @@ arbitrary code. A pack is a single `pack.json` file, and it may expose a few dro
 **Where to get them** — the catalogue repository,
 **[PixelAsh6/ArmouryDaemon_Packs](https://github.com/PixelAsh6/ArmouryDaemon_Packs)**, whose
 README is the reference for the pack format, the mechanism vocabulary and the script host API.
-Three packs are published there: **Wallpaper Engine**, **G-Helper** and **Rainmeter**.
+It publishes three **packs** — **Wallpaper Engine**, **G-Helper** and **Rainmeter** — and three
+**modules**: the **console launcher**, **idle mode** and the **killswitch**. A pack follows the
+tracked app; a module is a component of the daemon with its own switch, its own window and its
+own trigger.
 
 **How to install one** — Settings → **Install packs**, or from the command line:
 
@@ -56,11 +59,11 @@ A pack may declare the daemon it needs (`"min_engine": "1.2.0"`). A daemon that 
 refuses it **by name** instead of installing it, and the pack never lands on disk:
 
 ```console
-pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.1.6
+pack 'example-pack' (Example Pack) needs daemon 1.2.0 or newer; this daemon is 1.3.2
 ```
 
 The shipped packs are fine: the Rainmeter pack asks for `1.0.0`, and the daemon that ships it
-is `1.1.6`.
+is `1.3.2`.
 
 ### The lockout ("Cooldown")
 
@@ -91,7 +94,12 @@ the daemon's own value back.
 Manual actions — removing a tracked app, pausing, entering or leaving idle mode — bypass the
 lockout: they change the packs at once.
 
-### The console band (the game launcher)
+### The console launcher (the band)
+
+The launcher is a **module**: install it from the catalogue like a pack and it appears in the
+dashboard's Packs list as **Console launcher**. Its own window holds everything that belongs to
+it: the open mode, the games pinned to it and the SteamGridDB key its cover art uses. With the
+module not installed there is no band, no row state and no key field.
 
 Plug in a controller and the band opens: your tracked apps and any apps you pinned to it. The
 d-pad or the left stick scrolls, **A** launches, **B** (or unplugging the pad) closes it. A
@@ -108,10 +116,10 @@ The band can also be opened from the tray, and it can be told to stay out of the
 
 ### Global hotkeys
 
-| Key | What it does |
-|---|---|
-| **End** | Killswitch: hide the running tracked apps and mute their audio. Press again to put both back. |
-| **Home** | Idle mode. Press again to come back. |
+A key is owned by the module it drives, not by the daemon. **Killswitch** ships with **End**;
+**idle mode** ships with **Home**. Each module's own window records its combination, up to four
+keys, and the daemon reloads the table from the installed modules on the spot. A module that is
+not installed owns no key, so an unclaimed combination reaches the app you are in instead.
 
 Both keys are handled by a **low-level keyboard hook** (`WH_KEYBOARD_LL`), not by
 `RegisterHotKey`. That distinction matters: a registered hotkey is swallowed by Windows and
@@ -131,8 +139,10 @@ idle mode after a configurable number of minutes (180 by default).
 
 The dashboard's idle band reports how many monitors it covered and how many outputs it muted.
 
-While idle mode is up, pack switching is cancelled: tracked apps count as ordinary apps. The
-packs are applied again when you wake it with a tracked app still running.
+Idle mode is an overlay and a mute, nothing else: it does not revert the packs, freeze their
+switching or re-apply them when you wake it. A tracked app that starts behind the black screens
+is handled exactly as it would be without them, which is why waking up never lands in a state
+nobody asked for.
 
 ### Cover art
 
@@ -182,12 +192,12 @@ ArmouryDaemon.exe --help
 ```
 
 `--catalog-url <url>` lists that catalogue instead of the configured one. `--version` prints
-`ArmouryDaemon 1.1.6`, `--help` prints the flags the binary accepts. An argument the binary
+`ArmouryDaemon 1.3.2`, `--help` prints the flags the binary accepts. An argument the binary
 does not know is an error — the usage on stderr, exit code 2 — so the daemon never starts on
 a typo.
 
 The release build is a **GUI-subsystem binary** (PE subsystem 2), so it prints to the console it
-attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.1.6` on stdout, once, and
+attaches to: `ArmouryDaemon.exe --version` writes `ArmouryDaemon 1.3.2` on stdout, once, and
 exits 0. Redirected, the line goes to **both** stdout and stderr, so `2>&1 | Out-String` shows
 it **twice**. `cmd.exe`'s own `>` can misbehave, because the process attaches to the parent
 console (`AttachConsole`) and re-points the standard handles, so the file can come out empty
@@ -226,12 +236,12 @@ small, undecorated windows plus a tray icon:
   the state, the daemon's version, the uptime, the pack count, the tracked apps and the packs,
   with a status band for *paused* and *cooling down*. The cooling-down band names the app the
   window belongs to, and the cooldown row says that a change is waiting behind the window while
-  one is. Its Packs section also carries the built-in
-  **Console launcher** row.
+  one is. Its Packs section also carries the
+  **Console launcher** row, because the launcher is a module and not a pack.
 - **The Settings window** opens to the left of the dashboard: the **Cooldown** value, the
-  idle failsafe, the installed packs (each with a **Remove**), the console launcher's open mode
-  and the apps pinned to it, the SteamGridDB key, and the two buttons **Install packs** and
-  **Open packs folder**. The catalogue is checked in the Install packs window; the line under the
+  idle failsafe, every installed module and pack (each with a **Remove**), and the two buttons
+  **Install packs** and **Open packs folder**. A module's own settings are in its own window:
+  the console launcher's open mode, games and SteamGridDB key, and each mode's hotkey. The catalogue is checked in the Install packs window; the line under the
   packs row reports the **last check**, whoever ran it. The dashboard's figures live on the
   dashboard and in the Install packs window, not here. Windows open in a leftward chain: a new
   window goes immediately to the left of the current leftmost one, with a gap of exactly
@@ -254,7 +264,7 @@ AMD Excavator (2015) and later; see [Building from source](#building-from-source
 ### From the executable alone
 
 1. **Download** `ArmouryDaemon.exe` from the
-   [v1.1.5 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.1.6) and put it
+   [v1.3.2 release](https://github.com/PixelAsh6/ArmouryDaemon/releases/tag/v1.3.2) and put it
    in a folder you can write to, for example `C:\Apps\ArmouryDaemon`. The release carries this
    executable and its `ArmouryDaemon.exe.sha256` sidecar — the SHA-256 of the file, so a swapped
    binary is detectable — and nothing else.
@@ -271,9 +281,9 @@ AMD Excavator (2015) and later; see [Building from source](#building-from-source
    SteamGridDB key in Settings is for the **cover art** only. The
    [catalogue section](#the-pack-catalogue) has the details of the download and the check.
 
-The three packs — **Wallpaper Engine**, **G-Helper** and **Rainmeter** — are not in the release
-any more: the catalogue is where they come from, and they are installed into the `packs\` folder
-next to the executable, which is where your own packs go too.
+The three packs and the three modules are not in the release any more: the catalogue is where
+they come from. A pack lands in the `packs\` folder next to the executable, which is where your
+own packs go too; a module lands in `modules\<id>\` as a record plus its executable.
 
 ### Or the scripted install
 
@@ -331,7 +341,7 @@ and a Rust toolchain (edition 2024, `rust-version` 1.95).
 
 ```powershell
 cargo build --release        # -> target\release\ArmouryDaemon.exe
-cargo test                   # the unit tests (378: 273 in armoury, 105 in armoury-core)
+cargo test                   # the unit tests (462 across both crates and both binaries)
 powershell -ExecutionPolicy Bypass -File tools\daemon-selftest.ps1   # the 133-check integration harness
 ```
 

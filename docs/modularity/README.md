@@ -42,6 +42,18 @@ background.
 
 ## Current state
 
+- **1.3.2 closes this line.** The 2026-10-30 report fixed four things in `main`: the tray
+  click now hands the UI the foreground right before it sends the focus request (a bare
+  `SetForegroundWindow` from a process Windows did not consider the last to receive input
+  is refused, so the dashboard stayed behind the active window); every window grows by
+  what its laid-out body actually overflows instead of trusting a per-row font estimate,
+  with the frame's own margins not counted as overflow (counting them made the dashboard
+  grow ten points a frame); the pack worker drops a queued full-state job when a newer one
+  arrives and the CLI deadline is 20 s, because Wallpaper Engine's `-control stop` hung
+  past 10 s, was killed, and the stop only landed on the next pass; and a hotkey pack is
+  no longer read back after its apply, because that check measured the app's save delay,
+  not the pack's work. Two dead helpers (`hotkey::apply`, `trust::len`/`source`) went with
+  them. Counts: **462 unit tests, 0 failed** (run elevated), the harness unchanged.
 - **Phase C1-C3 are done on `feature/c1-c3-console-split`** (green run `40499523579`):
   the console launcher is its own exe — a second `[[bin]]` of the `armoury` crate whose
   crate root (`src/console_bin.rs`) declares the seven shared modules with `#[path]`
@@ -225,16 +237,14 @@ background.
 
 ## The next action
 
-**Phase C is done** — the console is its own exe and the daemon prefers it
-when a helper module carries it (`feature/c1-c3-console-split`, green run
-`40499523579`); the merge into `main`, the post-merge run and the branch
-prune complete this phase's session. **Phase D is next**: the Inno Setup
-installer (`D1`, core only, zero packs), the build-from-source script
-(`D2`), and the self-update decision (`D3`). The `C:\Apps` install of 1.2.0,
-the signing key and the next release are the user's calls.
+**Nothing is queued.** The modular request is shipped: the console launcher, idle mode and the
+killswitch are modules the catalogue serves, each with its own window and its own switch, and
+1.3.2 is the release that carries the last round of fixes. **Phase D was never started** (the
+Inno Setup installer, the build-from-source script, the self-update decision); it stays a
+sketch. **Phase E (WASM) is deferred indefinitely.**
 
-Phases run in order: **A → B → C → D**, and **E (WASM) is deferred**
-until the rest has shipped and settled.
+If work resumes on this folder, start from `PROGRESS.md` and treat the newest entry below as
+the state to beat.
 
 ---
 
