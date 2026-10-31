@@ -90,7 +90,7 @@ pub struct StatusSnapshot {
     /// Installed packs and their state, for the dashboard.
     #[serde(default)]
     pub packs: Vec<PackStatus>,
-    /// Console launcher auto-open: `"always"` (daemon startup), `"pad"` (controller connect),
+    /// Console bar auto-open: `"always"` (daemon startup), `"pad"` (controller connect),
     /// `"never"`. The tray's manual open works regardless.
     #[serde(default = "default_console_open")]
     pub console_open: String,

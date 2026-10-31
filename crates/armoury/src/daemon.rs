@@ -85,7 +85,7 @@ pub enum Start {
 ///
 /// An automatic open (the daemon starts, the machine resumes from sleep, the open mode
 /// changes) must never interrupt a game: it is refused while a tracked app is running. An
-/// explicit open (the tray's "Console mode", the dashboard's console button) always opens
+/// explicit open (the tray's "Console bar", the dashboard's console button) always opens
 /// the band - the user asked for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleOpen {
@@ -316,7 +316,7 @@ pub fn run(start: Start) {
     let pause_item = MenuItem::with_id("pause_all", "Pause all packs", true, None);
     let idle_item = MenuItem::with_id("idle", "Idle mode", true, None);
     let kill_item = MenuItem::with_id("killswitch", "Toggle killswitch", true, None);
-    let console_item = MenuItem::with_id("console", "Console mode", true, None);
+    let console_item = MenuItem::with_id("console", crate::ui::CONSOLE_FEATURE, true, None);
     let quit_item = MenuItem::with_id("quit", "Quit", true, None);
     if let Err(e) = menu.append_items(&[
         &open_item,
@@ -483,7 +483,7 @@ pub fn run(start: Start) {
                     }
                 }
                 "killswitch" => app.toggle_killswitch(),
-                // The tray's "Console mode": the user asked for the band, so it opens even
+                // The tray's "Console bar": the user asked for the band, so it opens even
                 // while a game is running.
                 "console" => app.open_console(ConsoleOpen::Explicit),
                 "quit" => {
@@ -1289,7 +1289,7 @@ enum ConsoleAction {
 /// known to have finished; `window_gone` says its band is gone — closed, hidden or
 /// minimised (the OS parks a minimised band at (-32000, -32000)). A launcher that is
 /// alive but has no band can never be used again, so it is replaced instead of kept:
-/// keeping it would turn the tray's "Console mode" into a no-op.
+/// keeping it would turn the tray's "Console bar" into a no-op.
 fn console_action(pid: u32, exited: bool, window_gone: bool) -> ConsoleAction {
     if pid == 0 || exited {
         ConsoleAction::Clear
@@ -2599,7 +2599,7 @@ impl App {
     ///
     /// `reason` says who asked for it: an automatic open (the daemon started, the machine
     /// resumed from sleep, the open mode changed) is refused while a tracked app is running
-    /// — the band would pop up over the game. An explicit open (the tray's "Console mode",
+    /// — the band would pop up over the game. An explicit open (the tray's "Console bar",
     /// the dashboard's console button) always opens the band.
     fn open_console(&mut self, reason: ConsoleOpen) {
         // Only an automatic open has to look at what is running.
@@ -4178,7 +4178,7 @@ mod tests {
 
     #[test]
     fn an_explicit_open_always_opens_the_band() {
-        // The user asked for it (the tray's "Console mode", the dashboard's console
+        // The user asked for it (the tray's "Console bar", the dashboard's console
         // button): the band opens even while a game is running.
         assert!(
             console_open_allowed(ConsoleOpen::Explicit, true),

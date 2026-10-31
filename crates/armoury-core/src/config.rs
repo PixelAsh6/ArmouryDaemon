@@ -55,7 +55,7 @@ pub struct AppConfig {
     /// double duty — the config switch and the "is the killswitch module installed" flag:
     /// `false` makes the toggle a no-op wherever it sits.
     pub killswitch_enabled: bool,
-    /// Console launcher auto-open: `always` (daemon startup), `pad` (controller connect), `never`.
+    /// Console bar auto-open: `always` (daemon startup), `pad` (controller connect), `never`.
     /// The tray's manual open is never affected.
     #[serde(default = "default_console_open", deserialize_with = "de_console_open")]
     pub console_open: String,
@@ -70,7 +70,7 @@ pub struct AppConfig {
     /// Pack catalog manifest URL; `None` = the official catalog.
     #[serde(default)]
     pub catalog_url: Option<String>,
-    /// Console launcher recency: exe base name (lowercase) -> unix seconds of the last play.
+    /// Console bar recency: exe base name (lowercase) -> unix seconds of the last play.
     #[serde(default)]
     pub last_played: HashMap<String, u64>,
     /// SteamGridDB API key for cover art (https://www.steamgriddb.com/profile/preferences).

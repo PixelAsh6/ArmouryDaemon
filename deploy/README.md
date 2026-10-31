@@ -20,7 +20,7 @@ the exact ACL, updating and uninstalling. The overview and the lone-exe install 
   **keyboard-only** by design: the mouse deliberately does not end an idle session, so a nudged
   mouse cannot do it by accident. It leaves the packs alone in both directions.
 - **Pause** - stop all pack switching without uninstalling anything.
-- **Console launcher** - a module: a launcher strip along the bottom of the screen with the
+- **Console bar** - a module: a launcher strip along the bottom of the screen with the
   cover art of your tracked and pinned apps. Open it from the tray, let it pop up on a controller
   connect, or keep it out of the way. A game that does not start keeps the band open and shows
   you why.
@@ -78,7 +78,7 @@ AMD Excavator (2015) and later; see [Building from source](../README.md#building
 
 3. The tray icon is a **purple squircle with a bold white A**. Left-click it for the dashboard;
    right-click for the menu (Open dashboard / Pause all packs / Idle mode / Toggle killswitch /
-   Console mode / Quit).
+   Console bar / Quit).
 
 ## Where things live
 
@@ -215,7 +215,7 @@ installed pack deletes it again.
 ## The self-test
 
 `tools/daemon-selftest.ps1` drives a throw-away daemon instance (its own pipe, config folder and
-single-instance guard) through the whole engine and prints one line per check - 84 of them. It
+single-instance guard) through the whole engine and prints one line per check. It
 needs no Wallpaper Engine, G-Helper or Rainmeter, but it does need an **elevated** shell: the
 executable carries a manifest that asks for administrator, so the runs it starts would raise a
 UAC prompt. A harness that is not elevated **skips** the command-line probes and prints why.

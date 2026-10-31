@@ -477,7 +477,7 @@ mod tests {
     fn a_helper_entry_carries_its_executable() {
         let catalog = parse(
             r#"{"schema": 2, "modules": [{
-                "id": "console", "kind": "helper", "name": "Console launcher",
+                "id": "console", "kind": "helper", "name": "Console bar",
                 "version": "1.0.0", "file": "modules/console/console.zip",
                 "sha256": "y", "size": 2400000, "entry": "ArmouryConsole.exe"}]}"#,
         )

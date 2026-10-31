@@ -1,4 +1,4 @@
-//! Console launcher (`--console`): the pad-driven cover-art strip the daemon spawns on a fresh
+//! Console bar (`--console`): the pad-driven cover-art strip the daemon spawns on a fresh
 //! controller connect (the tray menu and the settings preview can open it too).
 //!
 //! Its own process, like `--ui`: it connects to the daemon over the same JSONL pipe, receives

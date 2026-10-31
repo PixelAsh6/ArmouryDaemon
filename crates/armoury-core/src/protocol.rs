@@ -58,7 +58,7 @@ pub enum Request {
     },
     /// Remove an installed pack (its folder under `<install>\packs`).
     RemovePack { id: String },
-    /// Console launcher auto-open: `always` (daemon startup), `pad` (controller connect),
+    /// Console bar auto-open: `always` (daemon startup), `pad` (controller connect),
     /// `never`. The tray's manual open is never affected.
     SetConsoleOpen { mode: String },
     /// SteamGridDB API key for cover/hero art (empty string clears it).

@@ -71,7 +71,7 @@ const NO_PACKS_HINT: &str = "No packs installed yet.\nFind them in Settings → 
 
 /// The console launcher arrives as a helper pack (C2), so this row is its policy, not a
 /// daemon feature: one dropdown saying when the pack opens itself, in both packs lists.
-const CONSOLE_FEATURE: &str = "Console bar";
+pub(crate) const CONSOLE_FEATURE: &str = "Console bar";
 /// What the SteamGridDB field shows instead of the key: a row of dots.
 const SGDB_MASK: &str = "••••••••••••";
 /// Auto-open modes in dropdown order: (value stored in config.json, label).
