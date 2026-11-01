@@ -36,6 +36,11 @@ pub const SIDECAR_ASSET: &str = "ArmouryDaemon.exe.sha256";
 pub const SIG_ASSET: &str = "ArmouryDaemon.exe.minisig";
 /// How long the new build is given to answer before the old one is put back.
 pub const ROLLBACK_WAIT_MS: u64 = 30_000;
+/// The most any fetch here will read into memory. The `read_to_vec` default is 10 MiB,
+/// and the release executable passed that in 1.3.2 (13,495,808 bytes): the update stopped
+/// at 10 MiB before the hash was ever checked. 64 MiB is four times the biggest build
+/// here and still a ceiling, so a server cannot exhaust memory.
+pub const MAX_BODY: u64 = 64 * 1024 * 1024;
 
 /// What the feed says.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +275,8 @@ fn fetch(url: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("update: cannot fetch {url} ({e})"))?;
     response
         .body_mut()
+        .with_config()
+        .limit(MAX_BODY)
         .read_to_vec()
         .map_err(|e| format!("update: cannot download {url} ({e})"))
 }
